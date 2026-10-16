@@ -27,7 +27,7 @@ use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSpan, RealmSpec, RealmStac
 use boxel_worldgen::region::{
     Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid,
     LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope,
-    SelectorRule, ShapeEffect, ShapeModifier, TerrainKind, check_lod, lod_corners,
+    SelectorRule, ShapeEffect, ShapeModifier, TerrainKind, TopLayers, check_lod, lod_corners,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -178,12 +178,9 @@ impl TerrainKind<TestContext> for NoMargin {
     }
 }
 
-#[test]
-fn the_harness_catches_a_margin_under_the_heights() {
-    let registry = registry();
-    // Steep hills everywhere, their tops between the corners of a 16-block cell.
-    let hills = Relief::blocks(60, 20, 128, 2);
-    let world = world_of(
+/// The test world with `kind` everywhere (one Cell rule, one entry).
+fn one_kind_world(kind: Arc<dyn TerrainKind<TestContext>>) -> TestWorld {
+    world_of(
         vec![("test:surface", realm())],
         vec![(
             "test:land",
@@ -197,37 +194,60 @@ fn the_harness_catches_a_margin_under_the_heights() {
             },
         )],
         Vec::new(),
-        vec![(
-            "test:hills",
-            Arc::new(NoMargin(hills)) as Arc<dyn TerrainKind<TestContext>>,
-        )],
+        vec![("test:hills", kind)],
+    )
+}
+
+/// Steep hills everywhere, their tops between the corners of a 16-block cell.
+const STEEP: Relief = Relief::blocks(60, 20, 128, 2);
+
+#[test]
+fn the_harness_catches_a_margin_under_the_heights() {
+    let registry = registry();
+    let g = generator(
+        &one_kind_world(Arc::new(NoMargin(STEEP))),
+        SEED,
+        RegionSettings::default(),
     );
-    let g = generator(&world, SEED, RegionSettings::default());
     let columns: Vec<(i64, i64)> = (0..64).map(|n| (n * 37 + 3, n * 23 - 700)).collect();
     let e = check_lod(&g, &registry, &columns, 4..=4).expect_err("tops under the real ones");
     assert!(e.contains("under the real one"), "{e}");
     // The same kind with the default margin (its declared slope) passes.
-    let world = world_of(
-        vec![("test:surface", realm())],
-        vec![(
-            "test:land",
-            SelectorRule {
-                realm: id("test:surface"),
-                priority: 0,
-                condition: Vec::new(),
-                scope: Scope::Cell(CELLS),
-                entries: vec![Entry::new(id("test:hills"), 1)],
-                version: 1,
-            },
-        )],
-        Vec::new(),
-        vec![(
-            "test:hills",
-            Arc::new(hills) as Arc<dyn TerrainKind<TestContext>>,
-        )],
+    let g = generator(
+        &one_kind_world(Arc::new(STEEP)),
+        SEED,
+        RegionSettings::default(),
     );
-    let g = generator(&world, SEED, RegionSettings::default());
     report("default margin", check_lod(&g, &registry, &columns, 1..=4));
+}
+
+#[test]
+fn a_top_run_that_is_not_solid_slides_up_with_the_ground() {
+    let registry = registry();
+    // Glass over the Solid run: a column's highest Solid block lies 2 under its ground, and a
+    // cell's ground may stand up to its margin over its highest corner.
+    let decoration = Decoration::new(
+        (id("test:fill"), Arc::new(FloorFill)),
+        (
+            id("test:surface"),
+            Arc::new(TopLayers::new(vec![
+                ("test:glass".into(), 2),
+                ("test:cutout".into(), 1),
+            ])),
+        ),
+    );
+    let g = generator_with(
+        &one_kind_world(Arc::new(STEEP)),
+        SEED,
+        RegionSettings::default(),
+        decoration,
+    );
+    // Cells whose real tops stand a cell over their highest corner's (found by brute force: with
+    // the runs anchored at that corner, their coarse tops were a cell under the real ones), and a
+    // few more.
+    let mut columns = vec![(1680, -992), (-2464, 3856), (-2448, 3808), (5760, 6912)];
+    columns.extend(columns_in(4, [3, -2], 8, 5));
+    report("glass on top", check_lod(&g, &registry, &columns, 1..=4));
 }
 
 // ---- The divide term --------------------------------------------------------------------------

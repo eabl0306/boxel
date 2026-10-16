@@ -816,32 +816,20 @@ impl<Cx: Context> RegionGenerator<Cx> {
         if c.is_wet() && c.t < y1 && c.wet >= y0 {
             return blocks.fluid;
         }
-        // The highest Solid block of `y0..=min(y1, t)`: over `h` the top run's (the margin and the
-        // rise), then the runs, then the floor.
+        // The highest Solid block that may lie in `y0..=min(y1, t)`. A column's ground may stand
+        // anywhere from `h` up to `t` (the margin and the rise), so a run `d` blocks under the
+        // ground may hold any block of `h - d - n + 1..=t - d`, and the floor any block up to `t`
+        // less the runs: the runs slide up with the ground, so a non-Solid top run (glass on top)
+        // never hides the Solid one under it.
         let top = y1.min(c.t);
-        if top > c.h {
-            match runs.first() {
-                Some(&(state, _, true)) => return state,
-                Some(_) => {}
-                None => return blocks.floor,
-            }
-        }
-        let mut y = top.min(c.h);
-        let mut run_top = c.h;
+        let mut d = 0;
         for &(state, n, solid) in runs {
-            let run_bottom = run_top - n;
-            if y > run_bottom {
-                if y < y0 {
-                    return BlockState::AIR;
-                }
-                if solid {
-                    return state;
-                }
-                y = run_bottom;
+            if solid && top.min(c.t - d) >= y0.max(c.h - d - n + 1) {
+                return state;
             }
-            run_top = run_bottom;
+            d += n;
         }
-        if y >= y0 {
+        if top.min(c.t - d) >= y0 {
             blocks.floor
         } else {
             BlockState::AIR

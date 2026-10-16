@@ -143,8 +143,9 @@ pub trait SurfaceStage<Cx: Context>: GenEntry + Send + Sync {
 
     /// The far LOD form (ADR 0039 sec. 10): the top of each cell column of a node, from its
     /// ground down, into `out` (one per cell column, in `columns`' order, all without runs on
-    /// entry). The far LOD takes the blocks over the ground inside the reach's rise as the top
-    /// run's (or the floor), so a raised top stays on or over the real one.
+    /// entry). A cell column's ground may stand over its highest corner by its margin and the
+    /// reach's rise: the far LOD slides the runs up with it, so a coarse cell is Solid wherever a
+    /// real one may hold a Solid block (a non-Solid top run included).
     ///
     /// The default leaves every column without runs: the realm's floor up to the ground.
     fn lod_top(&self, columns: &LodColumns<'_, Cx>, registry: &BlockRegistry, out: &mut [LodTop]) {
