@@ -561,9 +561,10 @@ vuelo.
   generador nuevo en cada apertura, así abrir el mundo A, cerrarlo y abrir el B en los mismos
   workers nunca lee el memo de A.
 - **Chequeo de spans en debug.** En los builds de debug, `generate` comprueba que todo bloque que
-  no es aire queda dentro de las cotas de columna del reino y bajo la cota local de aire, y que los
-  bloques de volumen están solo donde `d_f >= K`. Los tests del motor corren en debug, así un tipo o
-  un mod con una cota mal hecha falla sus tests.
+  no es aire queda dentro de las cotas de columna del reino y bajo la cota local de aire, que la
+  etapa de superficie escribe solo dentro de su alcance declarado (si no, deja costuras entre
+  chunks), y que los bloques de volumen están solo donde `d_f >= K`. Los tests del motor corren en
+  debug, así un tipo o un mod con una cota mal hecha falla sus tests.
 - **Lado de consultas.** `WorldQuery { height_at(x, z), realm_at(y), biome_at(x, y, z),
   column(x, z) -> ColumnInfo, environment_at(x, y, z) }`: puro, unos 2 us en caliente, por
   `as_query()`. Hasta que exista la tabla `BiomeRule`, `biome_at` da una etiqueta provisoria: el

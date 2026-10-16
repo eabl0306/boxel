@@ -31,9 +31,10 @@ use boxel_worldgen::lod::LodSource;
 use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSky, RealmSpan, RealmSpec, RealmStack};
 use boxel_worldgen::region::{
-    Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ, Interval,
-    KindForm, KindGrid, KindLimits, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
-    RuleEntry, Scope, SelectorRule, TerrainKind, clear_worker_memo,
+    ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ,
+    Interval, KindForm, KindGrid, KindLimits, NoSurface, RegionGenerator, RegionSettings,
+    RegionSpec, RuleEntry, Scope, SelectorRule, SurfaceReach, SurfaceStage, TerrainKind,
+    clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher,
@@ -669,6 +670,107 @@ fn the_span_check_catches_a_range_or_bound_under_the_heights() {
     );
     let message = panic_of(|| drop(low_bounds.column_info(5, 5))).expect("caught");
     assert!(message.contains("span check"), "{message}");
+}
+
+/// A surface stage that declares `reach` and writes `test:glass` `below` blocks under each
+/// ground and `above` blocks over it, inside or outside its reach.
+struct Reaches {
+    reach: SurfaceReach,
+    below: i64,
+    above: i64,
+}
+
+impl HashParams for Reaches {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.below).write(&self.above);
+    }
+}
+impl GenEntry for Reaches {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+impl SurfaceStage<TestContext> for Reaches {
+    fn reach(&self) -> SurfaceReach {
+        self.reach
+    }
+    fn apply(
+        &self,
+        columns: &ChunkColumns<'_, TestContext>,
+        registry: &BlockRegistry,
+        out: &mut [BlockState],
+    ) {
+        let glass = registry.by_name("test:glass").unwrap();
+        for (c, &g) in columns.ground.iter().enumerate() {
+            for y in [g - self.below, g + self.above] {
+                let ly = y - columns.origin.y;
+                if (0..i64::from(CHUNK_SIZE)).contains(&ly) {
+                    out[((ly as usize) << 10) | c] = glass;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn the_span_check_catches_a_surface_stage_outside_its_reach() {
+    // A stage runs only in the chunks its declared reach touches, so what it writes outside its
+    // reach shows in some chunks and not in their neighbors: seams.
+    let world = world_of(
+        vec![("test:surface", realm())],
+        vec![(
+            "test:land",
+            rule(
+                0,
+                Vec::new(),
+                Scope::CELL,
+                vec![Entry::new(id("test:flat"), 1)],
+            ),
+        )],
+        Vec::new(),
+        vec![(
+            "test:flat",
+            Arc::new(FlatKind::blocks(40)) as Arc<dyn TerrainKind<TestContext>>,
+        )],
+    );
+    let registry = registry();
+    let with = |depth, rise, below, above| {
+        let mut checks = Checks::new();
+        let g = RegionGenerator::build(
+            RegionSpec {
+                seed: SEED,
+                dimension: &id("test:overworld"),
+                realm: &id("test:surface"),
+                realms: &world.realms,
+                rules: &world.rules,
+                entries: &world.entries,
+                kinds: &world.kinds,
+                decoration: Decoration::new(
+                    (id("test:fill"), Arc::new(FloorFill)),
+                    (
+                        id("test:reaches"),
+                        Arc::new(Reaches {
+                            reach: SurfaceReach { depth, rise },
+                            below,
+                            above,
+                        }),
+                    ),
+                ),
+                settings: RegionSettings::default(),
+            },
+            |s| TestContext::new(s, BASE),
+            &mut checks,
+        )
+        .expect("opens");
+        // The ground at y 40 is in chunk layer 1.
+        panic_of(|| drop(g.generate(key(0, 1, 0), &registry)))
+    };
+    assert_eq!(with(3, 1, 2, 1), None, "inside its reach");
+    let deep = with(1, 1, 2, 1).expect("caught");
+    assert!(deep.contains("outside its reach 40..=41"), "{deep}");
+    let high = with(3, 0, 2, 1).expect("caught");
+    assert!(high.contains("outside its reach 38..=40"), "{high}");
 }
 
 // ---- Uniform and 1-bit chunks -----------------------------------------------------------------

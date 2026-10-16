@@ -74,7 +74,8 @@ pub trait SurfaceStage<Cx: Context>: GenEntry + Send + Sync {
     fn reach(&self) -> SurfaceReach;
 
     /// Rewrites `out`, the chunk's states (`y << 10 | x << 5 | z`, with the rock, the fluid and
-    /// the air in place), inside each column's reach. Called only for chunks its reach touches.
+    /// the air in place), inside each column's reach. Called only for chunks its reach touches;
+    /// in debug builds [`decorate`] panics if it changed a block outside the reach.
     fn apply(
         &self,
         columns: &ChunkColumns<'_, Cx>,
@@ -319,7 +320,40 @@ pub fn decorate<Cx: Context>(
         }
     }
     if touched {
+        let before = cfg!(debug_assertions).then(|| states.clone());
         stages.surface.apply(columns, registry, &mut states);
+        if let Some(before) = before {
+            check_reach(columns, reach, &before, &states);
+        }
     }
     ChunkData::from_dense(&states)
+}
+
+/// The debug check of the surface stage: it changed only blocks inside each column's reach. A
+/// stage runs only in the chunks its declared reach touches, so a block it writes outside would
+/// show in some chunks and not in their neighbors (and never in the deep path).
+fn check_reach<Cx: Context>(
+    columns: &ChunkColumns<'_, Cx>,
+    reach: SurfaceReach,
+    before: &[BlockState],
+    after: &[BlockState],
+) {
+    let origin = columns.origin;
+    for (c, &g) in columns.ground.iter().enumerate() {
+        let lo = g.saturating_sub(reach.depth.into()).saturating_add(1);
+        let hi = g.saturating_add(reach.rise.into());
+        for ly in 0..CHUNK_SIZE as usize {
+            let (i, y) = ((ly << (2 * CHUNK_SHIFT)) | c, origin.y + ly as i64);
+            assert!(
+                before[i] == after[i] || (lo..=hi).contains(&y),
+                "span check: the surface stage changed the block at ({}, {y}, {}), outside its \
+                 reach {lo}..={hi} (depth {}, rise {} around the ground at y {g}): the chunks it \
+                 does not reach would not show it",
+                origin.x + (c >> CHUNK_SHIFT) as i64,
+                origin.z + (c & (CHUNK_SIZE as usize - 1)) as i64,
+                reach.depth,
+                reach.rise,
+            );
+        }
+    }
 }
