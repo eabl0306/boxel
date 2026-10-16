@@ -1570,6 +1570,59 @@ fn a_kind_alone_keeps_the_cap() {
     );
 }
 
+#[test]
+fn the_slope_check_counts_the_jitter() {
+    // A kind's rounding adds to its slope over a step of one block: a slope of 2.9 with a jitter
+    // of 52/256 block steps up to 3.1 blocks between neighbor columns.
+    let world = |kinds: Vec<(&'static str, KindLimits)>| {
+        let entries = kinds
+            .iter()
+            .map(|&(name, _)| Entry::new(id(name), 1))
+            .collect();
+        world_of(
+            vec![("test:surface", realm())],
+            vec![("test:land", rule(0, Vec::new(), Scope::CELL, entries))],
+            Vec::new(),
+            kinds
+                .into_iter()
+                .map(|(name, l)| {
+                    let kind: Arc<dyn TerrainKind<TestContext>> =
+                        Arc::new(Declared(l, KindForm::Height));
+                    (name, kind)
+                })
+                .collect(),
+        )
+    };
+    let jittered = |slope_milli, lo, hi, jitter| {
+        let mut l = declared_limits(slope_milli, lo, hi);
+        l.slope.jitter = jitter;
+        l
+    };
+    assert_eq!(
+        open(&world(vec![("test:a", jittered(2900, 0, 0, 0))])),
+        Ok(())
+    );
+    let alone = open(&world(vec![("test:a", jittered(2900, 0, 0, 52))])).expect_err("over the cap");
+    assert!(
+        alone.contains("terrain kind test:a of realm test:surface has a slope of 3.103, over 3"),
+        "{alone}"
+    );
+    // A pair at 2.5 with a border relief of 220 blocks (2.905) passes; a jitter of 30/256 on one
+    // kind takes it to 3.02.
+    let pair = |jitter| {
+        open(&world(vec![
+            ("test:a", jittered(2500, 90, 110, jitter)),
+            ("test:b", jittered(2500, -110, -90, 0)),
+        ]))
+    };
+    assert_eq!(pair(0), Ok(()));
+    let message = pair(30).expect_err("over the cap");
+    assert!(
+        message.contains("kinds test:a and test:b of realm test:surface can meet"),
+        "{message}"
+    );
+}
+
 fn declared_limits(slope_milli: u64, lo: i64, hi: i64) -> KindLimits {
     let relief = Span::new(lo << 8, hi << 8);
     KindLimits {

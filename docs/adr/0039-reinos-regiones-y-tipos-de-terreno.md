@@ -272,7 +272,8 @@ grad H = suma_k w_k grad H_k + suma_k (H_k - m) grad w_k      (para cualquier co
   tipos que las reglas puedan juntar en una misma ventana de 4 x 4 puntos de retícula, con los dos
   máximos tomados dentro del grupo. Con los tríos alcanza: un grupo más grande cumple si cumple el
   trío de su tipo más empinado y su par más lejano. Cada tipo solo también pide `slope <= 3`: es
-  el interior de sus regiones.
+  el interior de sus regiones. La pendiente de un tipo, para el chequeo, es la que declara más su
+  redondeo (el jitter de su `Slope`) en un paso de un bloque.
 - Solo por pares no alcanza: con `a` en [90, 110], `b` en [-110, -90] y un `c` más empinado en
   [-10, 10], cada par pasa con la pendiente máxima que le deja el chequeo y el punto triple llega a
   3,08.

@@ -141,7 +141,8 @@ impl fmt::Display for KindForm {
 pub struct KindLimits {
     /// The slope of its heights, base included, in [`HeightQ`] per block (a slope of 1 block per
     /// block is 256): the [`Field::slope`](crate::field::Field::slope) of the fields it adds up.
-    /// The jitter is its rounding, not part of the checked slope.
+    /// The border check takes its slope over one block, `per_block + jitter`, so its rounding
+    /// counts against the cap.
     pub slope: Slope,
     /// Its relief over the base, anywhere, in [`HeightQ`].
     pub relief: Span,

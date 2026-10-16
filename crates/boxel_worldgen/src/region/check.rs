@@ -47,7 +47,8 @@ pub fn border_relief(a: &KindLimits, b: &KindLimits) -> u64 {
 /// - every band relief lies inside its relief ([`Problem::KindLimits`]);
 /// - every kind alone, every pair and every triple passes [`slope_passes`] with its steepest slope
 ///   and largest border relief ([`Problem::KindSlope`]; a pair is reported only when its two kinds
-///   pass alone, a triple only when its three pairs pass).
+///   pass alone, a triple only when its three pairs pass). A kind's slope there is its slope over
+///   a step of one block, `per_block + jitter`: its rounding counts.
 ///
 /// Any two kinds of a realm may meet in a window: the rules' conditions cannot tell where they
 /// will hold, so the check takes every pair and triple of the realm. Triples are enough for any
@@ -71,7 +72,13 @@ pub fn check_kinds(
             checks.push(Problem::KindLimits { kind: id.clone() });
         }
     }
-    let slope = |k: usize| kinds[k].2.slope.per_block.raw();
+    // A kind's slope over one block, its rounding included: `per_block + jitter`, exact in Q16.
+    let slope = |k: usize| {
+        let s = kinds[k].2.slope;
+        s.per_block
+            .raw()
+            .saturating_add(s.jitter.saturating_mul(1 << 16))
+    };
     let relief = |a: usize, b: usize| border_relief(&kinds[a].2, &kinds[b].2);
     let pair = |a: usize, b: usize| slope_passes(slope(a).max(slope(b)), relief(a, b), lattice);
     let fail = |checks: &mut Checks, set: &[usize], slope: u64, relief: u64| {

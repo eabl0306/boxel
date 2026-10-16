@@ -178,7 +178,8 @@ pub enum Problem {
         realm: GenId,
         /// The one, two or three kinds.
         kinds: Vec<GenId>,
-        /// The steepest one's slope, in 1/256 block per block, Q16 (the raw value of a `Q16`).
+        /// The steepest one's slope over one block, its jitter included, in 1/256 block per
+        /// block, Q16 (the raw value of a `Q16`).
         slope: u64,
         /// The largest border relief between them, in 1/256 block.
         relief: u64,
