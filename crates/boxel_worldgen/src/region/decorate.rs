@@ -715,6 +715,8 @@ pub struct Stages<'a, Cx: Context> {
     pub surface: &'a dyn SurfaceStage<Cx>,
     /// The carvers, in the order they run.
     pub carvers: &'a [RealmCarver<Cx>],
+    /// The feature stages, in the order they run.
+    pub features: &'a [RealmFeature<Cx>],
     /// The realm's floor state, for the fill.
     pub floor: BlockState,
     /// The realm's fluid state, where a column's fluid top is over its ground (air for a realm
@@ -723,15 +725,16 @@ pub struct Stages<'a, Cx: Context> {
 }
 
 /// The chunk of `columns`: the rock of the fill at and under each column's ground, the fluid up to
-/// its fluid top, air above, the surface stage over it where its reach touches the chunk, and the
+/// its fluid top, air above, the surface stage over it where its reach touches the chunk, the
 /// carvers' masks over all of it (a voxel they carve turns to air where it is neither air nor the
-/// fluid).
+/// fluid), and the feature stages over the grounds where their reach touches the chunk.
 ///
 /// From the cheapest answer to the dearest: `Uniform` air over every column's reach and fluid;
 /// only the fill's rock under every column's reach (`Uniform` when the rock is one state and no
 /// carver carves the chunk, 1-bit when one does); a 1-bit chunk ([`ChunkData::from_occupancy`])
-/// when the rock is one state and neither the fluid nor the surface touches the chunk (the
-/// carvers' masks and-ed onto the ground's); else a dense chunk ([`ChunkData::from_dense`]).
+/// when the rock is one state and neither the fluid, the surface nor a feature stage touches the
+/// chunk (the carvers' masks and-ed onto the ground's); else a dense chunk
+/// ([`ChunkData::from_dense`]).
 pub fn decorate<Cx: Context>(
     columns: &ChunkColumns<'_, Cx>,
     stages: &Stages<'_, Cx>,
@@ -741,14 +744,23 @@ pub fn decorate<Cx: Context>(
     let y1 = y0 + i64::from(CHUNK_SIZE) - 1;
     let reach = stages.surface.reach();
     let (depth, rise) = (i64::from(reach.depth), i64::from(reach.rise));
+    // The highest any feature stage writes over a ground.
+    let grow = stages
+        .features
+        .iter()
+        .map(|f| i64::from(f.stage.reach().height))
+        .max()
+        .unwrap_or(0);
+    let over = rise.max(grow);
     let (mut min_g, mut max_g, mut max_top) = (i64::MAX, i64::MIN, i64::MIN);
-    let (mut touched, mut wet) = (false, false);
+    let (mut touched, mut wet, mut grown) = (false, false, false);
     for (&g, &w) in columns.ground.iter().zip(columns.fluid_top) {
         min_g = min_g.min(g);
         max_g = max_g.max(g);
-        max_top = max_top.max(g.saturating_add(rise)).max(w);
+        max_top = max_top.max(g.saturating_add(over)).max(w);
         touched |= depth + rise > 0 && g - depth < y1 && g.saturating_add(rise) >= y0;
         wet |= w > g && g < y1 && w >= y0;
+        grown |= grow > 0 && g < y1 && g.saturating_add(grow) >= y0;
     }
     if y0 > max_top {
         return ChunkData::uniform(BlockState::AIR);
@@ -774,7 +786,7 @@ pub fn decorate<Cx: Context>(
     match rock {
         // Under every column's reach: the rock alone, as the deep path gives it.
         Some(rock) if y1 <= min_g.saturating_sub(depth) => return carve.rock(rock, &mut rock_buf),
-        Some(Rock::Uniform(state)) if !touched && !wet => {
+        Some(Rock::Uniform(state)) if !touched && !wet && !grown => {
             let mut occupancy: Occupancy = [0; CHUNK_AREA];
             for (c, &g) in columns.ground.iter().enumerate() {
                 let (lx, lz) = (c >> CHUNK_SHIFT, c & (CHUNK_SIZE as usize - 1));
@@ -801,7 +813,7 @@ pub fn decorate<Cx: Context>(
             return ChunkData::from_occupancy(&occupancy, state, BlockState::AIR);
         }
         // Over every ground with nothing reaching the chunk (not reached: `y0 <= max_top`).
-        None if !touched && !wet => return ChunkData::uniform(BlockState::AIR),
+        None if !touched && !wet && !grown => return ChunkData::uniform(BlockState::AIR),
         _ => {}
     }
     let mut states = vec![BlockState::AIR; CHUNK_VOLUME];
@@ -834,6 +846,25 @@ pub fn decorate<Cx: Context>(
     // Only the rock and the surface stage's blocks over the grounds can be carved.
     if !stages.carvers.is_empty() && (rock.is_some() || (touched && rise > 0)) {
         carve.states(&carve.mask(), &mut states);
+    }
+    if grown {
+        for f in stages.features {
+            let reach = f.stage.reach();
+            let height = i64::from(reach.height);
+            let reached = columns
+                .ground
+                .iter()
+                .any(|&g| g < y1 && g.saturating_add(height) >= y0);
+            if !reached {
+                continue;
+            }
+            let before = cfg!(debug_assertions).then(|| states.clone());
+            let read = columns.read_by(f.id.as_str(), reach.apron);
+            f.stage.apply(&read, f.seed, registry, &mut states);
+            if let Some(before) = before {
+                check_feature_reach(columns, f, reach, &before, &states);
+            }
+        }
     }
     ChunkData::from_dense(&states)
 }
@@ -1020,6 +1051,36 @@ fn same_voxels(a: &CarveMask, b: &CarveMask) -> bool {
         CarveMask::Mixed(keep) => keep[i],
     };
     (0..CHUNK_AREA).all(|i| word(a, i) == word(b, i))
+}
+
+/// The debug check of a feature stage: it changed only blocks over each column's ground, as high
+/// as it declares. It runs only in the chunks its reach touches and never in the deep path, so a
+/// block it writes elsewhere would show in some chunks and not in others, and over the local top
+/// it would show only through the column stage.
+fn check_feature_reach<Cx: Context>(
+    columns: &ChunkColumns<'_, Cx>,
+    feature: &RealmFeature<Cx>,
+    reach: FeatureReach,
+    before: &[BlockState],
+    after: &[BlockState],
+) {
+    let origin = columns.origin;
+    for (c, &g) in columns.ground.iter().enumerate() {
+        let (lo, hi) = (g.saturating_add(1), g.saturating_add(reach.height.into()));
+        for ly in 0..CHUNK_SIZE as usize {
+            let (i, y) = ((ly << (2 * CHUNK_SHIFT)) | c, origin.y + ly as i64);
+            assert!(
+                before[i] == after[i] || (lo..=hi).contains(&y),
+                "span check: feature stage {} changed the block at ({}, {y}, {}), outside its \
+                 reach {lo}..={hi} (height {} over the ground at y {g}): the chunks it does not \
+                 reach would not show it",
+                feature.id,
+                origin.x + (c >> CHUNK_SHIFT) as i64,
+                origin.z + (c & (CHUNK_SIZE as usize - 1)) as i64,
+                reach.height,
+            );
+        }
+    }
 }
 
 /// The debug check of the surface stage: it changed only blocks inside each column's reach. A

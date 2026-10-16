@@ -942,6 +942,7 @@ impl Twin {
             fill: &self.fill as &dyn FillStage<TestContext>,
             surface: &self.surface as &dyn SurfaceStage<TestContext>,
             carvers: &[],
+            features: &[],
             floor: solid,
             fluid: registry.by_name("test:fluid").expect("test:fluid"),
         };
