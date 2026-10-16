@@ -425,7 +425,8 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
     debug de "solo vuelve aire lo sólido" que con una máscara no tiene caso: se cumple por
     construcción. Que el agua no caiga a una cueva (el fondo del mar abierto bajo el agua, o un
     bloque de la superficie dentro de ella) es regla del carver, la cáscara de agua: lee el tope
-    del fluido de sus columnas y de su apron.
+    del fluido de sus columnas y de su apron, y `apron_lo` le dice dónde no hace falta (sección
+    14).
   - Declaran su alcance (`CarveReach`): `surface`, hasta cuántos bloques bajo el suelo más bajo que
     leen sus reglas miran la superficie (desvanecidos por profundidad, entradas, un techo), y
     `apron`, cuántos bloques alrededor del chunk leen columnas, a lo sumo 32.
@@ -718,12 +719,16 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
 - Un chunk sobre la cota local de arriba es aire `Uniform` tras las lecturas de selección (unos
   2 us). Un chunk bajo la cota local de abajo (`deep`) toma el camino hondo, sin la etapa de
   columna: el relleno y los carvers sin columnas. `deep` queda bajo `ground_lo` menos el alcance de
-  la superficie y bajo el suelo más bajo de la columna de chunk y del apron de los carvers menos su
-  `surface`. El apron que cruza a otra celda de retícula lee la ventana de esa celda.
+  la superficie y bajo `apron_lo` menos el `surface` de los carvers. `apron_lo` es una cota de abajo
+  del suelo de la columna de chunk y del apron de los carvers (`ground_lo` sin carvers); el apron
+  que cruza a otra celda de retícula lee la ventana de esa celda. Los carvers la reciben en
+  `CarveChunk::apron_lo`, también en el camino hondo: así un carver de cuevas sabe sin leer su apron
+  si puede tener una columna mojada (ninguna si `apron_lo` queda en el nivel del fluido o más
+  arriba) y decide el anillo de su cáscara de agua.
 - En debug, el chequeo de spans hace cumplir los ganchos: el suelo de cada columna queda entre las
   cotas de su columna de chunk, y cada modificador dentro de su efecto en ella. El apron no es una
-  columna de chunk, así que sus cotas solo las prueba `deep`: un chunk en o bajo `deep` que arma
-  `generate_full` comprueba que todo suelo que leen los carvers queda su `surface` o más sobre él.
+  columna de chunk: cada chunk de la etapa de columna con carvers comprueba que todo suelo de su
+  apron queda sobre `apron_lo`, así un chunk bajo `deep` queda bajo todos su `surface` o más.
 - Esto hace barato generar el aire de la banda, no transmitirlo: cada chunk de la banda sigue
   siendo una slot y un job de generación.
 

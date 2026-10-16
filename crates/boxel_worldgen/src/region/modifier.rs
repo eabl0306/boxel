@@ -121,8 +121,7 @@ pub trait ShapeModifier<Cx: Context>: GenEntry + Send + Sync {
     /// inside [`ShapeModifier::effect`] ([`ShapeEffect::within`]): a river says `LowerOnly(0)`
     /// where no segment reaches. The generator reads it once per chunk column for the column's
     /// bounds and the deep path, and in debug builds holds the chunk's heights to it (an apron's,
-    /// in the chunks at or under the deep bound that `generate_full` builds). The default is the
-    /// whole effect.
+    /// in every chunk of the column stage with carvers). The default is the whole effect.
     fn column_effect(&self, cx: &Cx, seed: u64, area: Rect) -> ShapeEffect {
         let _ = (cx, seed, area);
         self.effect()

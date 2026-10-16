@@ -100,10 +100,15 @@ pub struct LocalBounds {
     /// is `Uniform` air, after the selection reads.
     pub top: i64,
     /// A chunk whose highest block is at or under this one lies under every column's surface
-    /// stage and every carver's surface reach ([`CarveReach::surface`], under the lowest ground
-    /// of the chunk column and of its carvers' apron): it takes the deep path, the fill and the
-    /// carvers without columns, without the column stage.
+    /// stage and every carver's surface reach ([`CarveReach::surface`] under `apron_lo`): it
+    /// takes the deep path, the fill and the carvers without columns, without the column stage.
     pub deep: i64,
+    /// A block at or under the lowest ground of the column and of its carvers' widest apron
+    /// around it ([`CarveReach::apron`], read from the next lattice cells' windows where it
+    /// reaches them): what `deep` is built from with carvers, and what they get as
+    /// [`CarveChunk::apron_lo`](super::CarveChunk::apron_lo). `ground_lo` without carvers or
+    /// with an apron of 0.
+    pub apron_lo: i64,
 }
 
 /// A kind of the realm, ready to run.
@@ -144,11 +149,10 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// In debug builds every chunk of the column stage, and every point query, checks its column
 /// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
 /// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges).
-/// A chunk of the column stage at or under its deep bound (one [`RegionGenerator::generate_full`]
-/// builds) also checks that every ground its carvers may read lies their surface reach over it,
-/// and every chunk of the column stage that its heights keep the 3:1 cap between axis neighbours
-/// (the slope check, ADR 0039 sec. 6). A kind or a mod with a bound, a range or a slope under its
-/// heights fails its tests there.
+/// Every chunk of the column stage also checks that every ground its carvers may read around it
+/// lies over its chunk column's `apron_lo` (so over `deep` by their surface reach), and that its
+/// heights keep the 3:1 cap between axis neighbours (the slope check, ADR 0039 sec. 6). A kind
+/// or a mod with a bound, a range or a slope under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     pub(super) key: BuildKey,
     dimension: GenId,
@@ -649,16 +653,17 @@ impl<Cx: Context> RegionGenerator<Cx> {
         {
             top = top.max(level);
         }
+        let apron_lo = apron.map_or(ground_lo, |a| ground_lo.min(block(a)));
         let mut deep = ground_lo.saturating_sub(self.reach.depth.into());
         if let Some(carve) = self.carve {
-            let lowest = apron.map_or(ground_lo, |a| ground_lo.min(block(a)));
-            deep = deep.min(lowest.saturating_sub(carve.surface.into()));
+            deep = deep.min(apron_lo.saturating_sub(carve.surface.into()));
         }
         LocalBounds {
             ground_lo,
             ground_hi,
             top,
             deep,
+            apron_lo,
         }
     }
 
@@ -971,13 +976,14 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let fluid_top = ground.map(|g| if g < level { level } else { g });
         if cfg!(debug_assertions) {
             self.check_grounds(origin, points, bounds, &ground);
-            self.check_deep(origin, bounds, &ground);
+            self.check_apron(origin, bounds);
             if self.slope_check {
                 self.check_slope(origin, &h);
             }
         }
         let around = Around(self);
-        let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around);
+        let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around)
+            .with_apron_lo(bounds.apron_lo);
         let chunk = super::decorate::decorate(&columns, &self.stages(registry, false), registry);
         if cfg!(debug_assertions) {
             self.check_top(origin, bounds, &chunk);
@@ -986,9 +992,11 @@ impl<Cx: Context> RegionGenerator<Cx> {
         chunk
     }
 
-    /// The deep path: the fill alone, carved by the carvers without columns.
-    fn deep(&self, origin: BlockPos, registry: &BlockRegistry) -> ChunkData {
-        super::decorate::deep(&self.cx, origin, &self.stages(registry, true), registry)
+    /// The deep path: the fill alone, carved by the carvers without columns (with the chunk
+    /// column's `apron_lo`).
+    fn deep(&self, origin: BlockPos, apron_lo: i64, registry: &BlockRegistry) -> ChunkData {
+        let stages = self.stages(registry, true);
+        super::decorate::deep(&self.cx, origin, apron_lo, &stages, registry)
     }
 
     /// The debug span check of the grounds: each lies between the bounds of its chunk column.
@@ -1030,52 +1038,50 @@ impl<Cx: Context> RegionGenerator<Cx> {
         );
     }
 
-    /// The debug span check of the deep bound, for a chunk at or under it (one
-    /// [`RegionGenerator::generate_full`] builds; [`WorldGenerator::generate`] takes the deep path
-    /// there): every ground the carvers may read, the chunk's and their widest apron's, lies their
-    /// surface reach or more over the chunk's top. The grounds' own check covers the chunk's
-    /// columns; this one covers the apron, whose bounds come from the hooks over rects that are
-    /// no chunk column ([`TerrainKind::column_bounds`], [`ShapeModifier::column_effect`]).
-    fn check_deep(&self, origin: BlockPos, bounds: &LocalBounds, ground: &[i64; CHUNK_AREA]) {
-        let y1 = origin.y + i64::from(CHUNK_SIZE) - 1;
-        let Some(carve) = self.carve.filter(|_| y1 <= bounds.deep) else {
+    /// The debug span check of the carvers' apron: every ground they may read, the chunk's and
+    /// their widest apron's, lies at or over the chunk column's `apron_lo`, the bound they get
+    /// ([`CarveChunk::apron_lo`](super::CarveChunk::apron_lo)) and that `deep` is built from (so
+    /// a chunk at or under `deep` lies their surface reach under all of them). The grounds' own
+    /// check covers the chunk's columns; this one covers the apron, whose bounds come from the
+    /// hooks over rects that are no chunk column ([`TerrainKind::column_bounds`],
+    /// [`ShapeModifier::column_effect`]).
+    fn check_apron(&self, origin: BlockPos, bounds: &LocalBounds) {
+        let Some(carve) = self.carve.filter(|c| c.apron > 0) else {
             return;
         };
-        // The chunk's columns and the square of the apron around them, `(x, z)` of `ground[k]` at
-        // `(xs[k / zs.len()], zs[k % zs.len()])`.
-        let (a, size) = (i64::from(carve.apron), i64::from(CHUNK_SIZE));
-        let xs: Vec<i64> = (origin.x - a..origin.x + size + a).collect();
-        let zs: Vec<i64> = (origin.z - a..origin.z + size + a).collect();
-        let ground = if a == 0 {
-            ground.to_vec()
-        } else {
+        let (o, a, size) = (origin, i64::from(carve.apron), i64::from(CHUNK_SIZE));
+        // The ring around the chunk column: the -x and +x strips over the whole side, then the
+        // -z and +z ones between them.
+        let strips = [
+            (o.x - a..o.x, o.z - a..o.z + size + a),
+            (o.x + size..o.x + size + a, o.z - a..o.z + size + a),
+            (o.x..o.x + size, o.z - a..o.z),
+            (o.x..o.x + size, o.z + size..o.z + size + a),
+        ];
+        for (xs, zs) in strips {
+            let (xs, zs): (Vec<i64>, Vec<i64>) = (xs.collect(), zs.collect());
             let n = xs.len() * zs.len();
             let (mut ground, mut fluid) = (vec![0; n], vec![0; n]);
             self.column_tops(&xs, &zs, &mut ground, &mut fluid);
-            ground
-        };
-        let (k, g) = ground
-            .iter()
-            .copied()
-            .enumerate()
-            .min_by_key(|&(_, g)| g)
-            .expect("columns");
-        assert!(
-            y1 <= g.saturating_sub(carve.surface.into()),
-            "{NAME} span check: realm {} chunk at ({}, {}, {}) lies at or under its deep bound {} \
-             (its top at y {y1}), but the column ({}, {}) its carvers may read (apron {a}) has its \
-             ground at y {g}, less than their surface reach {} over it: a kind's column bounds or \
-             a shape modifier's column effect over the apron around the chunk column are under \
-             its heights",
-            self.realm(),
-            origin.x,
-            origin.y,
-            origin.z,
-            bounds.deep,
-            xs[k / zs.len()],
-            zs[k % zs.len()],
-            carve.surface,
-        );
+            for (k, &g) in ground.iter().enumerate() {
+                assert!(
+                    bounds.apron_lo <= g,
+                    "{NAME} span check: realm {} column ({}, {}), in the apron of {a} blocks its \
+                     carvers read around the chunk at ({}, {}, {}), has its ground at y {g}, \
+                     under the chunk column's apron_lo {} that its carvers get and its deep bound \
+                     {} is built from: a kind's column bounds or a shape modifier's column effect \
+                     over the apron around the chunk column are under its heights",
+                    self.realm(),
+                    xs[k / zs.len()],
+                    zs[k % zs.len()],
+                    o.x,
+                    o.y,
+                    o.z,
+                    bounds.apron_lo,
+                    bounds.deep,
+                );
+            }
+        }
     }
 
     /// The debug slope check of a chunk column's heights `h` (ADR 0039 sec. 6): every two axis
@@ -1303,7 +1309,7 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
             if origin.y > bounds.top {
                 Some(ChunkData::uniform(BlockState::AIR))
             } else if origin.y + i64::from(CHUNK_SIZE) - 1 <= bounds.deep {
-                Some(self.deep(origin, registry))
+                Some(self.deep(origin, bounds.apron_lo, registry))
             } else {
                 None
             }

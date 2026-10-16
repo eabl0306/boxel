@@ -204,6 +204,7 @@ fn bench(c: &mut Criterion) {
                 seed: SEED,
                 origin: black_box(deep).pos.origin(),
                 columns: None,
+                apron_lo: bounds.apron_lo,
                 floor: solid,
                 fluid,
                 registry: &registry,

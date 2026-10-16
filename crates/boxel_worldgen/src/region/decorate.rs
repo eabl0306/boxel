@@ -93,6 +93,9 @@ pub struct ChunkColumns<'a, Cx: Context> {
     around: &'a dyn ColumnsAround,
     /// How far around the chunk the stage reading these may read columns, in blocks.
     apron: u32,
+    /// A block at or under every ground of the chunk's column and of the carvers' apron
+    /// ([`CarveChunk::apron_lo`]).
+    apron_lo: i64,
     /// The stage reading these, for messages.
     reader: &'a str,
 }
@@ -100,7 +103,8 @@ pub struct ChunkColumns<'a, Cx: Context> {
 impl<'a, Cx: Context> ChunkColumns<'a, Cx> {
     /// The columns of the chunk at `origin`, with `around` for the columns outside it. Its apron
     /// is 0 until [`decorate`] hands it to a stage that declares one (a carver's
-    /// [`CarveReach::apron`]).
+    /// [`CarveReach::apron`]), and the carvers' [`CarveChunk::apron_lo`] is `i64::MIN` (no bound)
+    /// until the region generator gives its chunk column's.
     pub fn new(
         origin: BlockPos,
         ground: &'a [i64; CHUNK_AREA],
@@ -117,8 +121,15 @@ impl<'a, Cx: Context> ChunkColumns<'a, Cx> {
             fields,
             around,
             apron: 0,
+            apron_lo: i64::MIN,
             reader: "a stage",
         }
+    }
+
+    /// The same columns with `apron_lo` for the carvers ([`CarveChunk::apron_lo`]).
+    pub(super) const fn with_apron_lo(mut self, apron_lo: i64) -> Self {
+        self.apron_lo = apron_lo;
+        self
     }
 
     /// How far around the chunk the stage holding these may read columns, in blocks (Chebyshev):
@@ -137,6 +148,7 @@ impl<'a, Cx: Context> ChunkColumns<'a, Cx> {
             fields: self.fields,
             around: self.around,
             apron,
+            apron_lo: self.apron_lo,
             reader,
         }
     }
@@ -333,6 +345,20 @@ pub struct CarveChunk<'a, Cx: Context> {
     /// The chunk's columns, with its apron's through [`ChunkColumns::tops`]; `None` in the deep
     /// path, for a chunk at least [`CarveReach::surface`] under every ground it may read.
     pub columns: Option<&'a ChunkColumns<'a, Cx>>,
+    /// A block at or under every ground the carvers may read: the lowest ground of the chunk's
+    /// column and of the realm's carvers' widest apron around it, from the hooks
+    /// ([`LocalBounds::apron_lo`]), the same in the column stage and in the deep path. In the
+    /// deep path the chunk lies the carvers' widest surface reach under it: that is what makes it
+    /// deep.
+    ///
+    /// A carver reads it to skip its apron where no rule of it can reach, without guessing: a
+    /// water shell needs no ring when it is at or over the realm's fluid level (no column there
+    /// is wet), nor in a chunk wholly more than the shell under it. It is a bound, not the
+    /// grounds, and it moves when the hooks tighten: a mask that depends on it beyond such
+    /// shortcuts changes with them.
+    ///
+    /// [`LocalBounds::apron_lo`]: super::LocalBounds::apron_lo
+    pub apron_lo: i64,
     /// The realm's floor state.
     pub floor: BlockState,
     /// The realm's fluid state (air for a realm without fluid): the carve never drains it.
@@ -635,6 +661,7 @@ pub fn decorate<Cx: Context>(
         cx: columns.cx,
         origin: columns.origin,
         columns: Some(columns),
+        apron_lo: columns.apron_lo,
         registry,
     };
     match rock {
@@ -709,6 +736,7 @@ pub fn decorate<Cx: Context>(
 pub(super) fn deep<Cx: Context>(
     cx: &Cx,
     origin: BlockPos,
+    apron_lo: i64,
     stages: &Stages<'_, Cx>,
     registry: &BlockRegistry,
 ) -> ChunkData {
@@ -721,6 +749,7 @@ pub(super) fn deep<Cx: Context>(
         cx,
         origin,
         columns: None,
+        apron_lo,
         registry,
     };
     carve.rock(rock, &mut buf)
@@ -733,6 +762,7 @@ struct Carve<'s, 'c, Cx: Context> {
     origin: BlockPos,
     /// `None` in the deep path.
     columns: Option<&'c ChunkColumns<'c, Cx>>,
+    apron_lo: i64,
     registry: &'s BlockRegistry,
 }
 
@@ -756,6 +786,7 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
                 seed: c.seed,
                 origin: self.origin,
                 columns: columns.as_ref(),
+                apron_lo: self.apron_lo,
                 floor: self.stages.floor,
                 fluid: self.stages.fluid,
                 registry: self.registry,
@@ -855,6 +886,7 @@ fn check_carve_reach<Cx: Context>(
         seed: chunk.seed,
         origin: chunk.origin,
         columns: None,
+        apron_lo: chunk.apron_lo,
         floor: chunk.floor,
         fluid: chunk.fluid,
         registry: chunk.registry,

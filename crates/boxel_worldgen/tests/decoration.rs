@@ -9,7 +9,8 @@
 //!   with a carver whose rules read the surface over an apron, near and far from the origin; the
 //!   same chunks in any order on any thread with the memo cold, warm and off; uniform rock and a
 //!   mask give a 1-bit chunk; no mask adds a block or drains the fluid; the digest line, the
-//!   order, duplicates, block names and the apron cap;
+//!   order, duplicates, block names and the apron cap; carvers get the lowest ground of their
+//!   apron (`apron_lo`) in the column stage and in the deep path;
 //! - every debug check: a column bound under the heights, a column bound right over every chunk
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
@@ -1285,4 +1286,92 @@ fn a_slope_under_the_heights_fails_the_slope_check() {
         unchecked.generate_full(key(3, 1, 0), &registry),
         unchecked.generate(key(3, 1, 0), &registry)
     );
+}
+
+/// A carver that carves nothing and records, per chunk, its origin, whether it got columns and
+/// its `apron_lo`, over an apron of 3 and a surface reach of 6 (a cave stage with a water shell).
+struct Lowest {
+    seen: Mutex<Vec<(BlockPos, bool, i64)>>,
+}
+
+impl HashParams for Lowest {
+    fn hash_params(&self, _: &mut ParamsHasher) {}
+}
+
+impl GenEntry for Lowest {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl CarverStage<TestContext> for Lowest {
+    fn reach(&self) -> CarveReach {
+        CarveReach {
+            surface: 6,
+            apron: 3,
+        }
+    }
+    fn carve(&self, chunk: &CarveChunk<'_, TestContext>) -> CarveMask {
+        let at = (chunk.origin, chunk.columns.is_some(), chunk.apron_lo);
+        self.seen.lock().unwrap().push(at);
+        CarveMask::Solid
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn carvers_get_the_lowest_ground_of_their_apron_in_both_paths() {
+    let registry = registry();
+    let lowest = Arc::new(Lowest {
+        seen: Mutex::new(Vec::new()),
+    });
+    let g = open(
+        &test_world(true),
+        with_valleys().with_carver(id("test:lowest"), Arc::clone(&lowest) as _),
+    );
+    let (mut deep, mut column, mut under) = (0, 0, 0);
+    for (cx, cz) in sample_columns() {
+        let b = g.local_bounds(cx, cz);
+        assert!(
+            b.apron_lo <= b.ground_lo && b.deep <= b.apron_lo - 6,
+            "{b:?}"
+        );
+        under += usize::from(b.apron_lo < b.ground_lo);
+        // Every ground of the chunk column and of the apron of 3 around it lies at or over it.
+        let (o, a) = ((cx << 5, cz << 5), 3);
+        let xs: Vec<i64> = (o.0 - a..o.0 + 32 + a).collect();
+        let zs: Vec<i64> = (o.1 - a..o.1 + 32 + a).collect();
+        let n = xs.len() * zs.len();
+        let (mut ground, mut fluid) = (vec![0; n], vec![0; n]);
+        g.column_tops(&xs, &zs, &mut ground, &mut fluid);
+        assert!(ground.iter().all(|&g| b.apron_lo <= g), "({cx}, {cz})");
+        lowest.seen.lock().unwrap().clear();
+        for y in (b.deep >> 5) - 1..=(b.top >> 5) {
+            drop(g.generate(key(cx, y, cz), &registry));
+        }
+        // The carver got it in every chunk it ran in, with columns or without: the deep path,
+        // whose chunks lie the surface reach under it, or the debug check of its reach, whose
+        // chunks lie that far under the true grounds.
+        let truth = ground.iter().copied().min().expect("columns");
+        for (origin, columns, apron_lo) in std::mem::take(&mut *lowest.seen.lock().unwrap()) {
+            let y1 = origin.y + 31;
+            assert_eq!(apron_lo, b.apron_lo, "{origin:?}");
+            if columns {
+                column += 1;
+            } else if y1 <= b.deep {
+                assert!(y1 <= apron_lo - 6, "{origin:?}");
+                deep += 1;
+            } else {
+                assert!(y1 <= truth - 6, "{origin:?}");
+            }
+        }
+    }
+    assert!(
+        deep >= 14 && column >= 14,
+        "{deep} deep, {column} column stage chunks"
+    );
+    // The apron reaches under the chunk column's own lowest ground somewhere.
+    assert!(under > 0, "no apron under its chunk column");
 }
