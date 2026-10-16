@@ -453,9 +453,14 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
     columnas con `ChunkColumns::tops` (las anclas vecinas cuyas copas entran al chunk), a lo sumo
     32. En debug, un bloque fuera de ese tramo falla.
   - Sus bloques son una función pura de su sal, el Context y las columnas que leen (las del chunk y
-    las del apron), así todo chunk que cruza un árbol escribe el mismo árbol. Una etapa que además
-    lee los estados del chunk (un tronco solo sobre pasto) deja sus árboles dentro de su chunk, como
-    los del demo.
+    las del apron), así todo chunk que cruza un árbol escribe el mismo árbol. De los estados del
+    chunk puede leer el del bloque que escribe (una hoja solo sobre aire), porque lo decide el chunk
+    que tiene ese bloque. Cualquier otro estado (el pasto bajo un tronco, una cueva de un carver)
+    solo lo ve el chunk que lo tiene: una feature que depende de él queda entera dentro de ese
+    chunk, capa incluida (una planta sobre un suelo en el último bloque de una capa cae en la capa
+    de arriba). Una feature que puede cruzar un borde decide con sus columnas (la clase de
+    superficie de la columna del ancla, la regla del carver ahí), como los árboles del demo, que
+    deciden el pasto por la altura del suelo.
   - Cuentan en la cota local de cada columna de chunk con `column_height` (sección 14).
   - Forma gruesa opcional (`lod_runs`): un tramo sólido `(estado, bloques)` por columna de celdas,
     una copa (sección 10).

@@ -423,8 +423,13 @@ pub struct FeatureReach {
 /// Its anchors lie in cells aligned with the chunks (8 or 16 blocks), and an anchor's column (its
 /// fields, its biome) decides its feature. Its blocks must be a pure function of its seed, the
 /// Context and the columns it reads (its chunk's and its apron's), so every chunk a tree crosses
-/// writes the same tree: a stage that also reads the chunk's states (a trunk only on the surface
-/// stage's top block) keeps its features inside their chunk, as no other chunk sees those states.
+/// writes the same tree. Of the chunk's states it may read the one of each block it writes (a
+/// leaf only over air): the chunk that holds the block decides it. Any other state (the surface
+/// stage's top block under a trunk, a carver's cave there) only the chunk that holds it sees, so
+/// a feature decided from it must lie wholly inside that chunk, its layer included (a plant over
+/// a ground on the top block of a layer lies in the next one). A feature that may cross a chunk
+/// border decides from its columns instead (the surface class of its anchor's column, the
+/// carver's own rule there), as the demo's trees decide their grass from the ground's height.
 pub trait FeatureStage<Cx: Context>: GenEntry + Send + Sync {
     /// How far it reaches over the ground and around its chunk.
     fn reach(&self) -> FeatureReach;
