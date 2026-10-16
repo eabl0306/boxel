@@ -151,7 +151,7 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges).
 /// Every chunk of the column stage also checks that every ground its carvers may read around it
 /// lies over its chunk column's `apron_lo` (so over `deep` by their surface reach), and that its
-/// heights keep the 3:1 cap between axis neighbours (the slope check, ADR 0039 sec. 6). A kind
+/// heights keep the 3:1 cap between axis neighbors (the slope check, ADR 0039 sec. 6). A kind
 /// or a mod with a bound, a range or a slope under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     pub(super) key: BuildKey,
@@ -387,7 +387,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The generator without its debug slope check (every chunk of the column stage holds its
-    /// heights to 3:1 between axis neighbours, ADR 0039 sec. 6), for a test whose fixture is
+    /// heights to 3:1 between axis neighbors, ADR 0039 sec. 6), for a test whose fixture is
     /// steeper than 3:1 on purpose and declares a smaller slope so it opens (a worst case of the
     /// far LOD's divide term). Never for a world: the far LOD's skirts cover 3:1 (ADR 0031).
     #[cfg(feature = "test-support")]
@@ -1085,7 +1085,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The debug slope check of a chunk column's heights `h` (ADR 0039 sec. 6): every two axis
-    /// neighbours, inside the chunk column and across its +x and +z borders (so each border pair
+    /// neighbors, inside the chunk column and across its +x and +z borders (so each border pair
     /// is checked once), differ by at most `MAX_SLOPE * HEIGHT_ONE` (768, 3 blocks), and so their
     /// grounds by at most 3 blocks.
     ///
@@ -1102,7 +1102,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let (mut px, mut pz) = (vec![0; size], vec![0; size]);
         self.heights_across(&[origin.x + size as i64], &zs, &mut px);
         self.heights_across(&xs, &[origin.z + size as i64], &mut pz);
-        // Column `(x, z)` of the chunk column, `x` or `z` 32 for the +x or +z neighbour.
+        // Column `(x, z)` of the chunk column, `x` or `z` 32 for the +x or +z neighbor.
         let at = |x: usize, z: usize| match (x == size, z == size) {
             (false, false) => h[(x << CHUNK_SHIFT) | z],
             (true, _) => px[z],
