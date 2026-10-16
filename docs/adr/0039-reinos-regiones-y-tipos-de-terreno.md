@@ -430,10 +430,14 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
      montaña. El código la calcula por celda de retícula con los pesos separados,
      `c_k = (Ls - fz) A_k(x) + fz B_k(x)`.
    - Desde el nivel 9, el máximo de `T_k` entre los tipos presentes.
-   - Hoy `MAX_LEVELS` es 6. La pasada admite hasta el nivel 8 con selección exacta y documenta la
-     selección solo en las esquinas más allá. En el código el corte es el tamaño de la celda contra
-     el de la retícula: exacta mientras una celda mide a lo sumo `Ls` (el nivel 8 con la retícula de
-     serie).
+   - Hoy `MAX_LEVELS` es 6. En el código las esquinas son exactas en todo nivel: en celdas más
+     grandes que `Ls`, cada esquina es un punto de retícula con el conteo de su caja. El tope es la
+     cota bilineal mientras una celda mide a lo sumo `2 Ls` (el nivel 9 con la retícula de serie, el
+     6 con la más chica, de 32 bloques: ahí la pasada lee todos los puntos de retícula). Más allá
+     toma el máximo de `T_k` de los tipos de las cajas de las esquinas, que puede no ver un tipo a
+     dos puntos de retícula de toda esquina. La primera versión leía solo el tipo de cada esquina,
+     y con la retícula de 32 bloques dejaba en el nivel 6 esquinas a 43 bloques de los chunks y
+     suelo grueso 33 bloques bajo el real.
 6. Las formas gruesas de los modificadores (ríos por nivel, costa, adaptación a estructuras),
    después la regla de fluido del reino sobre las esquinas sin margen, y después el `lod_top` del
    bioma.
@@ -470,6 +474,10 @@ están cortadas. El tope grueso quedaría entonces bajo el real, hasta la pendie
   código usa una cota más ajustada y probada: la distancia a A es convexa y 1-Lipschitz, así dentro
   de la celda n pasa el máximo de sus esquinas a lo sumo en la pendiente de la deformación por media
   diagonal de la celda (unos 0,35 s con pendiente 1/2). El 1,1 s queda como sobrestimación segura.
+  Un test con valles deformados lo prueba en cada celda: sin esa holgura quedan topes bajo el
+  suelo real.
+- `divide_tops` le pasa al corte la celda y el segmento compartido, así un río cuyo fondo baja
+  hacia el mar, o cuyo ancho depende de su orden, toma su cota en esa celda y no en todo el nodo.
 
 Además:
 
@@ -484,13 +492,17 @@ Además:
 - Memo: un struct en `LodScratch.memo`, con una ranura por `KindIx` y una para el Context, y la
   llave del contador de construcción (sección 13). Guarda además los bloques del registro y una
   tabla de 32 x 32 puntos de retícula. Un segundo job de la misma columna (columnas altas) no
-  recalcula nada. Unos 176 KiB con 3 tipos, sin contar los campos del Context.
+  recalcula nada. Un tipo guarda sus esquinas (unos 11 KiB) solo mientras está en el nodo: unos
+  166 KiB con 3 tipos y 215 KiB tras recorrer 33 de 48, sin contar los campos del Context.
 - Ganchos nuevos, todos con valor por defecto: `Context::lod_grid` (la grilla del Context en las
   esquinas, por defecto la de los chunks), `TerrainKind::lod_heights` (por defecto exacta en las
   esquinas, con el margen de la pendiente que el tipo declara) y `TerrainKind::lod_left_out` (cuánto
   pueden quedar las esquinas gruesas sobre las reales), `ShapeModifier::lod` y `lod_left_out`, y
   `SurfaceStage::lod_top` (hasta 4 tramos de estados desde el suelo; bajo ellos, el `floor` del
-  reino: la lejanía no dibuja los estratos del relleno).
+  reino: la lejanía no dibuja los estratos del relleno). `lod_top` lee las alturas de las
+  esquinas, así una celda empinada puede mostrar roca igual desde cualquier nodo. Los tramos suben
+  con el suelo de la celda hasta su margen, así un tramo de arriba que no es sólido (vidrio) no
+  esconde el sólido de abajo.
 - Las ediciones se superponen a las celdas como hoy (ADR 0031 sección 11). El contrato de la fuente
   no cambia.
 
@@ -532,7 +544,9 @@ compara en los niveles que se le piden (el plan pide 1 a 4):
   lo mismo en bloques: el suelo grueso cubre cada suelo real. En celdas enteras un margen corto casi
   nunca se ve, en bloques sí;
 - los desacuerdos de fluido (y los topes mojados a más de una celda), solo a menos de s de un borde
-  de fluido;
+  de fluido. Una columna que la pasada deja mojada cuenta como de fluido aunque su celda de arriba
+  salga sólida (su suelo es el de la esquina más alta: en una costa poco honda la tierra entre las
+  esquinas puede quedar sobre él);
 - bandas conservadoras, bordes iguales entre vecinos y tramos de volumen dentro de su cota (los
   volúmenes llegan con WG-VOLUME).
 

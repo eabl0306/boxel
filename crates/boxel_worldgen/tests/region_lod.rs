@@ -4,14 +4,18 @@
 //! - border nodes of 2 and 3 kinds at levels 1 to 4 against the cell rule on real chunks: dry tops
 //!   never under the real ones and within their declared margin over them, fluid only off within a
 //!   cell of a fluid edge, bands conservative, borders equal between neighbors; with exact kinds
-//!   and with a kind that drops octaves far away;
+//!   and with a kind that drops octaves far away; a non-Solid top run; steep rock from the
+//!   corners' heights;
 //! - a divide between two carved valleys inside one cell keeps the coarse top over the real one,
-//!   and the harness catches a coarse form without the divide term;
-//! - sea and coast cells at levels 1 to 6 agree with the chunks within a cell;
+//!   and the harness catches a coarse form without the divide term; meandering valleys need the
+//!   warp's slack, checked on every cell;
+//! - sea and coast cells at levels 1 to 6 agree with the chunks within a cell, shallow coasts too;
 //! - exactness: the pass's corners are the chunk columns' heights, bit for bit, at the origin,
-//!   `+-2^31`, `2^40` and near `+-MAX_BLOCK_COORD`, with a shape modifier too;
+//!   `+-2^31`, `2^40` and near `+-MAX_BLOCK_COORD`, with a shape modifier too, and in cells larger
+//!   than the lattice (with sound tops on the smallest lattice at level 6);
 //! - determinism with the memo cold, warm, evicted and off, on several threads, and world A then
-//!   world B on the same worker (the build counter); the memo stays within 512 KiB;
+//!   world B on the same worker (the build counter); the memo stays within 512 KiB, with 48 kinds
+//!   too;
 //! - the band and the cells stop at the realm's top plane, alone and inside a dimension;
 //! - the shape modifiers: in the chunk path and the bounds, their order and digest lines,
 //!   duplicates refused, an effect broken caught by the span check.
