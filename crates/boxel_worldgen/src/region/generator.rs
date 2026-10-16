@@ -7,7 +7,9 @@ use super::decorate::{
 use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowPoints};
 use super::select::{self, RuleEntry, Selector, SelectorRule, check_rule_entries};
-use super::{CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, check};
+use super::{
+    CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, REGION_LINE, check,
+};
 use crate::query::{ColumnInfo, WorldQuery};
 use crate::realm::{FluidRule, RealmSpec, RealmStack, check_floors};
 use crate::registry::{
@@ -52,7 +54,8 @@ impl Default for RegionSettings {
 }
 
 /// What a [`RegionGenerator`] is built from at world open: the world's seed, where it sits (its
-/// dimension and realm), the app's frozen registries, its decoration and its settings.
+/// dimension and realm), the app's frozen registries, the block registry its names are checked
+/// against, its decoration and its settings.
 pub struct RegionSpec<'a, Cx: Context> {
     /// The world's seed (the realm's comes from it and the realm's salt).
     pub seed: u64,
@@ -68,6 +71,9 @@ pub struct RegionSpec<'a, Cx: Context> {
     pub entries: &'a GenRegistry<RuleEntry>,
     /// The kinds written against `Cx`.
     pub kinds: &'a GenRegistry<Arc<dyn TerrainKind<Cx>>>,
+    /// The blocks: every block name the realm and its stages use must be in it (the world's
+    /// registry, the one chunks are generated with).
+    pub blocks: &'a BlockRegistry,
     /// The fill and surface stages.
     pub decoration: Decoration<Cx>,
     /// The other knobs.
@@ -137,10 +143,14 @@ pub struct RegionGenerator<Cx: Context> {
 
 impl<Cx: Context> RegionGenerator<Cx> {
     /// The generator of `spec.realm`, with the Context `context` builds from the realm's seed,
-    /// or `None` with every problem recorded in `checks` (the realm, the rules and entries the
+    /// or `None` with every problem recorded in `checks`: the realm, the rules and entries the
     /// realm reaches, their kinds and parameters, the kinds' forms, limits, slopes and border
-    /// reliefs, and every added entry that names a missing rule: [`check_rule_entries`]). Its digest lines ([`RegionGenerator::digest`]) are those of the realm: the realm,
-    /// its `region` settings, its `context`, its rules and entries, its kinds and its stages.
+    /// reliefs, every added entry that names a missing rule ([`check_rule_entries`]), and every
+    /// block name the realm (its floor and fluid) and its stages use
+    /// ([`Problem::UnknownBlock`](crate::registry::Problem::UnknownBlock), so a typo fails at
+    /// world open and never in a worker). Its digest lines ([`RegionGenerator::digest`]) are
+    /// those of the realm: the realm, its `region` settings, its `context`, its rules and
+    /// entries, its kinds and its stages.
     ///
     /// # Panics
     ///
@@ -159,6 +169,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             rules,
             entries,
             kinds,
+            blocks,
             decoration,
             settings,
         } = spec;
@@ -169,7 +180,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
              {MAX_LATTICE_SHIFT}"
         );
         let before = checks.found();
-        let r = checks.resolve(realms, realm, dimension)?;
+        let r = checks.resolve(realms, realm, Some(dimension))?;
         let realm_spec = realms[r].clone();
         if !realm_spec.form.is_built() {
             checks.push(Problem::FormNotBuilt {
@@ -179,6 +190,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             });
         }
         check_floors(checks, dimension, [(realm, &realm_spec)]);
+        check_realm_blocks(checks, blocks, realm, &realm_spec);
         let realm_seed = realm.seed(seed);
         let cx = context(realm_seed);
         let scope = DigestScope::of_realm(dimension, realm);
@@ -192,9 +204,15 @@ impl<Cx: Context> RegionGenerator<Cx> {
             params,
         };
         digest
-            .push(line("region", realm, CODE_VERSION, hash_params(&shift)))
+            .push(line(REGION_LINE, realm, CODE_VERSION, hash_params(&shift)))
             .push(line("context", realm, cx.version(), hash_params(&cx)));
         let Decoration { fill, surface } = decoration;
+        for name in fill.1.block_names() {
+            checks.block(blocks, name, &fill.0);
+        }
+        for name in surface.1.block_names() {
+            checks.block(blocks, name, &surface.0);
+        }
         digest
             .push(line(
                 "fill_stage",
@@ -664,6 +682,20 @@ impl<Cx: Context> RegionGenerator<Cx> {
             .map(|&k| self.kinds[k as usize].id.as_str())
             .collect();
         names.join(", ")
+    }
+}
+
+/// The checks of the block names of realm `realm`'s spec against `blocks`: its floor (air
+/// included: the block registry always holds it) and its fluid.
+pub fn check_realm_blocks(
+    checks: &mut Checks,
+    blocks: &BlockRegistry,
+    realm: &GenId,
+    spec: &RealmSpec,
+) {
+    checks.block(blocks, &spec.floor, realm);
+    if let FluidRule::SeaLevel { fluid, .. } = &spec.fluid {
+        checks.block(blocks, fluid, realm);
     }
 }
 

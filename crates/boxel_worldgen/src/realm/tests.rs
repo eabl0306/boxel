@@ -983,17 +983,16 @@ impl Registries {
     fn open(&self, preset: &GenId) -> Result<RegistryDigest, FreezeError> {
         let mut checks = Checks::new();
         let mut digest = DigestBuilder::new();
-        let world = id("test:world");
-        if let Some(p) = checks.resolve(&self.presets, preset, &world) {
+        if let Some(p) = checks.resolve(&self.presets, preset, None) {
             digest.add(&DigestScope::PRESET, &self.presets, p);
             for dim_id in &self.presets[p].0 {
-                let Some(d) = checks.resolve(&self.dimensions, dim_id, preset) else {
+                let Some(d) = checks.resolve(&self.dimensions, dim_id, Some(preset)) else {
                     continue;
                 };
                 digest.add(&DigestScope::of_dimension(dim_id), &self.dimensions, d);
                 let mut layouts = Vec::new();
                 for realm_id in &self.dimensions[d].0 {
-                    let Some(r) = checks.resolve(&self.realms, realm_id, dim_id) else {
+                    let Some(r) = checks.resolve(&self.realms, realm_id, Some(dim_id)) else {
                         continue;
                     };
                     let scope = DigestScope::of_realm(dim_id, realm_id);
@@ -1001,7 +1000,7 @@ impl Registries {
                     let realm = &self.realms[r];
                     layouts.push((realm_id, &realm.0));
                     for kind_id in &realm.1 {
-                        if let Some(k) = checks.resolve(&self.kinds, kind_id, realm_id) {
+                        if let Some(k) = checks.resolve(&self.kinds, kind_id, Some(realm_id)) {
                             digest.add(&scope, &self.kinds, k);
                         }
                     }
@@ -1124,8 +1123,7 @@ fn a_bad_mix_fails_at_world_open_with_every_id() {
         .expect_err("unknown preset");
     assert_eq!(
         unknown.to_string(),
-        "world generation check failed: test:world names test_preset test:nothing, which is not \
-         registered"
+        "world generation check failed: test_preset test:nothing is not registered"
     );
 }
 

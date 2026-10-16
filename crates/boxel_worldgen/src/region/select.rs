@@ -310,7 +310,7 @@ pub(crate) fn resolve<Cx: Context>(
                 None => checks.push(Problem::Unknown {
                     registry: PARAM_REGISTRY,
                     id: interval.param.clone(),
-                    by: id.clone(),
+                    by: Some(id.clone()),
                 }),
             }
         }
@@ -329,7 +329,7 @@ pub(crate) fn resolve<Cx: Context>(
                     weight: entry.weight,
                 });
             }
-            if let Some(k) = checks.resolve(kinds, &entry.kind, by) {
+            if let Some(k) = checks.resolve(kinds, &entry.kind, Some(by)) {
                 picks.push((k, u32::from(entry.weight)));
             }
         }
@@ -423,6 +423,6 @@ pub fn check_rule_entries(
     entries: &GenRegistry<RuleEntry>,
 ) {
     for (_, id, e) in entries.iter() {
-        checks.resolve(rules, &e.rule, id);
+        checks.resolve(rules, &e.rule, Some(id));
     }
 }

@@ -42,6 +42,11 @@ pub trait FillStage<Cx: Context>: GenEntry + Send + Sync {
         registry: &BlockRegistry,
         out: &mut Vec<BlockState>,
     ) -> Rock;
+
+    /// Every block name the stage looks up in the registry it gets (besides the realm's floor,
+    /// which it is handed), so the world open checks them and a typo fails at load
+    /// ([`RegionGenerator::build`](super::RegionGenerator::build)), not in a worker.
+    fn block_names(&self) -> Vec<&str>;
 }
 
 /// How far a surface stage reaches around a column's top solid block `g`: it may rewrite the
@@ -82,6 +87,11 @@ pub trait SurfaceStage<Cx: Context>: GenEntry + Send + Sync {
         registry: &BlockRegistry,
         out: &mut [BlockState],
     );
+
+    /// Every block name the stage looks up in the registry it gets, so the world open checks
+    /// them and a typo fails at load ([`RegionGenerator::build`](super::RegionGenerator::build)),
+    /// not in a worker.
+    fn block_names(&self) -> Vec<&str>;
 }
 
 /// A realm's decoration: its fill and surface stages, each with the id of its digest line.
@@ -136,6 +146,10 @@ impl<Cx: Context> FillStage<Cx> for FloorFill {
     ) -> Rock {
         Rock::Uniform(floor)
     }
+
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
 }
 
 /// No surface: the rock reaches the top.
@@ -158,6 +172,10 @@ impl<Cx: Context> SurfaceStage<Cx> for NoSurface {
     }
 
     fn apply(&self, _: &ChunkColumns<'_, Cx>, _: &BlockRegistry, _: &mut [BlockState]) {}
+
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
 }
 
 /// Layers of blocks on top of every column, top first: `[("game:grass", 1), ("game:dirt", 3)]`
@@ -224,6 +242,10 @@ impl<Cx: Context> SurfaceStage<Cx> for TopLayers {
                 top -= t;
             }
         }
+    }
+
+    fn block_names(&self) -> Vec<&str> {
+        self.layers.iter().map(|(name, _)| name.as_str()).collect()
     }
 }
 

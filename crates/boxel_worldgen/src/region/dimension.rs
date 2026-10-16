@@ -1,12 +1,20 @@
 //! [`DimensionGenerator`]: a dimension's realm stack, dispatching each chunk to its realm.
 
+use super::REGION_LINE;
 use crate::WorldGenerator;
 use crate::lod::{LodColumn, LodNode, LodRequest, LodScratch, LodSource};
 use crate::query::{ColumnInfo, WorldQuery};
 use crate::realm::{DEFAULT_REALM, RealmStack};
-use crate::registry::{GenId, RegistryDigest};
+use crate::registry::{
+    DigestBuilder, DigestEntry, DigestScope, GenId, RegistryDigest, hash_params,
+};
 use boxel_voxel::{BlockRegistry, ChunkData, ChunkKey};
+use std::borrow::Cow;
 use std::ops::RangeInclusive;
+
+/// The registry name of the digest line a realm gets when its generator brings no line of its
+/// own ([`DimensionGenerator::new`]).
+pub const REALM_GENERATOR: &str = "realm_generator";
 
 /// The generator of a dimension (ADR 0039 sec. 1 and 2): its [`RealmStack`] and one generator
 /// per realm (a [`RegionGenerator`](super::RegionGenerator), or any other).
@@ -29,6 +37,12 @@ impl DimensionGenerator {
     /// [`RealmStack::iter`]'s order). `digest` holds the dimension's lines (each realm's, from
     /// its generator, and the dimension's own): the generator's version is the low 32 bits of
     /// its sub-digest of `dimension` ([`RegistryDigest::dimension`]).
+    ///
+    /// A realm without a region generator's lines in `digest` (its `region` line: its generator
+    /// is another kind) gets one line for its generator: `realm_generator`, under the realm's
+    /// id, with the generator's [`WorldGenerator::version`] and the hash of its
+    /// [`WorldGenerator::name`]. So changing that generator changes the dimension's version and
+    /// shows in the save record's diff.
     ///
     /// # Panics
     ///
@@ -66,8 +80,26 @@ impl DimensionGenerator {
             .filter(|r| !r.is_empty())
             .reduce(|a, b| (*a.start()).min(*b.start())..=(*a.end()).max(*b.end()))
             .unwrap_or(RangeInclusive::new(1, 0));
+        let mut lines = DigestBuilder::new();
+        lines.extend(digest);
+        for ((realm, _), generator) in stack.iter().zip(&realms) {
+            let scope = DigestScope::of_realm(&dimension, realm);
+            if !digest
+                .entries()
+                .iter()
+                .any(|e| e.scope == scope && e.registry == REGION_LINE)
+            {
+                lines.push(DigestEntry {
+                    scope,
+                    registry: Cow::Borrowed(REALM_GENERATOR),
+                    id: realm.clone(),
+                    version: generator.version(),
+                    params: hash_params(generator.name()),
+                });
+            }
+        }
         Self {
-            digest: digest.dimension(&dimension),
+            digest: lines.finish().dimension(&dimension),
             dimension,
             stack,
             realms: realms.into(),
@@ -80,7 +112,8 @@ impl DimensionGenerator {
         &*self.realms[ix]
     }
 
-    /// The dimension's digest.
+    /// The dimension's digest: the lines it was built with, and a `realm_generator` line for
+    /// every realm whose generator brought none.
     pub fn digest(&self) -> &RegistryDigest {
         &self.digest
     }

@@ -5,7 +5,7 @@
 use super::{GenEntry, GenId, GenIx, GenRegistry, GenRegistryBuilder};
 use crate::realm::{MAX_REALM_PLANES, REALM_PLANE, RealmForm, RealmSpan};
 use crate::region::{KindForm, MAX_SLOPE};
-use boxel_voxel::MAX_BLOCK_COORD;
+use boxel_voxel::{BlockRegistry, MAX_BLOCK_COORD};
 use std::fmt;
 
 /// One problem a freeze check found, with the ids it involves. Its message names them, so a
@@ -31,14 +31,34 @@ pub enum Problem {
         /// The name ([`GenRegistryBuilder::new`]).
         registry: &'static str,
     },
-    /// An id that its registry does not hold, named by another entry.
+    /// An id that its registry does not hold, named by another entry or asked for at world
+    /// open.
     Unknown {
         /// The registry it was looked up in.
         registry: &'static str,
         /// The id.
         id: GenId,
-        /// The entry that names it (a preset, a dimension, a rule...).
+        /// The entry that names it (a preset, a dimension, a rule...), `None` for the root of a
+        /// world open (its preset, which no entry names).
+        by: Option<GenId>,
+    },
+    /// A block name that the block registry lacks, named by a world generation entry (a realm's
+    /// floor or fluid, a decoration stage, a generator spec): a typo fails at world open, not in a
+    /// worker in the middle of a game.
+    UnknownBlock {
+        /// The entry that names it.
         by: GenId,
+        /// The block name.
+        name: String,
+    },
+    /// A generator spec whose parameters are not of the type its generator kind reads.
+    Params {
+        /// The dimension the spec is for.
+        dimension: GenId,
+        /// The generator kind.
+        kind: GenId,
+        /// The type the kind reads.
+        expected: &'static str,
     },
     /// A realm whose span holds no `y` (its bottom plane is not under its top one).
     EmptySpan {
@@ -213,7 +233,11 @@ impl Problem {
         match self {
             Self::Duplicate { id, .. } => vec![id],
             Self::DuplicateRegistry { .. } => Vec::new(),
-            Self::Unknown { id, by, .. } => vec![id, by],
+            Self::Unknown { id, by, .. } => std::iter::once(id).chain(by).collect(),
+            Self::UnknownBlock { by, .. } => vec![by],
+            Self::Params {
+                dimension, kind, ..
+            } => vec![dimension, kind],
             Self::EmptySpan {
                 dimension, realm, ..
             }
@@ -267,9 +291,29 @@ impl fmt::Display for Problem {
             Self::DuplicateRegistry { registry } => {
                 write!(f, "more than one registry is named {registry}")
             }
-            Self::Unknown { registry, id, by } => {
-                write!(f, "{by} names {registry} {id}, which is not registered")
-            }
+            Self::Unknown {
+                registry,
+                id,
+                by: Some(by),
+            } => write!(f, "{by} names {registry} {id}, which is not registered"),
+            Self::Unknown {
+                registry,
+                id,
+                by: None,
+            } => write!(f, "{registry} {id} is not registered"),
+            Self::UnknownBlock { by, name } => write!(
+                f,
+                "{by} names the block {name:?}, which is not in the block registry"
+            ),
+            Self::Params {
+                dimension,
+                kind,
+                expected,
+            } => write!(
+                f,
+                "the generator spec of dimension {dimension} gives generator kind {kind} \
+                 parameters that are not its {expected}"
+            ),
             Self::EmptySpan {
                 dimension,
                 realm,
@@ -570,22 +614,37 @@ impl Checks {
     }
 
     /// The index of `id` in `registry`, or `None` with a [`Problem::Unknown`] recorded that
-    /// says `by` names it.
+    /// says `by` names it. `by` is `None` for the root of a world open, which no entry names
+    /// (its preset).
     pub fn resolve<T>(
         &mut self,
         registry: &GenRegistry<T>,
         id: &GenId,
-        by: &GenId,
+        by: Option<&GenId>,
     ) -> Option<GenIx<T>> {
         let ix = registry.find(id.as_str());
         if ix.is_none() {
             self.push(Problem::Unknown {
                 registry: registry.name(),
                 id: id.clone(),
-                by: by.clone(),
+                by: by.cloned(),
             });
         }
         ix
+    }
+
+    /// Whether `blocks` holds the block `name` as generation looks it up ([`crate::block`]: a
+    /// block name, its default state), with a [`Problem::UnknownBlock`] recorded that says `by`
+    /// names it when it does not.
+    pub fn block(&mut self, blocks: &BlockRegistry, name: &str, by: &GenId) -> bool {
+        let known = blocks.by_name(name).is_some();
+        if !known {
+            self.push(Problem::UnknownBlock {
+                by: by.clone(),
+                name: name.to_owned(),
+            });
+        }
+        known
     }
 
     /// The problems so far.

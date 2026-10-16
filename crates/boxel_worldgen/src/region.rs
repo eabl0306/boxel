@@ -33,8 +33,8 @@ pub use decorate::{
     ChunkColumns, Decoration, FillStage, FloorFill, NoSurface, Rock, Stages, SurfaceReach,
     SurfaceStage, TopLayers, decorate,
 };
-pub use dimension::DimensionGenerator;
-pub use generator::{LocalBounds, RegionGenerator, RegionSettings, RegionSpec};
+pub use dimension::{DimensionGenerator, REALM_GENERATOR};
+pub use generator::{LocalBounds, RegionGenerator, RegionSettings, RegionSpec, check_realm_blocks};
 pub use kind::{
     Context, FlatKind, HEIGHT_ONE, HEIGHT_SHIFT, HeightQ, KindForm, KindGrid, KindLimits,
     TerrainKind, block_of,
@@ -61,6 +61,10 @@ pub const DEFAULT_LATTICE_SHIFT: u32 = 8;
 /// The version of the region code (selection, blend, chunk path) in every realm's digest line
 /// `region`: bumped when the same registries give other terrain.
 pub const CODE_VERSION: u32 = 1;
+
+/// The registry name of a region generator's line for its code and lattice ([`CODE_VERSION`]):
+/// every region realm has one.
+pub const REGION_LINE: &str = "region";
 
 #[cfg(test)]
 mod tests;

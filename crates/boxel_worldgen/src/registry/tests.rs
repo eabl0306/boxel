@@ -490,22 +490,34 @@ fn unknown_ids_name_who_asked_for_them() {
     let r = registry(&[(id("test:a"), Entry::new(1))]);
     let mut checks = Checks::new();
     let preset = id("test:preset");
-    assert_eq!(checks.resolve(&r, &id("test:a"), &preset), r.find("test:a"));
+    assert_eq!(
+        checks.resolve(&r, &id("test:a"), Some(&preset)),
+        r.find("test:a")
+    );
     assert!(checks.is_empty());
-    assert_eq!(checks.resolve(&r, &id("test:missing"), &preset), None);
+    assert_eq!(checks.resolve(&r, &id("test:missing"), Some(&preset)), None);
     let error = checks.finish().expect_err("unknown id");
     assert_eq!(
         error.problems(),
         [Problem::Unknown {
             registry: "test_entry",
             id: id("test:missing"),
-            by: preset,
+            by: Some(preset),
         }]
     );
     assert_eq!(
         error.to_string(),
         "world generation check failed: test:preset names test_entry test:missing, which is not \
          registered"
+    );
+    // The root of a world open (its preset) has no referrer.
+    let mut checks = Checks::new();
+    assert_eq!(checks.resolve(&r, &id("test:nothing"), None), None);
+    let error = checks.finish().expect_err("unknown root");
+    assert_eq!(error.problems()[0].ids(), [&id("test:nothing")]);
+    assert_eq!(
+        error.to_string(),
+        "world generation check failed: test_entry test:nothing is not registered"
     );
 }
 
@@ -781,7 +793,7 @@ fn a_problem_found_twice_is_reported_once_and_counted_twice() {
     let problem = Problem::Unknown {
         registry: "test_entry",
         id: id("test:gone"),
-        by: id("test:by"),
+        by: Some(id("test:by")),
     };
     checks.push(problem.clone());
     checks.push(problem.clone());

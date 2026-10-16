@@ -32,9 +32,9 @@ use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSky, RealmSpan, RealmSpec, RealmStack};
 use boxel_worldgen::region::{
     ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ,
-    Interval, KindForm, KindGrid, KindLimits, NoSurface, RegionGenerator, RegionSettings,
-    RegionSpec, RuleEntry, Scope, SelectorRule, SurfaceReach, SurfaceStage, TerrainKind,
-    clear_worker_memo,
+    Interval, KindForm, KindGrid, KindLimits, NoSurface, REALM_GENERATOR, RegionGenerator,
+    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, SurfaceReach, SurfaceStage,
+    TerrainKind, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher,
@@ -710,6 +710,9 @@ impl SurfaceStage<TestContext> for Reaches {
             }
         }
     }
+    fn block_names(&self) -> Vec<&str> {
+        vec!["test:glass"]
+    }
 }
 
 #[test]
@@ -746,6 +749,7 @@ fn the_span_check_catches_a_surface_stage_outside_its_reach() {
                 rules: &world.rules,
                 entries: &world.entries,
                 kinds: &world.kinds,
+                blocks: &registry,
                 decoration: Decoration::new(
                     (id("test:fill"), Arc::new(FloorFill)),
                     (
@@ -826,6 +830,7 @@ fn flat_world(heights: &[i32], cells: u32) -> RegionGenerator<()> {
             rules: &rules,
             entries: &entries,
             kinds: &kinds,
+            blocks: &registry(),
             decoration: Decoration::new(
                 (id("test:fill"), Arc::new(FloorFill)),
                 (id("test:none"), Arc::new(NoSurface)),
@@ -1080,10 +1085,24 @@ fn a_dimension_dispatches_each_chunk_to_its_realm() {
     }
     assert_eq!(dim.vertical_chunks().start(), &i64::MIN);
     assert!(*dim.vertical_chunks().end() < 383);
+    // The two realms whose generators bring no line get one each (their generator's version and
+    // name), so the dimension's version follows them too.
+    let lines: Vec<(&str, &str)> = dim
+        .digest()
+        .entries()
+        .iter()
+        .filter(|e| e.registry == REALM_GENERATOR)
+        .map(|e| (e.scope.realm.as_ref().unwrap().as_str(), e.id.as_str()))
+        .collect();
+    assert_eq!(
+        lines,
+        [("test:deep", "test:deep"), ("test:sky", "test:sky")]
+    );
+    assert_ne!(WorldGenerator::version(&dim), surface_version);
     assert_eq!(
         WorldGenerator::version(&dim),
-        surface_version,
-        "one realm's lines: the same digest"
+        dim.digest().version(),
+        "the dimension's own digest"
     );
     assert!(dim.lod().is_none(), "no source yet");
     assert_eq!(dim.realms().len(), 3);
@@ -1295,6 +1314,7 @@ fn the_version_follows_every_entry_of_its_dimension() {
             rules: &world(CELLS).rules,
             entries: &world(CELLS).entries,
             kinds: &world(CELLS).kinds,
+            blocks: &registry(),
             decoration: decoration(),
             settings: RegionSettings {
                 lattice: 9,
@@ -1425,6 +1445,7 @@ fn open(world: &TestWorld) -> Result<(), String> {
             rules: &world.rules,
             entries: &world.entries,
             kinds: &world.kinds,
+            blocks: &registry(),
             decoration: decoration(),
             settings: RegionSettings::default(),
         },

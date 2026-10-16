@@ -372,6 +372,7 @@ pub fn try_generator(
             rules: &world.rules,
             entries: &world.entries,
             kinds: &world.kinds,
+            blocks: &registry(),
             decoration: decoration(),
             settings,
         },
