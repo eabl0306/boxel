@@ -1,0 +1,66 @@
+//! Terrain by regions (ADR 0039 sec. 4, 5, 6, 9, 13 and 14): a realm's region map gives every
+//! point of a lattice one terrain kind, the kinds' heights are blended exactly at their borders,
+//! and a shared decoration builds the chunks.
+//!
+//! - [`Context`]: a realm's shared fields and named parameters (the game's).
+//! - [`TerrainKind`]: a kind's heights, bounds and limits (the game's; [`FlatKind`] is the
+//!   engine's one).
+//! - [`SelectorRule`] and [`RuleEntry`]: the region map (game data; mods add rules and entries).
+//!   The selector is the only place a kind is chosen.
+//! - [`blend`]: the exact integer weights and blend.
+//! - [`FillStage`] and [`SurfaceStage`]: the decoration hook, with [`decorate`].
+//! - [`RegionGenerator`]: one realm, built at world open from the registries, with the freeze
+//!   checks of its rules and kinds.
+//! - [`DimensionGenerator`]: a dimension's realm stack, one generator per realm.
+//!
+//! Every per-worker memo is keyed by its generator's [`BuildKey`](crate::registry::BuildKey), so a
+//! world opened after another on the same workers never reads the first one's.
+//!
+//! Not built yet: core terms, volumes and the other realm forms (WG-VOLUME, WG-CAVERN), the far
+//! LOD's region pass (WG-REGIONLOD), the biome table and the rest of the decoration layer.
+
+pub mod blend;
+mod check;
+mod decorate;
+mod dimension;
+mod generator;
+mod kind;
+mod memo;
+mod select;
+
+pub use check::{border_relief, check_kinds, slope_passes};
+pub use decorate::{
+    ChunkColumns, Decoration, FillStage, FloorFill, NoSurface, Rock, Stages, SurfaceReach,
+    SurfaceStage, TopLayers, decorate,
+};
+pub use dimension::DimensionGenerator;
+pub use generator::{LocalBounds, RegionGenerator, RegionSettings, RegionSpec};
+pub use kind::{
+    Context, FlatKind, HEIGHT_ONE, HEIGHT_SHIFT, HeightQ, KindForm, KindGrid, KindLimits,
+    TerrainKind, block_of,
+};
+pub use memo::clear_worker_memo;
+pub use select::{
+    DEFAULT_CELL_SHIFT, Entry, Interval, MAX_WEIGHT, PARAM_REGISTRY, RuleEntry, Scope,
+    SelectorRule, check_rule_entries,
+};
+
+/// The steepest terrain the blend keeps along any line, in blocks per block (the far LOD's
+/// skirts cover up to 3:1, ADR 0031).
+pub const MAX_SLOPE: u32 = 3;
+
+/// The smallest region lattice: `2^5` blocks, so a chunk column lies in one lattice cell.
+pub const MIN_LATTICE_SHIFT: u32 = 5;
+
+/// The largest region lattice: `2^12` blocks, so the blend's sums stay far inside `i64`.
+pub const MAX_LATTICE_SHIFT: u32 = 12;
+
+/// The default region lattice: `2^8` (256) blocks, a blend band of 768.
+pub const DEFAULT_LATTICE_SHIFT: u32 = 8;
+
+/// The version of the region code (selection, blend, chunk path) in every realm's digest line
+/// `region`: bumped when the same registries give other terrain.
+pub const CODE_VERSION: u32 = 1;
+
+#[cfg(test)]
+mod tests;

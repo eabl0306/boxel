@@ -4,15 +4,15 @@
 
 use super::{GenEntry, GenId, GenIx, GenRegistry, GenRegistryBuilder};
 use crate::realm::{MAX_REALM_PLANES, REALM_PLANE, RealmForm, RealmSpan};
+use crate::region::{KindForm, MAX_SLOPE};
 use boxel_voxel::MAX_BLOCK_COORD;
 use std::fmt;
 
 /// One problem a freeze check found, with the ids it involves. Its message names them, so a
 /// refused mix of mods says which entries clash.
 ///
-/// The later steps add their checks here (WG-REGION: a `Point` selector rule with more than one
-/// entry, a region map without its fallback rule, the slope and border relief of kinds that can
-/// meet, wrappers that target missing slots...). [`Problem::Other`] carries the game's own.
+/// The later steps add their checks here (wrappers that target missing slots, core terms, features
+/// without a declared reach...). [`Problem::Other`] carries the game's own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Problem {
@@ -124,6 +124,79 @@ pub enum Problem {
         /// Its floor's block name.
         floor: String,
     },
+    /// A region map without its fallback rule: its last rule (the lowest priority) must have no
+    /// condition and a `Cell` scope, so every lattice point gets a kind.
+    NoFallback {
+        /// The realm.
+        realm: GenId,
+        /// Its last rule, `None` if it has none.
+        last: Option<GenId>,
+    },
+    /// A selector rule with a wrong number of entries: a `Point` rule needs exactly one, a `Cell`
+    /// rule at least one.
+    RuleEntries {
+        /// The rule.
+        rule: GenId,
+        /// Whether its scope is `Point`.
+        point: bool,
+        /// The kinds of its entries (its own and the added ones).
+        kinds: Vec<GenId>,
+    },
+    /// A selector entry whose weight is not in `1..=64`.
+    EntryWeight {
+        /// The rule.
+        rule: GenId,
+        /// The entry's kind.
+        kind: GenId,
+        /// Its weight.
+        weight: u8,
+    },
+    /// A kind listed twice in one selector rule (by the rule, or by an added entry).
+    DuplicateEntry {
+        /// The rule.
+        rule: GenId,
+        /// The kind.
+        kind: GenId,
+    },
+    /// A `Cell` rule whose region cells are smaller than the region lattice or over the largest
+    /// cellular cells.
+    CellSize {
+        /// The rule.
+        rule: GenId,
+        /// Its cells' `log2` size.
+        shift: u32,
+        /// The smallest size it may have: the lattice's `log2` spacing.
+        lattice: u32,
+        /// The largest.
+        max: u32,
+    },
+    /// Kinds of a realm that can meet whose slope and border relief break the 3:1 cap: the
+    /// steepest one's slope plus the largest border relief over 543 blocks (at the default
+    /// lattice) is over 3 (ADR 0039 sec. 6).
+    KindSlope {
+        /// The realm.
+        realm: GenId,
+        /// The two or three kinds.
+        kinds: Vec<GenId>,
+        /// The steepest one's slope, in 1/256 block per block, Q16 (the raw value of a `Q16`).
+        slope: u64,
+        /// The largest border relief between them, in 1/256 block.
+        relief: u64,
+        /// The lattice's `log2` spacing (the blend band is 3 lattice cells wide).
+        lattice: u32,
+    },
+    /// A kind whose form is not built yet.
+    KindFormNotBuilt {
+        /// The kind.
+        kind: GenId,
+        /// Its form.
+        form: KindForm,
+    },
+    /// A kind whose relief within a blend band is not inside its relief.
+    KindLimits {
+        /// The kind.
+        kind: GenId,
+    },
     /// A check the engine does not define (the game's own), with its ids and message.
     Other {
         /// The ids the problem involves.
@@ -155,6 +228,14 @@ impl Problem {
             | Self::FloorPolicy {
                 dimension, realm, ..
             } => vec![dimension, realm],
+            Self::NoFallback { realm, last } => std::iter::once(realm).chain(last).collect(),
+            Self::RuleEntries { rule, kinds, .. } => std::iter::once(rule).chain(kinds).collect(),
+            Self::EntryWeight { rule, kind, .. } | Self::DuplicateEntry { rule, kind } => {
+                vec![rule, kind]
+            }
+            Self::CellSize { rule, .. } => vec![rule],
+            Self::KindSlope { realm, kinds, .. } => std::iter::once(realm).chain(kinds).collect(),
+            Self::KindFormNotBuilt { kind, .. } | Self::KindLimits { kind } => vec![kind],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
             Self::Gap {
                 dimension,
@@ -281,9 +362,91 @@ impl fmt::Display for Problem {
                      {floor}; its form needs {needs}"
                 )
             }
+            Self::NoFallback { realm, last: None } => write!(
+                f,
+                "the region map of realm {realm} has no rule; it needs a fallback rule (no \
+                 condition, Cell scope) last"
+            ),
+            Self::NoFallback {
+                realm,
+                last: Some(last),
+            } => write!(
+                f,
+                "the region map of realm {realm} has no fallback rule: its last rule {last} has a \
+                 condition or a Point scope"
+            ),
+            Self::RuleEntries { rule, point, kinds } => {
+                write!(f, "selector rule {rule} has {} entries (", kinds.len())?;
+                list(f, kinds)?;
+                if *point {
+                    f.write_str("); a Point rule needs exactly one")
+                } else {
+                    f.write_str("); a Cell rule needs at least one")
+                }
+            }
+            Self::EntryWeight { rule, kind, weight } => write!(
+                f,
+                "selector rule {rule} gives kind {kind} the weight {weight}, outside 1 to {}",
+                crate::region::MAX_WEIGHT
+            ),
+            Self::DuplicateEntry { rule, kind } => {
+                write!(f, "selector rule {rule} lists kind {kind} more than once")
+            }
+            Self::CellSize {
+                rule,
+                shift,
+                lattice,
+                max,
+            } => write!(
+                f,
+                "selector rule {rule} has region cells of 2^{shift} blocks, outside 2^{lattice} \
+                 (the lattice) to 2^{max}"
+            ),
+            Self::KindSlope {
+                realm,
+                kinds,
+                slope,
+                relief,
+                lattice,
+            } => {
+                f.write_str("kinds ")?;
+                list(f, kinds)?;
+                // Display only: the check itself is exact.
+                let slope = *slope as f64 / 65536.0 / 256.0;
+                let relief = *relief as f64 / 256.0;
+                let band = 3.0 * f64::from(1u32 << lattice) / std::f64::consts::SQRT_2;
+                write!(
+                    f,
+                    " of realm {realm} can meet with a slope of {:.3} (the steepest {slope:.3} \
+                     plus a border relief of {relief:.1} blocks over {band:.0}), over \
+                     {MAX_SLOPE}",
+                    slope + relief / band
+                )
+            }
+            Self::KindFormNotBuilt { kind, form } => write!(
+                f,
+                "terrain kind {kind} has the form {form}, which is not built yet"
+            ),
+            Self::KindLimits { kind } => write!(
+                f,
+                "terrain kind {kind} declares a relief within the blend band outside its relief"
+            ),
             Self::Other { message, .. } => f.write_str(message),
         }
     }
+}
+
+/// `a, b and c`.
+fn list(f: &mut fmt::Formatter<'_>, ids: &[GenId]) -> fmt::Result {
+    for (i, id) in ids.iter().enumerate() {
+        let sep = match i {
+            0 => "",
+            _ if i + 1 == ids.len() => " and ",
+            _ => ", ",
+        };
+        write!(f, "{sep}{id}")?;
+    }
+    Ok(())
 }
 
 /// Every problem the checks found (never none): the one error of a failed freeze or world open.

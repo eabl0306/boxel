@@ -221,7 +221,10 @@ pub trait LodSource: Send + Sync {
         emit: &mut dyn FnMut(i64, LodNode<'_>),
     ) -> LodColumn;
 
-    /// Bumped when the coarse output changes (documentation, and a future persisted table).
+    /// Bumped when the coarse output changes (documentation, and a future persisted table). A
+    /// generator's source returns the generator's
+    /// [`WorldGenerator::version`](crate::WorldGenerator::version): 0 by default, as both
+    /// defaults are.
     fn version(&self) -> u32 {
         0
     }

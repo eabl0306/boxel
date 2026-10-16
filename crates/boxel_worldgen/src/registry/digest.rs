@@ -200,6 +200,19 @@ impl DigestBuilder {
         self
     }
 
+    /// Adds `entry`, a line built by hand (an entry outside a registry, such as a realm's
+    /// Context).
+    pub fn push(&mut self, entry: DigestEntry) -> &mut Self {
+        self.entries.push(entry);
+        self
+    }
+
+    /// Adds every line of `digest` (a realm generator's, into its dimension's).
+    pub fn extend(&mut self, digest: &RegistryDigest) -> &mut Self {
+        self.entries.extend_from_slice(&digest.entries);
+        self
+    }
+
     /// The digest.
     pub fn finish(self) -> RegistryDigest {
         RegistryDigest::from_entries(self.entries)

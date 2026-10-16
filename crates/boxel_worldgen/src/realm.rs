@@ -4,8 +4,9 @@
 //! freeze checks of a layout ([`check_realms`]) and the stack that finds the realm of a `y`
 //! ([`RealmStack`]).
 //!
-//! A realm's terrain comes from its own generator, and the generator of a dimension dispatches each
-//! chunk to the generator of its realm (WG-REGION).
+//! A realm's terrain comes from its own generator (a [`RegionGenerator`](crate::region::RegionGenerator));
+//! [`DimensionGenerator`](crate::region::DimensionGenerator) dispatches each chunk of a dimension
+//! to the generator of its realm.
 
 use crate::registry::{Checks, GenEntry, GenId, HashParams, ParamsHasher, Problem};
 use boxel_voxel::{CHUNK_SHIFT, MAX_BLOCK_COORD};
@@ -417,8 +418,9 @@ pub struct RealmSpec {
     pub span: RealmSpan,
     /// Which surfaces its kinds give. Only [`RealmForm::Ground`] is built.
     pub form: RealmForm,
-    /// The origin of its heights (the sea level of a surface realm): kinds work in 1/256 of a
-    /// block over it, and a height `h` is the block `datum + (h >> 8)`.
+    /// The origin of its heights (the sea level of a surface realm): kinds work in
+    /// [`HeightQ`](crate::region::HeightQ) over it, and a height `h` is the block `datum + (h >>
+    /// 8)`.
     pub datum: i64,
     /// Its fluid, column by column.
     pub fluid: FluidRule,
@@ -489,8 +491,9 @@ pub fn check_floors<'a>(
     }
 }
 
-/// The realms of a dimension, bottom first, and the planes between them: what a dimension's
-/// generator dispatches by.
+/// The realms of a dimension, bottom first, and the planes between them: what
+/// [`WorldGenerator::realms`](crate::WorldGenerator::realms) reports and what
+/// [`DimensionGenerator`](crate::region::DimensionGenerator) dispatches by.
 ///
 /// Built through the layout checks, its realms cover every `y` exactly once, so
 /// [`RealmStack::realm_of`] always answers: a binary search over at most [`MAX_REALM_PLANES`]
@@ -565,8 +568,8 @@ impl RealmStack {
         })
     }
 
-    /// One realm, unchecked: a realm generator's own view, where `realm_of` gives it for every
-    /// `y`.
+    /// One realm, unchecked: a realm generator's own view ([`RegionGenerator`'s
+    /// realms](crate::region::RegionGenerator)), where `realm_of` gives it for every `y`.
     pub(crate) fn of_one(id: GenId, spec: RealmSpec) -> Self {
         Self {
             realms: vec![(id, spec)].into(),
@@ -575,7 +578,8 @@ impl RealmStack {
         }
     }
 
-    /// The stack of a generator that declares no realm: one realm, `boxel:default`,
+    /// The stack of a generator that declares no realm (the default of
+    /// [`WorldGenerator::realms`](crate::WorldGenerator::realms)): one realm, `boxel:default`,
     /// spanning every `y`, with the [`RealmForm::Ground`] form, an open sky and the far LOD on
     /// (its own source, if any). Its floor is air: the engine does not know what lies under such
     /// a generator's terrain.

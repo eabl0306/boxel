@@ -13,8 +13,10 @@
 //!
 //! [`registry`] holds the ids, registries, salts and digest of the world generation entries a
 //! game and its mods register (ADR 0039 sec. 11 to 13), with the checks that run when the app is
-//! built and when a world opens; [`realm`] holds the layout of a dimension's realms along y and
-//! its checks.
+//! built and when a world opens; [`realm`] holds the realms of a dimension along y (their specs,
+//! their stack and its checks); [`region`] the terrain by regions: a realm's region map, its
+//! terrain kinds blended exactly at their borders, its decoration, and the generators of a realm
+//! and of a dimension; [`query`] what lies at a point, without building chunks.
 
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
@@ -26,11 +28,15 @@ pub mod exact;
 pub mod field;
 pub mod lod;
 pub mod noise;
+pub mod query;
 pub mod realm;
+pub mod region;
 pub mod registry;
 
 pub use lod::LodSource;
 pub use noise::Frequency;
+pub use query::{ColumnInfo, WorldQuery};
+pub use realm::RealmStack;
 pub use registry::{GenId, GenRegistry};
 
 /// A chunk generator.
@@ -60,6 +66,24 @@ pub trait WorldGenerator: Send + Sync + 'static {
     }
     /// Name for logs.
     fn name(&self) -> &str;
+    /// The version of this generator's output (ADR 0039 sec. 11): it changes when the same seed
+    /// gives other chunks. 0 by default. A region generator reports the low 32 bits of its
+    /// dimension's digest ([`RegistryDigest::dimension`](registry::RegistryDigest::dimension)),
+    /// so a change in another dimension leaves it alone. Its [`LodSource::version`] is the same.
+    fn version(&self) -> u32 {
+        0
+    }
+    /// The realms of the generator's dimension along y, bottom first (ADR 0039 sec. 2). The
+    /// default, [`RealmStack::single`], is one realm spanning every y with an open sky and the
+    /// far LOD on: what every generator was before realms.
+    fn realms(&self) -> &RealmStack {
+        RealmStack::single()
+    }
+    /// What lies at a point without building chunks (ADR 0039 sec. 13), `None` (the default) if
+    /// the generator cannot tell.
+    fn as_query(&self) -> Option<&dyn WorldQuery> {
+        None
+    }
 }
 
 /// Horizontal layers from y = 0 upwards, e.g. `[("game:bedrock", 1), ("game:stone", 3),
