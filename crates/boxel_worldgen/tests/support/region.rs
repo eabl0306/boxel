@@ -1,7 +1,8 @@
-//! Test content of the region generator (#119), shared by `tests/region.rs` and
-//! `benches/region.rs`: a `test:` Context with a base height, two parameters and a warp, test
-//! kinds that add relief to that base, the registries of a test world, and the hand-fused
-//! single-kind twin the bench compares against.
+//! Test content of the region generator (#119, #133), shared by `tests/region.rs`,
+//! `tests/region_lod.rs`, `tests/decoration.rs` and `benches/region.rs`: a `test:` Context with a
+//! base height, two parameters and a warp, test kinds that add relief to that base (also with
+//! bounds per chunk column), valleys carved by a shape modifier, the registries of a test world,
+//! and the hand-fused single-kind twin the bench compares against.
 #![allow(dead_code, reason = "each user takes part of it")]
 
 use boxel_voxel::{
@@ -530,6 +531,25 @@ impl Valleys {
         (id as u64, d)
     }
 
+    /// The distance from the columns `z0..=z1` to the nearest valley.
+    pub fn distance(&self, z0: i64, z1: i64) -> i64 {
+        let first = z0.div_euclid(self.period) - 1;
+        let last = z1.div_euclid(self.period) + 1;
+        (first..=last)
+            .flat_map(|k| [k * self.period, k * self.period + self.gap])
+            .map(|v| {
+                if v < z0 {
+                    z0 - v
+                } else if v > z1 {
+                    v - z1
+                } else {
+                    0
+                }
+            })
+            .min()
+            .expect("valleys")
+    }
+
     /// The carve of a height `h` at distance `n`.
     pub fn carve(&self, h: i64, n: i64) -> i64 {
         let floor = i64::from(self.floor);
@@ -567,6 +587,14 @@ impl<Cx: Context> ShapeModifier<Cx> for Valleys {
             jitter: 1,
         }
     }
+    /// No cut where every column of `area` is `width` or more from both valleys.
+    fn column_effect(&self, _: &Cx, _: u64, area: Rect) -> ShapeEffect {
+        if self.distance(area.z0, area.z1) >= self.width {
+            ShapeEffect::LowerOnly(0)
+        } else {
+            ShapeEffect::LowerOnly(self.depth)
+        }
+    }
     fn apply(&self, grid: &KindGrid<'_, Cx>, heights: &mut [HeightQ]) {
         for (row, _) in heights.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
             for (h, &z) in row.iter_mut().zip(grid.zs) {
@@ -596,6 +624,56 @@ impl<Cx: Context> ShapeModifier<Cx> for Valleys {
             |_, _, top, n| self.carve(top, n),
         );
     }
+}
+
+/// A test kind with its bounds per chunk column ([`TerrainKind::column_bounds`]): the [`Relief`]
+/// with the bound of its fields over the chunk column, much tighter than over the two lattice
+/// cells around a lattice point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Hooked(pub Relief);
+
+impl HashParams for Hooked {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+
+impl GenEntry for Hooked {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl TerrainKind<TestContext> for Hooked {
+    fn limits(&self, cx: &TestContext) -> KindLimits {
+        self.0.limits(cx)
+    }
+    fn range(&self, cx: &TestContext) -> Span {
+        self.0.range(cx)
+    }
+    fn bounds(&self, cx: &TestContext, seed: u64, q: (i64, i64), reach: i64) -> Span {
+        self.0.bounds(cx, seed, q, reach)
+    }
+    fn column_bounds(&self, cx: &TestContext, seed: u64, area: Rect) -> Option<Span> {
+        let b = Add::new(cx.base.clone(), self.0.noise(seed)).bound(area);
+        Some(Span::new(b.lo + self.0.offset, b.hi + self.0.offset))
+    }
+    fn heights(&self, grid: &KindGrid<'_, TestContext>, mask: &[bool], out: &mut [HeightQ]) {
+        self.0.heights(grid, mask, out);
+    }
+}
+
+/// The test kinds with their bounds per chunk column, as registry entries.
+pub fn hooked_entries() -> Vec<(&'static str, Arc<dyn TerrainKind<TestContext>>)> {
+    kinds()
+        .into_iter()
+        .map(|(name, k)| {
+            (
+                name,
+                Arc::new(Hooked(k)) as Arc<dyn TerrainKind<TestContext>>,
+            )
+        })
+        .collect()
 }
 
 /// The FNV fingerprint of a chunk's states.

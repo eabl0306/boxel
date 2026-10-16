@@ -35,17 +35,59 @@ struct Slot {
     point: Option<Point>,
 }
 
-/// The last window a table gave whole: its lattice cell, its points and its column's bounds.
+/// The distinct kinds of a window, each with the hull of the bounds of its points there
+/// ([`TerrainKind::bounds`](super::TerrainKind::bounds)): what a chunk column's bounds read where
+/// a kind gives no bounds of its own over the column.
 #[derive(Clone, Copy, Debug)]
-struct Last {
-    cell: (i64, i64),
-    points: WindowPoints,
-    bounds: LocalBounds,
+pub(crate) struct WindowKinds {
+    len: usize,
+    of: [(u32, i32, i32); 16],
+}
+
+impl WindowKinds {
+    /// The kinds of `points`, in the order they first appear.
+    pub(crate) fn of(points: &WindowPoints) -> Self {
+        let mut kinds = Self {
+            len: 0,
+            of: [(0, 0, 0); 16],
+        };
+        for p in points {
+            match kinds.of[..kinds.len].iter_mut().find(|k| k.0 == p.kind) {
+                Some(k) => *k = (k.0, k.1.min(p.lo), k.2.max(p.hi)),
+                None => {
+                    kinds.of[kinds.len] = (p.kind, p.lo, p.hi);
+                    kinds.len += 1;
+                }
+            }
+        }
+        kinds
+    }
+
+    /// `(kind, lo, hi)` of each kind.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, i32, i32)> + '_ {
+        self.of[..self.len].iter().copied()
+    }
+}
+
+/// The last window of a table: its lattice cell with its points and kinds, and the last chunk
+/// column of the cell with its bounds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Last {
+    /// The lattice cell.
+    pub(crate) cell: (i64, i64),
+    /// Its window's points.
+    pub(crate) points: WindowPoints,
+    /// Their kinds.
+    pub(crate) kinds: WindowKinds,
+    /// The chunk column.
+    pub(crate) column: (i64, i64),
+    /// Its bounds.
+    pub(crate) bounds: LocalBounds,
 }
 
 /// A direct-mapped table of lattice points (`SIDE * SIDE` slots of 32 bytes, 32 KiB), and the
-/// last window: the chunks of one lattice cell, often generated one after the other, read it
-/// once, and a chunk over or under its bounds reads only them.
+/// last window: the chunks of one chunk column, often generated one after the other, read its
+/// bounds alone, and the other chunk columns of its lattice cell its points and kinds.
 struct Table {
     slots: Box<[Slot]>,
     last: Option<Last>,
@@ -138,62 +180,21 @@ pub(crate) fn write(key: BuildKey, at: &[(i64, i64)], points: &[Option<Point>], 
     });
 }
 
-/// The bounds of the window of lattice cell `cell`, if it is the last one of the memo of `key`.
-pub(crate) fn last_bounds(key: BuildKey, cell: (i64, i64)) -> Option<LocalBounds> {
+/// The bounds of chunk column `column`, if it is the last window's of the memo of `key`.
+pub(crate) fn last_bounds(key: BuildKey, column: (i64, i64)) -> Option<LocalBounds> {
     with_table(key, |table| {
         table
             .last
             .as_ref()
-            .filter(|last| last.cell == cell)
+            .filter(|last| last.column == column)
             .map(|last| last.bounds)
     })
 }
 
-/// The window of lattice cell `cell` (its 16 points `at`) and its bounds, if it is the last one
-/// of the memo of `key`; else [`read`] of its points into `out`, with the mask of the missing
-/// ones.
-pub(crate) fn read_window(
-    key: BuildKey,
-    cell: (i64, i64),
-    at: &[(i64, i64); 16],
-    out: &mut [Option<Point>; 16],
-) -> Result<(WindowPoints, LocalBounds), u32> {
-    with_table(key, |table| {
-        if let Some(last) = table.last.filter(|last| last.cell == cell) {
-            return Ok((last.points, last.bounds));
-        }
-        let mut missing = 0;
-        for (n, (&(i, j), o)) in at.iter().zip(out.iter_mut()).enumerate() {
-            *o = table.get(i, j);
-            if o.is_none() {
-                missing |= 1 << n;
-            }
-        }
-        Err(missing)
-    })
-}
-
-/// Stores the points of `at` set in `mask` in the memo of `key`, and the window of `cell` with
-/// its bounds as the last one.
-pub(crate) fn write_window(
-    key: BuildKey,
-    cell: (i64, i64),
-    at: &[(i64, i64); 16],
-    (points, bounds): (&WindowPoints, LocalBounds),
-    mask: u32,
-) {
-    with_table(key, |table| {
-        for (n, (&(i, j), p)) in at.iter().zip(points).enumerate() {
-            if mask & (1 << n) != 0 {
-                table.set(i, j, *p);
-            }
-        }
-        table.last = Some(Last {
-            cell,
-            points: *points,
-            bounds,
-        });
-    });
+/// `f` on the last window of the memo of `key` (`None` before the first one). `f` must not read
+/// the memo itself.
+pub(crate) fn with_last<R>(key: BuildKey, f: impl FnOnce(&mut Option<Last>) -> R) -> R {
+    with_table(key, |table| f(&mut table.last))
 }
 
 /// Empties every memo of the region generators on the calling thread (benches of the cold path,

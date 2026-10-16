@@ -48,6 +48,12 @@ impl ShapeEffect {
             Self::Raise(r) => after >= before && after - before <= r as i64,
         }
     }
+
+    /// Whether every change this effect allows, `other` allows too: no deeper cut and no higher
+    /// rise (a column effect inside the modifier's own, [`ShapeModifier::column_effect`]).
+    pub const fn within(self, other: Self) -> bool {
+        self.lower() <= other.lower() && self.raise() <= other.raise()
+    }
 }
 
 impl HashParams for ShapeEffect {
@@ -81,6 +87,16 @@ pub trait ShapeModifier<Cx: Context>: GenEntry + Send + Sync {
     /// slopes, summed, alone and on top of every kind, pair and triple of kinds they cut, by the
     /// rule the kinds' check uses.
     fn slope(&self) -> Slope;
+
+    /// What it may do to the heights of the columns of `area` (a chunk column, or the part of a
+    /// carver's apron in one lattice cell; ADR 0039 sec. 14), inside [`ShapeModifier::effect`]
+    /// ([`ShapeEffect::within`]): a river says `LowerOnly(0)` where no segment reaches. The
+    /// generator reads it once per chunk column for the column's bounds and the deep path, and
+    /// in debug builds holds the chunk's heights to it. The default is the whole effect.
+    fn column_effect(&self, cx: &Cx, seed: u64, area: Rect) -> ShapeEffect {
+        let _ = (cx, seed, area);
+        self.effect()
+    }
 
     /// The grid form: rewrites `heights` (in [`HeightQ`], point `i * zs.len() + j` at `(xs[i],
     /// zs[j])` of `grid`) in place, for a chunk column, a point query or the corners of a LOD

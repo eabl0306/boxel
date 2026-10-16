@@ -764,7 +764,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             m.modifier
                 .lod(&grid, level, &mut slots.corners, &mut slots.tops);
             if let Some(before) = before {
-                self.check_effect(m, (&slots.xs, &slots.zs), &before, &slots.corners);
+                self.check_effect(m, m.effect, (&slots.xs, &slots.zs), &before, &slots.corners);
             }
         }
         if cfg!(debug_assertions) {

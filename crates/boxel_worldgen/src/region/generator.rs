@@ -5,12 +5,13 @@ use super::decorate::{
     ChunkColumns, Decoration, FillStage, Rock, Stages, SurfaceReach, SurfaceStage,
 };
 use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
-use super::memo::{self, Point, WindowPoints};
+use super::memo::{self, Point, WindowKinds, WindowPoints};
 use super::modifier::{ShapeEffect, ShapeModifier};
 use super::select::{self, RuleEntry, Selector, SelectorRule, check_rule_entries};
 use super::{
     CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, REGION_LINE, check,
 };
+use crate::field::Rect;
 use crate::lod::LodSource;
 use crate::query::{ColumnInfo, WorldQuery};
 use crate::realm::{FluidRule, RealmSpec, RealmStack, check_floors};
@@ -82,8 +83,10 @@ pub struct RegionSpec<'a, Cx: Context> {
     pub settings: RegionSettings,
 }
 
-/// The vertical bounds of a chunk column of a realm (ADR 0039 sec. 14), from its 16 lattice
-/// points: exact integers, every one a block `y`.
+/// The vertical bounds of a chunk column of a realm (ADR 0039 sec. 14): exact integers, every one
+/// a block `y`. They come from the kinds present in the 16 lattice points around the column (each
+/// kind's [`TerrainKind::column_bounds`] over the chunk column, else its points' bounds) and the
+/// shape modifiers' [`ShapeModifier::column_effect`] there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalBounds {
     /// A block at or under the lowest ground of the column (the open surface): the realm's
@@ -150,9 +153,6 @@ pub struct RegionGenerator<Cx: Context> {
     pub(super) kinds: Box<[RealmKind<Cx>]>,
     /// In the order they run.
     pub(super) modifiers: Box<[RealmModifier<Cx>]>,
-    /// The sum of the modifiers' deepest cuts and of their rises, in [`HeightQ`].
-    pub(super) lower: i64,
-    pub(super) raise: i64,
     fill: Arc<dyn FillStage<Cx>>,
     pub(super) surface: Arc<dyn SurfaceStage<Cx>>,
     pub(super) reach: SurfaceReach,
@@ -340,8 +340,6 @@ impl<Cx: Context> RegionGenerator<Cx> {
             selector,
             kinds: realm_kinds.into(),
             modifiers: modifiers.into(),
-            lower,
-            raise,
             fill: fill.1,
             surface: surface.1,
             reach,
@@ -433,40 +431,119 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The 16 lattice points around lattice cell `(i0, j0)`, point `a * 4 + b` at `(i0 - 1 + a,
-    /// j0 - 1 + b)`, and their column's bounds, through the memo when it is on.
-    fn window(&self, i0: i64, j0: i64) -> (WindowPoints, LocalBounds) {
-        let at = std::array::from_fn(|n| (i0 - 1 + (n / 4) as i64, j0 - 1 + (n % 4) as i64));
+    /// j0 - 1 + b)`, through the memo when it is on.
+    fn points(&self, cell: (i64, i64)) -> WindowPoints {
+        let last = self.memo.then(|| {
+            memo::with_last(self.key, |last| {
+                last.as_ref().filter(|l| l.cell == cell).map(|l| l.points)
+            })
+        });
+        last.flatten()
+            .unwrap_or_else(|| self.window_at(&window_coords(cell.0, cell.1)))
+    }
+
+    /// The lattice cell of chunk column `(cx, cz)` (in chunks).
+    const fn cell_of(&self, (cx, cz): (i64, i64)) -> (i64, i64) {
+        let s = self.shift - CHUNK_SHIFT;
+        (cx >> s, cz >> s)
+    }
+
+    /// The last window of the memo, if it is in the lattice cell of chunk column `column`: its
+    /// points and the column's bounds, which it computes from the cell's kinds when the last one
+    /// was another chunk column of the cell.
+    fn last_window<R>(&self, column: (i64, i64), f: impl FnOnce(&memo::Last) -> R) -> Option<R> {
         if !self.memo {
-            let points = self.window_at(&at);
-            return (points, self.bounds_of(&points));
+            return None;
         }
-        let mut read = [None; WINDOW_POINTS];
-        let missing = match memo::read_window(self.key, (i0, j0), &at, &mut read) {
-            Ok(window) => return window,
-            Err(missing) => missing,
-        };
-        for (n, (&(i, j), p)) in at.iter().zip(&mut read).enumerate() {
-            if missing & (1 << n) != 0 {
-                *p = Some(self.point(i, j));
+        let cell = self.cell_of(column);
+        memo::with_last(self.key, |last| {
+            let last = last.as_mut().filter(|l| l.cell == cell)?;
+            if last.column != column {
+                last.bounds = self.bounds_of(column, &last.kinds);
+                last.column = column;
             }
+            Some(f(last))
+        })
+    }
+
+    /// The bounds of chunk column `column` (in chunks), through the memo when it is on (the last
+    /// window's cell, without copying its points, when it is the column's).
+    fn bounds(&self, column: (i64, i64)) -> LocalBounds {
+        self.last_window(column, |l| l.bounds)
+            .unwrap_or_else(|| self.window(column).1)
+    }
+
+    /// The window of chunk column `column` (in chunks): its lattice cell's 16 points
+    /// ([`RegionGenerator::points`]) and its bounds, through the memo when it is on.
+    fn window(&self, column: (i64, i64)) -> (WindowPoints, LocalBounds) {
+        if let Some(window) = self.last_window(column, |l| (l.points, l.bounds)) {
+            return window;
         }
-        let points = read.map(|p| p.expect("every point read or computed"));
-        let bounds = self.bounds_of(&points);
-        memo::write_window(self.key, (i0, j0), &at, (&points, bounds), missing);
+        let cell = self.cell_of(column);
+        let points = self.window_at(&window_coords(cell.0, cell.1));
+        let kinds = WindowKinds::of(&points);
+        let bounds = self.bounds_of(column, &kinds);
+        if self.memo {
+            memo::with_last(self.key, |last| {
+                *last = Some(memo::Last {
+                    cell,
+                    points,
+                    kinds,
+                    column,
+                    bounds,
+                });
+            });
+        }
         (points, bounds)
     }
 
-    /// The bounds of the column whose window holds `points`: the kinds' bounds there, widened by
-    /// the shape modifiers' declared effects.
-    fn bounds_of(&self, points: &[Point; WINDOW_POINTS]) -> LocalBounds {
-        let lo = points.iter().map(|p| p.lo).min().expect("16 points");
-        let hi = points.iter().map(|p| p.hi).max().expect("16 points");
-        let spec = self.spec();
-        let (lo, hi) = (
-            clamp_height(i64::from(lo) - self.lower),
-            clamp_height(i64::from(hi) + self.raise),
+    /// The span of the heights (in [`HeightQ`], unclamped) of the columns of `area`, inside a
+    /// lattice cell whose window holds `kinds`: per kind its [`TerrainKind::column_bounds`] over
+    /// `area`, else the bounds of its points, then widened by the shape modifiers' column effects
+    /// there.
+    fn ground_span(&self, area: Rect, kinds: &WindowKinds) -> (i64, i64) {
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for (kind, point_lo, point_hi) in kinds.iter() {
+            let k = &self.kinds[kind as usize];
+            let (a, b) = match k.kind.column_bounds(&self.cx, k.seed, area) {
+                Some(b) => (clamp_height(b.lo), clamp_height(b.hi)),
+                None => (point_lo, point_hi),
+            };
+            lo = lo.min(a.into());
+            hi = hi.max(b.into());
+        }
+        let (mut lower, mut raise) = (0, 0);
+        for m in &self.modifiers {
+            let effect = m.modifier.column_effect(&self.cx, m.seed, area);
+            if cfg!(debug_assertions) {
+                self.check_column_effect(m, area, effect);
+            }
+            lower += i64::from(effect.lower());
+            raise += i64::from(effect.raise());
+        }
+        (lo - lower, hi + raise)
+    }
+
+    /// The debug check of a modifier's column effect: inside its declared effect, which the
+    /// realm's vertical range counts on.
+    fn check_column_effect(&self, m: &RealmModifier<Cx>, area: Rect, effect: ShapeEffect) {
+        assert!(
+            effect.within(m.effect),
+            "{NAME} span check: realm {} shape modifier {} gives the columns {area:?} the effect \
+             {effect:?}, outside its declared effect {:?}",
+            self.realm(),
+            m.id,
+            m.effect,
         );
-        let (ground_lo, ground_hi) = (block_of(spec.datum, lo), block_of(spec.datum, hi));
+    }
+
+    /// The bounds of chunk column `column` (in chunks), whose lattice cell's window holds
+    /// `kinds`.
+    fn bounds_of(&self, column: (i64, i64), kinds: &WindowKinds) -> LocalBounds {
+        let (lo, hi) = self.ground_span(chunk_rect(column), kinds);
+        let spec = self.spec();
+        let block = |h: i64| block_of(spec.datum, clamp_height(h));
+        let (ground_lo, ground_hi) = (block(lo), block(hi));
         let mut top = ground_hi.saturating_add(self.reach.rise.into());
         if let FluidRule::SeaLevel { level, .. } = spec.fluid
             && ground_lo < level
@@ -483,27 +560,36 @@ impl<Cx: Context> RegionGenerator<Cx> {
 
     /// The bounds of chunk column `(cx, cz)` (in chunks), after its selection reads.
     pub fn local_bounds(&self, cx: i64, cz: i64) -> LocalBounds {
-        let s = self.shift - CHUNK_SHIFT;
-        self.window(cx >> s, cz >> s).1
+        self.bounds((cx, cz))
     }
 
     /// The heights of the grid `xs` x `zs`, all in lattice cell `(i0, j0)` whose window holds
     /// `points`, into `out` (`i * zs.len() + j`): the kinds' heights blended, then the shape
-    /// modifiers.
+    /// modifiers. `area` is the chunk column the grid lies in, if one: in debug builds the
+    /// modifiers are held to their effect there ([`ShapeModifier::column_effect`]), else to their
+    /// declared one.
     fn heights_in(
         &self,
         (xs, zs): (&[i64], &[i64]),
         fields: &Cx::Grid,
         points: &[Point; WINDOW_POINTS],
+        area: Option<Rect>,
         out: &mut [HeightQ],
     ) {
         self.blend_in((xs, zs), fields, points, out);
-        self.shape((xs, zs), fields, out);
+        self.shape((xs, zs), fields, area, out);
     }
 
     /// The shape modifiers over the heights `out` of the grid `xs` x `zs`, in their order. In debug
-    /// builds each one is held to its declared effect.
-    fn shape(&self, (xs, zs): (&[i64], &[i64]), fields: &Cx::Grid, out: &mut [HeightQ]) {
+    /// builds each one is held to its effect over `area` (the chunk column of the grid), or to its
+    /// declared effect.
+    fn shape(
+        &self,
+        (xs, zs): (&[i64], &[i64]),
+        fields: &Cx::Grid,
+        area: Option<Rect>,
+        out: &mut [HeightQ],
+    ) {
         for m in &self.modifiers {
             let before = cfg!(debug_assertions).then(|| out.to_vec());
             let grid = KindGrid {
@@ -515,30 +601,38 @@ impl<Cx: Context> RegionGenerator<Cx> {
             };
             m.modifier.apply(&grid, out);
             if let Some(before) = before {
-                self.check_effect(m, (xs, zs), &before, out);
+                let effect =
+                    area.map_or(m.effect, |a| m.modifier.column_effect(&self.cx, m.seed, a));
+                self.check_effect(m, effect, (xs, zs), &before, out);
             }
         }
     }
 
-    /// The debug check of a shape modifier's effect: every height it left is one its declared
-    /// effect allows (the column bounds and the far LOD count on it).
+    /// The debug check of a shape modifier's effect: every height it left is one `effect` (its
+    /// declared effect, or its effect over the grid's chunk column) allows (the column bounds and
+    /// the far LOD count on it).
     pub(super) fn check_effect(
         &self,
         m: &RealmModifier<Cx>,
+        effect: ShapeEffect,
         (xs, zs): (&[i64], &[i64]),
         before: &[HeightQ],
         after: &[HeightQ],
     ) {
+        let what = if effect == m.effect {
+            "declared"
+        } else {
+            "column"
+        };
         for (n, (&b, &a)) in before.iter().zip(after).enumerate() {
             assert!(
-                m.effect.allows(b, a),
+                effect.allows(b, a),
                 "{NAME} span check: realm {} shape modifier {} turned the height {b} of column \
-                 ({}, {}) into {a}, outside its declared effect {:?}",
+                 ({}, {}) into {a}, outside its {what} effect {effect:?}",
                 self.realm(),
                 m.id,
                 xs[n / zs.len()],
                 zs[n % zs.len()],
-                m.effect,
             );
         }
     }
@@ -619,14 +713,15 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let (x0, z0) = (cx << CHUNK_SHIFT, cz << CHUNK_SHIFT);
         let (xs, zs) = chunk_axes(x0, z0);
         let fields = self.cx.grid(&xs, &zs);
-        let (points, _) = self.window(x0 >> self.shift, z0 >> self.shift);
-        self.heights_in((&xs, &zs), &fields, &points, out);
+        let points = self.points(self.cell_of((cx, cz)));
+        let area = Some(chunk_rect((cx, cz)));
+        self.heights_in((&xs, &zs), &fields, &points, area, out);
     }
 
     /// The dominant kind of column `(x, z)`: the largest blend weight, ties to the smaller id
     /// (the biome table's input). Selection reads only, no height.
     pub fn dominant_kind(&self, x: i64, z: i64) -> &GenId {
-        let (points, _) = self.window(x >> self.shift, z >> self.shift);
+        let points = self.points((x >> self.shift, z >> self.shift));
         let m = (1i64 << self.shift) - 1;
         let window = Window(points.map(|p| p.kind));
         let f = blend::factors(x & m, z & m, self.shift);
@@ -636,10 +731,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// The column at block `(x, z)`: its height, ground, fluid, dominant kind and its chunk
     /// column's bounds. The same bits as the chunk path.
     pub fn column_info(&self, x: i64, z: i64) -> ColumnInfo {
-        let (points, bounds) = self.window(x >> self.shift, z >> self.shift);
+        let column = (x >> CHUNK_SHIFT, z >> CHUNK_SHIFT);
+        let (points, bounds) = self.window(column);
         let fields = self.cx.grid(&[x], &[z]);
         let mut h = [0];
-        self.heights_in((&[x], &[z]), &fields, &points, &mut h);
+        let area = Some(chunk_rect(column));
+        self.heights_in((&[x], &[z]), &fields, &points, area, &mut h);
         let spec = self.spec();
         let ground = block_of(spec.datum, h[0]);
         let m = (1i64 << self.shift) - 1;
@@ -663,13 +760,13 @@ impl<Cx: Context> RegionGenerator<Cx> {
 
     /// The chunk at `key` through the column stage, without the fast paths over the local top
     /// and under the deep bound: what [`WorldGenerator::generate`] must equal, for tests of a
-    /// realm's bounds (a game's or a mod's kinds included).
+    /// realm's bounds (a game's or a mod's kinds and modifiers included).
     pub fn generate_full(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
         let origin = key.pos.origin();
         if !self.spec().span.contains(origin.y) {
             return ChunkData::uniform(BlockState::AIR);
         }
-        let window = self.window(origin.x >> self.shift, origin.z >> self.shift);
+        let window = self.window((key.pos.x, key.pos.z));
         self.column_stage(origin, &window, registry)
     }
 
@@ -683,7 +780,11 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let (xs, zs) = chunk_axes(origin.x, origin.z);
         let fields = self.cx.grid(&xs, &zs);
         let mut h = [0; CHUNK_AREA];
-        self.heights_in((&xs, &zs), &fields, points, &mut h);
+        let area = Some(chunk_rect((
+            origin.x >> CHUNK_SHIFT,
+            origin.z >> CHUNK_SHIFT,
+        )));
+        self.heights_in((&xs, &zs), &fields, points, area, &mut h);
         let spec = self.spec();
         let ground = h.map(|h| block_of(spec.datum, h));
         // `FluidRule::top`, with the rule read once.
@@ -730,7 +831,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
     }
 
-    /// The debug span check of the grounds: each lies between the bounds of the window's points.
+    /// The debug span check of the grounds: each lies between the bounds of its chunk column.
     fn check_grounds(
         &self,
         origin: BlockPos,
@@ -748,7 +849,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The debug span check of the ground `g` of column `(x, z)`: it lies between the bounds of
-    /// the window's points.
+    /// its chunk column (its kinds' and modifiers', from the window's points).
     fn check_ground(
         &self,
         (x, z): (i64, i64),
@@ -759,8 +860,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
         assert!(
             (bounds.ground_lo..=bounds.ground_hi).contains(&g),
             "{NAME} span check: realm {} column ({x}, {z}) has its ground at y {g}, outside the \
-             bounds {}..={} its kinds give at its 16 lattice points ({}): a kind's bounds are \
-             under its heights",
+             bounds {}..={} of its chunk column, from its kinds ({}) and shape modifiers: a \
+             kind's bounds or column bounds are under its heights, or a modifier cuts or raises \
+             more than its column effect says",
             self.realm(),
             bounds.ground_lo,
             bounds.ground_hi,
@@ -837,6 +939,19 @@ pub fn check_realm_blocks(
     }
 }
 
+/// The 16 lattice points of the window of lattice cell `(i0, j0)`: point `a * 4 + b` at
+/// `(i0 - 1 + a, j0 - 1 + b)`.
+fn window_coords(i0: i64, j0: i64) -> [(i64, i64); WINDOW_POINTS] {
+    std::array::from_fn(|n| (i0 - 1 + (n / 4) as i64, j0 - 1 + (n % 4) as i64))
+}
+
+/// The columns of chunk column `(cx, cz)` (in chunks).
+const fn chunk_rect((cx, cz): (i64, i64)) -> Rect {
+    let size = CHUNK_SIZE as i64;
+    let (x0, z0) = (cx << CHUNK_SHIFT, cz << CHUNK_SHIFT);
+    Rect::new(x0, z0, x0 + size - 1, z0 + size - 1)
+}
+
 /// `v` clamped into [`HeightQ`].
 pub(super) fn clamp_height(v: i64) -> HeightQ {
     v.clamp(i64::from(HeightQ::MIN), i64::from(HeightQ::MAX)) as HeightQ
@@ -881,7 +996,7 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
         if !self.spec().span.contains(origin.y) {
             return ChunkData::uniform(BlockState::AIR);
         }
-        let cell = (origin.x >> self.shift, origin.z >> self.shift);
+        let column = (key.pos.x, key.pos.z);
         let fast = |bounds: &LocalBounds| {
             if origin.y > bounds.top {
                 Some(ChunkData::uniform(BlockState::AIR))
@@ -891,14 +1006,15 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
                 None
             }
         };
-        // The chunks of the last lattice cell read its bounds alone.
+        // The chunks of the last window's chunk column read its bounds alone, those of its lattice
+        // cell its kinds.
         if self.memo
-            && let Some(bounds) = memo::last_bounds(self.key, cell)
-            && let Some(chunk) = fast(&bounds)
+            && let Some(chunk) =
+                fast(&memo::last_bounds(self.key, column).unwrap_or_else(|| self.bounds(column)))
         {
             return chunk;
         }
-        let window = self.window(cell.0, cell.1);
+        let window = self.window(column);
         if let Some(chunk) = fast(&window.1) {
             return chunk;
         }

@@ -9,7 +9,8 @@
 //!   The selector is the only place a kind is chosen.
 //! - [`blend`]: the exact integer weights and blend.
 //! - [`ShapeModifier`], [`FillStage`] and [`SurfaceStage`]: the decoration hook, with
-//!   [`decorate`].
+//!   [`decorate`]. Kinds and modifiers give bounds per chunk column
+//!   ([`TerrainKind::column_bounds`], [`ShapeModifier::column_effect`]).
 //! - [`RegionGenerator`]: one realm, built at world open from the registries, with the freeze
 //!   checks of its rules and kinds, and its far LOD: the region pass, one [`LodSource`] for the
 //!   whole realm (ADR 0039 sec. 10).
