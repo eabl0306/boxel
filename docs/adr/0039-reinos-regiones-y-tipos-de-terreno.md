@@ -404,8 +404,11 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   id y su línea `carver_stage` en el digest. Quedan fuera de la lejanía.
   - Dan una máscara (`CarveMask`: `Solid`, `Air` o `Mixed`, un bit por vóxel, 1 donde el vóxel
     queda), la forma del demo. El motor vacía solo vóxeles sólidos: nunca el aire ni el fluido del
-    reino. Así ninguna máscara agrega un bloque ni seca el mar, y el plan pedía un chequeo en debug
-    de "solo vuelve aire lo sólido" que con una máscara no tiene caso: se cumple por construcción.
+    reino. Así ninguna máscara agrega un bloque ni borra el fluido, y el plan pedía un chequeo en
+    debug de "solo vuelve aire lo sólido" que con una máscara no tiene caso: se cumple por
+    construcción. Que el agua no caiga a una cueva (el fondo del mar abierto bajo el agua, o un
+    bloque de la superficie dentro de ella) es regla del carver, la cáscara de agua: lee el tope
+    del fluido de sus columnas y de su apron.
   - Declaran su alcance (`CarveReach`): `surface`, hasta cuántos bloques bajo el suelo más bajo que
     leen sus reglas miran la superficie (desvanecidos por profundidad, entradas, un techo), y
     `apron`, cuántos bloques alrededor del chunk leen columnas, a lo sumo 32.

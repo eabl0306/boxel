@@ -279,7 +279,10 @@ pub struct CarveReach {
 /// [`ChunkData::from_occupancy`]) is 1 where the voxel stays, 0 where it is carved.
 ///
 /// A carver only turns solid voxels into air: the chunk path carves a voxel only where it holds
-/// neither air nor the realm's fluid, so no mask adds a block or drains the sea.
+/// neither air nor the realm's fluid, so no mask adds a block or removes the fluid. Keeping the
+/// fluid out of a cave (a sea floor opened under it, a surface stage's block inside it turned to
+/// air) is the carver's own rule, a water shell: it reads the fluid tops of its columns and of its
+/// apron ([`ChunkColumns::tops`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CarveMask {
     /// No voxel is carved.
