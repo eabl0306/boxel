@@ -7,8 +7,8 @@
 //! - a tree across chunk and layer borders is whole whichever chunk is generated first, on any
 //!   thread, with the memo cold or off; the same chunks in any order on any thread with any memo;
 //! - the far LOD: a run over the coarse ground drawn as cells (under the fluid too), the exported
-//!   harness passing with a carver and a feature stage, and catching a run under the ground or
-//!   taller than the features;
+//!   harness passing with a carver and a feature stage, and catching a run under the ground,
+//!   taller than the features or given differently by two nodes;
 //! - the digest line, the order by priority, the block names, duplicates and the declared reach;
 //! - the debug checks: a block outside the reach, a column height under the features or over the
 //!   declared height.
@@ -24,8 +24,8 @@ use boxel_worldgen::lod::{LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::region::{
     ChunkColumns, Context, Decoration, Entry, FeatureReach, FeatureStage, FlatKind, FloorFill,
-    HEIGHT_ONE, LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry,
-    Scope, SelectorRule, TerrainKind, check_lod, clear_worker_memo,
+    HEIGHT_ONE, LodColumns, LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
+    RuleEntry, Scope, SelectorRule, TerrainKind, check_lod, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -638,6 +638,67 @@ fn the_harness_catches_a_run_under_the_ground_or_over_the_height() {
     let columns = columns_in(2, [3, -2], 8, 4);
     let e = check_lod(&tall, &registry, &columns, 2..=2).expect_err("a tall run");
     assert!(e.contains("over the feature stages' height 12"), "{e}");
+}
+
+/// A feature stage whose far LOD gives a run of 6 `test:cutout` on every third dry cell column
+/// by its place in the node, not by the cell column: two nodes give a column different runs.
+struct NodeRuns;
+
+impl HashParams for NodeRuns {
+    fn hash_params(&self, _: &mut ParamsHasher) {}
+}
+
+impl GenEntry for NodeRuns {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl FeatureStage<TestContext> for NodeRuns {
+    fn reach(&self) -> FeatureReach {
+        FeatureReach {
+            height: 12,
+            apron: 0,
+        }
+    }
+    fn apply(
+        &self,
+        _: &ChunkColumns<'_, TestContext>,
+        _: u64,
+        _: &BlockRegistry,
+        _: &mut [BlockState],
+    ) {
+    }
+    fn block_names(&self) -> Vec<&str> {
+        vec!["test:cutout"]
+    }
+    fn lod_runs(
+        &self,
+        columns: &LodColumns<'_, TestContext>,
+        _: u64,
+        registry: &BlockRegistry,
+        out: &mut [(BlockState, u32)],
+    ) {
+        let leaves = registry.by_name("test:cutout").expect("test:cutout");
+        let dry = columns.ground.iter().zip(columns.fluid_top);
+        for (at, (o, (&g, &f))) in out.iter_mut().zip(dry).enumerate() {
+            if f == g && at % 3 == 0 {
+                *o = (leaves, 6);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_harness_catches_runs_that_two_nodes_give_differently() {
+    let registry = registry();
+    let g = lod_world(decoration().with_feature(id("test:noderuns"), Arc::new(NodeRuns)));
+    for level in [1, 4] {
+        let node = nodes_with(&g, level, 1, [3, -5], 1)[0];
+        let e = check_lod(&g, &registry, &columns_in(level, node, 0, 0), level..=level)
+            .expect_err("runs that differ at the borders");
+        assert!(e.contains("border cell"), "level {level}: {e}");
+    }
 }
 
 // ---- Registries and order ---------------------------------------------------------------------
