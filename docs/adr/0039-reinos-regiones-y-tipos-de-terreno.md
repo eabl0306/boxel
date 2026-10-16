@@ -862,8 +862,10 @@ no como tiempo de frame.
 - Despacho por reino: a lo sumo 50 ns por chunk.
 - Selección por columna de chunk: a lo sumo 0,5 us en caliente y 2 us en frío amortizado.
 - Chunks de WG-REGION (de superficie, hondos y de aire) contra un gemelo de un solo tipo hecho a
-  mano: en columnas interiores, a lo sumo un 5 % más; en columnas de borde, a lo sumo 12 us más.
-  Un chunk de aire sobre la cota local, a lo sumo 2 us de generación.
+  mano: en columnas interiores, a lo sumo un 5 % más. En columnas de borde se mide la maquinaria,
+  no los tipos (el dueño, 2026-10-15): la selección y la mezcla, a lo sumo 4 us por columna de
+  chunk por cada tipo de más. El costo propio de cada tipo es del presupuesto de ese tipo. Un
+  chunk de aire sobre la cota local, a lo sumo 2 us de generación.
 - Lejanía: la fuente a lo sumo 0,15 ms y el job entero a lo sumo 0,4 ms (la meta del ADR 0031 es
   0,3) en nodos interiores, de 2 tipos y de 3 tipos, en los niveles 1 a 4. Los niveles 5 y 6 (solo
   los usa `extreme`) se registran en la PR contra los mismos números. Un nodo paga unas

@@ -11,7 +11,7 @@
 //! H(p) = floor(sum_k c_k(p) H_k(p) / (9 L^2))
 //! ```
 //!
-//! `|sum_k c_k H_k| <= 9 L^2 2^31`, under `2^57` for the largest lattice
+//! `|sum_k c_k H_k| <= 9 L^2 2^31`, under `2^59` for the largest lattice
 //! ([`MAX_LATTICE_SHIFT`](super::MAX_LATTICE_SHIFT)): `i64` holds it with any number of kinds. The
 //! same formula serves a point, a chunk grid and a LOD corner, so they agree bit for bit.
 

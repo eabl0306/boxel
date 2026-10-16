@@ -11,8 +11,10 @@
 //! `kind_heights_*`, `context_grid` and `region_heights_*` split a chunk's cost: one kind's
 //! heights over a chunk column, the Context's fields, and the blended heights of the chunk column.
 //!
-//! Budgets: selection 0.5 us warm, 2 us cold amortized; interior chunks at most 5 % over the twin,
-//! border chunks at most 12 us over it; an air chunk over the local top at most 2 us.
+//! Budgets: selection 0.5 us warm, 2 us cold amortized; interior chunks at most 5 % over the twin;
+//! on a border column the machinery (selection and blend: `region_heights_border` less
+//! `region_heights_interior` and one `kind_heights_*` per extra kind) at most 4 us per extra kind;
+//! an air chunk over the local top at most 2 us.
 #[path = "../tests/support/region.rs"]
 mod support;
 
