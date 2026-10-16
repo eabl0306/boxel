@@ -1,0 +1,170 @@
+//! The region generator (#119, ADR 0039 "Presupuestos y medición"), on the `test:` content of
+//! `tests/support/region.rs` with region cells of the default size (`2^12`):
+//! - `select_*`: the selection of one chunk column (its 16 lattice points and its bounds): warm
+//!   (memo hits), cold (memo off: 16 points computed), and cold amortized over a fresh 64 x 64
+//!   area of chunk columns (each lattice point computed once, as when a world streams in);
+//! - `region_*` against `twin_*`: a surface chunk (the ground's), a deep chunk (under the deep
+//!   bound) and an air chunk (over the local top) on an interior column (16 points of one kind)
+//!   and on a border column (2 or 3 kinds), against the hand-fused single-kind twin of the
+//!   column's dominant kind.
+//!
+//! `kind_heights_*`, `context_grid` and `region_heights_*` split a chunk's cost: one kind's
+//! heights over a chunk column, the Context's fields, and the blended heights of the chunk column.
+//!
+//! Budgets: selection 0.5 us warm, 2 us cold amortized; interior chunks at most 5 % over the twin,
+//! border chunks at most 12 us over it; an air chunk over the local top at most 2 us.
+#[path = "../tests/support/region.rs"]
+mod support;
+
+use boxel_voxel::{ChunkKey, ChunkPos};
+use boxel_worldgen::WorldGenerator;
+use boxel_worldgen::region::{
+    Context, KindGrid, RegionGenerator, RegionSettings, TerrainKind, clear_worker_memo,
+};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+use support::*;
+
+/// The distinct kinds of the window of chunk column `(cx, cz)`.
+fn window_kinds(g: &RegionGenerator<TestContext>, cx: i64, cz: i64) -> usize {
+    let s = g.lattice() - 5;
+    let (i0, j0) = (cx >> s, cz >> s);
+    let mut kinds: Vec<_> = (0..16)
+        .map(|n| g.lattice_kind(i0 - 1 + n / 4, j0 - 1 + n % 4).clone())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds.len()
+}
+
+/// The first chunk column from `(cx, cz)` along +x whose window holds `kinds` kinds (1: interior)
+/// and whose dominant kind is not the basin (under the sea everywhere).
+fn find(g: &RegionGenerator<TestContext>, (cx, cz): (i64, i64), kinds: usize) -> (i64, i64) {
+    (0..1 << 16)
+        .map(|n| (cx + n * 3, cz + (n % 7) * 5))
+        .find(|&(x, z)| {
+            let ok = if kinds == 1 {
+                window_kinds(g, x, z) == 1
+            } else {
+                window_kinds(g, x, z) >= kinds
+            };
+            ok && g
+                .column_info(x << 5, z << 5)
+                .kind
+                .is_some_and(|k| k.as_str() != "test:basin")
+        })
+        .expect("a column")
+}
+
+fn key(x: i64, y: i64, z: i64) -> ChunkKey {
+    ChunkKey::new(ChunkPos::new(x, y, z))
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "the bench names the columns it measures"
+)]
+fn bench(c: &mut Criterion) {
+    let world = world(12);
+    let g = generator(&world, SEED, RegionSettings::default());
+    let cold = generator(
+        &world,
+        SEED,
+        RegionSettings {
+            memo: false,
+            ..RegionSettings::default()
+        },
+    );
+    let registry = registry();
+
+    let (col_x, col_z) = find(&g, (0, 0), 1);
+    c.bench_function("select_warm", |b| {
+        b.iter(|| g.local_bounds(black_box(col_x), col_z));
+    });
+    c.bench_function("query_column_warm", |b| {
+        b.iter(|| g.column_info(black_box(col_x << 5), col_z << 5));
+    });
+    c.bench_function("select_cold", |b| {
+        b.iter(|| cold.local_bounds(black_box(col_x), col_z));
+    });
+    c.bench_function("select_cold_amortized_per_column", |b| {
+        b.iter_custom(|iters| {
+            // Each iteration a fresh area (memos never hold it), 64 x 64 chunk columns.
+            let mut total = Duration::ZERO;
+            let per = 64 * 64;
+            let areas = iters.div_ceil(per);
+            for area in 0..areas {
+                clear_worker_memo();
+                let (x0, z0) = (area as i64 * 4096 + 1_000_000, -(area as i64) * 4096);
+                let start = Instant::now();
+                for n in 0..per as i64 {
+                    black_box(g.local_bounds(x0 + n / 64, z0 + n % 64));
+                }
+                total += start.elapsed();
+            }
+            total.mul_f64(iters as f64 / (areas * per) as f64)
+        });
+    });
+
+    // One kind's heights over a chunk column (what a border column pays again per extra kind).
+    let (xs, zs): (Vec<i64>, Vec<i64>) = ((0..32).collect(), (0..32).collect());
+    let fields = g.context().grid(&xs, &zs);
+    for (name, kind) in kinds() {
+        let grid = KindGrid {
+            cx: g.context(),
+            fields: &fields,
+            xs: &xs,
+            zs: &zs,
+            seed: SEED,
+        };
+        let mut out = [0; 1024];
+        c.bench_function(&format!("kind_heights_{}", &name[5..]), |b| {
+            b.iter(|| kind.heights(black_box(&grid), &[true; 1024], &mut out));
+        });
+    }
+    c.bench_function("context_grid", |b| {
+        b.iter(|| g.context().grid(black_box(&xs), &zs));
+    });
+
+    for (name, n_kinds) in [("interior", 1), ("border", 2)] {
+        let (cx, cz) = find(&g, (40, -40), n_kinds);
+        let info = g.column_info(cx << 5, cz << 5);
+        let dominant = info.kind.expect("a kind");
+        let (kind_name, relief) = kinds()
+            .into_iter()
+            .find(|(n, _)| *n == dominant.as_str())
+            .expect("a test kind");
+        let twin = Twin::new(kind_name, relief, SEED, g.lattice());
+        let bounds = g.local_bounds(cx, cz);
+        // Each its own surface chunk (the twin's ground differs from the blend's at a border).
+        let twin_ground = twin.ground(cx << 5, cz << 5);
+        let layers = [
+            ("surface", info.ground >> 5, twin_ground >> 5),
+            ("deep", (bounds.deep >> 5) - 1, (bounds.deep >> 5) - 1),
+            ("air", (bounds.top >> 5) + 1, (bounds.top >> 5) + 1),
+        ];
+        for (chunk, layer, twin_layer) in layers {
+            let (k, t) = (key(cx, layer, cz), key(cx, twin_layer, cz));
+            c.bench_function(&format!("region_{chunk}_{name}"), |b| {
+                b.iter(|| g.generate(black_box(k), &registry));
+            });
+            c.bench_function(&format!("twin_{chunk}_{name}"), |b| {
+                b.iter(|| twin.generate(black_box(t), &registry));
+            });
+        }
+        let mut heights = [0; 1024];
+        c.bench_function(&format!("region_heights_{name}"), |b| {
+            b.iter(|| g.chunk_heights(black_box(cx), cz, &mut heights));
+        });
+        eprintln!(
+            "{name} column ({cx}, {cz}): {} kinds, ground {} (twin {twin_ground}), {:?}",
+            window_kinds(&g, cx, cz),
+            info.ground,
+            bounds
+        );
+    }
+}
+
+criterion_group!(benches, bench);
+criterion_main!(benches);

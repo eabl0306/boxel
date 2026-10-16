@@ -29,5 +29,9 @@ bench = false
 name = "noise"
 harness = false
 
+[[bench]]
+name = "region"
+harness = false
+
 [lints]
 workspace = true
