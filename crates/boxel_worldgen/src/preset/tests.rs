@@ -13,6 +13,11 @@ fn id(name: &str) -> GenId {
     GenId::new(name).expect(name)
 }
 
+/// A preset of the one dimension `dimension` by `spec`, whose generator declares its realms.
+fn one(dimension: GenId, spec: GeneratorSpec) -> WorldPreset {
+    WorldPreset::one(PresetDimension::new(dimension, spec))
+}
+
 fn blocks() -> BlockRegistry {
     boxel_voxel::testing::registry()
 }
@@ -52,13 +57,10 @@ fn worldgen(flat_version: u32, solid: u32) -> Worldgen {
     let mut builder = WorldgenBuilder::new();
     let flat = || GeneratorSpec::new(id("test:flat"), layers(solid));
     builder
-        .preset(
-            id("test:flat"),
-            WorldPreset::one(id("test:overworld"), flat()),
-        )
+        .preset(id("test:flat"), one(id("test:overworld"), flat()))
         .preset(
             id("test:legacy"),
-            WorldPreset::one(
+            one(
                 id("test:overworld"),
                 GeneratorSpec::new(id("test:legacy"), ()),
             ),
@@ -67,8 +69,11 @@ fn worldgen(flat_version: u32, solid: u32) -> Worldgen {
             id("test:two"),
             WorldPreset {
                 dimensions: vec![
-                    (id("test:overworld"), flat()),
-                    (id("test:nether"), GeneratorSpec::new(id("test:legacy"), ())),
+                    PresetDimension::new(id("test:overworld"), flat()),
+                    PresetDimension::new(
+                        id("test:nether"),
+                        GeneratorSpec::new(id("test:legacy"), ()),
+                    ),
                 ],
                 version: 1,
             },
@@ -77,10 +82,10 @@ fn worldgen(flat_version: u32, solid: u32) -> Worldgen {
             id("test:broken"),
             WorldPreset {
                 dimensions: vec![
-                    (id("test:overworld"), flat()),
-                    (id("test:overworld"), flat()),
-                    (id("test:moon"), flat()),
-                    (
+                    PresetDimension::new(id("test:overworld"), flat()),
+                    PresetDimension::new(id("test:overworld"), flat()),
+                    PresetDimension::new(id("test:moon"), flat()),
+                    PresetDimension::new(
                         id("test:nether"),
                         GeneratorSpec::new(id("test:missing"), ()),
                     ),
@@ -90,14 +95,14 @@ fn worldgen(flat_version: u32, solid: u32) -> Worldgen {
         )
         .preset(
             id("test:typo"),
-            WorldPreset::one(
+            one(
                 id("test:overworld"),
                 GeneratorSpec::new(id("test:flat"), Layers(vec![("test:sold".into(), 3)])),
             ),
         )
         .preset(
             id("test:wrong_params"),
-            WorldPreset::one(
+            one(
                 id("test:overworld"),
                 GeneratorSpec::new(id("test:flat"), 7u32),
             ),
@@ -387,7 +392,7 @@ fn a_factory_that_builds_nothing_must_say_why() {
     builder
         .preset(
             id("test:silent"),
-            WorldPreset::one(
+            one(
                 id("test:overworld"),
                 GeneratorSpec::new(id("test:none"), ()),
             ),

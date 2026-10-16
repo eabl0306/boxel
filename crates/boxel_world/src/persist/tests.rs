@@ -1274,17 +1274,17 @@ fn worldgen_record(layers: u32) -> boxel_worldgen::preset::WorldgenRecord {
 fn test_worldgen() -> boxel_worldgen::preset::Worldgen {
     use boxel_worldgen::GenId;
     use boxel_worldgen::preset::{
-        DimensionDef, GeneratorKind, GeneratorSpec, WorldPreset, WorldgenBuilder,
+        DimensionDef, GeneratorKind, GeneratorSpec, PresetDimension, WorldPreset, WorldgenBuilder,
     };
     let id = |name: &str| GenId::new(name).unwrap();
     let mut builder = WorldgenBuilder::new();
     builder
         .preset(
             id("test:flat"),
-            WorldPreset::one(
+            WorldPreset::one(PresetDimension::new(
                 id("test:overworld"),
                 GeneratorSpec::new(id("test:terrain"), ()),
-            ),
+            )),
         )
         .dimension(id("test:overworld"), DimensionDef::default())
         .generator(

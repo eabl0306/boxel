@@ -54,7 +54,7 @@ ejemplos de acá usan nombres `game:`.
 
 ```
 WorldPreset (game:default, game:large_biomes, ...)  se elige al crear el mundo, se guarda por id
- `- dimensión -> DimensionDef + spec del generador  una dimensión cargada a la vez
+ `- dimensión -> spec del generador + sus reinos    una dimensión cargada a la vez
     `- DimensionGenerator: RealmStack + un generador  un generador por dimensión, despacha por reino
        por reino (RealmStack: los reinos ordenados por y)
        `- reino = RealmSpec + RegionGenerator<Cx>   su Context, su mapa de regiones, sus tipos,
@@ -76,14 +76,20 @@ WorldPreset (game:default, game:large_biomes, ...)  se elige al crear el mundo, 
   - más adelante, `column_bounds` (WG4, sección 14).
 
   `LodSource::version` devuelve `WorldGenerator::version`.
-- Dimensiones: `DimensionDef { realms, version }`, registrada bajo su id. Un preset
-  (`WorldPreset`) le asigna a cada id de dimensión un spec de generador (`GeneratorSpec`): el id de
-  un tipo de generador y sus parámetros tipados. La fábrica es la del tipo que nombra el spec, no
-  un campo de la dimensión: así una dimensión puede tener otro generador en otro preset. Una
-  dimensión sin reinos es la de un generador que declara los suyos (uno de antes de los reinos).
+- Dimensiones: `DimensionDef { version }`, registrada bajo su id. Es solo la identidad de la
+  dimensión, el nombre que su número representa en la tabla del mundo (más adelante puede sumar
+  los valores por defecto del entorno). El plan ponía la fábrica y los reinos en la dimensión; el
+  código los pone en el preset.
+- Cada entrada de un preset (`WorldPreset`) es una `PresetDimension { dimension, spec, realms }`:
+  el id de la dimensión, su spec de generador (`GeneratorSpec`: el id de un tipo de generador y sus
+  parámetros tipados) y su reparto de reinos. Así una misma dimensión tiene otro generador y otros
+  reinos en otro preset: un tipo de legado, el mundo por defecto, un mundo de revisión con más
+  reinos. Una entrada sin reinos es la de un generador que declara los suyos (uno de antes de los
+  reinos).
 - Fábricas, no instancias: cada tipo de generador (`GeneratorKind`) guarda una fábrica
   `Fn(&Build, &mut Checks) -> Option<Built>`. `Build` trae la semilla, el spec, la pila de reinos
-  ya chequeada, los registros congelados (con los del juego) y el registro de bloques. Así un mundo
+  de la entrada ya chequeada, los registros congelados (con los del juego) y el registro de
+  bloques. La fábrica tiene que armar justo esos reinos. Así un mundo
   se reabre desde sus metadatos y el juego arma un generador nuevo en cada apertura.
   `GeneratorKind::legacy` envuelve un generador hecho solo con la semilla, como los de hoy.
 - `WorldgenBuilder` junta presets, dimensiones, reinos y tipos al construir la app y los congela
@@ -102,7 +108,8 @@ ser +infinito e `y_lo`, -infinito.
 - Los planos están en múltiplos de 4096 bloques y dentro del mundo (+-`MAX_BLOCK_COORD`). Así
   ningún nodo de la lejanía hasta el nivel 7 (4096 bloques) cruza un plano, y un chunk está
   siempre en un solo reino.
-- Los reinos de una dimensión cubren cada y exactamente una vez: sin huecos ni solapamientos.
+- Los reinos de una dimensión cubren cada y exactamente una vez: sin huecos ni solapamientos. El
+  reparto es el de la entrada del preset (sección 1), así cada preset puede tener el suyo.
 - `realm_of(y)` es una búsqueda binaria entre a lo sumo 8 planos: O(1) para quien pregunte
   (streaming, lejanía, luz, física, la cámara).
 - Despacho: `generate(key)` llama a `realm_of` con un vóxel de su chunk (`key.pos.y << 5`: la clave
@@ -535,9 +542,10 @@ a mano queda probado sin tests de lejanía a medida.
   reino cuyo generador no es de regiones recibe una línea `realm_generator` (la versión y el
   nombre de su generador), así cambiarlo cambia la versión de la dimensión.
 - La dimensión tiene sus propias líneas: su definición, su spec (`generator_kind`: el id y la
-  versión del tipo, y el hash de los parámetros del spec) y la entrada de cada uno de sus reinos.
-  El preset tiene la suya, que `RegistryDigest::dimension` deja afuera: un preset no tiene
-  parámetros que cambien los chunks (esos van en el spec).
+  versión del tipo, y el hash de los parámetros del spec) y la entrada de cada reino que le da el
+  preset, también la de un reino cuyo generador no es de regiones. El preset tiene la suya (sus
+  dimensiones, sus tipos y sus repartos de reinos), que `RegistryDigest::dimension` deja afuera:
+  lo que cambia los chunks ya está en las líneas del spec y de los reinos.
 
 ### 12. Chequeos al congelar y al abrir
 
@@ -551,7 +559,7 @@ mundo para el conjunto que resuelve su preset. Rechazan:
   los nombres que declaran sus etapas (`block_names`) y los que chequea una fábrica
   (`Build::check_blocks`). Así un error de tipeo falla al abrir y no en un worker;
 - un preset sin dimensiones o con una dimensión dos veces, parámetros de un spec que no son del
-  tipo que lee su fábrica, y una fábrica que arma otros reinos que los de su dimensión;
+  tipo que lee su fábrica, y una fábrica que arma otros reinos que los que le da el preset;
 - una regla `Point` con más de una entrada, o una regla `Cell` sin ninguna;
 - un peso fuera de 1 a 64, un tipo dos veces en una regla, y celdas de región más chicas que la
   retícula;
@@ -755,23 +763,25 @@ Consecuencias del modelo:
     siguiente. A diferencia de `IdMap`, la tabla se guarda solo al crear el mundo, así el número de
     una dimensión agregada después se vuelve a dar en cada apertura y no queda guardado. Hoy nadie
     usa otro número que el 0, y una segunda dimensión ya pide un formato nuevo (sección 1);
-  - por dimensión, la tabla de reinos (id del reino y span, de `realms()` del generador), el spec
-    del generador (id del tipo, versión y hash de parámetros) y la lista del digest.
+  - por dimensión, la tabla de reinos (id del reino y span, de `realms()` del generador: los del
+    reparto del preset, o los que declara un generador de legado), el spec del generador (id del
+    tipo, versión y hash de parámetros) y la lista del digest.
 - Al abrir, el motor compara lo guardado en `boxel:worldgen` con los registros vivos y le devuelve
   al juego `WorldgenDiff { added, removed, changed }`: el juego lee el registro antes de abrir el
   store (`SavedWorldgen::read`) y se lo pasa a `Worldgen::open`, que da la diferencia en
   `OpenedWorld::diff`. La política es del juego. La que eligió el dueño para el juego: avisar y
   seguir. Los chunks que no se guardaron salen del conjunto nuevo, así la tierra guardada puede
   encontrarse con tierra nueva en una costura.
-- Agregar un reino a un mundo existente es una entrada agregada, más un span cambiado en el reino
-  que corta (en el reparto del juego, los últimos 256 bloques de la superficie sobre -4096 pasan a
+- Agregar un reino a un mundo existente (al reparto de su preset) es una entrada agregada, la
+  línea del preset cambiada, más un span cambiado en el reino que corta (en el reparto del juego, los últimos 256 bloques de la superficie sobre -4096 pasan a
   graduar hacia la roca del Nether). Solo muestran costura los chunks ya guardados ahí abajo: en la
   práctica, ninguno.
 - Los mundos viejos no tienen `boxel:worldgen`. Abren como legado: el juego reconstruye su
   generador desde el tipo de mundo que guardó en sus propios metadatos, con una fábrica de legado,
   sin cambios. Ningún mundo guardado gana costuras por este ADR. En el juego, cada tipo de mundo de
-  hoy es un preset con la misma clave y su fábrica de legado, así un mundo viejo y uno nuevo del
-  mismo tipo arman el mismo generador; el nuevo además guarda su registro.
+  hoy es un preset con la misma clave y su fábrica de legado, sin reparto de reinos, así un mundo
+  viejo y uno nuevo del mismo tipo arman el mismo generador; el nuevo además guarda su registro. Un
+  preset nuevo del juego usa la misma dimensión con su propio reparto.
 
 ### 18. La puerta de las estructuras
 

@@ -7,14 +7,16 @@
 //! - against the saved record, a changed entry version, an added realm and a removed entry give
 //!   the expected `WorldgenDiff`, and the same registries give an empty one;
 //! - a typo in a block name of a realm or a stage fails at world open with the id in the
-//!   message, together with the region map's own problems: every freeze check runs.
+//!   message, together with the region map's own problems: every freeze check runs;
+//! - the realms are the preset's: one dimension opens with the region layout, with a layout of
+//!   its own in another preset, and with no layout through a legacy factory, in one app.
 #[path = "support/region.rs"]
 mod support;
 
 use boxel_voxel::{BlockState, ChunkKey, ChunkPos};
 use boxel_worldgen::preset::{
-    Build, Built, DimensionDef, GeneratorKind, GeneratorSpec, WorldPreset, Worldgen,
-    WorldgenBuilder,
+    Build, Built, DimensionDef, GeneratorKind, GeneratorSpec, PresetDimension, WorldPreset,
+    Worldgen, WorldgenBuilder,
 };
 use boxel_worldgen::realm::{RealmLod, RealmSpan, RealmSpec};
 use boxel_worldgen::region::{
@@ -41,7 +43,7 @@ struct App {
     realms: Vec<(&'static str, RealmSpec)>,
     rules: Vec<(&'static str, SelectorRule)>,
     entries: Vec<(&'static str, RuleEntry)>,
-    /// The dimension's realms.
+    /// The dimension's realms in the preset `test:default`.
     dimension: Vec<&'static str>,
     surface: TopLayers,
 }
@@ -159,13 +161,7 @@ impl App {
             builder.realm(id(name), spec);
         }
         builder
-            .dimension(
-                id("test:overworld"),
-                DimensionDef {
-                    realms: self.dimension.into_iter().map(id).collect(),
-                    version: 1,
-                },
-            )
+            .dimension(id("test:overworld"), DimensionDef { version: 1 })
             .generator(
                 id("test:regions"),
                 GeneratorKind::new(1, move |build, checks| regions(build, checks, &surface)),
@@ -173,8 +169,11 @@ impl App {
             .preset(
                 id("test:default"),
                 WorldPreset::one(
-                    id("test:overworld"),
-                    GeneratorSpec::new(id("test:regions"), 8u32),
+                    PresetDimension::new(
+                        id("test:overworld"),
+                        GeneratorSpec::new(id("test:regions"), 8u32),
+                    )
+                    .with_realms(self.dimension.into_iter().map(id)),
                 ),
             );
         let mut checks = Checks::new();
@@ -338,8 +337,8 @@ fn an_added_realm_is_added_lines_and_the_span_it_cuts_changed() {
         .collect();
     assert_eq!(
         changed,
-        ["dimension test:overworld", "realm test:surface"],
-        "the dimension's realm list and the span the new realm cuts"
+        ["preset test:default", "realm test:surface"],
+        "the preset's realm layout and the span the new realm cuts"
     );
 }
 
@@ -387,19 +386,13 @@ fn a_typo_in_a_block_name_fails_at_world_open_with_every_check() {
 }
 
 #[test]
-fn a_factory_must_build_the_realms_of_its_dimension() {
+fn a_factory_must_build_the_realms_its_preset_lists() {
     let mut builder = WorldgenBuilder::<()>::new();
     for (name, spec) in realms() {
         builder.realm(id(name), spec);
     }
     builder
-        .dimension(
-            id("test:overworld"),
-            DimensionDef {
-                realms: vec![id("test:deep"), id("test:surface")],
-                version: 1,
-            },
-        )
+        .dimension(id("test:overworld"), DimensionDef { version: 1 })
         .generator(
             id("test:plain"),
             GeneratorKind::new(1, |_, _| Some(Built::new(Arc::new(deep())))),
@@ -407,8 +400,11 @@ fn a_factory_must_build_the_realms_of_its_dimension() {
         .preset(
             id("test:default"),
             WorldPreset::one(
-                id("test:overworld"),
-                GeneratorSpec::new(id("test:plain"), ()),
+                PresetDimension::new(
+                    id("test:overworld"),
+                    GeneratorSpec::new(id("test:plain"), ()),
+                )
+                .with_realms([id("test:deep"), id("test:surface")]),
             ),
         );
     let mut checks = Checks::new();
@@ -420,8 +416,107 @@ fn a_factory_must_build_the_realms_of_its_dimension() {
     assert!(
         message.contains(
             "generator kind test:plain built dimension test:overworld with the realms \
-             [boxel:default], not its definition's [test:deep, test:surface]"
+             [boxel:default], not its preset's [test:deep, test:surface]"
         ),
         "{message}"
+    );
+}
+
+#[test]
+fn one_dimension_has_the_realms_of_each_preset() {
+    // The test app, with two more presets of the same dimension: one realm of its own over all
+    // of y, and a legacy factory whose generator declares its realms.
+    let surface = app().surface;
+    let world = world_of(realms(), rules(CELLS), Vec::new(), kind_entries());
+    let terrain = Terrain {
+        rules: world.rules,
+        entries: world.entries,
+        kinds: world.kinds,
+    };
+    let mut builder = WorldgenBuilder::new();
+    for (name, spec) in realms() {
+        builder.realm(id(name), spec);
+    }
+    let regions_spec = || GeneratorSpec::new(id("test:regions"), 8u32);
+    builder
+        .realm(id("test:whole"), realm())
+        .dimension(id("test:overworld"), DimensionDef { version: 1 })
+        .generator(
+            id("test:regions"),
+            GeneratorKind::new(1, move |build, checks| regions(build, checks, &surface)),
+        )
+        .generator(
+            id("test:legacy"),
+            GeneratorKind::legacy(1, |_| Arc::new(deep())),
+        )
+        .preset(
+            id("test:default"),
+            WorldPreset::one(
+                PresetDimension::new(id("test:overworld"), regions_spec())
+                    .with_realms([id("test:surface"), id("test:deep")]),
+            ),
+        )
+        .preset(
+            id("test:whole"),
+            WorldPreset::one(
+                PresetDimension::new(id("test:overworld"), regions_spec())
+                    .with_realms([id("test:whole")]),
+            ),
+        )
+        .preset(
+            id("test:legacy"),
+            WorldPreset::one(PresetDimension::new(
+                id("test:overworld"),
+                GeneratorSpec::new(id("test:legacy"), ()),
+            )),
+        );
+    let mut checks = Checks::new();
+    let worldgen = builder.freeze(&mut checks, terrain).expect("frozen");
+    checks.finish().expect("the app builds");
+    let realms_of = |preset: &str| -> Vec<String> {
+        let opened = worldgen
+            .open(&id(preset), SEED, &registry(), None)
+            .unwrap_or_else(|e| panic!("{preset}: {e}"));
+        assert_eq!(opened.record.names, [id("test:overworld")], "{preset}");
+        let realms = opened
+            .first()
+            .generator
+            .realms()
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<Vec<_>>();
+        let recorded = opened.record.dimensions[0]
+            .realms
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            realms, recorded,
+            "{preset}: the record lists the generator's realms"
+        );
+        realms
+    };
+    assert_eq!(realms_of("test:default"), ["test:deep", "test:surface"]);
+    assert_eq!(realms_of("test:whole"), ["test:whole"]);
+    assert_eq!(realms_of("test:legacy"), ["boxel:default"]);
+    // The realm lines of the region layout are its own; the legacy world has none.
+    let record = |preset: &str| {
+        worldgen
+            .open(&id(preset), SEED, &registry(), None)
+            .expect("opens")
+            .record
+    };
+    let all = lines(record("test:whole").dimensions[0].digest.entries());
+    assert!(
+        all.contains(&"realm test:whole in realm test:whole of dimension test:overworld".into()),
+        "{all:#?}"
+    );
+    assert!(
+        record("test:legacy").dimensions[0]
+            .digest
+            .entries()
+            .iter()
+            .all(|e| e.scope.realm.is_none()),
+        "a legacy generator's realms are its own, with no realm lines"
     );
 }
