@@ -21,8 +21,12 @@ pub struct WorldgenRecord {
     /// The preset's digest line: its id, version and parameter hash.
     pub preset: DigestEntry,
     /// The dimension name table: dimension `n` (`DimensionId(n)` in chunk and save keys) is
-    /// `names[n]`. It only grows, like the block id map: a dimension keeps its number for good,
-    /// also once the preset drops it.
+    /// `names[n]`, at most [`MAX_DIMENSIONS`] names, each once. A dimension of the saved table
+    /// keeps its number for good, also once the preset drops it, and one the preset adds later
+    /// takes the next number. Unlike the block id map, the store saves the table only when the
+    /// world is made (the record is never written again), so that later number is given anew at
+    /// every open, not saved: nothing reads a number other than 0 until a second dimension, which
+    /// changes the save format anyway (ADR 0039 sec. 1).
     pub names: Vec<GenId>,
     /// Each dimension of the preset, in its order.
     pub dimensions: Vec<DimensionRecord>,

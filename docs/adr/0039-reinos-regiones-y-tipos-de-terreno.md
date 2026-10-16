@@ -750,8 +750,11 @@ Consecuencias del modelo:
 - Contenido (`WorldgenRecord`):
   - la línea del preset (id, versión y hash de parámetros), no solo su id: así un preset cambiado
     también sale en la diferencia;
-  - la tabla de nombres de dimensiones (`DimensionId` u16 -> `GenId`, que solo crece, como
-    `IdMap`). Al abrir, una dimensión conserva su número guardado y una nueva toma el siguiente;
+  - la tabla de nombres de dimensiones (`DimensionId` u16 -> `GenId`, hasta 65536 nombres, cada
+    uno una vez). Al abrir, una dimensión conserva su número guardado y una nueva toma el
+    siguiente. A diferencia de `IdMap`, la tabla se guarda solo al crear el mundo, así el número de
+    una dimensión agregada después se vuelve a dar en cada apertura y no queda guardado. Hoy nadie
+    usa otro número que el 0, y una segunda dimensión ya pide un formato nuevo (sección 1);
   - por dimensión, la tabla de reinos (id del reino y span, de `realms()` del generador), el spec
     del generador (id del tipo, versión y hash de parámetros) y la lista del digest.
 - Al abrir, el motor compara lo guardado en `boxel:worldgen` con los registros vivos y le devuelve
