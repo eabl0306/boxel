@@ -4,8 +4,8 @@
 //! that finds the realm of a `y` at and around every plane. Then a whole world open over
 //! test registries (a preset, its dimensions, their realms and kinds): every problem of a bad mix
 //! reported at once, and the digest of a good one per dimension and realm, with a realm added as
-//! one more line. The real presets and dimension tables come with WG-SAVE; these are `test:`
-//! stand-ins.
+//! one more line. These presets and dimensions are `test:` stand-ins of the checks alone; the
+//! real ones are `crate::preset`'s (tested there and in `tests/preset.rs`).
 use super::*;
 use crate::registry::{
     DigestBuilder, DigestScope, FreezeError, GenEntry, GenRegistry, GenRegistryBuilder,

@@ -16,7 +16,9 @@
 //! built and when a world opens; [`realm`] holds the realms of a dimension along y (their specs,
 //! their stack and its checks); [`region`] the terrain by regions: a realm's region map, its
 //! terrain kinds blended exactly at their borders, its decoration, and the generators of a realm
-//! and of a dimension; [`query`] what lies at a point, without building chunks.
+//! and of a dimension; [`query`] what lies at a point, without building chunks; [`preset`] what
+//! a world is made with (presets, dimensions, generator kinds and their factories), its open, and
+//! the record a world saves of it (ADR 0039 sec. 1 and 17).
 
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
@@ -28,6 +30,7 @@ pub mod exact;
 pub mod field;
 pub mod lod;
 pub mod noise;
+pub mod preset;
 pub mod query;
 pub mod realm;
 pub mod region;
