@@ -3,8 +3,9 @@
 //! registries with one name and unknown ids fail with their names in the message; an added entry
 //! changes no other entry's salt, seed or line, and removing it gives the old digest back; the
 //! diff of two digests; no two salts or octave seeds of the test entries collide; the fixed values
-//! of the salt and parameter hash; the build counter's memo rule, with a memo that fits a far LOD
-//! worker's scratch. The checks of realm layouts and a whole world open are in `realm/tests.rs`.
+//! of the salt, the parameter hash and a digest's hash; the build counter's memo rule, with a memo
+//! that fits a far LOD worker's scratch. The checks of realm layouts and a whole world open are in
+//! `realm/tests.rs`.
 use super::*;
 use crate::noise::{mix_seed, splitmix64};
 use boxel_voxel::RegistryError;
@@ -192,6 +193,23 @@ fn salts_and_parameter_hashes_have_fixed_values() {
     assert_eq!(hash_params(&id("test:a")), hash_params("test:a"));
     assert_eq!(hash_params(&String::from("x")), hash_params("x"));
     assert_ne!(hash_params(&0.0f64), hash_params(&-0.0f64));
+}
+
+#[test]
+fn a_digest_hash_has_a_fixed_value() {
+    // The digest is saved with a world (WG-SAVE), so its encoding is pinned too: an entry's
+    // parameter hash is its order then its parameters; the digest hashes the number of lines,
+    // then each line's scope (two `Option`s of ids), registry, id, version and parameter hash.
+    // An independent implementation computed the literals.
+    let r = registry(&[(id("test:a"), Entry::ordered(1, 2, -3))]);
+    let ix = GenIx::new(0);
+    assert_eq!(r.params_hash(ix), 0xa6b2_c04f_1ff6_07bf);
+    let digest = RegistryDigest::from_entries(vec![
+        DigestEntry::of(&realm_scope(), &r, ix),
+        line(&DigestScope::PRESET, "test_entry", "test:b", 5, 0),
+    ]);
+    assert_eq!(digest.hash(), 0x9bc3_5f5a_e567_9deb);
+    assert_eq!(digest.version(), 0xe567_9deb);
 }
 
 #[test]
