@@ -32,9 +32,10 @@ const MAX_LISTED: usize = 24;
 pub struct LodReport {
     /// Cell columns compared (one per column and level).
     pub cells: usize,
-    /// Of them, dry ones (a solid top cell in both).
+    /// Of them, dry ones (a solid top cell in both, over the realm's fluid in the pass).
     pub dry: usize,
-    /// Wet ones (a fluid top cell in both).
+    /// Wet ones (a fluid top cell in both, or the pass's column under the fluid), their tops
+    /// within a cell.
     pub wet: usize,
     /// Dry cell columns whose coarse top lies in the real top's cell.
     pub same_top: usize,
@@ -275,7 +276,8 @@ impl<'a> Real<'a> {
 /// ([`WorldGenerator::generate`]) and the cell rule. For each column, the cell column of each
 /// level that holds it:
 ///
-/// - dry (a solid top cell in both): the coarse top is never under the real one, and stands over
+/// - dry (a solid top cell in both, and the pass's cell column over the realm's fluid: not all
+///   its corners under the level): the coarse top is never under the real one, and stands over
 ///   it by at most the cell's declared margin (its coarse ground over its highest corner: the
 ///   kinds' margins, the modifiers' rises and the surface's rise), plus what the kinds and the
 ///   modifiers declare they leave out ([`TerrainKind::lod_left_out`],
@@ -283,9 +285,11 @@ impl<'a> Real<'a> {
 ///   every column of the cell is dry, the same in blocks: the pass's coarse ground covers every
 ///   real ground (the margins are sound), and its highest corner stands over them by at most
 ///   [`CORNER_STEP`] and what is left out (the corners are right);
-/// - fluid: where one is fluid and the other is not (or their fluid tops lie more than a cell
-///   apart), a fluid edge lies within a cell (the columns around hold both a fluid top and a
-///   solid one);
+/// - fluid (the others: a fluid top cell in either, or the pass's cell column under the fluid,
+///   whose ground is its highest corner's, so land between the corners or a floor under less
+///   than half a cell of fluid may stand over it): where one top is fluid and the other is not,
+///   or the tops lie more than a cell apart, a fluid edge lies within a cell (the columns around
+///   hold both a fluid top and a solid one);
 /// - the band is conservative there: the real cells over it are air, and the real cell at the
 ///   top row of the layer under it is not;
 /// - the node's border cells equal its 4 neighbors' and the layers' over and under it.
@@ -354,7 +358,7 @@ pub fn check_lod<Cx: Context>(
             };
             generator.lod_prepare(&req, registry, slots);
             let col = slots.cols[(cell_x as usize + 1) * EDGE + cell_z as usize + 1];
-            if !coarse_wet && !real_wet {
+            if !coarse_wet && !real_wet && !col.is_wet() {
                 report.dry += 1;
                 // In blocks, where every column is dry: the pass's ground covers each real
                 // ground, and its corners stand over them by at most a step and what is left out.

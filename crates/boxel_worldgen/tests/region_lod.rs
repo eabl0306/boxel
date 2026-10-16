@@ -408,6 +408,43 @@ fn sea_and_coast_cells_agree_with_the_chunks_within_a_cell() {
     assert!(far.wet > 0, "{far:?}");
 }
 
+#[test]
+fn a_shallow_coast_passes_the_harness() {
+    let registry = registry();
+    // A sea a few blocks deep along low land: cells whose 4 corners lie under the level may hold
+    // land at the level between them, and fluid over less than half of their top cell.
+    let kinds: Vec<(&str, Arc<dyn TerrainKind<TestContext>>)> = vec![
+        ("test:plains", Arc::new(Relief::blocks(-1, 3, 96, 2))),
+        ("test:hills", Arc::new(Relief::blocks(1, 4, 128, 2))),
+        ("test:basin", Arc::new(Relief::blocks(-4, 3, 256, 2))),
+    ];
+    let world = world_of(
+        vec![("test:surface", realm())],
+        rules(CELLS),
+        Vec::new(),
+        kinds,
+    );
+    let g = generator(&world, SEED, RegionSettings::default());
+    // Such cells (found by brute force: the harness took them for dry cells whose coarse top lay
+    // a cell under the real one), and a few more.
+    report(
+        "level 3",
+        check_lod(&g, &registry, &[(800, -488), (803, -483)], 3..=3),
+    );
+    let level4 = [
+        (224, 288),
+        (432, 128),
+        (448, 128),
+        (1600, -800),
+        (1632, -864),
+        (1824, -960),
+    ];
+    let r = report("level 4", check_lod(&g, &registry, &level4, 4..=4));
+    assert!(r.wet > 0, "{r:?}");
+    let columns = columns_in(2, [3, -2], 12, 9);
+    report("levels 1 to 4", check_lod(&g, &registry, &columns, 1..=4));
+}
+
 // ---- Exactness --------------------------------------------------------------------------------
 
 /// The exactness worlds: the test world, and the same with the valleys carved over it.
