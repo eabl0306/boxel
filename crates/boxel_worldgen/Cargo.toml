@@ -20,6 +20,8 @@ boxel_voxel.workspace = true
 boxel_worldgen = { workspace = true, features = ["test-support"] }
 # The example content (#48), for tests only.
 boxel_demo.workspace = true
+# The far LOD bench meshes the region pass's nodes as a LOD job does (ADR 0031).
+boxel_mesh.workspace = true
 # The `test:` blocks of engine tests (#48).
 boxel_voxel = { workspace = true, features = ["testing"] }
 # Property tests of the noise kit and the field bounds (#67).
@@ -38,6 +40,10 @@ harness = false
 
 [[bench]]
 name = "region"
+harness = false
+
+[[bench]]
+name = "region_lod"
 harness = false
 
 [lints]
