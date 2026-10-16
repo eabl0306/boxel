@@ -120,9 +120,10 @@ pub fn lod_by_effect<Cx: Context, M: ShapeModifier<Cx> + ?Sized>(
 /// A cell corner of a carve by segments, for [`divide_tops`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CarveCorner {
-    /// The segment nearest to the corner: any id that tells the carve's segments apart (or its
-    /// orders, or both), so that two corners with the same id measure their distance to one
-    /// segment.
+    /// The segment nearest to the corner: an id of that one segment (it may fold in the
+    /// segment's order), so that two corners with the same id measure their distance to the same
+    /// segment. An id that several segments share (an order alone) hides the divides between
+    /// them: the distance to a set of segments is not convex.
     pub segment: u64,
     /// The carve's distance input there, `n` (in the carve's fixed point): the distance from the
     /// corner (warped, if the carve warps) to that segment. Rounded down or up to an integer, as
@@ -188,8 +189,11 @@ pub fn divide_tops(
 
 /// What a warp adds to a carve's distance inside a cell of `size` blocks, for [`divide_tops`]:
 /// its slope (`displacement`, in the distance's units per block: the Lipschitz bound of the
-/// offset it adds to a column) over half the cell's diagonal ([`Rect::half_diagonal`]). 0 for no
-/// warp; about `0.35 size` blocks for a warp of slope 1/2.
+/// offset it adds to a column, as a vector, [`Warp::displacement_slope`], not one component's)
+/// over half the cell's diagonal ([`Rect::half_diagonal`]). 0 for no warp; about `0.35 size`
+/// blocks for a warp of slope 1/2.
+///
+/// [`Warp::displacement_slope`]: crate::noise::Warp::displacement_slope
 pub fn warp_slack(displacement: Slope, size: i64) -> u64 {
     if displacement == Slope::ZERO {
         return 0;
