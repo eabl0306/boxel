@@ -1,8 +1,9 @@
-//! Test content of the region generator (#119, #133), shared by `tests/region.rs`,
-//! `tests/region_lod.rs`, `tests/decoration.rs` and `benches/region.rs`: a `test:` Context with a
-//! base height, two parameters and a warp, test kinds that add relief to that base (also with
-//! bounds per chunk column), valleys carved by a shape modifier, a carver of holes under a roof,
-//! the registries of a test world, and the hand-fused single-kind twin the bench compares against.
+//! Test content of the region generator (#119, #133, #134), shared by `tests/region.rs`,
+//! `tests/region_lod.rs`, `tests/decoration.rs`, `tests/features.rs` and the benches: a `test:`
+//! Context with a base height, two parameters and a warp, test kinds that add relief to that base
+//! (also with bounds per chunk column), valleys carved by a shape modifier, a carver of holes
+//! under a roof, trees whose canopies cross chunk borders and plants (feature stages), the
+//! registries of a test world, and the hand-fused single-kind twin the bench compares against.
 #![allow(dead_code, reason = "each user takes part of it")]
 
 use boxel_voxel::{
@@ -18,6 +19,7 @@ use boxel_worldgen::region::{
     Interval, KindGrid, KindLimits, RegionGenerator, RegionSettings, RegionSpec, Rock, RuleEntry,
     Scope, SelectorRule, Stages, SurfaceStage, TerrainKind, TopLayers, block_of, decorate,
 };
+use boxel_worldgen::region::{FeatureReach, FeatureStage, LodColumns};
 use boxel_worldgen::registry::{
     Checks, FreezeError, GenEntry, GenId, GenRegistry, GenRegistryBuilder, HashParams, ParamsHasher,
 };
@@ -815,6 +817,251 @@ impl<Cx: Context> CarverStage<Cx> for Holes {
     }
     fn block_names(&self) -> Vec<&str> {
         Vec::new()
+    }
+}
+
+/// A test feature stage: trees with a trunk of `test:lamp` and a canopy of `test:cutout`, at most
+/// one per cell of [`Groves::CELL`] columns (one cell in `one_in`, by a hash of the cell), its
+/// trunk anywhere in the cell, so canopies cross cell and chunk borders: a chunk reads the grounds
+/// of the trunks around it through its apron. A tree grows on a dry column whose ground is at or
+/// over `min_ground`; its trunk is 4 to 6 blocks, its canopy a ring of radius 2 around its top two
+/// blocks and a cross over it. Each block goes only over air and inside its own column's reach
+/// (over the column's ground, at most [`Groves::HEIGHT`] over it), so a canopy over a slope is
+/// cut, the same from every chunk.
+///
+/// Its far LOD gives a run of `run` blocks of `test:cutout` (0: none) on every dry cell column
+/// whose ground is at or over `min_ground`, or on every cell column with `wet_runs` (wrong on a
+/// shallow coast: the run is buried under the land between the corners).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Groves {
+    /// One cell in this many holds a tree.
+    pub one_in: u64,
+    /// The lowest ground a tree grows on.
+    pub min_ground: i64,
+    /// The far LOD run's blocks, 0 for none.
+    pub run: u32,
+    /// Whether the far LOD gives the run on wet cells too.
+    pub wet_runs: bool,
+}
+
+impl Groves {
+    /// Columns per side of a tree cell, aligned with the chunks.
+    pub const CELL: i64 = 16;
+    /// The canopy's reach around the trunk.
+    pub const RADIUS: i64 = 2;
+    /// The reach over a column's ground: a tree is at most 7 blocks over its trunk's ground, and
+    /// 5 more let a canopy hang over a lower neighbor.
+    pub const HEIGHT: u32 = 12;
+
+    /// Trees in one cell of `one_in` on dry ground at or over y 0, with a far LOD run of `run`
+    /// on the dry cells.
+    pub const fn new(one_in: u64, run: u32) -> Self {
+        Self {
+            one_in,
+            min_ground: 0,
+            run,
+            wet_runs: false,
+        }
+    }
+
+    /// The tree of cell `(i, j)` under `seed`, if it has one: its trunk column and its trunk's
+    /// blocks. Its ground is the trunk column's.
+    pub fn tree(&self, seed: u64, (i, j): (i64, i64)) -> Option<(i64, i64, i64)> {
+        let h = splitmix64(seed ^ splitmix64(i as u64) ^ splitmix64(j as u64).rotate_left(32));
+        if !h.is_multiple_of(self.one_in) {
+            return None;
+        }
+        let x = i * Self::CELL + ((h >> 8) % Self::CELL as u64) as i64;
+        let z = j * Self::CELL + ((h >> 16) % Self::CELL as u64) as i64;
+        Some((x, z, 4 + ((h >> 24) % 3) as i64))
+    }
+
+    /// Calls `put(x, y, z, log)` for every block of the tree with its trunk at `(x, z)` on the
+    /// ground `g`, `trunk` blocks tall (each block once; `log` for the trunk).
+    pub fn blocks(x: i64, z: i64, g: i64, trunk: i64, mut put: impl FnMut(i64, i64, i64, bool)) {
+        let top = g + trunk;
+        for y in g + 1..=top {
+            put(x, y, z, true);
+        }
+        for y in top - 1..=top + 1 {
+            let r = if y <= top { Self::RADIUS } else { 1 };
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    if (dx.abs() == r && dz.abs() == r) || (dx == 0 && dz == 0 && y <= top) {
+                        continue;
+                    }
+                    put(x + dx, y, z + dz, false);
+                }
+            }
+        }
+    }
+
+    /// The cells whose trees may reach the columns of `area`.
+    fn cells(area: Rect) -> impl Iterator<Item = (i64, i64)> {
+        let (r, c) = (Self::RADIUS, Self::CELL);
+        let is = (area.x0 - r).div_euclid(c)..=(area.x1 + r).div_euclid(c);
+        let js = (area.z0 - r).div_euclid(c)..=(area.z1 + r).div_euclid(c);
+        is.flat_map(move |i| js.clone().map(move |j| (i, j)))
+    }
+
+    /// Whether the tree with its trunk at `(x, z)` may put a block over a column of `area`.
+    fn reaches(area: Rect, x: i64, z: i64) -> bool {
+        let r = Self::RADIUS;
+        x + r >= area.x0 && x - r <= area.x1 && z + r >= area.z0 && z - r <= area.z1
+    }
+}
+
+impl HashParams for Groves {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.one_in)
+            .write(&self.min_ground)
+            .write(&self.run)
+            .write(&self.wet_runs);
+    }
+}
+
+impl GenEntry for Groves {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> FeatureStage<Cx> for Groves {
+    fn reach(&self) -> FeatureReach {
+        FeatureReach {
+            height: Self::HEIGHT,
+            apron: Self::RADIUS as u32,
+        }
+    }
+    /// The height where a tree's cell hashes to one whose canopy reaches `area` (whatever its
+    /// ground), else 0.
+    fn column_height(&self, _cx: &Cx, seed: u64, area: Rect) -> u32 {
+        let grows = Self::cells(area).any(|cell| {
+            self.tree(seed, cell)
+                .is_some_and(|(x, z, _)| Self::reaches(area, x, z))
+        });
+        if grows { Self::HEIGHT } else { 0 }
+    }
+    fn apply(
+        &self,
+        columns: &ChunkColumns<'_, Cx>,
+        seed: u64,
+        registry: &BlockRegistry,
+        out: &mut [BlockState],
+    ) {
+        let log = registry.by_name("test:lamp").expect("test:lamp");
+        let leaves = registry.by_name("test:cutout").expect("test:cutout");
+        let o = columns.origin;
+        let size = i64::from(CHUNK_SIZE);
+        let chunk = Rect::new(o.x, o.z, o.x + size - 1, o.z + size - 1);
+        let height = i64::from(Self::HEIGHT);
+        for cell in Self::cells(chunk) {
+            let Some((x, z, trunk)) = self.tree(seed, cell) else {
+                continue;
+            };
+            if !Self::reaches(chunk, x, z) {
+                continue;
+            }
+            // The trunk's ground: the chunk's own column, or one of its apron.
+            let (lx, lz) = (x - o.x, z - o.z);
+            let (g, fluid) = if (0..size).contains(&lx) && (0..size).contains(&lz) {
+                let c = (lx * size + lz) as usize;
+                (columns.ground[c], columns.fluid_top[c])
+            } else {
+                let (mut g, mut f) = ([0], [0]);
+                columns.tops(&[x], &[z], &mut g, &mut f);
+                (g[0], f[0])
+            };
+            if g < self.min_ground || fluid > g || g + trunk + 1 < o.y || g + 1 > o.y + size - 1 {
+                continue;
+            }
+            Self::blocks(x, z, g, trunk, |bx, by, bz, is_log| {
+                let (lx, ly, lz) = (bx - o.x, by - o.y, bz - o.z);
+                if ![lx, ly, lz].iter().all(|v| (0..size).contains(v)) {
+                    return;
+                }
+                let c = (lx * size + lz) as usize;
+                let ground = columns.ground[c];
+                let i = ((ly as usize) << 10) | c;
+                if by > ground && by <= ground + height && out[i] == BlockState::AIR {
+                    out[i] = if is_log { log } else { leaves };
+                }
+            });
+        }
+    }
+    fn block_names(&self) -> Vec<&str> {
+        vec!["test:lamp", "test:cutout"]
+    }
+    fn lod_runs(
+        &self,
+        columns: &LodColumns<'_, Cx>,
+        _seed: u64,
+        registry: &BlockRegistry,
+        out: &mut [(BlockState, u32)],
+    ) {
+        if self.run == 0 {
+            return;
+        }
+        let leaves = registry.by_name("test:cutout").expect("test:cutout");
+        for ((o, &g), &f) in out.iter_mut().zip(columns.ground).zip(columns.fluid_top) {
+            if self.wet_runs || (f == g && g >= self.min_ground) {
+                *o = (leaves, self.run);
+            }
+        }
+    }
+}
+
+/// A test feature stage: one `test:plant` over the ground of one dry column in `one_in` (by a
+/// hash of the column), on ground at or over y 0, where it finds air.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Tufts {
+    /// One column in this many has a plant.
+    pub one_in: u64,
+}
+
+impl HashParams for Tufts {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.one_in);
+    }
+}
+
+impl GenEntry for Tufts {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> FeatureStage<Cx> for Tufts {
+    fn reach(&self) -> FeatureReach {
+        FeatureReach {
+            height: 1,
+            apron: 0,
+        }
+    }
+    fn apply(
+        &self,
+        columns: &ChunkColumns<'_, Cx>,
+        seed: u64,
+        registry: &BlockRegistry,
+        out: &mut [BlockState],
+    ) {
+        let plant = registry.by_name("test:plant").expect("test:plant");
+        let o = columns.origin;
+        for (c, (&g, &f)) in columns.ground.iter().zip(columns.fluid_top).enumerate() {
+            let ly = g + 1 - o.y;
+            let (x, z) = (o.x + (c >> 5) as i64, o.z + (c & 31) as i64);
+            let h = splitmix64(seed ^ splitmix64(x as u64) ^ splitmix64(z as u64).rotate_left(29));
+            if f > g || g < 0 || !(0..32).contains(&ly) || !h.is_multiple_of(self.one_in) {
+                continue;
+            }
+            let i = ((ly as usize) << 10) | c;
+            if out[i] == BlockState::AIR {
+                out[i] = plant;
+            }
+        }
+    }
+    fn block_names(&self) -> Vec<&str> {
+        vec!["test:plant"]
     }
 }
 
