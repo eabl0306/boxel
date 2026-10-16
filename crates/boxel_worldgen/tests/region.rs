@@ -20,7 +20,8 @@
 //! - the version follows every entry, setting and the realm, never the seed, the memo or another
 //!   dimension;
 //! - every freeze check of the region map and the kinds fails with its ids in the message, and the
-//!   shape modifiers' slopes, alone, summed and on top of the kinds they cut, keep the 3:1 cap.
+//!   shape modifiers' slopes, alone, summed and on top of the kinds they cut, keep the 3:1 cap (a
+//!   capped modifier's cap by itself, with the additive ones after it).
 #[path = "support/region.rs"]
 mod support;
 
@@ -35,8 +36,8 @@ use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSky, RealmSpan, RealmSpec,
 use boxel_worldgen::region::{
     ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ,
     Interval, KindForm, KindGrid, KindLimits, NoSurface, REALM_GENERATOR, RegionGenerator,
-    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeModifier, SurfaceReach,
-    SurfaceStage, TerrainKind, check_modifiers, clear_worker_memo,
+    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeModifier, SlopeMode,
+    SurfaceReach, SurfaceStage, TerrainKind, check_modifiers, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher, Problem,
@@ -1828,14 +1829,28 @@ fn modifier_slope(milli: u64) -> Slope {
     }
 }
 
-/// The problems of the shape modifiers `modifiers` on the kinds `kinds`, on the default lattice.
+/// The problems of the additive shape modifiers `modifiers` on the kinds `kinds`, on the default
+/// lattice.
 fn modifier_problems(kinds: &[(&str, KindLimits)], modifiers: &[(&str, Slope)]) -> Vec<Problem> {
+    let modifiers: Vec<_> = modifiers
+        .iter()
+        .map(|&(n, s)| (n, s, SlopeMode::Additive))
+        .collect();
+    mode_problems(kinds, &modifiers)
+}
+
+/// The problems of the shape modifiers `modifiers` (in the order they run, each with its mode) on
+/// the kinds `kinds`, on the default lattice.
+fn mode_problems(
+    kinds: &[(&str, KindLimits)],
+    modifiers: &[(&str, Slope, SlopeMode)],
+) -> Vec<Problem> {
     let mut checks = Checks::new();
     let kinds: Vec<_> = kinds
         .iter()
         .map(|&(n, l)| (id(n), KindForm::Height, l))
         .collect();
-    let modifiers: Vec<_> = modifiers.iter().map(|&(n, s)| (id(n), s)).collect();
+    let modifiers: Vec<_> = modifiers.iter().map(|&(n, s, m)| (id(n), s, m)).collect();
     check_modifiers(&mut checks, &id("test:realm"), &kinds, &modifiers, SHIFT);
     checks.problems().to_vec()
 }
@@ -1927,6 +1942,127 @@ fn shape_modifiers_keep_the_cap_with_the_kinds_they_cut() {
         e.contains("shape modifiers test:steep on kinds test:hills"),
         "{e}"
     );
+}
+
+/// A ridge along `z = 0` raised over the heights, `max(H, top - 742 |z|)`: its walls hold 2.9:1
+/// wherever it changes a height, whatever it gets, so declared capped it opens on the test kinds;
+/// declared additive the same slope would add to theirs.
+#[derive(Clone, Copy, Debug)]
+struct Ridge {
+    top: HeightQ,
+    mode: SlopeMode,
+}
+
+/// The ridge's walls, in 1/256 block per block.
+const RIDGE_WALL: i64 = 742;
+
+impl HashParams for Ridge {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.top)
+            .write(&matches!(self.mode, SlopeMode::Capped));
+    }
+}
+
+impl GenEntry for Ridge {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl ShapeModifier<TestContext> for Ridge {
+    fn effect(&self) -> boxel_worldgen::region::ShapeEffect {
+        // Over the lowest test height, a basin's (-52 blocks).
+        boxel_worldgen::region::ShapeEffect::Raise((self.top + 60 * HEIGHT_ONE) as u32)
+    }
+    fn slope(&self) -> Slope {
+        Slope {
+            per_block: boxel_worldgen::field::Q16::from_raw((RIDGE_WALL as u64) << 16),
+            jitter: 0,
+        }
+    }
+    fn slope_mode(&self) -> SlopeMode {
+        self.mode
+    }
+    fn apply(&self, grid: &KindGrid<'_, TestContext>, heights: &mut [HeightQ]) {
+        for row in heights.chunks_exact_mut(grid.zs.len()) {
+            for (h, &z) in row.iter_mut().zip(grid.zs) {
+                let ridge = i64::from(self.top) - RIDGE_WALL * z.abs();
+                *h = i64::from(*h).max(ridge) as HeightQ;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_capped_modifier_keeps_its_cap_by_itself() {
+    let (capped, additive) = (SlopeMode::Capped, SlopeMode::Additive);
+    let hills = [("test:hills", declared_limits(2000, 0, 0))];
+    // A cap of 2.9 on hills of 2.0: alone under 3, never added to the kinds'; additive, the same
+    // slope gives 4.9.
+    assert!(mode_problems(&hills, &[("test:cliffs", modifier_slope(2900), capped)]).is_empty());
+    let p = mode_problems(&hills, &[("test:cliffs", modifier_slope(2900), additive)]);
+    assert!(matches!(&p[..], [Problem::ShapeSlope { .. }]), "{p:?}");
+    // A cap over 3 by itself.
+    let p = mode_problems(&hills, &[("test:cliffs", modifier_slope(3100), capped)]);
+    assert_eq!(p.len(), 1);
+    assert_eq!(
+        p[0].to_string(),
+        "shape modifier test:cliffs of realm test:realm caps its heights' slope at 3.100: over 3"
+    );
+    // An additive modifier after a cap adds to its output; before it, to the kinds'.
+    let river = ("test:river", modifier_slope(400), additive);
+    let cliffs = ("test:cliffs", modifier_slope(2800), capped);
+    let p = mode_problems(&hills, &[cliffs, river]);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(
+        p[0].to_string(),
+        "shape modifier test:cliffs of realm test:realm caps its heights' slope at 2.800, and \
+         the additive test:river after it add 0.400: over 3"
+    );
+    assert!(mode_problems(&hills, &[river, cliffs]).is_empty());
+    // At world open, on the test kinds: refused additive, opened capped, and its heights keep
+    // 3:1 across the ridge (its chunks pass the debug slope check).
+    let ridge = |mode| Ridge {
+        top: 300 * HEIGHT_ONE,
+        mode,
+    };
+    let world = world(CELLS);
+    let mut checks = Checks::new();
+    let _ = RegionGenerator::build(
+        RegionSpec {
+            seed: SEED,
+            dimension: &id("test:overworld"),
+            realm: &id("test:surface"),
+            realms: &world.realms,
+            rules: &world.rules,
+            entries: &world.entries,
+            kinds: &world.kinds,
+            blocks: &registry(),
+            decoration: decoration().with_modifier(id("test:ridge"), Arc::new(ridge(additive))),
+            settings: RegionSettings::default(),
+        },
+        |realm_seed| TestContext::new(realm_seed, BASE),
+        &mut checks,
+    );
+    let e = checks.finish().expect_err("refused").to_string();
+    assert!(e.contains("shape modifiers test:ridge on kinds"), "{e}");
+    let g = generator_with(
+        &world,
+        SEED,
+        RegionSettings::default(),
+        decoration().with_modifier(id("test:ridge"), Arc::new(ridge(capped))),
+    );
+    let registry = registry();
+    let mut raised = 0;
+    for n in 0..12i64 {
+        let x = n * 1709 - 9000;
+        check_line(&g, (x, -150), (0, 1), 300, jitter(&g));
+        check_line(&g, (x, -150), (1, 2), 150, jitter(&g));
+        let ground = g.column_info(x, 0).ground;
+        raised += usize::from(ground >= 290);
+        drop(g.generate_full(key(x >> 5, ground >> 5, 0), &registry));
+    }
+    assert_eq!(raised, 12, "columns on the ridge");
 }
 
 #[test]

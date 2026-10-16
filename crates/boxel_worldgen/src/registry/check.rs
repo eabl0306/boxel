@@ -218,14 +218,14 @@ pub enum Problem {
         /// The kind.
         kind: GenId,
     },
-    /// Shape modifiers whose slopes, summed (ADR 0039 sec. 6 and 12), break the 3:1 cap alone
-    /// (`kinds` empty) or on top of kinds they cut: the kinds' steepest slope plus the
+    /// Additive shape modifiers whose slopes, summed (ADR 0039 sec. 6 and 12), break the 3:1 cap
+    /// alone (`kinds` empty) or on top of kinds they cut: the kinds' steepest slope plus the
     /// modifiers' plus the largest border relief over 543 blocks (at the default lattice) is
     /// over 3.
     ShapeSlope {
         /// The realm.
         realm: GenId,
-        /// Every shape modifier of the realm.
+        /// Every additive shape modifier of the realm.
         modifiers: Vec<GenId>,
         /// The one, two or three kinds, none for the modifiers alone.
         kinds: Vec<GenId>,
@@ -238,6 +238,21 @@ pub enum Problem {
         relief: u64,
         /// The lattice's `log2` spacing.
         lattice: u32,
+    },
+    /// A capped shape modifier ([`SlopeMode::Capped`](crate::region::SlopeMode::Capped)) whose
+    /// cap, plus the additive slopes of the modifiers that run after it, is over 3 (ADR 0039
+    /// sec. 6 and 12).
+    ShapeCap {
+        /// The realm.
+        realm: GenId,
+        /// The capped modifier.
+        modifier: GenId,
+        /// Its cap over one block, its jitter included, in 1/256 block per block, Q16.
+        cap: u64,
+        /// The additive modifiers after it, their slopes summed the same way.
+        after: Vec<GenId>,
+        /// Their slopes summed.
+        added: u64,
     },
     /// A carver whose apron is wider than [`MAX_APRON`](crate::region::MAX_APRON).
     CarverApron {
@@ -298,6 +313,12 @@ impl Problem {
                 .chain(modifiers)
                 .chain(kinds)
                 .collect(),
+            Self::ShapeCap {
+                realm,
+                modifier,
+                after,
+                ..
+            } => [realm, modifier].into_iter().chain(after).collect(),
             Self::CarverApron { carver, .. } => vec![carver],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
             Self::Gap {
@@ -560,6 +581,27 @@ impl fmt::Display for Problem {
                     q(*slope),
                     q(*added),
                 )
+            }
+            Self::ShapeCap {
+                realm,
+                modifier,
+                cap,
+                after,
+                added,
+            } => {
+                // Display only: the check itself is exact.
+                let q = |v: u64| v as f64 / 65536.0 / 256.0;
+                write!(
+                    f,
+                    "shape modifier {modifier} of realm {realm} caps its heights' slope at {:.3}",
+                    q(*cap)
+                )?;
+                if !after.is_empty() {
+                    f.write_str(", and the additive ")?;
+                    list(f, after)?;
+                    write!(f, " after it add {:.3}", q(*added))?;
+                }
+                write!(f, ": over {MAX_SLOPE}")
             }
             Self::CarverApron { carver, apron } => write!(
                 f,

@@ -56,6 +56,23 @@ impl ShapeEffect {
     }
 }
 
+/// How a shape modifier's declared slope ([`ShapeModifier::slope`]) composes with the slope of
+/// the heights it gets, for the freeze check of the 3:1 cap (ADR 0039 sec. 6 and 12).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SlopeMode {
+    /// Its slope adds to theirs: where they keep a slope of `L` along any line, its output keeps
+    /// `L + slope` (a carve whose walls scale with the height it cuts, `min(H, floor + (H -
+    /// floor) g(n))`). The check adds it to the kinds' steepest slope.
+    #[default]
+    Additive,
+    /// Its slope caps its output: wherever it changes a height, its output keeps the slope,
+    /// given heights that keep their own declared slopes (a max or min envelope: a cliff riser
+    /// `max(H, R)`, a valley floor `min(H, V)` whose own walls hold the cap). Where it leaves a
+    /// height, the height keeps the slope it had. The check holds the cap to 3 by itself, plus
+    /// the additive slopes of the modifiers that run after it, and never adds it to the kinds'.
+    Capped,
+}
+
 impl HashParams for ShapeEffect {
     fn hash_params(&self, h: &mut ParamsHasher) {
         match self {
@@ -83,10 +100,21 @@ pub trait ShapeModifier<Cx: Context>: GenEntry + Send + Sync {
     /// `min(H, floor + (H - floor) g(n))` adds its walls' steepness, its deepest cut times the
     /// slope of `g(n)` along a line.
     ///
-    /// The freeze check holds it to the 3:1 cap (ADR 0039 sec. 6 and 12): the realm's modifiers'
-    /// slopes, summed, alone and on top of every kind, pair and triple of kinds they cut, by the
-    /// rule the kinds' check uses.
+    /// The freeze check holds it to the 3:1 cap (ADR 0039 sec. 6 and 12) by its
+    /// [`ShapeModifier::slope_mode`]: an additive one's slope is summed with the realm's other
+    /// additive modifiers', alone and on top of every kind, pair and triple of kinds they cut, by
+    /// the rule the kinds' check uses; a capped one's slope is the cap of its output. In debug
+    /// builds every chunk holds the realm to the cap ([`RegionGenerator`]'s slope check), so a
+    /// slope declared under the truth fails the tests that generate its chunks.
+    ///
+    /// [`RegionGenerator`]: super::RegionGenerator
     fn slope(&self) -> Slope;
+
+    /// How its slope composes with the slope of the heights it gets: [`SlopeMode::Additive`] by
+    /// default.
+    fn slope_mode(&self) -> SlopeMode {
+        SlopeMode::Additive
+    }
 
     /// What it may do to the heights of the columns of `area` (a chunk column, or the part of a
     /// carver's apron in one lattice cell, a rect that is no chunk column; ADR 0039 sec. 14),

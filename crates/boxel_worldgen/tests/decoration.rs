@@ -14,7 +14,7 @@
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
 //!   whose rules read the surface deeper than its reach (and not one whose masks only spell the
-//!   same voxels two ways).
+//!   same voxels two ways), a kind or a modifier steeper than it declares.
 #[path = "support/region.rs"]
 mod support;
 
@@ -1181,4 +1181,108 @@ fn the_reach_check_compares_the_voxels_a_mask_leaves() {
     let chunk = g.generate_full(k, &registry);
     assert_eq!(chunk, g.generate(k, &registry));
     assert_eq!(chunk.as_uniform(), registry.by_name("test:solid"));
+}
+
+/// A kind flat inside each chunk column that steps 4 blocks up from one chunk column to the next
+/// along x, declaring a slope of 1: the freeze check passes it, and only the border of two chunk
+/// columns shows it.
+struct Steep;
+
+impl HashParams for Steep {
+    fn hash_params(&self, _: &mut ParamsHasher) {}
+}
+
+impl GenEntry for Steep {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl TerrainKind<()> for Steep {
+    fn limits(&self, _: &()) -> KindLimits {
+        let range = Span::new(-1 << 21, 1 << 21);
+        KindLimits {
+            slope: Slope {
+                per_block: boxel_worldgen::field::Q16::from_raw(256 << 16),
+                jitter: 0,
+            },
+            relief: range,
+            band: range,
+        }
+    }
+    fn range(&self, _: &()) -> Span {
+        Span::new(-1 << 21, 1 << 21)
+    }
+    fn heights(&self, grid: &KindGrid<'_, ()>, _: &[bool], out: &mut [HeightQ]) {
+        for (row, &x) in out.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
+            row.fill(((x >> 5) * 1024) as HeightQ);
+        }
+    }
+}
+
+/// Shape modifier `0`, declaring no slope.
+struct Lies(Valleys);
+
+impl HashParams for Lies {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+
+impl GenEntry for Lies {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl ShapeModifier<()> for Lies {
+    fn effect(&self) -> ShapeEffect {
+        ShapeModifier::<()>::effect(&self.0)
+    }
+    fn slope(&self) -> Slope {
+        Slope::ZERO
+    }
+    fn apply(&self, grid: &KindGrid<'_, ()>, heights: &mut [HeightQ]) {
+        self.0.apply(grid, heights);
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_slope_under_the_heights_fails_the_slope_check() {
+    let registry = registry();
+    let caught = |g: &RegionGenerator<()>, k: ChunkKey| {
+        let message = panic_of(|| drop(g.generate_full(k, &registry))).expect("caught");
+        assert!(
+            message.contains("slope check") && message.contains("more than 3 blocks apart"),
+            "{message}"
+        );
+    };
+    // A kind steeper than it declares across the +x border of every chunk column.
+    let steep = dry(Arc::new(Steep), bare()).expect("opens");
+    caught(&steep, key(0, 1, 0));
+    caught(&steep, key(-7, 1, 3));
+    // Valleys whose walls run 7.5:1 (30 blocks over 4), declaring no slope, on flat ground.
+    let walls = Valleys {
+        period: 256,
+        gap: 64,
+        width: 4,
+        floor: 10 * HEIGHT_ONE,
+        depth: 30 * 256,
+        divide: true,
+    };
+    let lying = flat(
+        40,
+        bare().with_modifier(id("test:valleys"), Arc::new(Lies(walls))),
+    )
+    .expect("opens");
+    caught(&lying, key(3, 1, 0));
+    // Away from the walls the heights keep the cap; out of the check (a test-only escape for
+    // fixtures steep on purpose), the walls' chunks build.
+    drop(lying.generate_full(key(3, 1, 4), &registry));
+    let unchecked = lying.without_slope_check();
+    assert_eq!(
+        unchecked.generate_full(key(3, 1, 0), &registry),
+        unchecked.generate(key(3, 1, 0), &registry)
+    );
 }

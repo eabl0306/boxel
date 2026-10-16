@@ -295,13 +295,30 @@ grad H = suma_k w_k grad H_k + suma_k (H_k - m) grad w_k      (para cualquier co
   3,08.
 - El tope de 3:1 vale en cualquier línea, no solo en los ejes. Es lo que piden los faldones de la
   lejanía (ADR 0031) y el test de pendiente.
-- Los modificadores de forma también declaran su pendiente (`ShapeModifier::slope`): lo que suman a
-  la pendiente de las alturas que reciben. Un corte de río `min(H, piso + (H - piso) g(n))` suma la
-  de sus paredes; una subida igual en toda columna no suma nada. El chequeo suma las de todos los
-  modificadores del reino, porque se apilan (un río que cruza una costa de acantilados), y pide que
-  la suma pase el tope sola y sumada a la pendiente más alta de cada tipo, par y trío de tipos, con
-  la misma regla de arriba. Un conjunto que ya falla sin modificadores lo informa el chequeo de los
-  tipos.
+- Los modificadores de forma también declaran su pendiente (`ShapeModifier::slope`) y cómo se
+  compone con la de las alturas que reciben (`ShapeModifier::slope_mode`, un `SlopeMode`):
+  - `Additive`, por defecto: lo que suman a la pendiente de las alturas que reciben. Un corte de
+    río `min(H, piso + (H - piso) g(n))` suma la de sus paredes; una subida igual en toda columna
+    no suma nada. El chequeo suma las de todos los aditivos del reino, porque se apilan (un río que
+    cruza una costa de acantilados), y pide que la suma pase el tope sola y sumada a la pendiente
+    más alta de cada tipo, par y trío de tipos, con la misma regla de arriba. Un conjunto que ya
+    falla sin modificadores lo informa el chequeo de los tipos.
+  - `Capped`: un tope de la pendiente de su salida, donde cambia una altura, si las alturas que
+    recibe cumplen las suyas. Es la forma de una envolvente: el escalón de un acantilado `max(H,
+    R)`, el fondo de un valle `min(H, V)` con paredes propias. Donde no cambia la altura, queda la
+    pendiente que traía. El chequeo pide que el tope, más las pendientes de los aditivos que corren
+    después (se suman a su salida), pase 3 solo, y no lo suma a los tipos. Así un acantilado de 3:1
+    entra junto a un tipo que ya usa todo el tope.
+- En debug, cada chunk de la etapa de columna comprueba el tope en sus alturas: dos columnas
+  vecinas en x o en z, dentro de su columna de chunk y a través de sus bordes +x y +z, difieren en
+  a lo sumo 768 (3 bloques en 1/256 de bloque). La regla es exacta. El chequeo de arriba acota
+  cada paso por un `B <= 768` real que cuenta todo redondeo como jitter declarado, salvo el piso de
+  la mezcla, que suma menos de 1: dos alturas enteras difieren entonces en menos de `B + 1`, o sea
+  en a lo sumo 768, y sus suelos (`h >> 8`) en a lo sumo 3 bloques. Un tipo o un modificador que
+  declara menos pendiente que la que tiene falla en los tests que generan sus chunks. Solo un
+  fixture empinado a propósito lo apaga (`RegionGenerator::without_slope_check`, con la feature
+  `test-support`): los valles con meandros del test del término de divisoria, de paredes más
+  empinadas que 3:1.
 
 ### 7. Términos de núcleo y volúmenes
 
@@ -643,8 +660,9 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - un tipo con una pendiente de más de 3, o un par o un trío de tipos que pueden juntarse y no
   pasan el chequeo de pendiente y relieve de borde (sección 6). Las condiciones no dicen dónde se
   cumplen, así el chequeo toma todo par y todo trío de tipos del reino;
-- modificadores de forma cuyas pendientes sumadas pasan el tope solas, o sobre un tipo, un par o
-  un trío de tipos que pasan sin ellos (sección 6);
+- modificadores de forma aditivos cuyas pendientes sumadas pasan el tope solas, o sobre un tipo, un
+  par o un trío de tipos que pasan sin ellos, y un modificador con tope cuyo tope, más las
+  pendientes de los aditivos que corren después, pasa 3 (sección 6);
 - dos etapas de una fase con el mismo id (modificadores o carvers), y un carver con un apron de más
   de 32 bloques;
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el

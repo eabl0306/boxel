@@ -56,7 +56,7 @@ pub use kind::{
 };
 pub use memo::clear_worker_memo;
 pub use modifier::{
-    CarveCorner, ShapeEffect, ShapeModifier, divide_tops, lod_by_effect, warp_slack,
+    CarveCorner, ShapeEffect, ShapeModifier, SlopeMode, divide_tops, lod_by_effect, warp_slack,
 };
 pub use select::{
     DEFAULT_CELL_SHIFT, Entry, Interval, MAX_WEIGHT, PARAM_REGISTRY, RuleEntry, Scope,

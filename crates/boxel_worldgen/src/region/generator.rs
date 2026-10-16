@@ -5,12 +5,13 @@ use super::decorate::{
     CarveReach, ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver, Stages,
     SurfaceReach, SurfaceStage,
 };
-use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
+use super::kind::{Context, HEIGHT_ONE, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowKinds, WindowPoints};
 use super::modifier::{ShapeEffect, ShapeModifier};
 use super::select::{self, RuleEntry, Selector, SelectorRule, check_rule_entries};
 use super::{
-    CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, REGION_LINE, check,
+    CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MAX_SLOPE, MIN_LATTICE_SHIFT,
+    REGION_LINE, check,
 };
 use crate::field::Rect;
 use crate::lod::LodSource;
@@ -144,8 +145,10 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
 /// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges).
 /// A chunk of the column stage at or under its deep bound (one [`RegionGenerator::generate_full`]
-/// builds) also checks that every ground its carvers may read lies their surface reach over it.
-/// A kind or a mod with a bound or a range under its heights fails its tests there.
+/// builds) also checks that every ground its carvers may read lies their surface reach over it,
+/// and every chunk of the column stage that its heights keep the 3:1 cap between axis neighbours
+/// ([`RegionGenerator::check_slope`]). A kind or a mod with a bound, a range or a slope under its
+/// heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     pub(super) key: BuildKey,
     dimension: GenId,
@@ -167,6 +170,8 @@ pub struct RegionGenerator<Cx: Context> {
     carve: Option<CarveReach>,
     digest: RegistryDigest,
     vertical: RangeInclusive<i64>,
+    /// Whether debug builds hold its chunks to the 3:1 cap ([`RegionGenerator::check_slope`]).
+    slope_check: bool,
 }
 
 impl<Cx: Context> RegionGenerator<Cx> {
@@ -347,7 +352,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         check::check_kinds(checks, realm, &limits, shift);
         let slopes: Vec<_> = modifiers
             .iter()
-            .map(|m| (m.id.clone(), m.modifier.slope()))
+            .map(|m| (m.id.clone(), m.modifier.slope(), m.modifier.slope_mode()))
             .collect();
         check::check_modifiers(checks, realm, &limits, &slopes, shift);
         if checks.found() > before {
@@ -373,7 +378,19 @@ impl<Cx: Context> RegionGenerator<Cx> {
             carve,
             digest: digest.finish(),
             vertical,
+            slope_check: true,
         })
+    }
+
+    /// The generator without its debug slope check ([`RegionGenerator::check_slope`]), for a
+    /// test whose fixture is steeper than 3:1 on purpose and declares a smaller slope so it opens
+    /// (a worst case of the far LOD's divide term). Never for a world: the far LOD's skirts cover
+    /// 3:1 (ADR 0031).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn without_slope_check(mut self) -> Self {
+        self.slope_check = false;
+        self
     }
 
     /// The realm's id.
@@ -819,8 +836,19 @@ impl<Cx: Context> RegionGenerator<Cx> {
             ground.len() == n && fluid_top.len() == n,
             "{NAME}::column_tops: one ground and one fluid top per column"
         );
-        let level = self.fluid_level();
-        let datum = self.spec().datum;
+        let mut h = vec![0; n];
+        self.heights_across(xs, zs, &mut h);
+        let (level, datum) = (self.fluid_level(), self.spec().datum);
+        for ((g, w), &h) in ground.iter_mut().zip(fluid_top.iter_mut()).zip(&h) {
+            *g = block_of(datum, h);
+            *w = if *g < level { level } else { *g };
+        }
+    }
+
+    /// The heights of the columns of the grid `xs` x `zs` into `out` (point `i * zs.len() + j`),
+    /// bit for bit as their own chunks compute them, each column with its own lattice cell's
+    /// window: blended, then shaped by the modifiers.
+    fn heights_across(&self, xs: &[i64], zs: &[i64], out: &mut [HeightQ]) {
         let (ci, cj) = (cells_of(xs, self.shift), cells_of(zs, self.shift));
         let (mut sx, mut sz, mut h) = (Vec::new(), Vec::new(), Vec::new());
         for (i, xi) in &ci {
@@ -835,9 +863,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 self.heights_in((&sx, &sz), &fields, &self.points((*i, *j)), None, &mut h);
                 for (row, &a) in h.chunks_exact(sz.len()).zip(xi) {
                     for (&h, &b) in row.iter().zip(zj) {
-                        let g = block_of(datum, h);
-                        ground[a * zs.len() + b] = g;
-                        fluid_top[a * zs.len() + b] = if g < level { level } else { g };
+                        out[a * zs.len() + b] = h;
                     }
                 }
             }
@@ -946,6 +972,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
         if cfg!(debug_assertions) {
             self.check_grounds(origin, points, bounds, &ground);
             self.check_deep(origin, bounds, &ground);
+            if self.slope_check {
+                self.check_slope(origin, &h);
+            }
         }
         let around = Around(self);
         let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &around);
@@ -1047,6 +1076,51 @@ impl<Cx: Context> RegionGenerator<Cx> {
             zs[k % zs.len()],
             carve.surface,
         );
+    }
+
+    /// The debug slope check of a chunk column's heights `h` (ADR 0039 sec. 6): every two axis
+    /// neighbours, inside the chunk column and across its +x and +z borders (so each border pair
+    /// is checked once), differ by at most `MAX_SLOPE * HEIGHT_ONE` (768, 3 blocks), and so their
+    /// grounds by at most 3 blocks.
+    ///
+    /// The rule is exact. The freeze check holds every axis step of the heights to a real bound
+    /// `B <= 768` that counts every rounding as declared jitter, but for the blend's own floor,
+    /// which adds less than 1 (a capped modifier's cap counts too): two integer heights then
+    /// differ by less than `B + 1`, so by at most 768. A ground is `datum + (h >> 8)`, and two
+    /// heights at most 768 apart give grounds at most 3 apart. A kind or a shape modifier whose
+    /// declared slope is under its heights' fails here, in any chunk where the realm passes 3:1.
+    fn check_slope(&self, origin: BlockPos, h: &[HeightQ; CHUNK_AREA]) {
+        let size = CHUNK_SIZE as usize;
+        let cap = i64::from(MAX_SLOPE) * i64::from(HEIGHT_ONE);
+        let (xs, zs) = chunk_axes(origin.x, origin.z);
+        let (mut px, mut pz) = (vec![0; size], vec![0; size]);
+        self.heights_across(&[origin.x + size as i64], &zs, &mut px);
+        self.heights_across(&xs, &[origin.z + size as i64], &mut pz);
+        // Column `(x, z)` of the chunk column, `x` or `z` 32 for the +x or +z neighbour.
+        let at = |x: usize, z: usize| match (x == size, z == size) {
+            (false, false) => h[(x << CHUNK_SHIFT) | z],
+            (true, _) => px[z],
+            (_, true) => pz[x],
+        };
+        for x in 0..size {
+            for z in 0..size {
+                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
+                    let (a, b) = (at(x, z), at(nx, nz));
+                    assert!(
+                        (i64::from(a) - i64::from(b)).abs() <= cap,
+                        "{NAME} slope check: realm {} columns ({}, {}) and ({}, {}) have the \
+                         heights {a} and {b} (in 1/256 block), more than {MAX_SLOPE} blocks apart: \
+                         a kind's or a shape modifier's declared slope (or a capped modifier's \
+                         cap) is under its heights' slope",
+                        self.realm(),
+                        origin.x + x as i64,
+                        origin.z + z as i64,
+                        origin.x + nx as i64,
+                        origin.z + nz as i64,
+                    );
+                }
+            }
+        }
     }
 
     /// The debug span check of the realm's range: the column's top lies in the realm's vertical

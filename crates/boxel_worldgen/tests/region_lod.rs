@@ -505,8 +505,11 @@ impl ShapeModifier<()> for Meander {
         ShapeEffect::LowerOnly(self.valleys.depth)
     }
     /// The straight valleys' walls. Its bends run much steeper (the distance's slope is `1 +` the
-    /// warp's, about 4 here): the worst case of the divide term on purpose, a test of the far
-    /// LOD's tops, not of the cap the freeze check holds declared slopes to.
+    /// warp's, about 4 here, walls of about 8:1): the worst case of the divide term on purpose, a
+    /// test of the far LOD's tops, not of the cap the freeze check holds declared slopes to. Its
+    /// generators opt out of the debug slope check (`without_slope_check`), which would catch
+    /// it: walls honest at 3:1 would need valleys about 3 times wider, a milder case than the
+    /// one this test is after.
     fn slope(&self) -> Slope {
         ShapeModifier::<()>::slope(&self.valleys)
     }
@@ -620,8 +623,9 @@ fn a_meandering_divide_takes_the_warps_slack() {
             warp: Warp::new(0x77, fbm(wavelength, 2), amplitude),
             slack,
         };
-        let with = carved_world(Arc::new(meander(true)));
-        let without = carved_world(Arc::new(meander(false)));
+        // Its bends run steeper than 3:1 on purpose: out of the debug slope check.
+        let with = carved_world(Arc::new(meander(true))).without_slope_check();
+        let without = carved_world(Arc::new(meander(false))).without_slope_check();
         for level in 1..=4u8 {
             for node in nodes {
                 assert_eq!(holes_in(&with, level, node), [], "level {level} {node:?}");

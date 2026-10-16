@@ -1,9 +1,10 @@
 //! The freeze checks of a realm's kinds (ADR 0039 sec. 6 and 12): their forms, their limits, the
 //! slope and border relief of every kind, pair and triple that can meet, and the shape modifiers'
-//! slopes on top of them.
+//! slopes on top of them (added, or as a cap of their own).
 
 use super::MAX_SLOPE;
 use super::kind::{HEIGHT_ONE, KindForm, KindLimits};
+use super::modifier::SlopeMode;
 use crate::field::Slope;
 use crate::registry::{Checks, GenId, Problem};
 
@@ -86,30 +87,70 @@ pub fn check_kinds(
 }
 
 /// The checks of the shape modifiers of `realm` (each id with its declared
-/// [`ShapeModifier::slope`](super::ShapeModifier::slope)) on top of its kinds (as
-/// [`check_kinds`] takes them), in `checks` ([`Problem::ShapeSlope`]): their slopes, summed (each
-/// over one block, its jitter included), pass [`slope_passes`] alone, and added to the steepest
-/// slope of every kind, pair and triple of kinds that passes [`check_kinds`] (a set is reported
-/// only when its smaller sets pass with the modifiers).
+/// [`ShapeModifier::slope`](super::ShapeModifier::slope) and [`SlopeMode`], in the order they
+/// run) on top of its kinds (as [`check_kinds`] takes them), in `checks`:
+/// - the additive ones' slopes, summed (each over one block, its jitter included), pass
+///   [`slope_passes`] alone, and added to the steepest slope of every kind, pair and triple of
+///   kinds that passes [`check_kinds`] ([`Problem::ShapeSlope`]; a set is reported only when its
+///   smaller sets pass with the modifiers);
+/// - each capped one's cap, plus the additive slopes of the modifiers that run after it (they add
+///   to its output), passes [`slope_passes`] alone ([`Problem::ShapeCap`]). A cap is the slope of
+///   its output wherever it changes a height, so it is never added to the kinds'.
 ///
 /// Every modifier may cut every kind, anywhere, and the modifiers stack (a river through a cliff
-/// coast): the conditions do not say where they act, so the check sums them all.
+/// coast): the conditions do not say where they act, so the check sums the additive ones all.
 pub fn check_modifiers(
     checks: &mut Checks,
     realm: &GenId,
     kinds: &[(GenId, KindForm, KindLimits)],
-    modifiers: &[(GenId, Slope)],
+    modifiers: &[(GenId, Slope, SlopeMode)],
     lattice: u32,
 ) {
-    if modifiers.is_empty() {
-        return;
+    let additive: Vec<(&GenId, u64)> = modifiers
+        .iter()
+        .filter(|m| m.2 == SlopeMode::Additive)
+        .map(|(id, s, _)| (id, step(*s)))
+        .collect();
+    if !additive.is_empty() {
+        check_additive(checks, realm, kinds, &additive, lattice);
     }
+    for (n, (id, cap, mode)) in modifiers.iter().enumerate() {
+        if *mode != SlopeMode::Capped {
+            continue;
+        }
+        let after: Vec<(&GenId, u64)> = modifiers[n + 1..]
+            .iter()
+            .filter(|m| m.2 == SlopeMode::Additive)
+            .map(|(id, s, _)| (id, step(*s)))
+            .collect();
+        let added = after.iter().fold(0u64, |sum, m| sum.saturating_add(m.1));
+        let cap = step(*cap);
+        if !slope_passes(cap.saturating_add(added), 0, lattice) {
+            checks.push(Problem::ShapeCap {
+                realm: realm.clone(),
+                modifier: id.clone(),
+                cap,
+                after: after.iter().map(|m| m.0.clone()).collect(),
+                added,
+            });
+        }
+    }
+}
+
+/// The additive modifiers' part of [`check_modifiers`]: each id with its slope over one block.
+fn check_additive(
+    checks: &mut Checks,
+    realm: &GenId,
+    kinds: &[(GenId, KindForm, KindLimits)],
+    modifiers: &[(&GenId, u64)],
+    lattice: u32,
+) {
     let added = modifiers
         .iter()
-        .fold(0u64, |sum, (_, s)| sum.saturating_add(step(*s)));
+        .fold(0u64, |sum, m| sum.saturating_add(m.1));
     let problem = |kinds: Vec<GenId>, slope, relief| Problem::ShapeSlope {
         realm: realm.clone(),
-        modifiers: modifiers.iter().map(|(id, _)| id.clone()).collect(),
+        modifiers: modifiers.iter().map(|m| m.0.clone()).collect(),
         kinds,
         slope,
         added,
