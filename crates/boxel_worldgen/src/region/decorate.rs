@@ -8,7 +8,7 @@
 //! registry of stages by `(phase, priority, id)`) comes with the steps that first need it; none of
 //! it has a slot here yet.
 
-use super::kind::Context;
+use super::kind::{Context, HeightQ};
 use super::modifier::ShapeModifier;
 use crate::block;
 use crate::registry::{GenEntry, GenId, HashParams, ParamsHasher};
@@ -111,6 +111,10 @@ pub struct LodColumns<'a, Cx: Context> {
     pub xs: &'a [i64],
     /// The corners' z: corner `i * zs.len() + j` is `(xs[i], zs[j])`.
     pub zs: &'a [i64],
+    /// The corners' heights (the kinds' blended, then the shape modifiers), in [`HeightQ`] over
+    /// the realm's datum: a cell column's relief is its 4 corners' (steep cells show rock), the
+    /// same from any node.
+    pub heights: &'a [HeightQ],
     /// Per cell column (`i * (zs.len() - 1) + j`, between corners `i..=i + 1` and `j..=j + 1`):
     /// the index of its highest corner.
     pub corner: &'a [u32],

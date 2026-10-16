@@ -25,9 +25,10 @@ use boxel_voxel::{
 use boxel_worldgen::lod::{LodColumn, LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSpan, RealmSpec, RealmStack};
 use boxel_worldgen::region::{
-    Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid,
-    LodReport, MIN_LATTICE_SHIFT, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
-    RuleEntry, Scope, SelectorRule, ShapeEffect, ShapeModifier, TerrainKind, TopLayers, check_lod,
+    CarveCorner, ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill,
+    HEIGHT_ONE, HeightQ, KindGrid, LodColumns, LodReport, LodTop, MIN_LATTICE_SHIFT, NoSurface,
+    RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeEffect,
+    ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, TopLayers, check_lod, divide_tops,
     lod_corners,
 };
 use boxel_worldgen::registry::{
@@ -251,6 +252,109 @@ fn a_top_run_that_is_not_solid_slides_up_with_the_ground() {
     report("glass on top", check_lod(&g, &registry, &columns, 1..=4));
 }
 
+/// The test surface, whose far LOD shows `test:solid` on the cells that rise more than a block
+/// per block between their corners: steep rock, from the corners' heights alone, so every node
+/// gives a cell the same top.
+struct SteepRock(TopLayers);
+
+impl HashParams for SteepRock {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.0);
+    }
+}
+
+impl GenEntry for SteepRock {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl SurfaceStage<TestContext> for SteepRock {
+    fn reach(&self) -> SurfaceReach {
+        SurfaceStage::<TestContext>::reach(&self.0)
+    }
+    fn apply(
+        &self,
+        columns: &ChunkColumns<'_, TestContext>,
+        registry: &BlockRegistry,
+        out: &mut [BlockState],
+    ) {
+        self.0.apply(columns, registry, out);
+    }
+    fn block_names(&self) -> Vec<&str> {
+        let mut names = SurfaceStage::<TestContext>::block_names(&self.0);
+        names.push("test:solid");
+        names
+    }
+    fn lod_top(
+        &self,
+        columns: &LodColumns<'_, TestContext>,
+        registry: &BlockRegistry,
+        out: &mut [LodTop],
+    ) {
+        self.0.lod_top(columns, registry, out);
+        let mut rock = LodTop::default();
+        rock.runs[0] = (registry.by_name("test:solid").unwrap(), 1);
+        let (nz, s) = (columns.zs.len(), 1i64 << columns.level);
+        for (n, top) in out.iter_mut().enumerate() {
+            let c = n / (nz - 1) * nz + n % (nz - 1);
+            let h = [c, c + 1, c + nz, c + nz + 1].map(|c| i64::from(columns.heights[c]));
+            let relief = (h.iter().max().unwrap() - h.iter().min().unwrap()) >> 8;
+            if relief > s {
+                *top = rock;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_surface_reads_the_corners_for_steep_rock() {
+    let registry = registry();
+    let surface = SteepRock(TopLayers::new(vec![
+        ("test:cutout".into(), 1),
+        ("test:glass".into(), 2),
+    ]));
+    let decoration = Decoration::new(
+        (id("test:fill"), Arc::new(FloorFill)),
+        (id("test:surface"), Arc::new(surface)),
+    );
+    let g = generator_with(
+        &one_kind_world(Arc::new(STEEP)),
+        SEED,
+        RegionSettings::default(),
+        decoration,
+    );
+    let (solid, cutout) = (
+        registry.by_name("test:solid").unwrap(),
+        registry.by_name("test:cutout").unwrap(),
+    );
+    for level in 1..=3u8 {
+        let node = [3, -2];
+        // Steep cells and gentle ones, and every border equal to its neighbors'.
+        let (mut rock, mut soil) = (0, 0);
+        g.column(
+            &request(level, node),
+            &registry,
+            &mut LodScratch::default(),
+            &mut |_, n| {
+                if let LodNode::Cells(cells) = n {
+                    rock += cells.0.iter().filter(|&&c| c == solid).count();
+                    soil += cells.0.iter().filter(|&&c| c == cutout).count();
+                }
+            },
+        );
+        assert!(
+            rock > 0 && soil > 0,
+            "level {level}: {rock} rock, {soil} soil"
+        );
+        let columns = columns_in(level, node, 4, u64::from(level));
+        report(
+            "steep rock",
+            check_lod(&g, &registry, &columns, level..=level),
+        );
+    }
+}
+
 // ---- The divide term --------------------------------------------------------------------------
 
 /// A flat kind at 40 blocks with the valleys of `valleys`, under `()`, dry.
@@ -353,6 +457,22 @@ fn a_divide_between_two_valleys_keeps_the_coarse_top_over_the_real_one() {
         "without, level 1",
         check_lod(&without, &registry, &columns, 1..=1),
     );
+}
+
+#[test]
+fn the_divide_term_hands_its_carve_the_cell_and_the_shared_segment() {
+    // 2 x 1 cells: the first's corners share segment 7, the second's do not.
+    let c = |segment, n| CarveCorner { segment, n };
+    let corners = [c(7, 4), c(7, 5), c(7, 6), c(7, 3), c(7, 1), c(8, 9)];
+    let mut tops = [100, 100];
+    let calls = std::cell::RefCell::new(Vec::new());
+    divide_tops((2, 1), &corners, 2, &mut tops, |cell, segment, top, n| {
+        calls.borrow_mut().push((cell, segment, top, n));
+        top / 2
+    });
+    // The cell, its segment, its top and its largest `n` plus the slack.
+    assert_eq!(calls.into_inner(), [(0, 7, 100, 8)]);
+    assert_eq!(tops, [50, 100]);
 }
 
 // ---- Sea and coasts ---------------------------------------------------------------------------

@@ -585,7 +585,7 @@ impl<Cx: Context> ShapeModifier<Cx> for Valleys {
             &at,
             0,
             tops,
-            |top, n| self.carve(top, n),
+            |_, _, top, n| self.carve(top, n),
         );
     }
 }

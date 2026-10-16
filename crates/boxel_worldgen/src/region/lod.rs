@@ -839,6 +839,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             fields: slots.fields.as_ref().expect("set by lod_prepare"),
             xs: &slots.xs,
             zs: &slots.zs,
+            heights: &slots.corners,
             corner,
             ground,
             fluid_top,

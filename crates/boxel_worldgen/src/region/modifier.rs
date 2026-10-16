@@ -125,7 +125,9 @@ pub struct CarveCorner {
     /// segment.
     pub segment: u64,
     /// The carve's distance input there, `n` (in the carve's fixed point): the distance from the
-    /// corner (warped, if the carve warps) to that segment.
+    /// corner (warped, if the carve warps) to that segment. Rounded down or up to an integer, as
+    /// the carve rounds it in its columns, the divide term holds as it is; rounded to the nearest,
+    /// it takes one more unit of slack.
     pub n: i64,
 }
 
@@ -139,11 +141,17 @@ pub struct CarveCorner {
 ///
 /// - where the 4 corners of a cell share their nearest segment `A`, the cell's `n` stays under
 ///   the corners' largest plus `slack` ([`warp_slack`]), and its top becomes `min(top,
-///   carve(top, n_max))`. The distance to a segment is convex and 1-Lipschitz, so for a point `p`
-///   of the cell with bilinear weights `l_c`, `n(p) <= d_A(p + w(p)) <= sum l_c n(c) + sum l_c
-///   |w(p) - w(c)|`, and the last sum is at most the warp's slope over half the cell's diagonal;
+///   carve(cell, A, top, n_max))`. The distance to a segment is convex and 1-Lipschitz, so for a
+///   point `p` of the cell with bilinear weights `l_c`, `n(p) <= d_A(p + w(p)) <= sum l_c n(c) +
+///   sum l_c |w(p) - w(c)|`, and the last sum is at most the warp's slope over half the cell's
+///   diagonal;
 /// - where they do not, a divide between two valleys may lie inside the cell, higher than any
 ///   carved corner: the top stays the uncarved bound.
+///
+/// `carve(cell, segment, height, n)` bounds the carve of any height up to `height` at any
+/// distance up to `n` from `segment` in cell `cell` (`i * nz + j`): what else the carve reads
+/// (the floor of a river that falls toward the sea, the width of its order) it takes at its
+/// highest over that segment and cell.
 ///
 /// Conservative, and exact-safe: it only lowers tops it can prove. Panics if the slices do not
 /// fit the grid.
@@ -152,7 +160,7 @@ pub fn divide_tops(
     corners: &[CarveCorner],
     slack: u64,
     tops: &mut [i64],
-    carve: impl Fn(i64, i64) -> i64,
+    carve: impl Fn(usize, u64, i64, i64) -> i64,
 ) {
     assert_eq!(corners.len(), (nx + 1) * (nz + 1), "divide_tops: corners");
     assert_eq!(tops.len(), nx * nz, "divide_tops: tops");
@@ -171,8 +179,9 @@ pub fn divide_tops(
                 continue;
             }
             let n_max = cell.iter().map(|c| c.n).max().expect("4 corners");
-            let top = &mut tops[i * nz + j];
-            *top = (*top).min(carve(*top, n_max.saturating_add(slack)));
+            let at = i * nz + j;
+            let top = tops[at];
+            tops[at] = top.min(carve(at, cell[0].segment, top, n_max.saturating_add(slack)));
         }
     }
 }
