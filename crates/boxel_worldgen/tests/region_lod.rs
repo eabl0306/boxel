@@ -716,6 +716,59 @@ fn the_memo_stays_within_its_budget() {
     assert!(bytes > 0);
 }
 
+#[test]
+fn the_memo_holds_the_kinds_of_a_node_not_of_the_realm() {
+    let registry = registry();
+    // 48 kinds in region cells of 1024 blocks: a node holds a few, a walk across the map most.
+    let names: Vec<String> = (0..48).map(|k| format!("test:kind{k}")).collect();
+    let kinds: Vec<(&str, Arc<dyn TerrainKind<TestContext>>)> = names
+        .iter()
+        .zip(0..)
+        .map(|(name, k)| {
+            let kind = Relief::blocks(6 + 2 * k, 4, 512, 2);
+            (
+                name.as_str(),
+                Arc::new(kind) as Arc<dyn TerrainKind<TestContext>>,
+            )
+        })
+        .collect();
+    let rule = SelectorRule {
+        realm: id("test:surface"),
+        priority: 0,
+        condition: Vec::new(),
+        scope: Scope::Cell(10),
+        entries: names.iter().map(|n| Entry::new(id(n), 1)).collect(),
+        version: 1,
+    };
+    let world = world_of(
+        vec![("test:surface", realm())],
+        vec![("test:land", rule)],
+        Vec::new(),
+        kinds,
+    );
+    let g = generator(&world, SEED, RegionSettings::default());
+    let mut scratch = LodScratch::default();
+    let mut seen = Vec::new();
+    for n in 0..64 {
+        let node = [n * 3 - 90, (n * 7) % 40 - 20];
+        for level in [3u8, 4] {
+            fingerprint(&g, &registry, &request(level, node), &mut scratch);
+        }
+        let e = 32i64 << 4;
+        seen.push(g.dominant_kind(node[0] * e, node[1] * e).clone());
+    }
+    seen.sort();
+    seen.dedup();
+    assert!(seen.len() >= 30, "the walk met {} kinds", seen.len());
+    let bytes = boxel_worldgen::region::lod_memo_bytes(&g, &mut scratch).expect("its memo");
+    eprintln!(
+        "the far LOD memo after {} of 48 kinds: {} KiB",
+        seen.len(),
+        bytes >> 10
+    );
+    assert!(bytes <= 512 << 10, "{bytes} bytes");
+}
+
 // ---- Realms ------------------------------------------------------------------------------------
 
 /// A flat kind at `height` blocks in a realm of `span`, dry.

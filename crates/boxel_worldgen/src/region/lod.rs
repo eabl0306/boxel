@@ -39,8 +39,9 @@
 //!
 //! The memo ([`LodScratch::memo`]) keeps, for one generator at a time (its build key): the
 //! blocks of the registry, a table of lattice points' kinds, the Context's fields at the last
-//! corner grid (one slot) and each kind's corner heights and margins there (a slot per kind), so
-//! a second job of the same column (tall columns) recomputes nothing. Off
+//! corner grid (one slot) and each kind's corner heights and margins there (a slot per kind,
+//! empty for a kind absent from that grid), so a second job of the same column (tall columns)
+//! recomputes nothing. Off
 //! ([`RegionSettings::memo`](super::RegionSettings::memo)), every call starts empty.
 
 use super::blend::{self, Counts, Window};
@@ -145,7 +146,8 @@ impl Col {
     }
 }
 
-/// A kind's slot: its mask, corner heights and margins at the slots' corner grid.
+/// A kind's slot: its mask, corner heights and margins at the slots' corner grid. Only a kind
+/// present there holds them, so the memo grows with the kinds of a node, not of the realm.
 #[derive(Clone, Debug, Default)]
 struct KindSlot {
     /// Whether the kind is present at the corner grid (its heights and margins are set).
@@ -153,6 +155,26 @@ struct KindSlot {
     mask: Vec<bool>,
     heights: Vec<HeightQ>,
     margins: Vec<HeightQ>,
+}
+
+impl KindSlot {
+    /// Marks the kind present at the corner grid: its mask, all unset the first time.
+    fn mark(&mut self) -> &mut [bool] {
+        if !self.present {
+            self.present = true;
+            self.mask.clear();
+            self.mask.resize(CORNERS * CORNERS, false);
+        }
+        &mut self.mask
+    }
+
+    /// Gives back what an absent kind holds.
+    fn release(&mut self) {
+        debug_assert!(!self.present);
+        self.mask = Vec::new();
+        self.heights = Vec::new();
+        self.margins = Vec::new();
+    }
 }
 
 /// A lattice cell the corners fall in: its window's kinds with their counts.
@@ -411,8 +433,6 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
         for k in &mut slots.kinds {
             k.present = false;
-            k.mask.clear();
-            k.mask.resize(CORNERS * CORNERS, false);
         }
         slots.corners.clear();
         slots.corners.resize(CORNERS * CORNERS, 0);
@@ -452,6 +472,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let fields = slots.fields.as_ref().expect("set by lod_prepare");
         for (k, slot) in self.kinds.iter().zip(&mut slots.kinds) {
             if !slot.present {
+                slot.release();
                 continue;
             }
             slot.heights.resize(CORNERS * CORNERS, 0);
@@ -521,10 +542,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
         for cell in &cells {
             let ((a0, a1, _), (b0, b1, _)) = (range(cell.i, px), range(cell.j, pz));
             for &(k, _) in &cell.present {
-                let slot = &mut slots.kinds[k as usize];
-                slot.present = true;
+                let mask = slots.kinds[k as usize].mark();
                 for a in a0..=a1 {
-                    slot.mask[a * CORNERS + b0..=a * CORNERS + b1].fill(true);
+                    mask[a * CORNERS + b0..=a * CORNERS + b1].fill(true);
                 }
             }
         }
@@ -631,10 +651,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
             for b in 0..EDGE {
                 let corners = [(a, b), (a + 1, b), (a, b + 1), (a + 1, b + 1)];
                 for (ka, kb) in corners {
-                    let slot = &mut slots.kinds[at[ka * CORNERS + kb] as usize];
-                    slot.present = true;
+                    let mask = slots.kinds[at[ka * CORNERS + kb] as usize].mark();
                     for (ca, cb) in corners {
-                        slot.mask[ca * CORNERS + cb] = true;
+                        mask[ca * CORNERS + cb] = true;
                     }
                 }
             }
