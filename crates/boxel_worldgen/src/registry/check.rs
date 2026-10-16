@@ -4,6 +4,7 @@
 
 use super::{GenEntry, GenId, GenIx, GenRegistry, GenRegistryBuilder};
 use crate::realm::{MAX_REALM_PLANES, REALM_PLANE, RealmForm, RealmSpan};
+use boxel_voxel::MAX_BLOCK_COORD;
 use std::fmt;
 
 /// One problem a freeze check found, with the ids it involves. Its message names them, so a
@@ -51,6 +52,16 @@ pub enum Problem {
         /// The plane's `y`.
         y: i64,
     },
+    /// A realm plane outside the world, `-MAX_BLOCK_COORD..=MAX_BLOCK_COORD` (an open end is
+    /// `None`, not a far plane).
+    PlaneOutsideWorld {
+        /// The dimension.
+        dimension: GenId,
+        /// The realm.
+        realm: GenId,
+        /// The plane's `y`.
+        y: i64,
+    },
     /// Two realms of one dimension whose spans overlap.
     Overlap {
         /// The dimension.
@@ -59,6 +70,18 @@ pub enum Problem {
         a: GenId,
         /// The other (the same as `a` when a dimension lists a realm twice).
         b: GenId,
+    },
+    /// A stretch of `y` that no realm of a dimension covers: the realms must cover every `y`
+    /// exactly once.
+    Gap {
+        /// The dimension.
+        dimension: GenId,
+        /// The uncovered stretch.
+        span: RealmSpan,
+        /// The realm under it, `None` if the stretch goes down forever.
+        below: Option<GenId>,
+        /// The realm over it, `None` if the stretch goes up forever.
+        above: Option<GenId>,
     },
     /// A dimension whose realms have more than [`MAX_REALM_PLANES`] planes.
     TooManyPlanes {
@@ -104,10 +127,22 @@ impl Problem {
             | Self::OffPlane {
                 dimension, realm, ..
             }
+            | Self::PlaneOutsideWorld {
+                dimension, realm, ..
+            }
             | Self::FormNotBuilt {
                 dimension, realm, ..
             } => vec![dimension, realm],
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
+            Self::Gap {
+                dimension,
+                below,
+                above,
+                ..
+            } => std::iter::once(dimension)
+                .chain(below)
+                .chain(above)
+                .collect(),
             Self::TooManyPlanes { dimension, .. } => vec![dimension],
             Self::DrawRealms { dimension, draw } => {
                 std::iter::once(dimension).chain(draw).collect()
@@ -145,6 +180,29 @@ impl fmt::Display for Problem {
                 "realm {realm} of dimension {dimension} has a plane at y {y}, which is not a \
                  multiple of {REALM_PLANE}"
             ),
+            Self::PlaneOutsideWorld {
+                dimension,
+                realm,
+                y,
+            } => write!(
+                f,
+                "realm {realm} of dimension {dimension} has a plane at y {y}, outside the world \
+                 (-{MAX_BLOCK_COORD} to {MAX_BLOCK_COORD})"
+            ),
+            Self::Gap {
+                dimension,
+                span,
+                below,
+                above,
+            } => {
+                write!(f, "dimension {dimension} has no realm for y in {span}")?;
+                match (below, above) {
+                    (Some(b), Some(a)) => write!(f, ", between realms {b} and {a}"),
+                    (Some(b), None) => write!(f, ", over realm {b}"),
+                    (None, Some(a)) => write!(f, ", under realm {a}"),
+                    (None, None) => Ok(()),
+                }
+            }
             Self::Overlap { dimension, a, b } if a == b => {
                 write!(f, "dimension {dimension} lists realm {a} twice")
             }

@@ -1,8 +1,9 @@
 //! Realm spans, and every layout check failing with its ids in the message (ADR 0039 "Cómo se
-//! prueba" 4 and 11). Then a whole world open over test registries (a preset, its dimensions,
-//! their realms and kinds): every problem of a bad mix reported at once, and the digest of a
-//! good one per dimension and realm, with a realm added as one more line. The real presets and
-//! dimension tables come with WG-SAVE; these are `test:` stand-ins.
+//! prueba" 4 and 11), the realms covering every y exactly once. Then a whole world open over
+//! test registries (a preset, its dimensions, their realms and kinds): every problem of a bad mix
+//! reported at once, and the digest of a good one per dimension and realm, with a realm added as
+//! one more line. The real presets and dimension tables come with WG-SAVE; these are `test:`
+//! stand-ins.
 use super::*;
 use crate::registry::{
     DigestBuilder, DigestScope, FreezeError, GenEntry, GenRegistry, GenRegistryBuilder,
@@ -277,14 +278,149 @@ fn a_dimension_needs_exactly_one_drawn_realm() {
         &["dimension test:dim has 2 realms the far LOD draws (test:low, test:high)"],
     );
 
+    // No realm at all: nothing covers any y, and nothing is drawn.
     let (problems, _) = check(&[]);
     assert_eq!(
         problems,
-        [Problem::DrawRealms {
-            dimension: id("test:dim"),
-            draw: Vec::new(),
-        }]
+        [
+            Problem::Gap {
+                dimension: id("test:dim"),
+                span: RealmSpan::ALL,
+                below: None,
+                above: None,
+            },
+            Problem::DrawRealms {
+                dimension: id("test:dim"),
+                draw: Vec::new(),
+            },
+        ]
     );
+}
+
+#[test]
+fn a_y_outside_every_realm_is_refused() {
+    let gap = |span, below: Option<&str>, above: Option<&str>| Problem::Gap {
+        dimension: id("test:dim"),
+        span,
+        below: below.map(id),
+        above: above.map(id),
+    };
+    // A stretch between two realms, in any listing order.
+    let low = ("test:low", ground(RealmSpan::below(0), RealmLod::Off));
+    let high = ("test:high", ground(RealmSpan::above(4096), RealmLod::Draw));
+    for realms in [[low, high], [high, low]] {
+        let (problems, message) = check(&realms);
+        assert_eq!(
+            problems,
+            [gap(
+                RealmSpan::between(0, 4096),
+                Some("test:low"),
+                Some("test:high")
+            )]
+        );
+        assert_eq!(
+            message,
+            "world generation check failed: dimension test:dim has no realm for y in [0, 4096), \
+             between realms test:low and test:high"
+        );
+    }
+    // Open ends left uncovered, under and over a bounded realm.
+    let (problems, message) = check(&[(
+        "test:mid",
+        ground(RealmSpan::between(0, 4096), RealmLod::Draw),
+    )]);
+    assert_eq!(
+        problems,
+        [
+            gap(RealmSpan::below(0), None, Some("test:mid")),
+            gap(RealmSpan::above(4096), Some("test:mid"), None),
+        ]
+    );
+    names_all(
+        &message,
+        &[
+            "no realm for y in (-inf, 0), under realm test:mid",
+            "no realm for y in [4096, +inf), over realm test:mid",
+        ],
+    );
+    // Overlaps do not hide a gap further up, and an empty span covers nothing.
+    let (problems, _) = check(&[
+        ("test:a", ground(RealmSpan::below(8192), RealmLod::Draw)),
+        ("test:b", ground(RealmSpan::below(4096), RealmLod::Off)),
+        (
+            "test:flat",
+            ground(RealmSpan::between(12288, 12288), RealmLod::Off),
+        ),
+        ("test:c", ground(RealmSpan::above(16384), RealmLod::Off)),
+    ]);
+    assert!(
+        problems.contains(&gap(
+            RealmSpan::between(8192, 16384),
+            Some("test:a"),
+            Some("test:c")
+        )),
+        "{problems:?}"
+    );
+    assert_eq!(
+        problems
+            .iter()
+            .filter(|p| matches!(p, Problem::Gap { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_plane_outside_the_world_is_refused() {
+    let far = MAX_BLOCK_COORD + REALM_PLANE;
+    let (problems, message) = check(&[
+        ("test:low", ground(RealmSpan::below(-far), RealmLod::Off)),
+        (
+            "test:surface",
+            ground(RealmSpan::between(-far, far), RealmLod::Draw),
+        ),
+        ("test:high", ground(RealmSpan::above(far), RealmLod::Off)),
+    ]);
+    let outside = |realm: &str, y| Problem::PlaneOutsideWorld {
+        dimension: id("test:dim"),
+        realm: id(realm),
+        y,
+    };
+    assert_eq!(
+        problems,
+        [
+            outside("test:low", -far),
+            outside("test:surface", -far),
+            outside("test:surface", far),
+            outside("test:high", far),
+        ]
+    );
+    names_all(
+        &message,
+        &[&format!(
+            "realm test:low of dimension test:dim has a plane at y {}, outside the world",
+            -far
+        )],
+    );
+    // The world limit itself is a plane like any other; open ends never count.
+    let (problems, _) = check(&[
+        (
+            "test:low",
+            ground(RealmSpan::below(-MAX_BLOCK_COORD), RealmLod::Off),
+        ),
+        (
+            "test:surface",
+            ground(
+                RealmSpan::between(-MAX_BLOCK_COORD, MAX_BLOCK_COORD),
+                RealmLod::Draw,
+            ),
+        ),
+        (
+            "test:high",
+            ground(RealmSpan::above(MAX_BLOCK_COORD), RealmLod::Off),
+        ),
+    ]);
+    assert_eq!(problems, []);
 }
 
 #[test]

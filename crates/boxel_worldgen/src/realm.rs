@@ -7,6 +7,7 @@
 //! WG-REGION, which builds on these types.
 
 use crate::registry::{Checks, GenId, HashParams, ParamsHasher, Problem};
+use boxel_voxel::MAX_BLOCK_COORD;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -194,15 +195,16 @@ impl HashParams for RealmLayout {
 /// The freeze checks of the realms of `dimension`, in the dimension's order (ADR 0039 sec. 12),
 /// recorded in `checks`:
 ///
-/// - every span holds some `y` ([`Problem::EmptySpan`]) and its planes are multiples of
-///   [`REALM_PLANE`] ([`Problem::OffPlane`]);
-/// - no two spans overlap ([`Problem::Overlap`], once per pair);
+/// - every span holds some `y` ([`Problem::EmptySpan`]), and its planes are multiples of
+///   [`REALM_PLANE`] ([`Problem::OffPlane`]) inside the world, `-MAX_BLOCK_COORD..=
+///   MAX_BLOCK_COORD` ([`Problem::PlaneOutsideWorld`]; an open end is `None`, never a far
+///   plane);
+/// - every form is built ([`Problem::FormNotBuilt`]);
+/// - no two spans overlap ([`Problem::Overlap`], once per pair) and no `y` is outside every span
+///   ([`Problem::Gap`], once per uncovered stretch), so the realms cover every `y` exactly once
+///   and finding the realm of a `y` never fails;
 /// - at most [`MAX_REALM_PLANES`] distinct planes ([`Problem::TooManyPlanes`]);
-/// - exactly one realm with [`RealmLod::Draw`] ([`Problem::DrawRealms`]);
-/// - every form is built ([`Problem::FormNotBuilt`]).
-///
-/// Gaps between spans are not checked here: what a `y` outside every realm generates is the
-/// realm stack's business (WG-REGION).
+/// - exactly one realm with [`RealmLod::Draw`] ([`Problem::DrawRealms`]).
 pub fn check_realms<'a>(
     checks: &mut Checks,
     dimension: &GenId,
@@ -221,6 +223,13 @@ pub fn check_realms<'a>(
         for y in layout.span.planes() {
             if y.rem_euclid(REALM_PLANE) != 0 {
                 checks.push(Problem::OffPlane {
+                    dimension: dimension.clone(),
+                    realm: realm.clone(),
+                    y,
+                });
+            }
+            if !(-MAX_BLOCK_COORD..=MAX_BLOCK_COORD).contains(&y) {
+                checks.push(Problem::PlaneOutsideWorld {
                     dimension: dimension.clone(),
                     realm: realm.clone(),
                     y,
@@ -247,6 +256,7 @@ pub fn check_realms<'a>(
             }
         }
     }
+    check_cover(checks, dimension, &realms);
     if planes.len() > MAX_REALM_PLANES {
         checks.push(Problem::TooManyPlanes {
             dimension: dimension.clone(),
@@ -263,6 +273,44 @@ pub fn check_realms<'a>(
             dimension: dimension.clone(),
             draw,
         });
+    }
+}
+
+/// Records a [`Problem::Gap`] for every stretch of `y` that no span of `realms` covers, bottom
+/// first: a sweep over the spans sorted by their bottom plane.
+fn check_cover(checks: &mut Checks, dimension: &GenId, realms: &[(&GenId, &RealmLayout)]) {
+    let mut spans: Vec<(i128, i128, &GenId)> = realms
+        .iter()
+        .filter(|(_, layout)| !layout.span.is_empty())
+        .map(|&(realm, layout)| {
+            let (lo, hi) = layout.span.wide();
+            (lo, hi, realm)
+        })
+        .collect();
+    spans.sort_by_key(|&(lo, hi, _)| (lo, hi));
+    // Everything under `covered` is covered; `top` is the realm that reaches it.
+    let (mut covered, mut top) = (i128::MIN, None);
+    let mut gap = |lo: i128, hi: i128, below: Option<&GenId>, above: Option<&GenId>| {
+        // Inside the sweep `lo` is a finite plane or -infinity and `hi` a finite plane or
+        // +infinity: both convert back to an `i64` plane or an open end.
+        let plane = |y: i128, open: i128| (y != open).then_some(y as i64);
+        checks.push(Problem::Gap {
+            dimension: dimension.clone(),
+            span: RealmSpan::new(plane(lo, i128::MIN), plane(hi, i128::MAX)),
+            below: below.cloned(),
+            above: above.cloned(),
+        });
+    };
+    for &(lo, hi, realm) in &spans {
+        if lo > covered {
+            gap(covered, lo, top, Some(realm));
+        }
+        if hi > covered {
+            (covered, top) = (hi, Some(realm));
+        }
+    }
+    if covered < i128::MAX {
+        gap(covered, i128::MAX, top, None);
     }
 }
 
