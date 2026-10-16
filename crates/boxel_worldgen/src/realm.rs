@@ -509,7 +509,7 @@ pub struct RealmStack {
 }
 
 /// The id of the realm (and its environment) of a generator that declares none.
-const DEFAULT_REALM: &str = "boxel:default";
+pub(crate) const DEFAULT_REALM: &str = "boxel:default";
 
 static SINGLE: LazyLock<RealmStack> = LazyLock::new(|| {
     let id = GenId::new(DEFAULT_REALM).expect("a valid id");

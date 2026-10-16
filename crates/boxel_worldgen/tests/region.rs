@@ -1014,6 +1014,62 @@ fn a_dimension_dispatches_each_chunk_to_its_realm() {
 }
 
 #[test]
+fn a_dimension_refuses_a_realm_generator_in_another_realms_place() {
+    // The stack sorts its realms bottom first, whatever order they came in: a caller that builds
+    // the realm generators in id order can put them in the wrong places, and the dimension came
+    // out silently wrong (a realm generator gives air outside its own span).
+    let world = world_of(
+        vec![
+            ("test:deep", spec(RealmSpan::below(-4096), RealmLod::Off)),
+            (
+                "test:surface",
+                spec(RealmSpan::above(-4096), RealmLod::Draw),
+            ),
+        ],
+        rules(CELLS),
+        Vec::new(),
+        kind_entries(),
+    );
+    let stack = || {
+        let realms = world
+            .realms
+            .iter()
+            .map(|(_, id, s)| (id.clone(), s.clone()))
+            .collect();
+        RealmStack::build(&mut Checks::new(), &id("test:overworld"), realms).unwrap()
+    };
+    let surface = || -> Box<dyn WorldGenerator> {
+        Box::new(generator(&world, SEED, RegionSettings::default()))
+    };
+    let deep = || -> Box<dyn WorldGenerator> { Box::new(Fill(BlockState(2), i64::MIN..=-129)) };
+    let digest = DigestBuilder::new().finish();
+    let message = panic_of(|| {
+        drop(DimensionGenerator::new(
+            id("test:overworld"),
+            stack(),
+            vec![surface(), deep()],
+            &digest,
+        ));
+    })
+    .expect("refused");
+    assert!(
+        message.contains("realm 0 of the stack is test:deep, its generator's is test:surface"),
+        "{message}"
+    );
+    // In place, and a generator without realms anywhere.
+    let dim = DimensionGenerator::new(
+        id("test:overworld"),
+        stack(),
+        vec![deep(), surface()],
+        &digest,
+    );
+    assert_eq!(
+        dim.realm_generator(1).realms().id(0).as_str(),
+        "test:surface"
+    );
+}
+
+#[test]
 fn the_version_follows_every_entry_of_its_dimension() {
     let version = |world: &TestWorld, settings: RegionSettings| {
         WorldGenerator::version(&generator(world, SEED, settings))

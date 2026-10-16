@@ -3,7 +3,7 @@
 use crate::WorldGenerator;
 use crate::lod::{LodColumn, LodNode, LodRequest, LodScratch, LodSource};
 use crate::query::{ColumnInfo, WorldQuery};
-use crate::realm::RealmStack;
+use crate::realm::{DEFAULT_REALM, RealmStack};
 use crate::registry::{GenId, RegistryDigest};
 use boxel_voxel::{BlockRegistry, ChunkData, ChunkKey};
 use std::ops::RangeInclusive;
@@ -32,7 +32,8 @@ impl DimensionGenerator {
     ///
     /// # Panics
     ///
-    /// If `realms` and `stack` differ in length.
+    /// If `realms` and `stack` differ in length, or if a generator that reports one realm of its
+    /// own (a [`RegionGenerator`](super::RegionGenerator)) sits in another realm's place.
     pub fn new(
         dimension: GenId,
         stack: RealmStack,
@@ -44,6 +45,17 @@ impl DimensionGenerator {
             stack.len(),
             "DimensionGenerator: one generator per realm"
         );
+        for (ix, generator) in realms.iter().enumerate() {
+            // A generator without realms reports the default one: it fits any place.
+            let own = generator.realms();
+            let id = own.id(0);
+            assert!(
+                own.len() != 1 || id == stack.id(ix) || id.as_str() == DEFAULT_REALM,
+                "DimensionGenerator: realm {ix} of the stack is {}, its generator's is {id} (the \
+                 generators go bottom first, in the stack's order)",
+                stack.id(ix),
+            );
+        }
         let vertical = realms
             .iter()
             .zip(stack.iter())
