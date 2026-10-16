@@ -147,7 +147,7 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// A chunk of the column stage at or under its deep bound (one [`RegionGenerator::generate_full`]
 /// builds) also checks that every ground its carvers may read lies their surface reach over it,
 /// and every chunk of the column stage that its heights keep the 3:1 cap between axis neighbours
-/// ([`RegionGenerator::check_slope`]). A kind or a mod with a bound, a range or a slope under its
+/// (the slope check, ADR 0039 sec. 6). A kind or a mod with a bound, a range or a slope under its
 /// heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
     pub(super) key: BuildKey,
@@ -382,10 +382,10 @@ impl<Cx: Context> RegionGenerator<Cx> {
         })
     }
 
-    /// The generator without its debug slope check ([`RegionGenerator::check_slope`]), for a
-    /// test whose fixture is steeper than 3:1 on purpose and declares a smaller slope so it opens
-    /// (a worst case of the far LOD's divide term). Never for a world: the far LOD's skirts cover
-    /// 3:1 (ADR 0031).
+    /// The generator without its debug slope check (every chunk of the column stage holds its
+    /// heights to 3:1 between axis neighbours, ADR 0039 sec. 6), for a test whose fixture is
+    /// steeper than 3:1 on purpose and declares a smaller slope so it opens (a worst case of the
+    /// far LOD's divide term). Never for a world: the far LOD's skirts cover 3:1 (ADR 0031).
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn without_slope_check(mut self) -> Self {
