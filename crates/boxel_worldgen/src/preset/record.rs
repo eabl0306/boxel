@@ -4,6 +4,10 @@ use crate::realm::RealmSpan;
 use crate::registry::{DigestBuilder, DigestEntry, GenId, RegistryDigest, WorldgenDiff};
 use boxel_voxel::DimensionId;
 
+/// The most names a world's dimension table ([`WorldgenRecord::names`]) holds: one per
+/// [`DimensionId`]. A saved table with more is damaged.
+pub const MAX_DIMENSIONS: usize = 1 << 16;
+
 /// What a world saves of how it is generated (ADR 0039 sec. 17), under the engine's meta key
 /// `boxel:worldgen`, written once, when the world is created ([`Worldgen::open`](super::Worldgen::open)
 /// gives it; the bytes are the store's): the preset, the dimension name table, and per

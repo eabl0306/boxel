@@ -291,6 +291,33 @@ fn dimensions_keep_their_saved_numbers() {
 }
 
 #[test]
+fn a_full_dimension_table_is_an_error_not_a_panic() {
+    let w = worldgen(1, 3);
+    let mut saved = w
+        .open(&id("test:flat"), 1, &blocks(), None)
+        .expect("opens")
+        .record;
+    // Every number taken by other names: the overworld has none left.
+    saved.names = (0..MAX_DIMENSIONS)
+        .map(|n| id(&format!("test:d{n}")))
+        .collect();
+    let error = w
+        .open(&id("test:flat"), 1, &blocks(), Some(&saved))
+        .expect_err("no number left");
+    assert_eq!(
+        error.to_string(),
+        "world generation check failed: dimension test:overworld gets no number: the world's \
+         dimension table already holds 65536 names"
+    );
+    // The last number is still a number.
+    saved.names.pop();
+    let opened = w
+        .open(&id("test:flat"), 1, &blocks(), Some(&saved))
+        .expect("the last number");
+    assert_eq!(opened.first().number, DimensionId(u16::MAX));
+}
+
+#[test]
 fn a_bad_preset_fails_at_world_open_with_every_id() {
     let w = worldgen(1, 3);
     let error = w

@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 mod record;
 
-pub use record::{DimensionRecord, SpecLine, WorldgenRecord};
+pub use record::{DimensionRecord, MAX_DIMENSIONS, SpecLine, WorldgenRecord};
 
 /// The name of the presets' registry, in digest lines and messages.
 pub const PRESET_REGISTRY: &str = "preset";
@@ -568,8 +568,9 @@ impl<R> Worldgen<R> {
             };
             made.extend(self.dimension(&mut checks, (dimension, d), (spec, k), seed, blocks));
         }
+        let (names, numbers) = number(&mut checks, &made, saved);
         checks.finish()?;
-        Ok(opened(preset_line, made, saved))
+        Ok(opened(preset_line, made, names, numbers, saved))
     }
 
     /// The generator of `dimension` (`d` in the dimensions' registry) by `spec` (its kind `k`),
@@ -677,27 +678,63 @@ impl<R> Worldgen<R> {
     }
 }
 
-/// The world of the dimensions `made` with the preset's line `preset`: numbered by `saved`'s
-/// name table (a dimension it lacks takes the next number), with its record and the diff
-/// against `saved`.
-fn opened(preset: DigestEntry, made: Vec<Made>, saved: Option<&WorldgenRecord>) -> OpenedWorld {
+/// The name table of the world of the dimensions `made` and their numbers in it: `saved`'s
+/// table (none: an empty one), where a dimension it lacks takes the next number. A dimension
+/// past the last number ([`MAX_DIMENSIONS`]) is a problem in `checks`, not a panic: a saved table
+/// comes from the world's file.
+fn number(
+    checks: &mut Checks,
+    made: &[Made],
+    saved: Option<&WorldgenRecord>,
+) -> (Vec<GenId>, Vec<DimensionId>) {
     let mut names: Vec<GenId> = saved.map_or_else(Vec::new, |s| s.names.clone());
+    let mut numbers = Vec::with_capacity(made.len());
+    for Made { id, .. } in made {
+        let n = match names.iter().position(|n| n == id) {
+            Some(n) => n,
+            None if names.len() < MAX_DIMENSIONS => {
+                names.push(id.clone());
+                names.len() - 1
+            }
+            None => {
+                checks.push(Problem::Other {
+                    ids: vec![id.clone()],
+                    message: format!(
+                        "dimension {id} gets no number: the world's dimension table already \
+                         holds {MAX_DIMENSIONS} names"
+                    ),
+                });
+                continue;
+            }
+        };
+        numbers.push(DimensionId(
+            u16::try_from(n).expect("the table holds at most MAX_DIMENSIONS names"),
+        ));
+    }
+    (names, numbers)
+}
+
+/// The world of the dimensions `made` with the preset's line `preset`, numbered `numbers` in the
+/// name table `names` ([`number`]), with its record and the diff against `saved`.
+fn opened(
+    preset: DigestEntry,
+    made: Vec<Made>,
+    names: Vec<GenId>,
+    numbers: Vec<DimensionId>,
+    saved: Option<&WorldgenRecord>,
+) -> OpenedWorld {
     let mut dimensions = Vec::with_capacity(made.len());
     let mut records = Vec::with_capacity(made.len());
-    for Made {
-        id,
-        built,
-        lines,
-        spec,
-    } in made
+    for (
+        Made {
+            id,
+            built,
+            lines,
+            spec,
+        },
+        number,
+    ) in made.into_iter().zip(numbers)
     {
-        let number = names.iter().position(|n| *n == id).unwrap_or_else(|| {
-            names.push(id.clone());
-            names.len() - 1
-        });
-        let number = DimensionId(
-            u16::try_from(number).expect("a world has at most 2^16 dimensions in its table"),
-        );
         let mut digest = DigestBuilder::new();
         for line in lines {
             digest.push(line);
