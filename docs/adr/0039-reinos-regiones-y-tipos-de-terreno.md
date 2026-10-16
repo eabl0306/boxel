@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #117). El dueño aprobó el plan de generación v2 el 2026-10-15, con el
   diseño B como base y todas las recomendaciones del plan. Es un contrato. Lo construyen los
   pasos de la sección 20, cada uno en su rama, y cada parte protegida pide su propio OK cuando le
-  toca. Hechos: WG1, WG-REG, WG-REGION (#119), WG-SAVE (#121) y WG-REGIONLOD (#120); donde el
-  código precisó el contrato, este texto ya lo dice.
+  toca. Hechos: WG1, WG-REG, WG-REGION (#119), WG-SAVE (#121), WG-REGIONLOD (#120) y WG-DECOR
+  (#133); donde el código precisó el contrato, este texto ya lo dice.
 - Fecha: 2026-10-15
 - Revisa: ADR 0024 sección 4 y ADR 0029 sección 7 (una clave de metadatos reservada más,
   `boxel:worldgen`).
@@ -295,6 +295,13 @@ grad H = suma_k w_k grad H_k + suma_k (H_k - m) grad w_k      (para cualquier co
   3,08.
 - El tope de 3:1 vale en cualquier línea, no solo en los ejes. Es lo que piden los faldones de la
   lejanía (ADR 0031) y el test de pendiente.
+- Los modificadores de forma también declaran su pendiente (`ShapeModifier::slope`): lo que suman a
+  la pendiente de las alturas que reciben. Un corte de río `min(H, piso + (H - piso) g(n))` suma la
+  de sus paredes; una subida igual en toda columna no suma nada. El chequeo suma las de todos los
+  modificadores del reino, porque se apilan (un río que cruza una costa de acantilados), y pide que
+  la suma pase el tope sola y sumada a la pendiente más alta de cada tipo, par y trío de tipos, con
+  la misma regla de arriba. Un conjunto que ya falla sin modificadores lo informa el chequeo de los
+  tipos.
 
 ### 7. Términos de núcleo y volúmenes
 
@@ -378,7 +385,8 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   `Raise(max)` (escalones de acantilado, dunas; suma a la cota de la columna y al margen de la
   lejanía). `LowerOnly` no queda libre de margen: ver el término de divisoria (sección 10). Los
   ríos, los lagos y la forma de la costa son del reino entero, así cortan a todos los tipos igual.
-  Corren en orden `(priority, id)`, cada uno con la sal de su id y su línea en el digest. En debug,
+  Corren en orden `(priority, id)`, cada uno con la sal de su id y su línea en el digest. Declaran
+  también su pendiente (sección 6) y su efecto en cada columna de chunk (sección 14). En debug,
   cada chunk y cada nodo comprueba que un modificador respeta su efecto. No nombran bloques.
 - **Bioma.** Una tabla `BiomeRule`: el mecanismo es del motor y los datos del juego. Cada entrada
   es `{ bioma, tipos o etiquetas de tipo, intervalos sobre parámetros del Context, peso }`.
@@ -391,8 +399,27 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   - Los ids de bioma son etiquetas: nada se guarda por chunk.
 - **Relleno** (la roca: estratos, provincias, basamento) y **reglas de superficie** por bioma, una
   llamada por (chunk, etapa, bioma presente), cada una con `lod_top` para la lejanía.
-- **Carvers**: campos 3D puros, o carvers por celda de origen con alcance declarado. Quedan fuera
-  de la lejanía.
+- **Carvers** (`CarverStage`): campos 3D puros, o carvers por celda de origen con alcance
+  declarado. Corren después de la superficie, en orden `(priority, id)`, cada uno con la sal de su
+  id y su línea `carver_stage` en el digest. Quedan fuera de la lejanía.
+  - Dan una máscara (`CarveMask`: `Solid`, `Air` o `Mixed`, un bit por vóxel, 1 donde el vóxel
+    queda), la forma del demo. El motor vacía solo vóxeles sólidos: nunca el aire ni el fluido del
+    reino. Así ninguna máscara agrega un bloque ni seca el mar, y el plan pedía un chequeo en debug
+    de "solo vuelve aire lo sólido" que con una máscara no tiene caso: se cumple por construcción.
+  - Declaran su alcance (`CarveReach`): `surface`, hasta cuántos bloques bajo el suelo más bajo que
+    leen sus reglas miran la superficie (desvanecidos por profundidad, entradas, un techo), y
+    `apron`, cuántos bloques alrededor del chunk leen columnas, a lo sumo 32.
+  - Corren también en el camino hondo, sin columnas (sección 14). Roca uniforme y una máscara dan
+    un chunk de 1 bit, sin array denso.
+  - En debug, un chunk que queda `surface` o más bajo todo suelo que el carver puede leer comprueba
+    que su máscara con columnas es la de sin columnas. Un carver que mira la superficie más hondo
+    que lo que declara falla ahí, en vez de dar otro chunk en el camino hondo.
+- **Columnas de alrededor**: una etapa lee el suelo y el tope del fluido de columnas fuera de su
+  chunk con `ChunkColumns::tops`, calculadas a pedido con el mismo Context, tipos (cada columna con
+  la ventana de su celda de retícula), mezcla, modificadores y regla de fluido que su propio chunk,
+  bit a bit. Solo hasta su apron: la superficie no tiene (cada columna la decide su chunk) y un
+  carver declara el suyo. En debug, leer más allá falla, porque el camino hondo no cuenta ese
+  suelo.
 - **Features**: anclas en celdas alineadas a chunks, con alcance y altura declarados. Decide el
   bioma de la columna del ancla. Forma gruesa opcional (una copa como tramos sólidos).
 - **Pasos post**: reescrituras locales al chunk con consultas de solo lectura. Declaran que no
@@ -601,8 +628,8 @@ mundo para el conjunto que resuelve su preset. Rechazan:
   agregada a una regla que no existe). El preset es la raíz: nadie lo nombra, así su id
   desconocido dice solo "preset X is not registered" (`Checks::resolve` toma `by: Option<&GenId>`);
 - un nombre de bloque que el registro de bloques no tiene: el `floor` y el fluido de cada reino,
-  los nombres que declaran sus etapas (`block_names`) y los que chequea una fábrica
-  (`Build::check_blocks`). Así un error de tipeo falla al abrir y no en un worker;
+  los nombres que declaran sus etapas (`block_names`, carvers incluidos) y los que chequea una
+  fábrica (`Build::check_blocks`). Así un error de tipeo falla al abrir y no en un worker;
 - un preset sin dimensiones o con una dimensión dos veces, parámetros de un spec que no son del
   tipo que lee su fábrica, y una fábrica que arma otros reinos que los que le da el preset;
 - una regla `Point` con más de una entrada, o una regla `Cell` sin ninguna;
@@ -613,6 +640,10 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - un tipo con una pendiente de más de 3, o un par o un trío de tipos que pueden juntarse y no
   pasan el chequeo de pendiente y relieve de borde (sección 6). Las condiciones no dicen dónde se
   cumplen, así el chequeo toma todo par y todo trío de tipos del reino;
+- modificadores de forma cuyas pendientes sumadas pasan el tope solas, o sobre un tipo, un par o
+  un trío de tipos que pasan sin ellos (sección 6);
+- dos etapas de una fase con el mismo id (modificadores o carvers), y un carver con un apron de más
+  de 32 bloques;
 - términos de núcleo cuyo cono o pendiente propia, sumados a la pendiente de su tipo, rompen el
   tope (sección 7);
 - features sin alcance o sin altura declarados;
@@ -648,17 +679,28 @@ problemas salen en el mismo error. Solo una pila de reinos que no se arma la dej
 
 ### 14. Cotas verticales por columna
 
-Dentro del generador, sin cambiar el motor (desde W1):
+Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
 
-- Por (reino, columna de chunk): la unión de las cotas de los tipos presentes en sus 16 puntos de
-  retícula, más los deltas declarados de los modificadores (los ríos solo bajan), las features (la
-  altura de los árboles), los carvers (su profundidad) y las estructuras (las cajas de sus piezas).
-  Son enteros exactos y 16 lecturas del memo.
-- Las mismas lecturas dan `ground_lo`, una cota de abajo de la superficie abierta: la cota de
-  altura más baja de los tipos menos el corte más hondo (carver, río o término de núcleo). Solo la
-  lee el piso del cielo (sección 15).
+- Por (reino, columna de chunk), desde los tipos presentes en sus 16 puntos de retícula: cada tipo
+  da su cota sobre la columna de chunk (`TerrainKind::column_bounds`), y el que no la da usa las
+  cotas de sus puntos. Se suma el efecto de cada modificador sobre esa columna de chunk
+  (`ShapeModifier::column_effect`, dentro de su efecto declarado: un río dice `LowerOnly(0)` donde
+  no llega ningún segmento), así un río de 128 bloques no baja la cota de todas las columnas. Las
+  features (la altura de los árboles, WG-FEATURES) y las estructuras (las cajas de sus piezas) se
+  suman cuando lleguen. Son enteros exactos.
+- El memo guarda la última columna de chunk con sus cotas, y los puntos y los tipos de su celda de
+  retícula: otra columna de chunk de la misma celda solo llama a los ganchos (una llamada por tipo
+  presente y por modificador).
+- Las mismas lecturas dan `ground_lo`, una cota de abajo del suelo: la cota más baja de los tipos
+  menos los cortes de los modificadores (río o término de núcleo). Los carvers no la mueven: bajan
+  el camino hondo. El piso del cielo (sección 15) tendrá que contar también su alcance.
 - Un chunk sobre la cota local de arriba es aire `Uniform` tras las lecturas de selección (unos
-  2 us). Un chunk bajo la cota local de abajo toma el camino hondo, sin la etapa de columna.
+  2 us). Un chunk bajo la cota local de abajo (`deep`) toma el camino hondo, sin la etapa de
+  columna: el relleno y los carvers sin columnas. `deep` queda bajo `ground_lo` menos el alcance de
+  la superficie y bajo el suelo más bajo de la columna de chunk y del apron de los carvers menos su
+  `surface`. El apron que cruza a otra celda de retícula lee la ventana de esa celda.
+- En debug, el chequeo de spans hace cumplir los ganchos: el suelo de cada columna queda entre las
+  cotas de su columna de chunk, y cada modificador dentro de su efecto en ella.
 - Esto hace barato generar el aire de la banda, no transmitirlo: cada chunk de la banda sigue
   siendo una slot y un job de generación.
 
@@ -970,6 +1012,14 @@ no como tiempo de frame.
     tipos, que en un nodo de borde pagan sus esquinas en todo el nodo (no en una parte). Lo que
     falta es del juego: con la forma gruesa de los tipos desde el nivel 3, la fuente queda de 58 a
     102 us en los niveles 4 y 6.
+  - Medido en WG-DECOR (criterion `region`, una corrida por lado contra main): la selección en
+    caliente bajó de 24 a 6 ns (lee las cotas de la última columna de chunk sin copiar sus puntos)
+    y en frío amortizado subió de 47,2 a 48,6 ns por columna de chunk (+3 %: los ganchos de cada
+    columna de chunk nueva). Los chunks de superficie, hondos y de aire quedan iguales o mejor
+    contra el gemelo (superficie interior 22,0 us contra 21,3). Con un carver de test (agujeros
+    bajo un techo de 6 bloques, apron de 3): un chunk hondo de 1 bit cuesta 2,25 us, y 2,04 de
+    ellos son la máscara del carver; el chunk del suelo, 40,9 us contra 23,5 sin carver en la
+    misma corrida (la máscara con su techo, el anillo del apron a pedido y el tallado denso).
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
@@ -979,7 +1029,9 @@ no como tiempo de frame.
 - Medición: solo el nivel 1 en cada paso (AGENTS.md). WG-REG y WG-SAVE son solo tests (WG-SAVE
   corre una vez `just perf-smoke` porque toca `persist`). WG-REGION mide con criterion la selección
   y los chunks contra el gemelo de un solo tipo, y `headless_world` da los mismos quads y chunks en
-  el demo. WG-REGIONLOD mide la fuente y el job en los niveles 1, 4 y 6. No hay ronda de control
+  el demo. WG-REGIONLOD mide la fuente y el job en los niveles 1, 4 y 6. WG-DECOR mide la
+  selección y los chunks contra el gemelo antes y después, y un carver (chunk hondo y de superficie);
+  `headless_world` sigue igual en el demo. No hay ronda de control
   hasta terminar la generación y el trabajo de bloques del motor.
 
 ## Cómo se prueba
