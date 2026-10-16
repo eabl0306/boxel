@@ -1087,15 +1087,17 @@ no como tiempo de frame.
     misma corrida (la máscara con su techo, el anillo del apron a pedido y el tallado denso).
   - Medido en WG-FEATURES (criterion, contra feat/wg-decor f7cb704, antes del rebase sobre main;
     `region_lod` dos corridas por lado, `region` una). Sin features, la fuente y el job quedan
-    dentro del ruido (de -10 a +13 us por nodo, sin signo fijo) y los chunks igual contra el gemelo
-    (superficie interior 23,1 us contra 23,3, el gemelo 22,5 contra 22,6). Con un tramo de 6
-    bloques sobre cada celda seca, la fuente sube una mediana de 2 us en el nivel 4 y de 1 us en el
-    6; en el nivel 1 sube unos 8 us, porque el tramo son 3 celdas más de la regla de la celda por
-    columna (el juego da tramos solo en los niveles 4 a 6). El job cambia solo por lo que se dibuja
-    (el nodo interior del nivel 1 mallea un nodo menos: de 317 a 198 us). Con los árboles y plantas
-    de test, el chunk del suelo cuesta 28,0 us contra 23,3 sin ellos, y el de arriba, que los
-    árboles pueden alcanzar, 15,2 us de etapa de columna en vez de los 37 ns del camino de aire: un
-    `column_height` de 0 donde nada crece lo evita.
+    dentro del ruido: en la primera corrida la fuente va de -10 a +13 us por nodo, sin signo fijo,
+    y la segunda corrida de la rama, con la máquina ocupada, da hasta +32 us en los niveles 4 y 6.
+    Los chunks quedan igual contra el gemelo (superficie interior 23,1 us contra 23,3, el gemelo
+    22,5 contra 22,6). Con un tramo de 6 bloques sobre cada celda seca, la fuente sube una mediana
+    de 2 us en el nivel 4 y de 1 us en el 6; en el nivel 1 sube unos 8 us, sobre los 5 del plan,
+    porque el tramo son 3 celdas más de la regla de la celda por columna (el juego da tramos solo
+    en los niveles 4 a 6). El job cambia por lo que se dibuja (el nodo interior del nivel 1 mallea
+    un nodo menos: de 317 a 198 us), salvo dos corridas sueltas del nivel 6 que no se repiten (+55
+    y +128 us). Con los árboles y plantas de test, el chunk del suelo cuesta 28,0 us contra 23,3
+    sin ellos, y el de arriba, que los árboles pueden alcanzar, 15,2 us de etapa de columna en vez
+    de los 37 ns del camino de aire: un `column_height` de 0 donde nada crece lo evita.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
