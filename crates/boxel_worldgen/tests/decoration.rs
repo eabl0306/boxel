@@ -3,22 +3,24 @@
 //! - bounds per chunk column: the kinds' `column_bounds` and the shape modifiers' `column_effect`
 //!   tighten the local bounds, the heights stay the same, and every block stays under them;
 //! - the apron: what a stage reads around its chunk are its neighbor chunks' columns, bit for bit,
-//!   across the corner of a lattice cell with 2 kinds, and the point query's;
+//!   across the corner of a lattice cell with 2 kinds, and the point query's; also at `+-2^31`,
+//!   `2^40` and near `+-MAX_BLOCK_COORD`, with the widest apron;
 //! - carvers: the deep path equals the column stage on stacks of chunks across the deep threshold
-//!   with a carver whose rules read the surface over an apron; the same chunks in any order on
-//!   any thread with the memo cold, warm and off; uniform rock and a mask give a 1-bit chunk; no
-//!   mask adds a block or drains the fluid; the digest line, the order, duplicates, block names
-//!   and the apron cap;
+//!   with a carver whose rules read the surface over an apron, near and far from the origin; the
+//!   same chunks in any order on any thread with the memo cold, warm and off; uniform rock and a
+//!   mask give a 1-bit chunk; no mask adds a block or drains the fluid; the digest line, the
+//!   order, duplicates, block names and the apron cap;
 //! - every debug check: a column bound under the heights, a column bound right over every chunk
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
-//!   whose rules read the surface deeper than its reach.
+//!   whose rules read the surface deeper than its reach (and not one whose masks only spell the
+//!   same voxels two ways).
 #[path = "support/region.rs"]
 mod support;
 
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos,
-    LocalPos, Paletted,
+    LocalPos, MAX_BLOCK_COORD, Paletted,
 };
 use boxel_worldgen::WorldGenerator;
 use boxel_worldgen::field::{Rect, Slope, Span};
@@ -26,9 +28,9 @@ use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::realm::{FluidRule, RealmSpec};
 use boxel_worldgen::region::{
     CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, Context, Decoration, Entry,
-    FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, NoSurface, RegionGenerator,
-    RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeEffect, ShapeModifier,
-    SurfaceReach, SurfaceStage, TerrainKind, block_of, clear_worker_memo,
+    FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, MAX_APRON, NoSurface,
+    RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeEffect,
+    ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, block_of, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, GenEntry, GenId, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -357,6 +359,63 @@ fn a_stage_reads_its_neighbor_chunks_columns_bit_for_bit() {
                 (s != BlockState::AIR && s != fluid).then_some(((ground >> 5) << 5) + i64::from(ly))
             });
             assert_eq!(top, Some(ground), "({x}, {z})");
+        }
+    }
+}
+
+#[test]
+fn the_apron_and_the_deep_path_agree_far_from_the_origin() {
+    let records = Arc::new(Records {
+        apron: MAX_APRON,
+        seen: Mutex::new(Vec::new()),
+    });
+    let world = test_world(false);
+    let g = open(
+        &world,
+        with_valleys().with_carver(id("test:records"), Arc::clone(&records) as _),
+    );
+    let holes = carved(true, RegionSettings::default());
+    let registry = registry();
+    let far = MAX_BLOCK_COORD - (1 << 14);
+    for origin in [1 << 31, -(1 << 31), 1 << 40, far, -far] {
+        // A chunk column at the +x +z corner of its lattice cell, toward the origin so the chunk
+        // columns around it lie in the world: its apron of a whole chunk crosses into 3 cells.
+        let c = ((origin >> 5) - origin.signum() * 64) | 7;
+        let (cx, cz) = (c, -c | 7);
+        records.seen.lock().unwrap().clear();
+        let ground = g.column_info(cx << 5, cz << 5).ground;
+        drop(g.generate_full(key(cx, ground >> 5, cz), &registry));
+        let seen = std::mem::take(&mut *records.seen.lock().unwrap());
+        assert_eq!(seen.len(), 1, "origin {origin}");
+        // Every column of the apron: its own chunk column's heights, bit for bit.
+        let mut heights = std::collections::HashMap::new();
+        let s = &seen[0];
+        for (i, &x) in s.xs.iter().enumerate() {
+            for (j, &z) in s.zs.iter().enumerate() {
+                let h = heights.entry((x >> 5, z >> 5)).or_insert_with(|| {
+                    let mut h = [0; CHUNK_AREA];
+                    g.chunk_heights(x >> 5, z >> 5, &mut h);
+                    h
+                });
+                let ground = block_of(0, h[(((x & 31) << 5) | (z & 31)) as usize]);
+                let n = i * s.zs.len() + j;
+                assert_eq!(
+                    (s.ground[n], s.fluid[n]),
+                    (ground, ground.max(0)),
+                    "column ({x}, {z})"
+                );
+            }
+        }
+        assert_eq!(heights.len(), 9);
+        // The carved chunks across the deep bound: the deep path gives the column stage's.
+        let b = holes.local_bounds(cx, cz);
+        for y in (b.deep >> 5) - 1..=(b.top >> 5) + 1 {
+            let k = key(cx, y, cz);
+            assert_eq!(
+                holes.generate(k, &registry),
+                holes.generate_full(k, &registry),
+                "{k:?}"
+            );
         }
     }
 }
