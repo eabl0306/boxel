@@ -88,8 +88,10 @@ WorldPreset (game:default, game:large_biomes, ...)  se elige al crear el mundo, 
 Un reino es una losa horizontal de la dimensión entre dos planos, `y_lo <= y < y_hi`. `y_hi` puede
 ser +infinito e `y_lo`, -infinito.
 
-- Los planos están en múltiplos de 4096 bloques. Así ningún nodo de la lejanía hasta el nivel 7
-  (4096 bloques) cruza un plano, y un chunk está siempre en un solo reino.
+- Los planos están en múltiplos de 4096 bloques y dentro del mundo (+-`MAX_BLOCK_COORD`). Así
+  ningún nodo de la lejanía hasta el nivel 7 (4096 bloques) cruza un plano, y un chunk está
+  siempre en un solo reino.
+- Los reinos de una dimensión cubren cada y exactamente una vez: sin huecos ni solapamientos.
 - `realm_of(y)` es una búsqueda binaria entre a lo sumo 8 planos: O(1) para quien pregunte
   (streaming, lejanía, luz, física, la cámara).
 - Despacho: `generate(key)` llama a `realm_of` con un vóxel de su chunk (`key.pos.y << 5`: la clave
@@ -184,9 +186,10 @@ imágenes de V1.
 - Las reglas son datos del juego, y los mods les agregan entradas: `SelectorRule { id, priority,
   condition, scope, entries }`. `condition` es una conjunción de intervalos enteros sobre
   parámetros con nombre del Context (`ParamId`, leídos como `i32` en los puntos de la retícula).
-  Decide la primera regla en orden `(priority, id)` cuya condición se cumple. Todo mapa tiene una
-  regla de reserva, de prioridad mínima, con alcance `Cell` y sin condición, así cada punto recibe
-  un tipo; el chequeo al congelar rechaza un mapa sin ella.
+  Decide la primera regla cuya condición se cumple, en orden `(priority, id)` (sección 11: la
+  prioridad más alta primero). Todo mapa tiene una regla de reserva, de prioridad mínima, con
+  alcance `Cell` y sin condición, así cada punto recibe un tipo; el chequeo al congelar rechaza un
+  mapa sin ella.
 - Alcances (`scope`):
   - `Cell(cs)`: el tipo de la celda de región. Es un campo celular con jitter, de paso 2^cs (2^12
     por defecto) y deformado por la deformación grande del Context. Cada punto va al sitio más
@@ -340,8 +343,8 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   -> bioma -> RELLENO -> SUPERFICIE -> CARVERS -> FEATURES -> ESTRUCTURAS -> POST
 ```
 
-- Las fases son fijas. Dentro de una fase, el orden es `(priority, id)`. Cada etapa tiene una sal
-  explícita que sale de su id.
+- Las fases son fijas. Dentro de una fase, el orden es `(priority, id)` (sección 11). Cada etapa
+  tiene una sal explícita que sale de su id.
 - **Modificadores de forma.** Corren sobre la grilla de alturas ya mezclada, con una forma por
   punto o grilla y una forma gruesa para la lejanía. Declaran su efecto: `LowerOnly` (ríos, lagos,
   cañones) o `Raise(max)` (escalones de acantilado, dunas; suma a la cota de la columna y al margen
@@ -490,13 +493,22 @@ a mano queda probado sin tests de lejanía a medida.
 - `GenRegistry<T>`: lo arman los plugins al construir la app y se congela antes de abrir cualquier
   mundo (ADR 0034 sección 1). Al congelar se ordena por `GenId` (o por `(fase, priority, id)` en las
   entradas con orden), nunca por orden de registro ni de hash, y se dan índices densos en ese
-  orden. Los duplicados se rechazan.
+  orden.
+- Registrar nunca falla. Los duplicados se rechazan al congelar, todos juntos en un solo error.
+- La prioridad va de mayor a menor, igual en las reglas del selector y en las etapas de la
+  decoración: la más alta decide o corre primero, y la regla de reserva, de prioridad mínima,
+  decide última.
 - `salt(id) = splitmix64(fnv1a64(bytes del id))`, mezclada en la semilla del reino, nunca sumada:
   un fbm le da a la octava k la semilla `seed + k`, así una sal sumada podría caer sobre otra
   octava. Un test comprueba que no chocan dos sales ni dos semillas de octava.
-- Versiones: toda entrada tiene `version: u32`. `RegistryDigest` es la lista ordenada de
-  `(id, version, hash de parámetros)` de cada entrada a la que llega un preset, por dimensión y por
-  reino, más su hash de 64 bits. `WorldGenerator::version()` devuelve sus 32 bits bajos.
+- Versiones: toda entrada tiene `version: u32`. El hash de parámetros incluye el orden de la
+  entrada (fase y prioridad), así un cambio de prioridad es una entrada cambiada.
+- `RegistryDigest` es la lista ordenada de `(id, version, hash de parámetros)` de cada entrada a la
+  que llega un preset, por dimensión y por reino, más su hash de 64 bits. Una línea se identifica
+  por `(alcance, registro, id)`, con el alcance = dimensión y reino: un id es único solo dentro de
+  su registro (un reino y su entorno pueden llamarse igual).
+- `WorldGenerator::version()` devuelve los 32 bits bajos del digest de su propia dimensión
+  (`RegistryDigest::dimension`), así un cambio en otra dimensión no la sube.
 
 ### 12. Chequeos al congelar y al abrir
 
@@ -513,6 +525,8 @@ mundo para el conjunto que resuelve su preset. Rechazan:
 - features sin alcance o sin altura declarados;
 - spans de reinos que se pisan o que no están en planos de 4096 bloques, o más de 8 planos por
   dimensión (el tope que hace O(1) a `realm_of`);
+- reinos que dejan algún y sin cubrir, así `realm_of` siempre responde;
+- planos fuera del mundo (más allá de +-`MAX_BLOCK_COORD`); un extremo abierto no es un plano;
 - un mapa de regiones sin regla de reserva (sección 4);
 - una forma que no coincide con la política del `floor`, o que todavía no está hecha;
 - una dimensión sin exactamente un reino `Draw`.
@@ -887,7 +901,7 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
 11. **Reinos**: `realm_of` coincide en cada plano y alrededor; a un chunk lo genera exactamente un
     reino; las huellas del `ContactField` coinciden desde los dos lados de un plano; el gradiente
     del relleno no deja aire en un plano de roca con roca. El chequeo rechaza dos reinos `Draw` en
-    una dimensión y una forma que no está hecha.
+    una dimensión, una forma que no está hecha, un hueco entre reinos y un plano fuera del mundo.
 12. **Cielo** (EW-REALMSKY, EW-SKYUNDER): un reino de techo deja igual todo techo de cielo de la
     superficie; caminar desde el comienzo local da lo mismo que desde el tope global cuando no hay
     nada más del reino arriba; los pisos no dependen de las ediciones ni del orden de carga; un
