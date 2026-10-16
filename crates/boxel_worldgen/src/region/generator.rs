@@ -6,15 +6,17 @@ use super::decorate::{
 };
 use super::kind::{Context, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowPoints};
+use super::modifier::{ShapeEffect, ShapeModifier};
 use super::select::{self, RuleEntry, Selector, SelectorRule, check_rule_entries};
 use super::{
     CODE_VERSION, DEFAULT_LATTICE_SHIFT, MAX_LATTICE_SHIFT, MIN_LATTICE_SHIFT, REGION_LINE, check,
 };
+use crate::lod::LodSource;
 use crate::query::{ColumnInfo, WorldQuery};
 use crate::realm::{FluidRule, RealmSpec, RealmStack, check_floors};
 use crate::registry::{
-    BuildKey, Checks, DigestBuilder, DigestEntry, DigestScope, GenId, GenRegistry, Problem,
-    RegistryDigest, hash_params,
+    BuildKey, Checks, DigestBuilder, DigestEntry, DigestScope, GenEntry, GenId, GenRegistry,
+    ParamsHasher, Problem, RegistryDigest, hash_params,
 };
 use crate::{WorldGenerator, block};
 use boxel_voxel::{
@@ -98,11 +100,20 @@ pub struct LocalBounds {
 }
 
 /// A kind of the realm, ready to run.
-struct RealmKind<Cx: Context> {
-    id: GenId,
-    kind: Arc<dyn TerrainKind<Cx>>,
+pub(super) struct RealmKind<Cx: Context> {
+    pub(super) id: GenId,
+    pub(super) kind: Arc<dyn TerrainKind<Cx>>,
     /// The realm's seed mixed with the kind's salt.
-    seed: u64,
+    pub(super) seed: u64,
+}
+
+/// A shape modifier of the realm, ready to run.
+pub(super) struct RealmModifier<Cx: Context> {
+    pub(super) id: GenId,
+    pub(super) modifier: Arc<dyn ShapeModifier<Cx>>,
+    /// The realm's seed mixed with the modifier's salt.
+    pub(super) seed: u64,
+    pub(super) effect: ShapeEffect,
 }
 
 /// One realm's terrain (ADR 0039 sec. 4, 5, 9 and 14): the realm's [`Context`], its region map
@@ -120,23 +131,31 @@ struct RealmKind<Cx: Context> {
 ///   multiply), the exact blend, the fluid rule, then [`decorate`](super::decorate) (rock,
 ///   fluid, surface; `Uniform`, 1-bit or dense).
 ///
+/// Its far LOD is the region pass ([`LodSource`], ADR 0039 sec. 10): the same selection, blend
+/// and shape modifiers at the cell corners of each node, a sound top per cell and the cell rule.
+///
 /// In debug builds every chunk of the column stage, and every point query, checks its column
 /// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
 /// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges). A
 /// kind or a mod with a bound or a range under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
-    key: BuildKey,
+    pub(super) key: BuildKey,
     dimension: GenId,
     /// The realm alone, as [`WorldGenerator::realms`] reports it.
     stack: RealmStack,
-    cx: Cx,
-    shift: u32,
-    memo: bool,
-    selector: Selector,
-    kinds: Box<[RealmKind<Cx>]>,
+    pub(super) cx: Cx,
+    pub(super) shift: u32,
+    pub(super) memo: bool,
+    pub(super) selector: Selector,
+    pub(super) kinds: Box<[RealmKind<Cx>]>,
+    /// In the order they run.
+    pub(super) modifiers: Box<[RealmModifier<Cx>]>,
+    /// The sum of the modifiers' deepest cuts and of their rises, in [`HeightQ`].
+    pub(super) lower: i64,
+    pub(super) raise: i64,
     fill: Arc<dyn FillStage<Cx>>,
-    surface: Arc<dyn SurfaceStage<Cx>>,
-    reach: SurfaceReach,
+    pub(super) surface: Arc<dyn SurfaceStage<Cx>>,
+    pub(super) reach: SurfaceReach,
     digest: RegistryDigest,
     vertical: RangeInclusive<i64>,
 }
@@ -206,7 +225,11 @@ impl<Cx: Context> RegionGenerator<Cx> {
         digest
             .push(line(REGION_LINE, realm, CODE_VERSION, hash_params(&shift)))
             .push(line("context", realm, cx.version(), hash_params(&cx)));
-        let Decoration { fill, surface } = decoration;
+        let Decoration {
+            fill,
+            surface,
+            mut modifiers,
+        } = decoration;
         for name in fill.1.block_names() {
             checks.block(blocks, name, &fill.0);
         }
@@ -226,6 +249,44 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 surface.1.version(),
                 hash_params(&*surface.1),
             ));
+        // By `(phase, priority, id)`, as a registry orders its entries: the higher priority first.
+        modifiers.sort_by(|(a, ma), (b, mb)| {
+            let key = |m: &Arc<dyn ShapeModifier<Cx>>| {
+                let o = m.order();
+                (o.phase, std::cmp::Reverse(o.priority))
+            };
+            key(ma).cmp(&key(mb)).then_with(|| a.cmp(b))
+        });
+        let mut ids: Vec<&GenId> = modifiers.iter().map(|(id, _)| id).collect();
+        ids.sort();
+        for run in ids.chunk_by(|a, b| a == b).filter(|r| r.len() > 1) {
+            checks.push(Problem::Duplicate {
+                registry: "shape_modifier",
+                id: run[0].clone(),
+                count: run.len(),
+            });
+        }
+        let modifiers: Vec<RealmModifier<Cx>> = modifiers
+            .into_iter()
+            .map(|(id, modifier)| {
+                let mut params = ParamsHasher::new();
+                params.write(&modifier.order()).write(&*modifier);
+                digest.push(line(
+                    "shape_modifier",
+                    &id,
+                    modifier.version(),
+                    params.finish(),
+                ));
+                RealmModifier {
+                    seed: id.seed(realm_seed),
+                    effect: modifier.effect(),
+                    id,
+                    modifier,
+                }
+            })
+            .collect();
+        let lower = modifiers.iter().map(|m| i64::from(m.effect.lower())).sum();
+        let raise = modifiers.iter().map(|m| i64::from(m.effect.raise())).sum();
         // Once per world would do; a problem two realms find is reported once.
         check_rule_entries(checks, rules, entries);
         let resolved = select::resolve(
@@ -260,7 +321,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
         let selector = resolved.expect("no problem").selector;
         let reach = surface.1.reach();
-        let vertical = vertical(&realm_spec, &cx, &realm_kinds, reach);
+        let vertical = vertical(&realm_spec, &cx, &realm_kinds, reach, (lower, raise));
         Some(Self {
             key: BuildKey::next(),
             dimension: dimension.clone(),
@@ -270,6 +331,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
             memo: settings.memo,
             selector,
             kinds: realm_kinds.into(),
+            modifiers: modifiers.into(),
+            lower,
+            raise,
             fill: fill.1,
             surface: surface.1,
             reach,
@@ -303,6 +367,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
         &self.digest
     }
 
+    /// The version of its output: the low 32 bits of its dimension's sub-digest of the realm's
+    /// lines, what [`WorldGenerator::version`] and [`LodSource::version`] both report.
+    pub fn version(&self) -> u32 {
+        self.digest.dimension(&self.dimension).version()
+    }
+
     /// `log2` of the region lattice's spacing.
     pub const fn lattice(&self) -> u32 {
         self.shift
@@ -326,11 +396,10 @@ impl<Cx: Context> RegionGenerator<Cx> {
         let k = &self.kinds[kind as usize];
         let reach = 2i64 << self.shift;
         let b = k.kind.bounds(&self.cx, k.seed, (qx, qz), reach);
-        let clamp = |v: i64| v.clamp(i64::from(HeightQ::MIN), i64::from(HeightQ::MAX)) as i32;
         Point {
             kind,
-            lo: clamp(b.lo),
-            hi: clamp(b.hi),
+            lo: clamp_height(b.lo),
+            hi: clamp_height(b.hi),
         }
     }
 
@@ -379,11 +448,16 @@ impl<Cx: Context> RegionGenerator<Cx> {
         (points, bounds)
     }
 
-    /// The bounds of the column whose window holds `points`.
+    /// The bounds of the column whose window holds `points`: the kinds' bounds there, widened by
+    /// the shape modifiers' declared effects.
     fn bounds_of(&self, points: &[Point; WINDOW_POINTS]) -> LocalBounds {
         let lo = points.iter().map(|p| p.lo).min().expect("16 points");
         let hi = points.iter().map(|p| p.hi).max().expect("16 points");
         let spec = self.spec();
+        let (lo, hi) = (
+            clamp_height(i64::from(lo) - self.lower),
+            clamp_height(i64::from(hi) + self.raise),
+        );
         let (ground_lo, ground_hi) = (block_of(spec.datum, lo), block_of(spec.datum, hi));
         let mut top = ground_hi.saturating_add(self.reach.rise.into());
         if let FluidRule::SeaLevel { level, .. } = spec.fluid
@@ -405,9 +479,64 @@ impl<Cx: Context> RegionGenerator<Cx> {
         self.window(cx >> s, cz >> s).1
     }
 
-    /// The blended heights of the grid `xs` x `zs`, all in lattice cell `(i0, j0)` whose window
-    /// holds `points`, into `out` (`i * zs.len() + j`).
+    /// The heights of the grid `xs` x `zs`, all in lattice cell `(i0, j0)` whose window holds
+    /// `points`, into `out` (`i * zs.len() + j`): the kinds' heights blended, then the shape
+    /// modifiers.
     fn heights_in(
+        &self,
+        (xs, zs): (&[i64], &[i64]),
+        fields: &Cx::Grid,
+        points: &[Point; WINDOW_POINTS],
+        out: &mut [HeightQ],
+    ) {
+        self.blend_in((xs, zs), fields, points, out);
+        self.shape((xs, zs), fields, out);
+    }
+
+    /// The shape modifiers over the heights `out` of the grid `xs` x `zs`, in their order. In debug
+    /// builds each one is held to its declared effect.
+    fn shape(&self, (xs, zs): (&[i64], &[i64]), fields: &Cx::Grid, out: &mut [HeightQ]) {
+        for m in &self.modifiers {
+            let before = cfg!(debug_assertions).then(|| out.to_vec());
+            let grid = KindGrid {
+                cx: &self.cx,
+                fields,
+                xs,
+                zs,
+                seed: m.seed,
+            };
+            m.modifier.apply(&grid, out);
+            if let Some(before) = before {
+                self.check_effect(m, (xs, zs), &before, out);
+            }
+        }
+    }
+
+    /// The debug check of a shape modifier's effect: every height it left is one its declared
+    /// effect allows (the column bounds and the far LOD count on it).
+    pub(super) fn check_effect(
+        &self,
+        m: &RealmModifier<Cx>,
+        (xs, zs): (&[i64], &[i64]),
+        before: &[HeightQ],
+        after: &[HeightQ],
+    ) {
+        for (n, (&b, &a)) in before.iter().zip(after).enumerate() {
+            assert!(
+                m.effect.allows(b, a),
+                "{NAME} span check: realm {} shape modifier {} turned the height {b} of column \
+                 ({}, {}) into {a}, outside its declared effect {:?}",
+                self.realm(),
+                m.id,
+                xs[n / zs.len()],
+                zs[n % zs.len()],
+                m.effect,
+            );
+        }
+    }
+
+    /// The blended heights of the grid `xs` x `zs` (see [`RegionGenerator::heights_in`]).
+    fn blend_in(
         &self,
         (xs, zs): (&[i64], &[i64]),
         fields: &Cx::Grid,
@@ -476,7 +605,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
     }
 
-    /// The blended heights of chunk column `(cx, cz)` (in chunks), per column `x << 5 | z`.
+    /// The heights of chunk column `(cx, cz)` (in chunks), per column `x << 5 | z`: blended, then
+    /// shaped by the modifiers.
     pub fn chunk_heights(&self, cx: i64, cz: i64, out: &mut [HeightQ; CHUNK_AREA]) {
         let (x0, z0) = (cx << CHUNK_SHIFT, cz << CHUNK_SHIFT);
         let (xs, zs) = chunk_axes(x0, z0);
@@ -699,6 +829,11 @@ pub fn check_realm_blocks(
     }
 }
 
+/// `v` clamped into [`HeightQ`].
+pub(super) fn clamp_height(v: i64) -> HeightQ {
+    v.clamp(i64::from(HeightQ::MIN), i64::from(HeightQ::MAX)) as HeightQ
+}
+
 /// The 32 x and z of the chunk column whose lowest corner is `(x0, z0)`.
 fn chunk_axes(x0: i64, z0: i64) -> ([i64; CHUNK_SIZE as usize], [i64; CHUNK_SIZE as usize]) {
     (
@@ -714,13 +849,15 @@ fn vertical<Cx: Context>(
     cx: &Cx,
     kinds: &[RealmKind<Cx>],
     reach: SurfaceReach,
+    (lower, raise): (i64, i64),
 ) -> RangeInclusive<i64> {
     let span = spec.span.chunk_layers();
     let (lo, hi) = kinds.iter().fold((i64::MAX, i64::MIN), |(lo, hi), k| {
         let r = k.kind.range(cx);
         (lo.min(r.lo), hi.max(r.hi))
     });
-    let clamp = |v: i64| v.clamp(i64::from(HeightQ::MIN), i64::from(HeightQ::MAX)) as HeightQ;
+    let (lo, hi) = (lo.saturating_sub(lower), hi.saturating_add(raise));
+    let clamp = clamp_height;
     let mut top = block_of(spec.datum, clamp(hi)).saturating_add(reach.rise.into());
     if let FluidRule::SeaLevel { level, .. } = spec.fluid
         && block_of(spec.datum, clamp(lo)) < level
@@ -766,6 +903,11 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
         self.vertical.clone()
     }
 
+    /// The region pass of the far LOD (ADR 0039 sec. 10): the realm's own source.
+    fn lod(&self) -> Option<&dyn LodSource> {
+        Some(self)
+    }
+
     fn name(&self) -> &str {
         self.realm().as_str()
     }
@@ -773,7 +915,7 @@ impl<Cx: Context> WorldGenerator for RegionGenerator<Cx> {
     /// The low 32 bits of the digest of the realm's lines: its dimension's sub-digest when the
     /// realm is the dimension's only one.
     fn version(&self) -> u32 {
-        self.digest.dimension(&self.dimension).version()
+        Self::version(self)
     }
 
     /// The realm alone (inside a dimension, its [`DimensionGenerator`](super::DimensionGenerator)

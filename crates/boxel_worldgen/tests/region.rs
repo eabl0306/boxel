@@ -1104,7 +1104,8 @@ fn a_dimension_dispatches_each_chunk_to_its_realm() {
         dim.digest().version(),
         "the dimension's own digest"
     );
-    assert!(dim.lod().is_none(), "no source yet");
+    let source = dim.lod().expect("the drawn realm's region pass");
+    assert_eq!(source.version(), WorldGenerator::version(&dim));
     assert_eq!(dim.realms().len(), 3);
     let q = dim.as_query().expect("a query side");
     assert_eq!(q.realm_at(-4097).as_str(), "test:deep");

@@ -9,7 +9,8 @@ use crate::registry::GenId;
 pub struct ColumnInfo {
     /// The realm.
     pub realm: GenId,
-    /// The blended height, in 1/256 block over the realm's datum.
+    /// The height (the kinds' blended, then the realm's shape modifiers), in 1/256 block over the
+    /// realm's datum.
     pub height: HeightQ,
     /// The `y` of the top solid block.
     pub ground: i64,

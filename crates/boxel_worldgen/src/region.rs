@@ -8,30 +8,42 @@
 //! - [`SelectorRule`] and [`RuleEntry`]: the region map (game data; mods add rules and entries).
 //!   The selector is the only place a kind is chosen.
 //! - [`blend`]: the exact integer weights and blend.
-//! - [`FillStage`] and [`SurfaceStage`]: the decoration hook, with [`decorate`].
+//! - [`ShapeModifier`], [`FillStage`] and [`SurfaceStage`]: the decoration hook, with
+//!   [`decorate`].
 //! - [`RegionGenerator`]: one realm, built at world open from the registries, with the freeze
-//!   checks of its rules and kinds.
+//!   checks of its rules and kinds, and its far LOD: the region pass, one [`LodSource`] for the
+//!   whole realm (ADR 0039 sec. 10).
 //! - [`DimensionGenerator`]: a dimension's realm stack, one generator per realm.
+//! - With the `test-support` feature, `check_lod`: the exported harness that checks a realm's far
+//!   LOD against its real chunks.
 //!
 //! Every per-worker memo is keyed by its generator's [`BuildKey`](crate::registry::BuildKey), so a
 //! world opened after another on the same workers never reads the first one's.
 //!
-//! Not built yet: core terms, volumes and the other realm forms (WG-VOLUME, WG-CAVERN), the far
-//! LOD's region pass (WG-REGIONLOD), the biome table and the rest of the decoration layer.
+//! Not built yet: core terms, volumes and the other realm forms (WG-VOLUME, WG-CAVERN), the biome
+//! table and the rest of the decoration layer.
+//!
+//! [`LodSource`]: crate::lod::LodSource
 
 pub mod blend;
 mod check;
+#[cfg(feature = "test-support")]
+mod check_lod;
 mod decorate;
 mod dimension;
 mod generator;
 mod kind;
+mod lod;
 mod memo;
+mod modifier;
 mod select;
 
 pub use check::{border_relief, check_kinds, slope_passes};
+#[cfg(feature = "test-support")]
+pub use check_lod::{CORNER_STEP, LodReport, check_lod, lod_corners, lod_memo_bytes};
 pub use decorate::{
-    ChunkColumns, Decoration, FillStage, FloorFill, NoSurface, Rock, Stages, SurfaceReach,
-    SurfaceStage, TopLayers, decorate,
+    ChunkColumns, Decoration, FillStage, FloorFill, LOD_TOP_RUNS, LodColumns, LodTop, NoSurface,
+    Rock, Stages, SurfaceReach, SurfaceStage, TopLayers, decorate,
 };
 pub use dimension::{DimensionGenerator, REALM_GENERATOR};
 pub use generator::{LocalBounds, RegionGenerator, RegionSettings, RegionSpec, check_realm_blocks};
@@ -40,6 +52,9 @@ pub use kind::{
     TerrainKind, block_of,
 };
 pub use memo::clear_worker_memo;
+pub use modifier::{
+    CarveCorner, ShapeEffect, ShapeModifier, divide_tops, lod_by_effect, warp_slack,
+};
 pub use select::{
     DEFAULT_CELL_SHIFT, Entry, Interval, MAX_WEIGHT, PARAM_REGISTRY, RuleEntry, Scope,
     SelectorRule, check_rule_entries,

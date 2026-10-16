@@ -7,10 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The exported harness of a realm's far LOD (`region::check_lod`, ADR 0039 sec. 10), for the
+# tests of a game's or a mod's kinds.
+test-support = []
+
 [dependencies]
 boxel_voxel.workspace = true
 
 [dev-dependencies]
+# Enables `test-support` for the crate's own integration tests.
+boxel_worldgen = { workspace = true, features = ["test-support"] }
 # The example content (#48), for tests only.
 boxel_demo.workspace = true
 # The `test:` blocks of engine tests (#48).

@@ -10,6 +10,7 @@ use boxel_voxel::{
 use boxel_worldgen::field::{Add, Field, LatticeField, NoiseField, Rect, Span};
 use boxel_worldgen::noise::{Basis, Fbm, Frequency, Warp, mix_seed};
 use boxel_worldgen::realm::{FluidRule, RealmForm, RealmLod, RealmSky, RealmSpan, RealmSpec};
+use boxel_worldgen::region::{CarveCorner, ShapeEffect, ShapeModifier, divide_tops};
 use boxel_worldgen::region::{
     ChunkColumns, Context, Decoration, Entry, FillStage, FloorFill, HeightQ, Interval, KindGrid,
     KindLimits, RegionGenerator, RegionSettings, RegionSpec, Rock, RuleEntry, Scope, SelectorRule,
@@ -151,7 +152,7 @@ impl Relief {
     }
 
     /// Its noise under `seed`.
-    fn noise(&self, seed: u64) -> NoiseField {
+    pub fn noise(&self, seed: u64) -> NoiseField {
         NoiseField::new(
             seed,
             fbm(self.wavelength, self.octaves),
@@ -392,6 +393,203 @@ pub fn generator(
     try_generator(world, seed, settings).expect("the test world opens")
 }
 
+/// The generator of `world`'s realm `test:surface` with `decoration`, which must pass its checks.
+pub fn generator_with(
+    world: &TestWorld,
+    seed: u64,
+    settings: RegionSettings,
+    decoration: Decoration<TestContext>,
+) -> RegionGenerator<TestContext> {
+    let mut checks = Checks::new();
+    let generator = RegionGenerator::build(
+        RegionSpec {
+            seed,
+            dimension: &id("test:overworld"),
+            realm: &id("test:surface"),
+            realms: &world.realms,
+            rules: &world.rules,
+            entries: &world.entries,
+            kinds: &world.kinds,
+            blocks: &registry(),
+            decoration,
+            settings,
+        },
+        |realm_seed| TestContext::new(realm_seed, BASE),
+        &mut checks,
+    );
+    checks.finish().expect("the test world opens");
+    generator.expect("no problem")
+}
+
+/// A test kind whose far LOD drops the octaves of its noise shorter than `8 s` from level
+/// `from` on (`s` the cell size), with the margin of what is kept and the bound of what is
+/// dropped as left out: a `lod_heights` of its own, as a game writes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CoarseRelief {
+    /// The kind.
+    pub relief: Relief,
+    /// The first level that drops octaves.
+    pub from: u8,
+}
+
+impl HashParams for CoarseRelief {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.relief).write(&self.from);
+    }
+}
+
+impl GenEntry for CoarseRelief {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl CoarseRelief {
+    /// The noise of `level` under `seed` and how far it is from the whole one.
+    fn lod_noise(&self, seed: u64, level: u8) -> (NoiseField, u64) {
+        let noise = self.relief.noise(seed);
+        if level < self.from {
+            return (noise, 0);
+        }
+        noise.split_at(8 << level)
+    }
+}
+
+impl TerrainKind<TestContext> for CoarseRelief {
+    fn limits(&self, cx: &TestContext) -> KindLimits {
+        self.relief.limits(cx)
+    }
+    fn range(&self, cx: &TestContext) -> Span {
+        self.relief.range(cx)
+    }
+    fn bounds(&self, cx: &TestContext, seed: u64, q: (i64, i64), reach: i64) -> Span {
+        self.relief.bounds(cx, seed, q, reach)
+    }
+    fn heights(&self, grid: &KindGrid<'_, TestContext>, mask: &[bool], out: &mut [HeightQ]) {
+        self.relief.heights(grid, mask, out);
+    }
+    fn lod_heights(
+        &self,
+        grid: &KindGrid<'_, TestContext>,
+        level: u8,
+        _mask: &[bool],
+        out: &mut [HeightQ],
+        margin: &mut [HeightQ],
+    ) {
+        let (noise, dropped) = self.lod_noise(grid.seed, level);
+        let mut n = vec![0; grid.len()];
+        noise.grid(grid.xs, grid.zs, &mut n);
+        for ((o, &b), n) in out.iter_mut().zip(&grid.fields.base).zip(n) {
+            *o = (b + self.relief.offset + n) as HeightQ;
+        }
+        // The kept field's slope over half a cell's diagonal, and what the dropped octaves add.
+        let half = Rect::cell(0, 0, 1 << level).half_diagonal();
+        let slope = grid.cx.base().slope().sum(noise.slope());
+        margin.fill((slope.over(half) + dropped) as HeightQ);
+    }
+    fn lod_left_out(&self, cx: &TestContext, level: u8) -> HeightQ {
+        let _ = cx;
+        self.lod_noise(0, level).1 as HeightQ
+    }
+}
+
+/// A pair of straight valleys along x every `period` blocks of z, at `z = 0` and `z = gap`
+/// (modulo the period), carved `min(H, floor + (H - floor) min(n, width) / width)` with `n` the
+/// distance to the nearer one: two valleys with a divide between them. Its far LOD form uses the
+/// divide term (`divide: true`) or not, to show the harness what goes wrong without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Valleys {
+    /// The pattern's period along z, in blocks.
+    pub period: i64,
+    /// The second valley's offset from the first.
+    pub gap: i64,
+    /// The half-width of a valley, in blocks.
+    pub width: i64,
+    /// The valleys' floor, in 1/256 blocks.
+    pub floor: HeightQ,
+    /// The deepest cut it declares, in 1/256 blocks.
+    pub depth: u32,
+    /// Whether its coarse form takes the divide term.
+    pub divide: bool,
+}
+
+impl Valleys {
+    /// The nearer valley of column `z` (its id) and the distance to it.
+    pub fn nearest(&self, z: i64) -> (u64, i64) {
+        let (k, r) = (z.div_euclid(self.period), z.rem_euclid(self.period));
+        // The valleys around `r`: the gap's, this period's start and the next's.
+        let candidates = [
+            (2 * k, r),
+            (2 * k + 1, (r - self.gap).abs()),
+            (2 * k + 2, self.period - r),
+        ];
+        let (id, d) = candidates
+            .into_iter()
+            .min_by_key(|&(id, d)| (d, id))
+            .expect("three");
+        (id as u64, d)
+    }
+
+    /// The carve of a height `h` at distance `n`.
+    pub fn carve(&self, h: i64, n: i64) -> i64 {
+        let floor = i64::from(self.floor);
+        let g = n.clamp(0, self.width);
+        h.min(floor + ((h - floor) * g).div_euclid(self.width))
+    }
+}
+
+impl HashParams for Valleys {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.period)
+            .write(&self.gap)
+            .write(&self.width)
+            .write(&self.floor)
+            .write(&self.depth)
+            .write(&self.divide);
+    }
+}
+
+impl GenEntry for Valleys {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> ShapeModifier<Cx> for Valleys {
+    fn effect(&self) -> ShapeEffect {
+        ShapeEffect::LowerOnly(self.depth)
+    }
+    fn apply(&self, grid: &KindGrid<'_, Cx>, heights: &mut [HeightQ]) {
+        for (row, _) in heights.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
+            for (h, &z) in row.iter_mut().zip(grid.zs) {
+                *h = self.carve(i64::from(*h), self.nearest(z).1) as HeightQ;
+            }
+        }
+    }
+    fn lod(&self, grid: &KindGrid<'_, Cx>, _level: u8, corners: &mut [HeightQ], tops: &mut [i64]) {
+        self.apply(grid, corners);
+        let at: Vec<CarveCorner> = grid
+            .xs
+            .iter()
+            .flat_map(|_| grid.zs.iter())
+            .map(|&z| {
+                let (segment, n) = self.nearest(z);
+                CarveCorner {
+                    segment: if self.divide { segment } else { 0 },
+                    n,
+                }
+            })
+            .collect();
+        divide_tops(
+            (grid.xs.len() - 1, grid.zs.len() - 1),
+            &at,
+            0,
+            tops,
+            |top, n| self.carve(top, n),
+        );
+    }
+}
+
 /// The FNV fingerprint of a chunk's states.
 pub fn fingerprint(chunk: &ChunkData) -> u64 {
     let mut dense = vec![BlockState::AIR; boxel_voxel::CHUNK_VOLUME];
@@ -518,4 +716,46 @@ impl Twin {
         };
         decorate(&columns, &stages, registry)
     }
+}
+
+/// The distinct kinds of the lattice points a level-`level` node column at `column` reads: the
+/// windows of the lattice cells its padded corners fall in.
+pub fn node_kinds(g: &RegionGenerator<TestContext>, level: u8, column: [i64; 2]) -> usize {
+    let ls = g.lattice();
+    let (s, e) = (1i64 << level, 32i64 << level);
+    let (x, z) = (column[0] * e - s, column[1] * e - s);
+    let (i0, i1) = ((x >> ls) - 1, ((x + 34 * s) >> ls) + 2);
+    let (j0, j1) = ((z >> ls) - 1, ((z + 34 * s) >> ls) + 2);
+    let mut kinds = Vec::new();
+    for i in i0..=i1 {
+        for j in j0..=j1 {
+            kinds.push(g.lattice_kind(i, j).clone());
+        }
+    }
+    kinds.sort();
+    kinds.dedup();
+    kinds.len()
+}
+
+/// Node columns of `level` with exactly `kinds` kinds, searched from `from` along a diagonal walk.
+pub fn nodes_with(
+    g: &RegionGenerator<TestContext>,
+    level: u8,
+    kinds: usize,
+    from: [i64; 2],
+    count: usize,
+) -> Vec<[i64; 2]> {
+    let e = 32i64 << level;
+    let step = (1024 / e).max(1);
+    let mut found = Vec::new();
+    for n in 0..1 << 16 {
+        let c = [from[0] + n * step, from[1] + (n * 7 % 13) * step];
+        if node_kinds(g, level, c) == kinds {
+            found.push(c);
+            if found.len() == count {
+                return found;
+            }
+        }
+    }
+    panic!("no {count} node columns of level {level} with {kinds} kinds from {from:?}");
 }

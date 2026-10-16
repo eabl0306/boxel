@@ -8,7 +8,7 @@ use crate::realm::{DEFAULT_REALM, RealmStack};
 use crate::registry::{
     DigestBuilder, DigestEntry, DigestScope, GenId, RegistryDigest, hash_params,
 };
-use boxel_voxel::{BlockRegistry, ChunkData, ChunkKey};
+use boxel_voxel::{BlockRegistry, BlockState, ChunkData, ChunkKey};
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
 
@@ -159,8 +159,9 @@ impl WorldGenerator for DimensionGenerator {
     }
 }
 
-/// The drawn realm's source. It draws that realm's band; clipping the band to the realm's span
-/// comes with the region pass of the far LOD (WG-REGIONLOD).
+/// The drawn realm's source: it draws that realm's band, never over its top plane (the realms
+/// above are never in the far LOD, ADR 0039 sec. 10). A region generator clips its own cells at
+/// both planes; this clips the band of any other generator at the top one.
 impl LodSource for DimensionGenerator {
     fn column(
         &self,
@@ -169,10 +170,29 @@ impl LodSource for DimensionGenerator {
         scratch: &mut LodScratch,
         emit: &mut dyn FnMut(i64, LodNode<'_>),
     ) -> LodColumn {
-        self.realms[self.stack.drawn()]
+        let drawn = self.stack.drawn();
+        let source = self.realms[drawn]
             .lod()
-            .expect("lod() answers only when the drawn realm has a source")
-            .column(req, registry, scratch, emit)
+            .expect("lod() answers only when the drawn realm has a source");
+        let Some(plane) = self.stack.spec(drawn).span.hi else {
+            return source.column(req, registry, scratch, emit);
+        };
+        let first = super::lod::cut_band(
+            LodColumn {
+                lo: i64::MIN,
+                hi: i64::MAX,
+                below: BlockState::AIR,
+            },
+            plane,
+            req.level,
+        )
+        .hi;
+        let band = source.column(req, registry, scratch, &mut |layer, node| {
+            if layer < first {
+                emit(layer, node);
+            }
+        });
+        super::lod::cut_band(band, plane, req.level)
     }
 
     fn version(&self) -> u32 {

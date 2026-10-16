@@ -1,7 +1,7 @@
 //! Terrain kinds ([`TerrainKind`]) and the realm's shared fields they read ([`Context`]), ADR
 //! 0039 sec. 5.
 
-use crate::field::{Slope, Span};
+use crate::field::{Rect, Slope, Span};
 use crate::registry::{GenEntry, GenId, HashParams, ParamsHasher};
 use std::fmt;
 
@@ -66,6 +66,15 @@ pub trait Context: HashParams + Send + Sync + 'static {
     /// `(xs[i], zs[j])`). A field's value at a point must not depend on the grid it is computed
     /// in, so a point, a chunk and a LOD corner agree bit for bit.
     fn grid(&self, xs: &[i64], zs: &[i64]) -> Self::Grid;
+
+    /// The shared fields at the cell corners of a far LOD node of `level` (cells of `2^level`
+    /// blocks; `xs` and `zs` step by the cell size), once per node (ADR 0039 sec. 10). A Context
+    /// may leave out there what its kinds do not read at that level (fine detail far away). By
+    /// default the chunks' [`Context::grid`], so a corner and a chunk column agree bit for bit.
+    fn lod_grid(&self, xs: &[i64], zs: &[i64], level: u8) -> Self::Grid {
+        let _ = level;
+        self.grid(xs, zs)
+    }
 }
 
 /// No shared fields and no parameters.
@@ -165,8 +174,9 @@ impl HashParams for KindLimits {
 /// against its realm's [`Context`]. Registered under its id in a registry of `Arc<dyn
 /// TerrainKind<Cx>>`; its [`GenEntry`] gives its version and parameter hash.
 ///
-/// The generator calls it once per (chunk column, kind present) and once per point query; the
-/// loops inside are the kind's, monomorphic. Every height is in [`HeightQ`] over the realm's
+/// The generator calls it once per (chunk column, kind present), once per point query and once
+/// per (far LOD node, kind present) ([`TerrainKind::lod_heights`]); the loops inside are the
+/// kind's, monomorphic. Every height is in [`HeightQ`] over the realm's
 /// datum, and a kind's heights must be a pure function of `(seed, x, z)` and the Context: the
 /// same at a point, in a chunk and at a LOD corner, bit for bit.
 pub trait TerrainKind<Cx: Context>: GenEntry + Send + Sync {
@@ -194,6 +204,50 @@ pub trait TerrainKind<Cx: Context>: GenEntry + Send + Sync {
     /// Its heights at the points of `grid` where `mask` is set (`mask` and `out` are indexed like
     /// the grid). The other entries of `out` may hold anything.
     fn heights(&self, grid: &KindGrid<'_, Cx>, mask: &[bool], out: &mut [HeightQ]);
+
+    /// Its heights for the far LOD (ADR 0039 sec. 10) at the cell corners of a node of `level`
+    /// (cells of `s = 2^level` blocks): `grid` holds the corners (`xs` and `zs` step by `s`, the
+    /// fields are [`Context::lod_grid`]'s), `out` their heights where `mask` is set, and `margin`
+    /// per cell (`margin[i * (zs.len() - 1) + j]` for the cell between corners `i..=i + 1` and
+    /// `j..=j + 1`) how far the kind's real heights may stand over the highest of the cell's 4
+    /// corners in `out`, at any column of the closed cell. The region pass reads the margin of a
+    /// cell only where `mask` holds its 4 corners, and the other entries may hold anything.
+    ///
+    /// The corners may be coarse (octaves dropped, valleys left out) as long as the margins stay
+    /// sound: a real height is never over `max corner + margin`. How far coarse corners may stand
+    /// over the real heights is [`TerrainKind::lod_left_out`].
+    ///
+    /// The default is exact at the corners ([`TerrainKind::heights`]), with the margin of the
+    /// slope the kind declares in [`TerrainKind::limits`] over half a cell's diagonal (how far a
+    /// point of a cell is from its corners on average, [`Rect::half_diagonal`]): correct for any
+    /// kind whose heights keep that slope (the border check relies on it too), and loose, about
+    /// `0.7 s` times the slope. A kind with tighter bounds (the fines of
+    /// [`Field::cells`](crate::field::Field::cells)) writes its own.
+    fn lod_heights(
+        &self,
+        grid: &KindGrid<'_, Cx>,
+        level: u8,
+        mask: &[bool],
+        out: &mut [HeightQ],
+        margin: &mut [HeightQ],
+    ) {
+        self.heights(grid, mask, out);
+        let size = 1i64 << level.min(62);
+        let m = self
+            .limits(grid.cx)
+            .slope
+            .over(Rect::cell(0, 0, size).half_diagonal());
+        margin.fill(HeightQ::try_from(m).unwrap_or(HeightQ::MAX));
+    }
+
+    /// How far the corners of its [`TerrainKind::lod_heights`] may stand over its real heights
+    /// at `level`, in [`HeightQ`]: the depth of what the coarse form leaves out there (dropped
+    /// octaves, valleys). The far LOD ground may stand that much more over the real one than its
+    /// margins say (the exported harness allows it). 0 by default: exact corners.
+    fn lod_left_out(&self, cx: &Cx, level: u8) -> HeightQ {
+        let _ = (cx, level);
+        0
+    }
 }
 
 /// A kind at one height everywhere: `height` over the datum, whatever the Context. Its relief

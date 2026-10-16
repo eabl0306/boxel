@@ -1,12 +1,15 @@
-//! The decoration hook of a realm (ADR 0039 sec. 9), in its minimal form: the fill stage (the
-//! rock, [`FillStage`]) and the surface stage (the top of each column, [`SurfaceStage`]), traits
-//! the game implements, and [`decorate`], which builds a chunk from its columns' grounds with them.
+//! The decoration hook of a realm (ADR 0039 sec. 9), in its minimal form: the shape modifiers
+//! ([`ShapeModifier`](super::ShapeModifier), on the blended heights), the fill stage (the rock,
+//! [`FillStage`]) and the surface stage (the top of each column, [`SurfaceStage`], with its far
+//! LOD form [`SurfaceStage::lod_top`]), traits the game implements, and [`decorate`], which builds
+//! a chunk from its columns' grounds with them.
 //!
-//! The rest of the decoration layer (shape modifiers, biomes, carvers, features, structures and
-//! post steps, each a registry of stages by `(phase, priority, id)`) comes with the steps that
-//! first need it; none of it has a slot here yet.
+//! The rest of the decoration layer (biomes, carvers, features, structures and post steps, each a
+//! registry of stages by `(phase, priority, id)`) comes with the steps that first need it; none of
+//! it has a slot here yet.
 
 use super::kind::Context;
+use super::modifier::ShapeModifier;
 use crate::block;
 use crate::registry::{GenEntry, GenId, HashParams, ParamsHasher};
 use boxel_voxel::{
@@ -73,6 +76,51 @@ pub struct ChunkColumns<'a, Cx: Context> {
     pub fields: &'a Cx::Grid,
 }
 
+/// The most runs a surface stage gives a far LOD cell column ([`LodTop`]).
+pub const LOD_TOP_RUNS: usize = 4;
+
+/// The top of a far LOD cell column as a surface stage gives it ([`SurfaceStage::lod_top`]):
+/// runs of `(state, blocks)` from the column's ground down, top first; a run of 0 blocks ends
+/// them. Under the runs lies the realm's floor (the far LOD draws no fill stage: its strata are
+/// not seen from far away). The default, no run, is the floor up to the ground.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LodTop {
+    /// The runs, top first.
+    pub runs: [(BlockState, u32); LOD_TOP_RUNS],
+}
+
+impl LodTop {
+    /// The runs in use, top first.
+    pub fn used(&self) -> impl Iterator<Item = (BlockState, u32)> + '_ {
+        self.runs.iter().copied().take_while(|&(_, n)| n > 0)
+    }
+}
+
+/// The cell columns of a far LOD node, as the region pass leaves them for the surface stage
+/// ([`SurfaceStage::lod_top`]): the node's padded `34 x 34` cell columns of `2^level` blocks, each
+/// with its ground, its fluid and the corner it takes its look from (the highest one: a steep
+/// cell shows what its top shows).
+pub struct LodColumns<'a, Cx: Context> {
+    /// The LOD level: cells are `2^level` blocks.
+    pub level: u8,
+    /// The realm's Context.
+    pub cx: &'a Cx,
+    /// Its fields at the cells' corners ([`Context::lod_grid`]).
+    pub fields: &'a Cx::Grid,
+    /// The corners' x, in blocks.
+    pub xs: &'a [i64],
+    /// The corners' z: corner `i * zs.len() + j` is `(xs[i], zs[j])`.
+    pub zs: &'a [i64],
+    /// Per cell column (`i * (zs.len() - 1) + j`, between corners `i..=i + 1` and `j..=j + 1`):
+    /// the index of its highest corner.
+    pub corner: &'a [u32],
+    /// Per cell column: the `y` of its top solid block (its highest corner's, without margin).
+    pub ground: &'a [i64],
+    /// Per cell column: the `y` of its highest fluid block, or its ground if it is dry (the
+    /// realm's fluid rule on its corners).
+    pub fluid_top: &'a [i64],
+}
+
 /// The top of each column of a realm (ADR 0039 sec. 9, SURFACE): soil, sand, snow.
 pub trait SurfaceStage<Cx: Context>: GenEntry + Send + Sync {
     /// How far it reaches around each column's ground.
@@ -92,23 +140,48 @@ pub trait SurfaceStage<Cx: Context>: GenEntry + Send + Sync {
     /// them and a typo fails at load ([`RegionGenerator::build`](super::RegionGenerator::build)),
     /// not in a worker.
     fn block_names(&self) -> Vec<&str>;
+
+    /// The far LOD form (ADR 0039 sec. 10): the top of each cell column of a node, from its
+    /// ground down, into `out` (one per cell column, in `columns`' order, all without runs on
+    /// entry). The far LOD takes the blocks over the ground inside the reach's rise as the top
+    /// run's (or the floor), so a raised top stays on or over the real one.
+    ///
+    /// The default leaves every column without runs: the realm's floor up to the ground.
+    fn lod_top(&self, columns: &LodColumns<'_, Cx>, registry: &BlockRegistry, out: &mut [LodTop]) {
+        let _ = (columns, registry, out);
+    }
 }
 
-/// A realm's decoration: its fill and surface stages, each with the id of its digest line.
+/// A realm's decoration: its shape modifiers, fill stage and surface stage, each with the id of
+/// its digest line.
 pub struct Decoration<Cx: Context> {
     /// The fill stage.
     pub fill: (GenId, Arc<dyn FillStage<Cx>>),
     /// The surface stage.
     pub surface: (GenId, Arc<dyn SurfaceStage<Cx>>),
+    /// The shape modifiers, in any order: they run by `(priority, id)`, the higher priority
+    /// first ([`GenEntry::order`]).
+    pub modifiers: Vec<(GenId, Arc<dyn ShapeModifier<Cx>>)>,
 }
 
 impl<Cx: Context> Decoration<Cx> {
-    /// The stages `fill` and `surface`, with their ids.
+    /// The stages `fill` and `surface`, with their ids, and no shape modifier.
     pub fn new(
         fill: (GenId, Arc<dyn FillStage<Cx>>),
         surface: (GenId, Arc<dyn SurfaceStage<Cx>>),
     ) -> Self {
-        Self { fill, surface }
+        Self {
+            fill,
+            surface,
+            modifiers: Vec::new(),
+        }
+    }
+
+    /// The decoration with the shape modifier `modifier` under `id` too.
+    #[must_use]
+    pub fn with_modifier(mut self, id: GenId, modifier: Arc<dyn ShapeModifier<Cx>>) -> Self {
+        self.modifiers.push((id, modifier));
+        self
     }
 }
 
@@ -117,6 +190,11 @@ impl<Cx: Context> Clone for Decoration<Cx> {
         Self {
             fill: (self.fill.0.clone(), Arc::clone(&self.fill.1)),
             surface: (self.surface.0.clone(), Arc::clone(&self.surface.1)),
+            modifiers: self
+                .modifiers
+                .iter()
+                .map(|(id, m)| (id.clone(), Arc::clone(m)))
+                .collect(),
         }
     }
 }
@@ -246,6 +324,17 @@ impl<Cx: Context> SurfaceStage<Cx> for TopLayers {
 
     fn block_names(&self) -> Vec<&str> {
         self.layers.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// The same layers on every cell column: exact, as long as there are at most
+    /// [`LOD_TOP_RUNS`] (the floor stands in for the ones after).
+    fn lod_top(&self, _columns: &LodColumns<'_, Cx>, registry: &BlockRegistry, out: &mut [LodTop]) {
+        let mut top = LodTop::default();
+        let layers = self.layers.iter().filter(|(_, t)| *t > 0);
+        for (run, (name, t)) in top.runs.iter_mut().zip(layers) {
+            *run = (block(registry, name, "TopLayers"), *t);
+        }
+        out.fill(top);
     }
 }
 
