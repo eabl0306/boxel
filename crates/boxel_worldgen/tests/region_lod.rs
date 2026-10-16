@@ -26,6 +26,7 @@ use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, DimensionId, LocalPos,
     MAX_BLOCK_COORD, MAX_CHUNK_COORD,
 };
+use boxel_worldgen::field::Slope;
 use boxel_worldgen::lod::{LodCells, LodColumn, LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::noise::Warp;
 use boxel_worldgen::realm::{FluidRule, RealmLod, RealmSpan, RealmSpec, RealmStack};
@@ -503,6 +504,12 @@ impl ShapeModifier<()> for Meander {
     fn effect(&self) -> ShapeEffect {
         ShapeEffect::LowerOnly(self.valleys.depth)
     }
+    /// The straight valleys' walls. Its bends run much steeper (the distance's slope is `1 +` the
+    /// warp's, about 4 here): the worst case of the divide term on purpose, a test of the far
+    /// LOD's tops, not of the cap the freeze check holds declared slopes to.
+    fn slope(&self) -> Slope {
+        ShapeModifier::<()>::slope(&self.valleys)
+    }
     fn apply(&self, grid: &KindGrid<'_, ()>, heights: &mut [HeightQ]) {
         for (row, &x) in heights.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {
             for (h, &z) in row.iter_mut().zip(grid.zs) {
@@ -745,7 +752,8 @@ fn a_shallow_coast_passes_the_harness() {
 
 // ---- Exactness --------------------------------------------------------------------------------
 
-/// The exactness worlds: the test world, and the same with the valleys carved over it.
+/// The exactness worlds: the test world, and the same with wide valleys carved over it (walls of
+/// 400 / 2048, so the hills keep the 3:1 cap with them).
 fn exact_worlds() -> Vec<RegionGenerator<TestContext>> {
     let world = world(CELLS);
     vec![
@@ -757,9 +765,12 @@ fn exact_worlds() -> Vec<RegionGenerator<TestContext>> {
             decoration().with_modifier(
                 id("test:valleys"),
                 Arc::new(Valleys {
+                    period: 8192,
+                    gap: 4096,
+                    width: 2048,
                     floor: -20 * HEIGHT_ONE,
                     depth: 400 * 256,
-                    ..VALLEYS
+                    divide: true,
                 }),
             ),
         ),
@@ -1382,6 +1393,9 @@ impl GenEntry for Lift {
 impl<Cx: boxel_worldgen::region::Context> ShapeModifier<Cx> for Lift {
     fn effect(&self) -> ShapeEffect {
         ShapeEffect::Raise(self.declared)
+    }
+    fn slope(&self) -> Slope {
+        Slope::ZERO
     }
     fn apply(&self, _grid: &KindGrid<'_, Cx>, heights: &mut [HeightQ]) {
         for h in heights {

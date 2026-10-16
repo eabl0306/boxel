@@ -218,6 +218,27 @@ pub enum Problem {
         /// The kind.
         kind: GenId,
     },
+    /// Shape modifiers whose slopes, summed (ADR 0039 sec. 6 and 12), break the 3:1 cap alone
+    /// (`kinds` empty) or on top of kinds they cut: the kinds' steepest slope plus the
+    /// modifiers' plus the largest border relief over 543 blocks (at the default lattice) is
+    /// over 3.
+    ShapeSlope {
+        /// The realm.
+        realm: GenId,
+        /// Every shape modifier of the realm.
+        modifiers: Vec<GenId>,
+        /// The one, two or three kinds, none for the modifiers alone.
+        kinds: Vec<GenId>,
+        /// The kinds' steepest slope over one block, its jitter included, in 1/256 block per
+        /// block, Q16 (0 without kinds).
+        slope: u64,
+        /// The modifiers' slopes summed, the same way.
+        added: u64,
+        /// The largest border relief between the kinds, in 1/256 block.
+        relief: u64,
+        /// The lattice's `log2` spacing.
+        lattice: u32,
+    },
     /// A check the engine does not define (the game's own), with its ids and message.
     Other {
         /// The ids the problem involves.
@@ -261,6 +282,15 @@ impl Problem {
             Self::CellSize { rule, .. } => vec![rule],
             Self::KindSlope { realm, kinds, .. } => std::iter::once(realm).chain(kinds).collect(),
             Self::KindFormNotBuilt { kind, .. } | Self::KindLimits { kind } => vec![kind],
+            Self::ShapeSlope {
+                realm,
+                modifiers,
+                kinds,
+                ..
+            } => std::iter::once(realm)
+                .chain(modifiers)
+                .chain(kinds)
+                .collect(),
             Self::Overlap { dimension, a, b } => vec![dimension, a, b],
             Self::Gap {
                 dimension,
@@ -489,6 +519,40 @@ impl fmt::Display for Problem {
                 f,
                 "terrain kind {kind} declares a relief within the blend band outside its relief"
             ),
+            Self::ShapeSlope {
+                realm,
+                modifiers,
+                kinds,
+                slope,
+                added,
+                relief,
+                lattice,
+            } => {
+                f.write_str("shape modifiers ")?;
+                list(f, modifiers)?;
+                // Display only: the check itself is exact.
+                let q = |v: u64| v as f64 / 65536.0 / 256.0;
+                if kinds.is_empty() {
+                    return write!(
+                        f,
+                        " of realm {realm} add a slope of {:.3}, over {MAX_SLOPE}",
+                        q(*added)
+                    );
+                }
+                f.write_str(" on kinds ")?;
+                list(f, kinds)?;
+                let relief = *relief as f64 / 256.0;
+                let band = 3.0 * f64::from(1u32 << lattice) / std::f64::consts::SQRT_2;
+                write!(
+                    f,
+                    " of realm {realm} give a slope of {:.3} (the kinds' steepest {:.3} plus the \
+                     modifiers' {:.3} plus a border relief of {relief:.1} blocks over {band:.0}), \
+                     over {MAX_SLOPE}",
+                    q(*slope) + q(*added) + relief / band,
+                    q(*slope),
+                    q(*added),
+                )
+            }
             Self::Other { message, .. } => f.write_str(message),
         }
     }

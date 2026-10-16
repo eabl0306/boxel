@@ -164,12 +164,15 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// The generator of `spec.realm`, with the Context `context` builds from the realm's seed,
     /// or `None` with every problem recorded in `checks`: the realm, the rules and entries the
     /// realm reaches, their kinds and parameters, the kinds' forms, limits, slopes and border
-    /// reliefs, every added entry that names a missing rule ([`check_rule_entries`]), and every
+    /// reliefs, the shape modifiers' slopes on top of them ([`check_modifiers`]), every added
+    /// entry that names a missing rule ([`check_rule_entries`]), and every
     /// block name the realm (its floor and fluid) and its stages use
     /// ([`Problem::UnknownBlock`](crate::registry::Problem::UnknownBlock), so a typo fails at
     /// world open and never in a worker). Its digest lines ([`RegionGenerator::digest`]) are
     /// those of the realm: the realm, its `region` settings, its `context`, its rules and
     /// entries, its kinds and its stages.
+    ///
+    /// [`check_modifiers`]: super::check_modifiers
     ///
     /// # Panics
     ///
@@ -316,6 +319,11 @@ impl<Cx: Context> RegionGenerator<Cx> {
             .map(|k| (k.id.clone(), k.kind.form(), k.kind.limits(&cx)))
             .collect();
         check::check_kinds(checks, realm, &limits, shift);
+        let slopes: Vec<_> = modifiers
+            .iter()
+            .map(|m| (m.id.clone(), m.modifier.slope()))
+            .collect();
+        check::check_modifiers(checks, realm, &limits, &slopes, shift);
         if checks.found() > before {
             return None;
         }

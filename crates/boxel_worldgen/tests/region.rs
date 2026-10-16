@@ -18,7 +18,8 @@
 //!   ranges, version and query side, and other realms leave a realm's chunks alone;
 //! - the version follows every entry, setting and the realm, never the seed, the memo or another
 //!   dimension;
-//! - every freeze check of the region map and the kinds fails with its ids in the message.
+//! - every freeze check of the region map and the kinds fails with its ids in the message, and the
+//!   shape modifiers' slopes, alone, summed and on top of the kinds they cut, keep the 3:1 cap.
 #[path = "support/region.rs"]
 mod support;
 
@@ -34,10 +35,10 @@ use boxel_worldgen::region::{
     ChunkColumns, Decoration, DimensionGenerator, Entry, FlatKind, FloorFill, HEIGHT_ONE, HeightQ,
     Interval, KindForm, KindGrid, KindLimits, NoSurface, REALM_GENERATOR, RegionGenerator,
     RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, SurfaceReach, SurfaceStage,
-    TerrainKind, clear_worker_memo,
+    TerrainKind, check_modifiers, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
-    Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher,
+    Checks, DigestBuilder, GenEntry, GenId, GenRegistryBuilder, HashParams, ParamsHasher, Problem,
 };
 use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use proptest::prelude::*;
@@ -1783,6 +1784,115 @@ fn declared_limits(slope_milli: u64, lo: i64, hi: i64) -> KindLimits {
         relief,
         band: relief,
     }
+}
+
+/// A shape modifier slope of `milli` thousandths of a block per block.
+fn modifier_slope(milli: u64) -> Slope {
+    Slope {
+        per_block: boxel_worldgen::field::Q16::from_raw(milli * 256 * 65536 / 1000),
+        jitter: 0,
+    }
+}
+
+/// The problems of the shape modifiers `modifiers` on the kinds `kinds`, on the default lattice.
+fn modifier_problems(kinds: &[(&str, KindLimits)], modifiers: &[(&str, Slope)]) -> Vec<Problem> {
+    let mut checks = Checks::new();
+    let kinds: Vec<_> = kinds
+        .iter()
+        .map(|&(n, l)| (id(n), KindForm::Height, l))
+        .collect();
+    let modifiers: Vec<_> = modifiers.iter().map(|&(n, s)| (id(n), s)).collect();
+    check_modifiers(&mut checks, &id("test:realm"), &kinds, &modifiers, SHIFT);
+    checks.problems().to_vec()
+}
+
+#[test]
+fn shape_modifiers_keep_the_cap_with_the_kinds_they_cut() {
+    let kinds = |problem: &Problem| match problem {
+        Problem::ShapeSlope { kinds, .. } => kinds
+            .iter()
+            .map(|k| k.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let flat = [("test:flat", declared_limits(0, 0, 0))];
+    // Alone: one modifier, or two whose slopes sum, over the cap.
+    let p = modifier_problems(&flat, &[("test:steep", modifier_slope(3100))]);
+    assert_eq!(p.len(), 1);
+    assert!(kinds(&p[0]).is_empty());
+    assert_eq!(
+        p[0].to_string(),
+        "shape modifiers test:steep of realm test:realm add a slope of 3.100, over 3"
+    );
+    let two = [
+        ("test:a", modifier_slope(1600)),
+        ("test:b", modifier_slope(1600)),
+    ];
+    let p = modifier_problems(&flat, &two);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].to_string().contains("test:a and test:b"), "{}", p[0]);
+    // On a kind: 2.0 plus 1.1 is over, plus 0.9 is not.
+    let hills = [("test:hills", declared_limits(2000, 0, 0))];
+    let p = modifier_problems(&hills, &[("test:river", modifier_slope(1100))]);
+    assert_eq!(p.iter().map(kinds).collect::<Vec<_>>(), [["test:hills"]]);
+    assert!(modifier_problems(&hills, &[("test:river", modifier_slope(900))]).is_empty());
+    // A pair that passes alone (2.0 + 400 / 543 = 2.74) and fails with a river of 0.3, while each
+    // kind alone passes with it: reported as the pair, once.
+    let pair = [
+        ("test:hills", declared_limits(2000, 0, 0)),
+        ("test:plains", declared_limits(0, 400, 400)),
+    ];
+    let p = modifier_problems(&pair, &[("test:river", modifier_slope(300))]);
+    assert_eq!(
+        p.iter().map(kinds).collect::<Vec<_>>(),
+        [["test:hills", "test:plains"]]
+    );
+    let message = p[0].to_string();
+    assert!(
+        message.contains(
+            "shape modifiers test:river on kinds test:hills and test:plains of realm test:realm \
+             give a slope of 3.037"
+        ),
+        "{message}"
+    );
+    // A pair the kinds' own check refuses is not reported again.
+    let bad = [
+        ("test:hills", declared_limits(2000, 0, 0)),
+        ("test:plains", declared_limits(0, 800, 800)),
+    ];
+    assert!(modifier_problems(&bad, &[("test:river", modifier_slope(100))]).is_empty());
+    // At world open: the test world with valleys too steep for its hills.
+    let world = world(CELLS);
+    let steep = Valleys {
+        period: 4096,
+        gap: 1024,
+        width: 128,
+        floor: -40 * HEIGHT_ONE,
+        depth: 320 * 256,
+        divide: true,
+    };
+    let mut checks = Checks::new();
+    let _ = RegionGenerator::build(
+        RegionSpec {
+            seed: SEED,
+            dimension: &id("test:overworld"),
+            realm: &id("test:surface"),
+            realms: &world.realms,
+            rules: &world.rules,
+            entries: &world.entries,
+            kinds: &world.kinds,
+            blocks: &registry(),
+            decoration: decoration().with_modifier(id("test:steep"), Arc::new(steep)),
+            settings: RegionSettings::default(),
+        },
+        |realm_seed| TestContext::new(realm_seed, BASE),
+        &mut checks,
+    );
+    let e = checks.finish().expect_err("refused").to_string();
+    assert!(
+        e.contains("shape modifiers test:steep on kinds test:hills"),
+        "{e}"
+    );
 }
 
 #[test]

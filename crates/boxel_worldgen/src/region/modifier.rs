@@ -71,6 +71,17 @@ pub trait ShapeModifier<Cx: Context>: GenEntry + Send + Sync {
     /// What it may do to a height.
     fn effect(&self) -> ShapeEffect;
 
+    /// The slope it may add to the heights it gets, in [`HeightQ`] per block, its rounding as
+    /// jitter: where they keep a slope of `L` along any line, its output keeps `L + slope`. A
+    /// cut or a rise that is the same at every column adds [`Slope::ZERO`]; a river carve
+    /// `min(H, floor + (H - floor) g(n))` adds its walls' steepness, its deepest cut times the
+    /// slope of `g(n)` along a line.
+    ///
+    /// The freeze check holds it to the 3:1 cap (ADR 0039 sec. 6 and 12): the realm's modifiers'
+    /// slopes, summed, alone and on top of every kind, pair and triple of kinds they cut, by the
+    /// rule the kinds' check uses.
+    fn slope(&self) -> Slope;
+
     /// The grid form: rewrites `heights` (in [`HeightQ`], point `i * zs.len() + j` at `(xs[i],
     /// zs[j])` of `grid`) in place, for a chunk column, a point query or the corners of a LOD
     /// node.

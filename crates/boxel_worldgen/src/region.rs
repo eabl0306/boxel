@@ -38,7 +38,7 @@ mod memo;
 mod modifier;
 mod select;
 
-pub use check::{border_relief, check_kinds, slope_passes};
+pub use check::{border_relief, check_kinds, check_modifiers, slope_passes};
 #[cfg(feature = "test-support")]
 pub use check_lod::{CORNER_STEP, LodReport, check_lod, lod_corners, lod_memo_bytes};
 pub use decorate::{

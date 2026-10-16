@@ -7,7 +7,7 @@
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE, ChunkData, ChunkKey,
 };
-use boxel_worldgen::field::{Add, Field, LatticeField, NoiseField, Rect, Span};
+use boxel_worldgen::field::{Add, Field, LatticeField, NoiseField, Q16, Rect, Slope, Span};
 use boxel_worldgen::noise::{Basis, Fbm, Frequency, Warp, mix_seed};
 use boxel_worldgen::realm::{FluidRule, RealmForm, RealmLod, RealmSky, RealmSpan, RealmSpec};
 use boxel_worldgen::region::{CarveCorner, ShapeEffect, ShapeModifier, divide_tops};
@@ -558,6 +558,14 @@ impl GenEntry for Valleys {
 impl<Cx: Context> ShapeModifier<Cx> for Valleys {
     fn effect(&self) -> ShapeEffect {
         ShapeEffect::LowerOnly(self.depth)
+    }
+    /// The walls: at most the deepest cut over the width, per block of distance (the distance
+    /// is `z`'s, 1 per block), rounded down once.
+    fn slope(&self) -> Slope {
+        Slope {
+            per_block: Q16::ratio(u128::from(self.depth), self.width as u128),
+            jitter: 1,
+        }
     }
     fn apply(&self, grid: &KindGrid<'_, Cx>, heights: &mut [HeightQ]) {
         for (row, _) in heights.chunks_exact_mut(grid.zs.len()).zip(grid.xs) {

@@ -1,8 +1,10 @@
-//! The freeze checks of a realm's kinds (ADR 0039 sec. 6 and 12): their forms, their limits, and
-//! the slope and border relief of every kind, pair and triple that can meet.
+//! The freeze checks of a realm's kinds (ADR 0039 sec. 6 and 12): their forms, their limits, the
+//! slope and border relief of every kind, pair and triple that can meet, and the shape modifiers'
+//! slopes on top of them.
 
 use super::MAX_SLOPE;
 use super::kind::{HEIGHT_ONE, KindForm, KindLimits};
+use crate::field::Slope;
 use crate::registry::{Checks, GenId, Problem};
 
 /// Whether a set of kinds whose steepest slope is `slope` (raw Q16, in 1/256 block per block) and
@@ -72,16 +74,7 @@ pub fn check_kinds(
             checks.push(Problem::KindLimits { kind: id.clone() });
         }
     }
-    // A kind's slope over one block, its rounding included: `per_block + jitter`, exact in Q16.
-    let slope = |k: usize| {
-        let s = kinds[k].2.slope;
-        s.per_block
-            .raw()
-            .saturating_add(s.jitter.saturating_mul(1 << 16))
-    };
-    let relief = |a: usize, b: usize| border_relief(&kinds[a].2, &kinds[b].2);
-    let pair = |a: usize, b: usize| slope_passes(slope(a).max(slope(b)), relief(a, b), lattice);
-    let fail = |checks: &mut Checks, set: &[usize], slope: u64, relief: u64| {
+    for (set, slope, relief) in failing_sets(&limits_of(kinds), 0, lattice) {
         checks.push(Problem::KindSlope {
             realm: realm.clone(),
             kinds: set.iter().map(|&k| kinds[k].0.clone()).collect(),
@@ -89,18 +82,89 @@ pub fn check_kinds(
             relief,
             lattice,
         });
+    }
+}
+
+/// The checks of the shape modifiers of `realm` (each id with its declared
+/// [`ShapeModifier::slope`](super::ShapeModifier::slope)) on top of its kinds (as
+/// [`check_kinds`] takes them), in `checks` ([`Problem::ShapeSlope`]): their slopes, summed (each
+/// over one block, its jitter included), pass [`slope_passes`] alone, and added to the steepest
+/// slope of every kind, pair and triple of kinds that passes [`check_kinds`] (a set is reported
+/// only when its smaller sets pass with the modifiers).
+///
+/// Every modifier may cut every kind, anywhere, and the modifiers stack (a river through a cliff
+/// coast): the conditions do not say where they act, so the check sums them all.
+pub fn check_modifiers(
+    checks: &mut Checks,
+    realm: &GenId,
+    kinds: &[(GenId, KindForm, KindLimits)],
+    modifiers: &[(GenId, Slope)],
+    lattice: u32,
+) {
+    if modifiers.is_empty() {
+        return;
+    }
+    let added = modifiers
+        .iter()
+        .fold(0u64, |sum, (_, s)| sum.saturating_add(step(*s)));
+    let problem = |kinds: Vec<GenId>, slope, relief| Problem::ShapeSlope {
+        realm: realm.clone(),
+        modifiers: modifiers.iter().map(|(id, _)| id.clone()).collect(),
+        kinds,
+        slope,
+        added,
+        relief,
+        lattice,
     };
+    if !slope_passes(added, 0, lattice) {
+        checks.push(problem(Vec::new(), 0, 0));
+        return;
+    }
+    let limits = limits_of(kinds);
+    let without = failing_sets(&limits, 0, lattice);
+    for (set, slope, relief) in failing_sets(&limits, added, lattice) {
+        // A set that fails without the modifiers is the kinds' problem, reported there.
+        if without.iter().any(|(s, _, _)| *s == set) {
+            continue;
+        }
+        let ids = set.iter().map(|&k| kinds[k].0.clone()).collect();
+        checks.push(problem(ids, slope, relief));
+    }
+}
+
+/// A slope over one block, its rounding included: `per_block + jitter`, exact in Q16.
+fn step(s: Slope) -> u64 {
+    s.per_block
+        .raw()
+        .saturating_add(s.jitter.saturating_mul(1 << 16))
+}
+
+/// The limits of `kinds`.
+fn limits_of(kinds: &[(GenId, KindForm, KindLimits)]) -> Vec<KindLimits> {
+    kinds.iter().map(|(_, _, limits)| *limits).collect()
+}
+
+/// Every kind alone, pair and triple of `kinds` that fails [`slope_passes`] with its steepest
+/// slope (over one block) plus `added` and its largest border relief, as `(indices, steepest
+/// slope, relief)`: a pair only when its two kinds pass alone, a triple only when its three pairs
+/// pass.
+fn failing_sets(kinds: &[KindLimits], added: u64, lattice: u32) -> Vec<(Vec<usize>, u64, u64)> {
+    let slope = |k: usize| step(kinds[k].slope);
+    let relief = |a: usize, b: usize| border_relief(&kinds[a], &kinds[b]);
+    let passes = |s: u64, d: u64| slope_passes(s.saturating_add(added), d, lattice);
+    let alone = |k: usize| passes(slope(k), 0);
+    let pair = |a: usize, b: usize| passes(slope(a).max(slope(b)), relief(a, b));
     let n = kinds.len();
-    let alone = |k: usize| slope_passes(slope(k), 0, lattice);
+    let mut failing = Vec::new();
     for k in 0..n {
         if !alone(k) {
-            fail(checks, &[k], slope(k), 0);
+            failing.push((vec![k], slope(k), 0));
         }
     }
     for a in 0..n {
         for b in a + 1..n {
             if alone(a) && alone(b) && !pair(a, b) {
-                fail(checks, &[a, b], slope(a).max(slope(b)), relief(a, b));
+                failing.push((vec![a, b], slope(a).max(slope(b)), relief(a, b)));
             }
         }
     }
@@ -112,10 +176,11 @@ pub fn check_kinds(
                 }
                 let s = slope(a).max(slope(b)).max(slope(c));
                 let d = relief(a, b).max(relief(a, c)).max(relief(b, c));
-                if !slope_passes(s, d, lattice) {
-                    fail(checks, &[a, b, c], s, d);
+                if !passes(s, d) {
+                    failing.push((vec![a, b, c], s, d));
                 }
             }
         }
     }
+    failing
 }
