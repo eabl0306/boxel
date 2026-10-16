@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #117). El dueño aprobó el plan de generación v2 el 2026-10-15, con el
   diseño B como base y todas las recomendaciones del plan. Es un contrato. Lo construyen los
   pasos de la sección 20, cada uno en su rama, y cada parte protegida pide su propio OK cuando le
-  toca. Hechos: WG1, WG-REG, WG-REGION (#119) y WG-SAVE (#121); donde el código precisó el
-  contrato, este texto ya lo dice.
+  toca. Hechos: WG1, WG-REG, WG-REGION (#119), WG-SAVE (#121) y WG-REGIONLOD (#120); donde el
+  código precisó el contrato, este texto ya lo dice.
 - Fecha: 2026-10-15
 - Revisa: ADR 0024 sección 4 y ADR 0029 sección 7 (una clave de metadatos reservada más,
   `boxel:worldgen`).
@@ -373,11 +373,13 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
 - Las fases son fijas. Dentro de una fase, el orden es `(priority, id)` (sección 11). Cada etapa
   tiene una sal explícita que sale de su id.
 - **Modificadores de forma.** Corren sobre la grilla de alturas ya mezclada, con una forma por
-  punto o grilla y una forma gruesa para la lejanía. Declaran su efecto: `LowerOnly` (ríos, lagos,
-  cañones) o `Raise(max)` (escalones de acantilado, dunas; suma a la cota de la columna y al margen
-  de la lejanía). `LowerOnly` no queda libre de margen: ver el término de divisoria (sección 10).
-  Los ríos, los lagos y la forma de la costa son del reino entero, así cortan a todos los tipos
-  igual.
+  punto o grilla y una forma gruesa para la lejanía. Declaran su efecto: `LowerOnly(max)` (ríos,
+  lagos, cañones; `max` es su corte más hondo, que baja `ground_lo` y el camino hondo) o
+  `Raise(max)` (escalones de acantilado, dunas; suma a la cota de la columna y al margen de la
+  lejanía). `LowerOnly` no queda libre de margen: ver el término de divisoria (sección 10). Los
+  ríos, los lagos y la forma de la costa son del reino entero, así cortan a todos los tipos igual.
+  Corren en orden `(priority, id)`, cada uno con la sal de su id y su línea en el digest. En debug,
+  cada chunk y cada nodo comprueba que un modificador respeta su efecto. No nombran bloques.
 - **Bioma.** Una tabla `BiomeRule`: el mecanismo es del motor y los datos del juego. Cada entrada
   es `{ bioma, tipos o etiquetas de tipo, intervalos sobre parámetros del Context, peso }`.
   - El tipo que entra es el dominante de la columna (el de mayor `c_k`, y un empate va al índice
@@ -414,8 +416,10 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
    una columna de chunk da los bits del chunk). Desde el nivel 8 cada esquina es un punto de
    retícula y `c_k` es una lectura de conteo de caja.
 3. Para cada tipo presente, `lod_heights` en las esquinas donde `c_k > 0` (máscara), con su margen
-   por celda. La prueba de interior (un solo tipo) se hace por bloque de 4 x 4 esquinas, no por
-   nodo.
+   por celda. La prueba de interior (un solo tipo) se hace por celda de retícula, no por nodo: es
+   tan fina como la de bloques de 4 x 4 esquinas hasta el nivel 6 y más fina después (en el código,
+   la máscara cubre las esquinas de cada celda de retícula cerrada que tiene el tipo en su
+   ventana).
 4. La mezcla exacta de las alturas de las esquinas.
 5. Tope grueso por celda. H es una combinación convexa de los `H_k`, así dentro de una celda
    `H <= suma_k c_k(p) T_k / (N Ls^2)`, con `T_k` el máximo de `H_k` en las esquinas más
@@ -423,10 +427,13 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
    - Hasta el nivel 8 la celda cae en una sola celda de retícula, la cota es bilineal y su máximo
      está en una esquina: `top = máximo en las 4 esquinas de suma_k c_k T_k / (N Ls^2)`. Es
      ajustada: una celda de llanura en el borde de una banda de montaña sube solo por su peso de
-     montaña.
+     montaña. El código la calcula por celda de retícula con los pesos separados,
+     `c_k = (Ls - fz) A_k(x) + fz B_k(x)`.
    - Desde el nivel 9, el máximo de `T_k` entre los tipos presentes.
    - Hoy `MAX_LEVELS` es 6. La pasada admite hasta el nivel 8 con selección exacta y documenta la
-     selección solo en las esquinas más allá.
+     selección solo en las esquinas más allá. En el código el corte es el tamaño de la celda contra
+     el de la retícula: exacta mientras una celda mide a lo sumo `Ls` (el nivel 8 con la retícula de
+     serie).
 6. Las formas gruesas de los modificadores (ríos por nivel, costa, adaptación a estructuras),
    después la regla de fluido del reino sobre las esquinas sin margen, y después el `lod_top` del
    bioma.
@@ -447,7 +454,8 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
 - Los términos de núcleo, `max(pendiente propia, s_c) * s` (el cono es un mínimo, así que lleva el
   término de cruce).
 
-**Término de divisoria.** Un corte `LowerOnly` como `H = min(H, floor + (H - floor) g(n))`, con n
+**Término de divisoria** (`divide_tops`, con `warp_slack`). Un corte `LowerOnly` como
+`H = min(H, floor + (H - floor) g(n))`, con n
 sacado de un mínimo sobre segmentos, puede dejar una divisoria dentro de una celda cuyas 4 esquinas
 están cortadas. El tope grueso quedaría entonces bajo el real, hasta la pendiente de la pared por s.
 
@@ -458,16 +466,31 @@ están cortadas. El tope grueso quedaría entonces bajo el real, hasta la pendie
 - Donde las 4 esquinas comparten su segmento más cercano A, la distancia a A es convexa, así sin
   deformación n dentro de la celda no pasa el máximo de sus esquinas. La deformación de los
   meandros (Lipschitz 1/2) suma a lo sumo unos 1,1 s, así el corte de la celda usa
-  `n_max = máximo de n en las esquinas + 1,1 s` (g crece con n: un n más grande corta menos).
+  `n_max = máximo de n en las esquinas + 1,1 s` (g crece con n: un n más grande corta menos). El
+  código usa una cota más ajustada y probada: la distancia a A es convexa y 1-Lipschitz, así dentro
+  de la celda n pasa el máximo de sus esquinas a lo sumo en la pendiente de la deformación por media
+  diagonal de la celda (unos 0,35 s con pendiente 1/2). El 1,1 s queda como sobrestimación segura.
 
 Además:
 
-- Las costas no se mueven con el nivel: la regla de fluido lee las esquinas sin margen, y el suelo
-  de una celda mojada tiene tope en `datum - 1`.
+- Las costas no se mueven con el nivel: la regla de fluido lee las esquinas sin margen (una celda
+  es mojada si sus 4 esquinas quedan bajo el nivel), y el suelo de una celda mojada es el de su
+  esquina más alta, sin margen, así queda bajo el nivel. Cambia lo que decía este texto (tope en
+  `datum - 1`): con ese tope, el margen subía el fondo de un mar poco hondo hasta la fila de la
+  superficie en los niveles lejanos, y el mar se veía como tierra cuando el nivel caía en el borde
+  de una celda. El test de mares y costas lo encontró.
 - Los valles que se dejan de lado en los niveles lejanos solo suben el suelo grueso. No piden
   margen; el error de arriba que admite el test crece en su profundidad.
 - Memo: un struct en `LodScratch.memo`, con una ranura por `KindIx` y una para el Context, y la
-  llave del contador de construcción (sección 13).
+  llave del contador de construcción (sección 13). Guarda además los bloques del registro y una
+  tabla de 32 x 32 puntos de retícula. Un segundo job de la misma columna (columnas altas) no
+  recalcula nada. Unos 176 KiB con 3 tipos, sin contar los campos del Context.
+- Ganchos nuevos, todos con valor por defecto: `Context::lod_grid` (la grilla del Context en las
+  esquinas, por defecto la de los chunks), `TerrainKind::lod_heights` (por defecto exacta en las
+  esquinas, con el margen de la pendiente que el tipo declara) y `TerrainKind::lod_left_out` (cuánto
+  pueden quedar las esquinas gruesas sobre las reales), `ShapeModifier::lod` y `lod_left_out`, y
+  `SurfaceStage::lod_top` (hasta 4 tramos de estados desde el suelo; bajo ellos, el `floor` del
+  reino: la lejanía no dibuja los estratos del relleno).
 - Las ediciones se superponen a las celdas como hoy (ADR 0031 sección 11). El contrato de la fuente
   no cambia.
 
@@ -500,12 +523,20 @@ Además:
   columna de celdas en todo nivel (cualquier bloque sólido hace sólida su celda).
 
 **Harness exportado.** `boxel_worldgen` gana la feature `test-support` con
-`check_lod(generator, columns, levels)`, que arma chunks reales y compara en los niveles 1 a 4:
+`check_lod(generator, registry, columns, levels)` (`region::check_lod`), que arma chunks reales y
+compara en los niveles que se le piden (el plan pide 1 a 4):
 
 - en celdas secas, el tope grueso nunca queda bajo el real, y lo pasa a lo sumo por el margen
-  declarado más la profundidad de los valles que se dejaron de lado;
-- los desacuerdos de fluido, solo a menos de s de un borde de fluido;
-- bandas conservadoras, bordes iguales entre vecinos y tramos de volumen dentro de su cota.
+  declarado más la profundidad de los valles que se dejaron de lado (`lod_left_out`), más un paso
+  de esquina (6 bloques) y una celda de redondeo. Donde todas las columnas de la celda son secas,
+  lo mismo en bloques: el suelo grueso cubre cada suelo real. En celdas enteras un margen corto casi
+  nunca se ve, en bloques sí;
+- los desacuerdos de fluido (y los topes mojados a más de una celda), solo a menos de s de un borde
+  de fluido;
+- bandas conservadoras, bordes iguales entre vecinos y tramos de volumen dentro de su cota (los
+  volúmenes llegan con WG-VOLUME).
+
+`lod_corners` da las esquinas de la pasada, para comparar con las columnas de chunk.
 
 El juego y cualquier tipo de un mod lo llaman con sus propias columnas, así un `lod_heights` escrito
 a mano queda probado sin tests de lejanía a medida.
@@ -918,6 +949,13 @@ no como tiempo de frame.
   los usa `extreme`) se registran en la PR contra los mismos números. Un nodo paga unas
   1225 x (1 + parte de borde) evaluaciones de tipo (unas 1,4 veces en el nivel 6) más 1 a 3 us de
   mezcla; lo que más pesa sigue siendo la grilla del Context.
+  - Medido en WG-REGIONLOD (criterion `region_lod`, tipos de test con 6 octavas, unos 38 ns por
+    esquina): la fuente de 75 a 156 us en los niveles 1 a 4 (dos casos pasan 0,15 ms: el nodo de 3
+    tipos del nivel 1 por 1 us y el de 2 tipos del nivel 4 por 6 us) y el job de 183 a 389 us, todos
+    dentro de 0,4 ms. La pasada misma cuesta de 30 a 54 us por nodo; el resto son el Context y los
+    tipos, que en un nodo de borde pagan sus esquinas en todo el nodo (no en una parte). Lo que
+    falta es del juego: con la forma gruesa de los tipos desde el nivel 3, la fuente queda de 58 a
+    102 us en los niveles 4 y 6.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
