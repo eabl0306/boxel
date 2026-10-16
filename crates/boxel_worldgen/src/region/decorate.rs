@@ -857,7 +857,7 @@ fn check_carve_reach<Cx: Context>(
         registry: chunk.registry,
     };
     assert!(
-        carver.stage.carve(&without) == *mask,
+        same_voxels(&carver.stage.carve(&without), mask),
         "span check: carver {} carved the chunk at ({}, {}, {}), {surface} or more blocks under \
          every ground it may read (the lowest at y {lowest}), one way with its columns and \
          another without: its rules read the surface deeper than its reach (surface {surface}), \
@@ -867,6 +867,17 @@ fn check_carve_reach<Cx: Context>(
         origin.y,
         origin.z,
     );
+}
+
+/// Whether two masks leave the same voxels: a `Mixed` mask may hold every bit or none (one the
+/// carver did not pass through [`CarveMask::of`]), and gives the same chunk as `Solid` or `Air`.
+fn same_voxels(a: &CarveMask, b: &CarveMask) -> bool {
+    let word = |m: &CarveMask, i: usize| match m {
+        CarveMask::Solid => u32::MAX,
+        CarveMask::Air => 0,
+        CarveMask::Mixed(keep) => keep[i],
+    };
+    (0..CHUNK_AREA).all(|i| word(a, i) == word(b, i))
 }
 
 /// The debug check of the surface stage: it changed only blocks inside each column's reach. A

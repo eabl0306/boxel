@@ -1079,3 +1079,47 @@ fn an_apron_bound_under_the_heights_fails_the_span_check() {
     }
     assert!(caught >= 3, "{caught} chunks caught");
 }
+
+/// A carver that carves nothing, as a `Mixed` mask of every bit with columns (one it did not pass
+/// through `CarveMask::of`) and as `Solid` without.
+struct Unpacked;
+
+impl HashParams for Unpacked {
+    fn hash_params(&self, _: &mut ParamsHasher) {}
+}
+
+impl GenEntry for Unpacked {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl CarverStage<()> for Unpacked {
+    fn reach(&self) -> CarveReach {
+        CarveReach::default()
+    }
+    fn carve(&self, chunk: &CarveChunk<'_, ()>) -> CarveMask {
+        match chunk.columns {
+            Some(_) => CarveMask::Mixed(Box::new([u32::MAX; CHUNK_AREA])),
+            None => CarveMask::Solid,
+        }
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn the_reach_check_compares_the_voxels_a_mask_leaves() {
+    let registry = registry();
+    let g = flat(
+        40,
+        bare().with_carver(id("test:unpacked"), Arc::new(Unpacked)),
+    )
+    .expect("opens");
+    // Under every ground: the same voxels either way, so the same chunk, and no span check fails.
+    let k = key(1, -2, 1);
+    let chunk = g.generate_full(k, &registry);
+    assert_eq!(chunk, g.generate(k, &registry));
+    assert_eq!(chunk.as_uniform(), registry.by_name("test:solid"));
+}
