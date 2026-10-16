@@ -13,22 +13,33 @@ use crate::registry::{Checks, GenId, Problem};
 /// most the steepest slope, and a step of the 3 x 3 box moves the counts of all kinds together by
 /// at most 6 of 9, so the second is at most `relief * sqrt(2) / (3 L)` (`relief / 543` at the
 /// default lattice). The check is `slope + sqrt(2) relief / (3 L) <= 3`, exact: with `R = 3 -
-/// slope` (in Q16 of 1/256 block), `2 relief^2 2^32 <= 9 L^2 R^2`.
+/// slope` (in Q16 of 1/256 block), `2 relief^2 2^32 <= 9 L^2 R^2`. A left side past `u128` (a
+/// relief over `2^47`, far beyond any cap) fails.
 pub fn slope_passes(slope: u64, relief: u64, lattice: u32) -> bool {
     let cap = (u64::from(MAX_SLOPE) * u64::from(HEIGHT_ONE.unsigned_abs())) << 16;
     let Some(room) = cap.checked_sub(slope) else {
         return false;
     };
     let (room, relief) = (u128::from(room), u128::from(relief));
+    let Some(lhs) = relief
+        .checked_mul(relief)
+        .and_then(|r| r.checked_mul(1 << 33))
+    else {
+        return false;
+    };
+    // `9 L^2 R^2 < 2^4 2^(2 lattice) 2^52`: inside `u128` up to a lattice of 2^36 (a generator's
+    // is at most 2^12).
     let l = 1u128 << lattice;
-    (2 * relief * relief) << 32 <= 9 * l * l * room * room
+    lhs <= 9 * l * l * room * room
 }
 
 /// The largest difference between two kinds inside a blend band: `max(hi_a - lo_b, hi_b -
-/// lo_a)` of their band reliefs (never negative: the two sum to both widths).
+/// lo_a)` of their band reliefs (never negative: the two sum to both widths), exact for any
+/// bands (at most `2^64 - 1`).
 pub fn border_relief(a: &KindLimits, b: &KindLimits) -> u64 {
-    let d = (a.band.hi - b.band.lo).max(b.band.hi - a.band.lo);
-    d.unsigned_abs()
+    let (a, b) = (a.band, b.band);
+    let d = (i128::from(a.hi) - i128::from(b.lo)).max(i128::from(b.hi) - i128::from(a.lo));
+    u64::try_from(d).unwrap_or(u64::MAX)
 }
 
 /// The checks of the kinds of `realm` (each id with its form and limits), in `checks`:

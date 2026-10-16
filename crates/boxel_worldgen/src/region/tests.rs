@@ -113,3 +113,36 @@ fn the_slope_check_is_exact_at_its_edge() {
     assert!(slope_passes(one * 5 / 2, 271 * 256, 8));
     assert!(!slope_passes(one * 5 / 2, 272 * 256, 8));
 }
+
+#[test]
+fn huge_border_reliefs_fail_the_slope_check() {
+    // The squared relief overflowed `u128` from about 2^47.5 and wrapped to a small number, so a
+    // loose but sound band (+-2^49 in 1/256 block) passed.
+    for relief in [1 << 48, 1 << 50, u64::MAX] {
+        assert!(!slope_passes(0, relief, MAX_LATTICE_SHIFT), "{relief}");
+    }
+    let wide = |lo: i64, hi: i64| KindLimits {
+        slope: crate::field::Slope::ZERO,
+        relief: crate::field::Span::new(lo, hi),
+        band: crate::field::Span::new(lo, hi),
+    };
+    // The widest bands differ by `2^64 - 1`, past `i64`.
+    let all = wide(i64::MIN, i64::MAX);
+    assert_eq!(border_relief(&all, &all), u64::MAX);
+    let id = |name| crate::registry::GenId::new(name).unwrap();
+    let mut checks = crate::registry::Checks::new();
+    check_kinds(
+        &mut checks,
+        &id("test:surface"),
+        &[
+            (
+                id("test:loose"),
+                KindForm::Height,
+                wide(-(1 << 49), 1 << 49),
+            ),
+            (id("test:flat"), KindForm::Height, wide(0, 0)),
+        ],
+        DEFAULT_LATTICE_SHIFT,
+    );
+    assert_eq!(checks.problems().len(), 1, "{:?}", checks.problems());
+}
