@@ -2,8 +2,8 @@
 
 use super::blend::{self, WINDOW_POINTS, Window};
 use super::decorate::{
-    CarveReach, ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver,
-    RealmFeature, Stages, SurfaceReach, SurfaceStage,
+    ChunkColumns, ColumnsAround, Decoration, FillStage, MAX_APRON, RealmCarver, RealmFeature,
+    Stages, SurfaceReach, SurfaceStage,
 };
 use super::kind::{Context, HEIGHT_ONE, HeightQ, KindGrid, TerrainKind, block_of};
 use super::memo::{self, Point, WindowKinds, WindowPoints};
@@ -89,8 +89,11 @@ pub struct RegionSpec<'a, Cx: Context> {
 /// The vertical bounds of a chunk column of a realm (ADR 0039 sec. 14): exact integers, every one
 /// a block `y`. They come from the kinds present in the 16 lattice points around the column (each
 /// kind's [`TerrainKind::column_bounds`] over the chunk column, else its points' bounds), the
-/// shape modifiers' [`ShapeModifier::column_effect`] there and the feature stages'
-/// [`FeatureStage::column_height`](super::FeatureStage::column_height).
+/// shape modifiers' [`ShapeModifier::column_effect`] there, the feature stages'
+/// [`FeatureStage::column_height`](super::FeatureStage::column_height) and the carvers'
+/// [`CarverStage::column_reach`].
+///
+/// [`CarverStage::column_reach`]: super::CarverStage::column_reach
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalBounds {
     /// A block at or under the lowest ground of the column (the open surface): the realm's
@@ -103,14 +106,19 @@ pub struct LocalBounds {
     /// it is `Uniform` air, after the selection reads.
     pub top: i64,
     /// A chunk whose highest block is at or under this one lies under every column's surface
-    /// stage and every carver's surface reach ([`CarveReach::surface`] under `apron_lo`): it
-    /// takes the deep path, the fill and the carvers without columns, without the column stage.
+    /// stage and every carver's surface reach over the chunk column
+    /// ([`CarverStage::column_reach`] under `apron_lo`): it takes the deep path, the fill and the
+    /// carvers without columns, without the column stage.
+    ///
+    /// [`CarverStage::column_reach`]: super::CarverStage::column_reach
     pub deep: i64,
     /// A block at or under the lowest ground of the column and of its carvers' widest apron
     /// around it ([`CarveReach::apron`], read from the next lattice cells' windows where it
     /// reaches them): what `deep` is built from with carvers, and what they get as
     /// [`CarveChunk::apron_lo`](super::CarveChunk::apron_lo). `ground_lo` without carvers or
     /// with an apron of 0.
+    ///
+    /// [`CarveReach::apron`]: super::CarveReach::apron
     pub apron_lo: i64,
 }
 
@@ -153,7 +161,7 @@ pub(super) struct RealmModifier<Cx: Context> {
 /// bounds: each column's ground lies between the bounds of its 16 points, nothing but air lies
 /// over the column's top, and that top lies in the realm's vertical range (the kinds' ranges).
 /// Every chunk of the column stage also checks that every ground its carvers may read around it
-/// lies over its chunk column's `apron_lo` (so over `deep` by their surface reach), and that its
+/// lies over its chunk column's `apron_lo` (so over `deep` by their column reach), and that its
 /// heights keep the 3:1 cap between axis neighbors (the slope check, ADR 0039 sec. 6). A kind
 /// or a mod with a bound, a range or a slope under its heights fails its tests there.
 pub struct RegionGenerator<Cx: Context> {
@@ -173,8 +181,8 @@ pub struct RegionGenerator<Cx: Context> {
     pub(super) reach: SurfaceReach,
     /// In the order they run.
     carvers: Box<[RealmCarver<Cx>]>,
-    /// The carvers' widest surface reach and apron, `None` without carvers.
-    carve: Option<CarveReach>,
+    /// The carvers' widest apron, `None` without carvers.
+    carve_apron: Option<u32>,
     /// In the order they run.
     pub(super) features: Box<[RealmFeature<Cx>]>,
     digest: RegistryDigest,
@@ -326,13 +334,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 }
             })
             .collect();
-        let carve = carvers
-            .iter()
-            .map(|c| c.stage.reach())
-            .reduce(|a, b| CarveReach {
-                surface: a.surface.max(b.surface),
-                apron: a.apron.max(b.apron),
-            });
+        let carve_apron = carvers.iter().map(|c| c.stage.reach().apron).max();
         sort_stages(checks, "feature_stage", &mut features);
         let features: Vec<RealmFeature<Cx>> = features
             .into_iter()
@@ -423,7 +425,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             surface: surface.1,
             reach,
             carvers: carvers.into(),
-            carve,
+            carve_apron,
             features: features.into(),
             digest: digest.finish(),
             vertical,
@@ -638,8 +640,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
     fn bounds_of(&self, column: (i64, i64), kinds: &WindowKinds) -> LocalBounds {
         let area = chunk_rect(column);
         let span = self.ground_span(area, kinds);
-        let apron = self.carve.filter(|c| c.apron > 0).map(|c| {
-            let a = i64::from(c.apron);
+        let apron = self.carve_apron.filter(|&a| a > 0).map(|a| {
+            let a = i64::from(a);
             let wide = Rect::new(area.x0 - a, area.z0 - a, area.x1 + a, area.z1 + a);
             let (s, own) = (self.shift, self.cell_of(column));
             let mut lo = i64::MAX;
@@ -661,7 +663,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
             }
             lo
         });
-        self.assemble(span, apron, self.column_height(area))
+        self.assemble(
+            span,
+            apron,
+            self.column_height(area),
+            self.carve_reach(column),
+        )
     }
 
     /// [`RegionGenerator::bounds_of`] from the kinds of the chunk column's own lattice cell alone,
@@ -670,10 +677,10 @@ impl<Cx: Context> RegionGenerator<Cx> {
     fn bounds_in_cell(&self, column: (i64, i64), kinds: &WindowKinds) -> Option<LocalBounds> {
         let area = chunk_rect(column);
         let span = self.ground_span(area, kinds);
-        let apron = match self.carve.filter(|c| c.apron > 0) {
+        let apron = match self.carve_apron.filter(|&a| a > 0) {
             None => None,
-            Some(c) => {
-                let a = i64::from(c.apron);
+            Some(a) => {
+                let a = i64::from(a);
                 let wide = Rect::new(area.x0 - a, area.z0 - a, area.x1 + a, area.z1 + a);
                 let s = self.shift;
                 let inside = wide.x0 >> s == wide.x1 >> s && wide.z0 >> s == wide.z1 >> s;
@@ -683,7 +690,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 Some(self.ground_span(wide, kinds).0)
             }
         };
-        Some(self.assemble(span, apron, self.column_height(area)))
+        Some(self.assemble(
+            span,
+            apron,
+            self.column_height(area),
+            self.carve_reach(column),
+        ))
     }
 
     /// The most blocks the feature stages write over the ground at the columns of `area` (a chunk
@@ -709,10 +721,30 @@ impl<Cx: Context> RegionGenerator<Cx> {
         most
     }
 
+    /// The deepest the carvers read the surface in the chunks of chunk column `column` (in
+    /// chunks): the largest of their [`CarverStage::column_reach`] over it and their apron, 0
+    /// without carvers.
+    ///
+    /// [`CarverStage::column_reach`]: super::CarverStage::column_reach
+    fn carve_reach(&self, column: (i64, i64)) -> u32 {
+        self.carvers
+            .iter()
+            .map(|c| c.column_reach(&self.cx, column))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The bounds of a chunk column whose heights span `(lo, hi)` (in [`HeightQ`], unclamped),
-    /// with the lowest height `apron` of the carvers' apron around it, if they have one, and
-    /// features up to `grow` blocks over its ground.
-    fn assemble(&self, (lo, hi): (i64, i64), apron: Option<i64>, grow: u32) -> LocalBounds {
+    /// with the lowest height `apron` of the carvers' apron around it, if they have one, features
+    /// up to `grow` blocks over its ground and carvers reading the surface down to `carve` blocks
+    /// under it.
+    fn assemble(
+        &self,
+        (lo, hi): (i64, i64),
+        apron: Option<i64>,
+        grow: u32,
+        carve: u32,
+    ) -> LocalBounds {
         let spec = self.spec();
         let block = |h: i64| block_of(spec.datum, clamp_height(h));
         let (ground_lo, ground_hi) = (block(lo), block(hi));
@@ -725,8 +757,8 @@ impl<Cx: Context> RegionGenerator<Cx> {
         }
         let apron_lo = apron.map_or(ground_lo, |a| ground_lo.min(block(a)));
         let mut deep = ground_lo.saturating_sub(self.reach.depth.into());
-        if let Some(carve) = self.carve {
-            deep = deep.min(apron_lo.saturating_sub(carve.surface.into()));
+        if !self.carvers.is_empty() {
+            deep = deep.min(apron_lo.saturating_sub(carve.into()));
         }
         LocalBounds {
             ground_lo,
@@ -1138,15 +1170,15 @@ impl<Cx: Context> RegionGenerator<Cx> {
     /// The debug span check of the carvers' apron: every ground they may read, the chunk's and
     /// their widest apron's, lies at or over the chunk column's `apron_lo`, the bound they get
     /// ([`CarveChunk::apron_lo`](super::CarveChunk::apron_lo)) and that `deep` is built from (so
-    /// a chunk at or under `deep` lies their surface reach under all of them). The grounds' own
+    /// a chunk at or under `deep` lies their column reach under all of them). The grounds' own
     /// check covers the chunk's columns; this one covers the apron, whose bounds come from the
     /// hooks over rects that are no chunk column ([`TerrainKind::column_bounds`],
     /// [`ShapeModifier::column_effect`]).
     fn check_apron(&self, origin: BlockPos, bounds: &LocalBounds) {
-        let Some(carve) = self.carve.filter(|c| c.apron > 0) else {
+        let Some(apron) = self.carve_apron.filter(|&a| a > 0) else {
             return;
         };
-        let (o, a, size) = (origin, i64::from(carve.apron), i64::from(CHUNK_SIZE));
+        let (o, a, size) = (origin, i64::from(apron), i64::from(CHUNK_SIZE));
         // The ring around the chunk column: the -x and +x strips over the whole side, then the
         // -z and +z ones between them.
         let strips = [

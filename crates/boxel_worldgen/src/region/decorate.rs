@@ -160,8 +160,8 @@ impl<'a, Cx: Context> ChunkColumns<'a, Cx> {
     /// too, with the bits of [`ChunkColumns::ground`]), computed on demand as their own chunks do.
     ///
     /// A stage reads the surface around its chunk only as far as it declares: the deep path
-    /// ([`CarveReach::surface`]) counts the grounds of its apron. In debug builds a column past
-    /// the apron panics.
+    /// ([`CarverStage::column_reach`]) counts the grounds of its apron. In debug builds a column
+    /// past the apron panics.
     ///
     /// # Panics
     ///
@@ -282,7 +282,8 @@ pub struct CarveReach {
     /// Blocks under the lowest ground of the columns it reads (its chunk's and its apron's) down
     /// to which its rules read the surface (fades by depth, entrances, a roof): deeper, its mask
     /// is the one it gives without columns, so a chunk at least this far under every such ground
-    /// takes the deep path.
+    /// takes the deep path. The most over every chunk column: a chunk column may declare less
+    /// ([`CarverStage::column_reach`]).
     pub surface: u32,
     /// How far around its chunk it reads columns ([`ChunkColumns::tops`]), in blocks
     /// (Chebyshev), at most [`MAX_APRON`].
@@ -345,13 +346,14 @@ pub struct CarveChunk<'a, Cx: Context> {
     /// The chunk's lowest corner.
     pub origin: BlockPos,
     /// The chunk's columns, with its apron's through [`ChunkColumns::tops`]; `None` in the deep
-    /// path, for a chunk at least [`CarveReach::surface`] under every ground it may read.
+    /// path, for a chunk at least its chunk column's [`CarverStage::column_reach`] under every
+    /// ground it may read.
     pub columns: Option<&'a ChunkColumns<'a, Cx>>,
     /// A block at or under every ground the carvers may read: the lowest ground of the chunk's
     /// column and of the realm's carvers' widest apron around it, from the hooks
     /// ([`LocalBounds::apron_lo`]), the same in the column stage and in the deep path. In the
-    /// deep path the chunk lies the carvers' widest surface reach under it: that is what makes it
-    /// deep.
+    /// deep path the chunk lies the carvers' widest reach over its chunk column
+    /// ([`CarverStage::column_reach`]) under it: that is what makes it deep.
     ///
     /// A carver reads it to skip its apron where no rule of it can reach, without guessing: a
     /// water shell needs no ring when it is at or over the realm's fluid level (no column there
@@ -375,11 +377,29 @@ pub struct CarveChunk<'a, Cx: Context> {
 ///
 /// Its mask must be a pure function of its seed, the chunk, the Context and the columns it reads
 /// (its chunk's and its apron's), so a chunk and its neighbors agree; and it may read the surface
-/// only down to its declared [`CarveReach::surface`]: in debug builds a chunk that lies that far
-/// under every ground it may read checks that its mask with columns is its mask without them.
+/// only down to its reach over the chunk's column ([`CarverStage::column_reach`], at most its
+/// declared [`CarveReach::surface`]): in debug builds a chunk that lies that far under every
+/// ground it may read checks that its mask with columns is its mask without them.
 pub trait CarverStage<Cx: Context>: GenEntry + Send + Sync {
     /// How far it reads the surface.
     fn reach(&self) -> CarveReach;
+
+    /// How far its rules read the surface in the chunks of one chunk column, at most the
+    /// declared [`CarveReach::surface`]: `area` is the chunk column with the carver's apron around
+    /// it ([`CarveReach::apron`]), the columns it may read for those chunks. A chunk of the chunk
+    /// column at least this far under every ground it may read takes the deep path, so a carver
+    /// whose entrances (its deepest rules) lie only in some regions gives a smaller reach away
+    /// from them, and the deep path starts higher there. It must count every rule that reads the
+    /// surface in those chunks, one decided at a column of the apron included, and be a pure
+    /// function of the Context, its seed and `area`.
+    ///
+    /// In debug builds a chunk of the column stage that lies this far under every ground it may
+    /// read checks that its mask with columns is its mask without them, and a reach over the
+    /// declared one panics. By default the declared [`CarveReach::surface`].
+    fn column_reach(&self, cx: &Cx, seed: u64, area: Rect) -> u32 {
+        let _ = (cx, seed, area);
+        self.reach().surface
+    }
 
     /// The voxels of `chunk` it leaves.
     fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask;
@@ -399,6 +419,29 @@ pub struct RealmCarver<Cx: Context> {
     pub stage: Arc<dyn CarverStage<Cx>>,
     /// Its seed.
     pub seed: u64,
+}
+
+impl<Cx: Context> RealmCarver<Cx> {
+    /// Its [`CarverStage::column_reach`] in the chunks of chunk column `(x, z)` (in chunks): over
+    /// the chunk column and its apron around it. In debug builds a reach over the declared
+    /// [`CarveReach::surface`], the carver's worst case, panics.
+    pub(super) fn column_reach(&self, cx: &Cx, (x, z): (i64, i64)) -> u32 {
+        let reach = self.stage.reach();
+        let (a, size) = (i64::from(reach.apron), i64::from(CHUNK_SIZE));
+        let (x0, z0) = (x << CHUNK_SHIFT, z << CHUNK_SHIFT);
+        let area = Rect::new(x0 - a, z0 - a, x0 + size - 1 + a, z0 + size - 1 + a);
+        let r = self.stage.column_reach(cx, self.seed, area);
+        if cfg!(debug_assertions) {
+            assert!(
+                r <= reach.surface,
+                "span check: carver {} gives the columns {area:?} a surface reach of {r}, over \
+                 its declared surface reach {}",
+                self.id,
+                reach.surface,
+            );
+        }
+        r
+    }
 }
 
 /// How far a feature stage reaches ([`FeatureStage::reach`]).
@@ -994,11 +1037,11 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
     }
 }
 
-/// The debug check of a carver's surface reach: in a chunk at least [`CarveReach::surface`]
-/// under every ground the carver may read (its chunk's and its apron's), its mask with the
-/// columns is its mask without them, as the deep path gives it. A carver whose rules read the
-/// surface deeper would carve such a chunk one way in the column stage and another in the deep
-/// path.
+/// The debug check of a carver's surface reach: in a chunk at least its chunk column's
+/// [`CarverStage::column_reach`] under every ground the carver may read (its chunk's and its
+/// apron's), its mask with the columns is its mask without them, as the deep path gives it. A
+/// carver whose rules read the surface deeper would carve such a chunk one way in the column stage
+/// and another in the deep path.
 fn check_carve_reach<Cx: Context>(
     carver: &RealmCarver<Cx>,
     reach: CarveReach,
@@ -1008,7 +1051,8 @@ fn check_carve_reach<Cx: Context>(
 ) {
     let origin = columns.origin;
     let y1 = origin.y + i64::from(CHUNK_SIZE) - 1;
-    let surface = i64::from(reach.surface);
+    let column = (origin.x >> CHUNK_SHIFT, origin.z >> CHUNK_SHIFT);
+    let surface = i64::from(carver.column_reach(chunk.cx, column));
     let mut lowest = columns.ground.iter().copied().min().expect("1024 columns");
     if y1 > lowest.saturating_sub(surface) {
         return;
@@ -1038,12 +1082,13 @@ fn check_carve_reach<Cx: Context>(
         same_voxels(&carver.stage.carve(&without), mask),
         "span check: carver {} carved the chunk at ({}, {}, {}), {surface} or more blocks under \
          every ground it may read (the lowest at y {lowest}), one way with its columns and \
-         another without: its rules read the surface deeper than its reach (surface {surface}), \
-         so the deep path would carve it otherwise",
+         another without: its rules read the surface deeper than its reach there (column reach \
+         {surface}, declared surface {}), so the deep path would carve it otherwise",
         carver.id,
         origin.x,
         origin.y,
         origin.z,
+        reach.surface,
     );
 }
 

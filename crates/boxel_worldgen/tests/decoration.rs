@@ -1,5 +1,5 @@
-//! The decoration of the region generator (#133, ADR 0039 sec. 9, 12 and 14; "Cómo se prueba"
-//! tests 1, 3, 6 and 8), over `test:` content (`support/region.rs`):
+//! The decoration of the region generator (#133, #135, ADR 0039 sec. 9, 12 and 14; "Cómo se
+//! prueba" tests 1, 3, 6 and 8), over `test:` content (`support/region.rs`):
 //! - bounds per chunk column: the kinds' `column_bounds` and the shape modifiers' `column_effect`
 //!   tighten the local bounds, the heights stay the same, and every block stays under them;
 //! - the apron: what a stage reads around its chunk are its neighbor chunks' columns, bit for bit,
@@ -11,11 +11,16 @@
 //!   mask give a 1-bit chunk; no mask adds a block or drains the fluid; the digest line, the
 //!   order, duplicates, block names and the apron cap; carvers get the lowest ground of their
 //!   apron (`apron_lo`) in the column stage and in the deep path;
+//! - the reach per chunk column (#135): a carver whose entrances lie in some regions only gives a
+//!   smaller reach away from them, the deep bound moves up there and only there, more chunks take
+//!   the deep path, and the world is the same block for block, near the entrances and away, near
+//!   and far from the origin, in any order on any thread with any memo;
 //! - every debug check: a column bound under the heights, a column bound right over every chunk
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
 //!   whose rules read the surface deeper than its reach (and not one whose masks only spell the
-//!   same voxels two ways), a kind or a modifier steeper than it declares.
+//!   same voxels two ways), a reach per chunk column under the rules or over the declared one, a
+//!   kind or a modifier steeper than it declares.
 #[path = "support/region.rs"]
 mod support;
 
@@ -29,9 +34,10 @@ use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::realm::{FluidRule, RealmSpec};
 use boxel_worldgen::region::{
     CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, Context, Decoration, Entry,
-    FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, MAX_APRON, NoSurface,
-    RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule, ShapeEffect,
-    ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, block_of, clear_worker_memo,
+    FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, LocalBounds, MAX_APRON,
+    NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule,
+    ShapeEffect, ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, block_of,
+    clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, GenEntry, GenId, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -376,6 +382,7 @@ fn the_apron_and_the_deep_path_agree_far_from_the_origin() {
         with_valleys().with_carver(id("test:records"), Arc::clone(&records) as _),
     );
     let holes = carved(true, RegionSettings::default());
+    let regional = entrances(Declares::Regional, RegionSettings::default());
     let registry = registry();
     let far = MAX_BLOCK_COORD - (1 << 14);
     for origin in [1 << 31, -(1 << 31), 1 << 40, far, -far] {
@@ -408,15 +415,18 @@ fn the_apron_and_the_deep_path_agree_far_from_the_origin() {
             }
         }
         assert_eq!(heights.len(), 9);
-        // The carved chunks across the deep bound: the deep path gives the column stage's.
-        let b = holes.local_bounds(cx, cz);
-        for y in (b.deep >> 5) - 1..=(b.top >> 5) + 1 {
-            let k = key(cx, y, cz);
-            assert_eq!(
-                holes.generate(k, &registry),
-                holes.generate_full(k, &registry),
-                "{k:?}"
-            );
+        // The carved chunks across the deep bound, with a reach per chunk column too: the deep
+        // path gives the column stage's.
+        for g in [&holes, &regional] {
+            let b = g.local_bounds(cx, cz);
+            for y in (b.deep >> 5) - 1..=(b.top >> 5) + 1 {
+                let k = key(cx, y, cz);
+                assert_eq!(
+                    g.generate(k, &registry),
+                    g.generate_full(k, &registry),
+                    "{k:?}"
+                );
+            }
         }
     }
 }
@@ -475,15 +485,33 @@ fn the_deep_path_equals_the_column_stage_with_a_carver() {
 
 #[test]
 fn carved_chunks_are_the_same_in_any_order_on_any_thread_with_any_memo() {
-    let g = carved(true, RegionSettings::default());
-    let off = carved(
-        true,
-        RegionSettings {
-            memo: false,
-            ..RegionSettings::default()
-        },
-    );
-    let (cx, cz) = sample_columns()[3];
+    same_in_any_order(|settings| carved(true, settings), sample_columns()[3]);
+    // A reach per chunk column, where the chunk columns around hold some near the shafts and some
+    // away from them.
+    let column = (0..64)
+        .map(|n| (n * 7 - 40, n * 5 - 30))
+        .find(|&(cx, cz)| {
+            let near = (0..36)
+                .filter(|n| near_shafts(cx - 2 + n / 6, cz - 2 + n % 6))
+                .count();
+            (6..=30).contains(&near)
+        })
+        .expect("a column near and away from the shafts");
+    same_in_any_order(|settings| entrances(Declares::Regional, settings), column);
+}
+
+/// Asserts that the 6 x 6 x 6 chunks around the ground of chunk column `(cx, cz)` from the
+/// generators `of` builds are the same in any order, on any thread, with the memo cold, warm and
+/// off.
+fn same_in_any_order(
+    of: impl Fn(RegionSettings) -> RegionGenerator<TestContext>,
+    (cx, cz): (i64, i64),
+) {
+    let g = of(RegionSettings::default());
+    let off = of(RegionSettings {
+        memo: false,
+        ..RegionSettings::default()
+    });
     let ground = g.column_info(cx << 5, cz << 5).ground;
     let mut keys = Vec::new();
     for x in 0..6 {
@@ -1374,4 +1402,144 @@ fn carvers_get_the_lowest_ground_of_their_apron_in_both_paths() {
     );
     // The apron reaches under the chunk column's own lowest ground somewhere.
     assert!(under > 0, "no apron under its chunk column");
+}
+
+// ---- The reach per chunk column ---------------------------------------------------------------
+
+/// How deep the shafts of [`entrances`] open under their grounds.
+const SHAFTS: u32 = 40;
+
+/// The carver of [`entrances`]: the holes of [`carved`] (a roof of 6 over an apron of 3) and
+/// shafts [`SHAFTS`] blocks deep in one region of 256 x 256 blocks in 3.
+const fn shafts(declares: Declares) -> Entrances {
+    Entrances::new(Holes::new(5, 6, 3), SHAFTS, declares)
+}
+
+/// The test world with the valleys and `carver` as `test:entrances`.
+fn carved_by(
+    carver: Arc<dyn CarverStage<TestContext>>,
+    settings: RegionSettings,
+) -> RegionGenerator<TestContext> {
+    try_open(
+        &test_world(true),
+        with_valleys().with_carver(id("test:entrances"), carver),
+        settings,
+    )
+    .expect("opens")
+}
+
+/// The test world with the valleys and [`shafts`], its reach per chunk column as `declares`
+/// says.
+fn entrances(declares: Declares, settings: RegionSettings) -> RegionGenerator<TestContext> {
+    carved_by(Arc::new(shafts(declares)), settings)
+}
+
+/// The seed of `test:entrances` in the test world.
+fn shafts_seed() -> u64 {
+    id("test:entrances").seed(id("test:surface").seed(SEED))
+}
+
+/// Whether the columns [`shafts`] reads for the chunks of chunk column `(cx, cz)` (with its
+/// apron of 3) touch a region with shafts: where its reach is theirs.
+fn near_shafts(cx: i64, cz: i64) -> bool {
+    let (x0, z0) = (cx << 5, cz << 5);
+    let area = Rect::new(x0 - 3, z0 - 3, x0 + 34, z0 + 34);
+    shafts(Declares::Regional).touches(shafts_seed(), area)
+}
+
+/// Whether chunk column `(cx, cz)` holds shafts (all of it lies in one region).
+fn holds_shafts(cx: i64, cz: i64) -> bool {
+    shafts(Declares::Regional).region(shafts_seed(), (cx >> 3, cz >> 3))
+}
+
+#[test]
+fn a_reach_per_chunk_column_moves_the_deep_path_up_away_from_the_entrances() {
+    let registry = registry();
+    let settings = RegionSettings::default();
+    let global = entrances(Declares::Global, settings);
+    let regional = entrances(Declares::Regional, settings);
+    // The same holes with the same seed and no shafts: what the shafts carve is the difference.
+    let holes = carved_by(Arc::new(Holes::new(5, 6, 3)), settings);
+    let (mut near, mut away, mut shafted) = (0, 0, 0);
+    let (mut deep_global, mut deep_regional) = (0, 0);
+    let columns = sample_columns()
+        .into_iter()
+        .chain((0..10).map(|n| (n * 8 + 4, 3 - n * 8)));
+    for (cx, cz) in columns {
+        let (g, r) = (global.local_bounds(cx, cz), regional.local_bounds(cx, cz));
+        // Only the deep bound moves: away from the shafts it lies the holes' roof under the
+        // apron's lowest ground, not the shafts' depth.
+        assert_eq!(LocalBounds { deep: g.deep, ..r }, g, "({cx}, {cz})");
+        assert_eq!(g.deep, g.apron_lo - i64::from(SHAFTS), "({cx}, {cz})");
+        if near_shafts(cx, cz) {
+            near += 1;
+            assert_eq!(r.deep, g.deep, "({cx}, {cz})");
+        } else {
+            away += 1;
+            assert_eq!(r.deep, r.apron_lo - 6, "({cx}, {cz})");
+        }
+        // The same world block for block: every chunk across both deep bounds is the column
+        // stage's and the global reach's.
+        for y in (g.deep >> 5) - 2..=(r.top >> 5) + 1 {
+            let k = key(cx, y, cz);
+            let chunk = regional.generate(k, &registry);
+            assert_eq!(chunk, regional.generate_full(k, &registry), "{k:?}");
+            assert_eq!(chunk, global.generate(k, &registry), "{k:?}");
+            if holds_shafts(cx, cz) && chunk != holes.generate(k, &registry) {
+                shafted += 1;
+            }
+            deep_global += usize::from((y << 5) + 31 <= g.deep);
+            deep_regional += usize::from((y << 5) + 31 <= r.deep);
+        }
+    }
+    assert!(
+        near >= 4 && away >= 4,
+        "{near} near the shafts, {away} away"
+    );
+    assert!(shafted >= 4, "{shafted} chunks with shafts");
+    assert!(
+        deep_regional >= deep_global + away,
+        "{deep_regional} deep chunks against {deep_global}"
+    );
+    // Over an area, fewer chunks go through the column stage.
+    let (a, b) = (
+        column_stage_chunks(&global, (-16, -16)),
+        column_stage_chunks(&regional, (-16, -16)),
+    );
+    assert!(b < a, "{b} column stage chunks against {a}");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_column_reach_under_the_rules_or_over_the_declared_one_fails() {
+    let registry = registry();
+    // The roof's reach everywhere: in a chunk column with shafts, a chunk the roof's reach under
+    // every ground it reads and within the shafts' depth of some, which the column stage carves
+    // and the deep path would not.
+    let roof = entrances(Declares::Roof, RegionSettings::default());
+    let mut caught = 0;
+    let columns = (0..400).map(|n| (n * 3 - 600, 7 - n * 5));
+    for (cx, cz) in columns.filter(|&(cx, cz)| holds_shafts(cx, cz)).take(6) {
+        let b = roof.local_bounds(cx, cz);
+        let messages = ((b.deep >> 5) - 1..=b.top >> 5)
+            .filter_map(|y| panic_of(|| drop(roof.generate_full(key(cx, y, cz), &registry))));
+        if let Some(message) = messages.into_iter().next() {
+            assert!(
+                message.contains("test:entrances") && message.contains("deeper than its reach"),
+                "{message}"
+            );
+            caught += 1;
+        }
+    }
+    assert!(caught >= 4, "{caught} of 6 chunk columns caught");
+    // A reach over the declared one: the bounds of any chunk column catch it.
+    let over = entrances(Declares::Over, RegionSettings::default());
+    let message = panic_of(|| {
+        over.local_bounds(1, 1);
+    })
+    .expect("caught");
+    assert!(
+        message.contains("test:entrances") && message.contains("over its declared surface reach"),
+        "{message}"
+    );
 }

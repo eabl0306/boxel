@@ -1,9 +1,10 @@
-//! Test content of the region generator (#119, #133, #134), shared by `tests/region.rs`,
+//! Test content of the region generator (#119, #133, #134, #135), shared by `tests/region.rs`,
 //! `tests/region_lod.rs`, `tests/decoration.rs`, `tests/features.rs` and the benches: a `test:`
 //! Context with a base height, two parameters and a warp, test kinds that add relief to that base
 //! (also with bounds per chunk column), valleys carved by a shape modifier, a carver of holes
-//! under a roof, trees whose canopies cross chunk borders and plants (feature stages), the
-//! registries of a test world, and the hand-fused single-kind twin the bench compares against.
+//! under a roof and one with entrances in some regions only, trees whose canopies cross chunk
+//! borders and plants (feature stages), the registries of a test world, and the hand-fused
+//! single-kind twin the bench compares against.
 #![allow(dead_code, reason = "each user takes part of it")]
 
 use boxel_voxel::{
@@ -818,6 +819,143 @@ impl<Cx: Context> CarverStage<Cx> for Holes {
     fn block_names(&self) -> Vec<&str> {
         Vec::new()
     }
+}
+
+/// How [`Entrances`] gives its reach per chunk column ([`CarverStage::column_reach`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Declares {
+    /// Its declared surface reach everywhere (the default).
+    Global,
+    /// The shafts' depth where the columns it reads touch a region with shafts, the holes' roof
+    /// elsewhere: right.
+    Regional,
+    /// The holes' roof everywhere: under its shafts.
+    Roof,
+    /// One block over its declared surface reach everywhere.
+    Over,
+}
+
+/// A test carver with entrances in some regions only: the holes of [`Holes`] everywhere, and in
+/// one region of `2^shift` x `2^shift` blocks in `one_in` (by a hash of the region) a shaft of
+/// 2 x 2 columns every 8 blocks along x and z, open from each column's ground down to `depth`
+/// blocks under it. So its rules read the surface `depth` blocks deep where the columns it reads
+/// touch such a region and the holes' roof elsewhere. It declares a surface reach of the deeper
+/// of the two over the holes' apron, and per chunk column what `declares` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Entrances {
+    /// The holes.
+    pub holes: Holes,
+    /// `log2` of a region's side, in blocks.
+    pub shift: u32,
+    /// One region in this many holds shafts.
+    pub one_in: u64,
+    /// How deep a shaft opens under its column's ground, in blocks.
+    pub depth: u32,
+    /// Its reach per chunk column.
+    pub declares: Declares,
+}
+
+impl Entrances {
+    /// The holes `holes` and shafts `depth` blocks deep in one region of 256 x 256 blocks in 3,
+    /// with a reach per chunk column as `declares` says.
+    pub const fn new(holes: Holes, depth: u32, declares: Declares) -> Self {
+        Self {
+            holes,
+            shift: 8,
+            one_in: 3,
+            depth,
+            declares,
+        }
+    }
+
+    /// Whether region `(i, j)` (blocks `i << shift..(i + 1) << shift` along x) holds shafts under
+    /// `seed`.
+    pub fn region(&self, seed: u64, (i, j): (i64, i64)) -> bool {
+        let h =
+            splitmix64(seed ^ 0x5aff ^ splitmix64(i as u64) ^ splitmix64(j as u64).rotate_left(32));
+        h.is_multiple_of(self.one_in)
+    }
+
+    /// Whether a column of `area` lies in a region with shafts under `seed`.
+    pub fn touches(&self, seed: u64, area: Rect) -> bool {
+        let s = self.shift;
+        (area.x0 >> s..=area.x1 >> s)
+            .any(|i| (area.z0 >> s..=area.z1 >> s).any(|j| self.region(seed, (i, j))))
+    }
+
+    /// Whether column `(x, z)` is a shaft's under `seed`.
+    pub fn shaft(&self, seed: u64, x: i64, z: i64) -> bool {
+        x & 7 < 2 && z & 7 < 2 && self.region(seed, (x >> self.shift, z >> self.shift))
+    }
+}
+
+impl HashParams for Entrances {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.holes)
+            .write(&self.shift)
+            .write(&self.one_in)
+            .write(&self.depth)
+            .write(&(self.declares as u8));
+    }
+}
+
+impl GenEntry for Entrances {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> CarverStage<Cx> for Entrances {
+    fn reach(&self) -> CarveReach {
+        CarveReach {
+            surface: self.depth.max(self.holes.roof),
+            apron: self.holes.reads,
+        }
+    }
+    fn column_reach(&self, _: &Cx, seed: u64, area: Rect) -> u32 {
+        let surface = self.depth.max(self.holes.roof);
+        match self.declares {
+            Declares::Global => surface,
+            Declares::Regional if self.touches(seed, area) => surface,
+            Declares::Regional | Declares::Roof => self.holes.roof,
+            Declares::Over => surface + 1,
+        }
+    }
+    fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask {
+        let holes = self.holes.carve(chunk);
+        let Some(c) = chunk.columns else {
+            return holes;
+        };
+        let (o, depth) = (c.origin, i64::from(self.depth));
+        let mut keep: Box<Occupancy> = Box::new([u32::MAX; CHUNK_AREA]);
+        for (n, &g) in c.ground.iter().enumerate() {
+            let (lx, lz) = (n >> 5, n & 31);
+            if !self.shaft(chunk.seed, o.x + lx as i64, o.z + lz as i64) {
+                continue;
+            }
+            // From the ground down to `depth` under it, inside the chunk.
+            for ly in (g - depth + 1 - o.y).max(0)..=(g - o.y).min(31) {
+                keep[ly as usize * 32 + lx] &= !(1 << lz);
+            }
+        }
+        holes.and(CarveMask::of(keep))
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+/// The chunks of 32 x 32 chunk columns from `(cx, cz)` that `g` builds through the column stage:
+/// those over the deep bound and at or under the local top of their chunk column.
+pub fn column_stage_chunks(g: &RegionGenerator<TestContext>, (cx, cz): (i64, i64)) -> i64 {
+    let mut chunks = 0;
+    for x in cx..cx + 32 {
+        for z in cz..cz + 32 {
+            let b = g.local_bounds(x, z);
+            chunks += ((b.top >> 5) - ((b.deep - 31) >> 5)).max(0);
+        }
+    }
+    chunks
 }
 
 /// A test feature stage: trees with a trunk of `test:lamp` and a canopy of `test:cutout`, at most
