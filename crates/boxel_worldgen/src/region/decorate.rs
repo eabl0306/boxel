@@ -390,7 +390,8 @@ pub trait CarverStage<Cx: Context>: GenEntry + Send + Sync {
     /// column at least this far under every ground it may read takes the deep path, so a carver
     /// whose entrances (its deepest rules) lie only in some regions gives a smaller reach away
     /// from them, and the deep path starts higher there. It must count every rule that reads the
-    /// surface in those chunks, one decided at a column of the apron included, and be a pure
+    /// surface in those chunks, one decided at a column of the apron included (an entrance at a
+    /// cell corner on the chunk's +x or +z border lies in the next chunk column), and be a pure
     /// function of the Context, its seed and `area`.
     ///
     /// In debug builds a chunk of the column stage that lies this far under every ground it may
