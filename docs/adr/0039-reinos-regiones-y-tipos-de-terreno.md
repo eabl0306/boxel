@@ -1109,14 +1109,15 @@ no como tiempo de frame.
     sin ellos, y el de arriba, que los árboles pueden alcanzar, 15,2 us de etapa de columna en vez
     de los 37 ns del camino de aire: un `column_height` de 0 donde nada crece lo evita.
   - Medido en WG-CAVEREACH (criterion `region`, una corrida por lado contra main, con la máquina
-    ocupada): la selección y los chunks quedan dentro del ruido (en frío amortizado 51,5 contra
-    50,8 ns por columna de chunk; superficie interior 23,7 contra 24,4 us, el gemelo 25,0 contra
-    23,3; chunk hondo con carver 2,40 contra 2,28 us). Dos corridas sueltas pasan el 5 % y no se
-    repiten en la segunda corrida (la consulta de columna en caliente, 464 contra 522 ns y después
-    459 contra 465), y la grilla del Context, que no cambia, se mueve hasta un 6 %. Con un carver de
-    test con pozos de 40 bloques en una región de cada 3 (`Entrances`), en una columna lejos de los
-    pozos el chunk que pasa al camino hondo cuesta 2,3 us en vez de 37,0 us por la etapa de columna,
-    y sobre 32 x 32 columnas de chunk la etapa de columna arma 8460 chunks en vez de 9024.
+    ocupada): la selección y los chunks quedan dentro del ruido (superficie interior 23,7 contra
+    24,4 us, el gemelo 25,0 contra 23,3; chunk hondo con carver 2,40 contra 2,28 us). Dos medidas
+    pasan el 5 % en una corrida y no en la otra: la consulta de columna en caliente (464 contra
+    522 ns, y en la segunda corrida 459 contra 465) y la selección en frío amortizada (51,5 contra
+    50,8 ns por columna de chunk, y en la segunda 51,8 contra 54,7). La grilla del Context, que no
+    cambia, se mueve hasta un 6 %. Con un carver de test con pozos de 40 bloques en una región de
+    cada 3 (`Entrances`), en una columna lejos de los pozos el chunk que pasa al camino hondo cuesta
+    2,3 us en vez de 37,0 us por la etapa de columna, y sobre 32 x 32 columnas de chunk la etapa de
+    columna arma 8460 chunks en vez de 9024.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
