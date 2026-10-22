@@ -833,6 +833,10 @@ pub enum Declares {
     Roof,
     /// One block over its declared surface reach everywhere.
     Over,
+    /// The shafts' depth where its chunk column alone, without the apron, touches a region with
+    /// shafts, the holes' roof elsewhere: under the straddling shafts decided in the next chunk
+    /// columns.
+    Own,
 }
 
 /// A test carver with entrances in some regions only: the holes of [`Holes`] everywhere, and in
@@ -841,6 +845,11 @@ pub enum Declares {
 /// blocks under it. So its rules read the surface `depth` blocks deep where the columns it reads
 /// touch such a region and the holes' roof elsewhere. It declares a surface reach of the deeper
 /// of the two over the holes' apron, and per chunk column what `declares` says.
+///
+/// With `straddle`, each shaft straddles a line where x or z is a multiple of 8 and takes the
+/// region of the column on the line: a chunk column's shafts on its +x and +z borders are decided
+/// in the next chunk columns (as a cell corner on a chunk's border is), so where that one lies in
+/// another region, only the apron tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Entrances {
     /// The holes.
@@ -853,6 +862,8 @@ pub struct Entrances {
     pub depth: u32,
     /// Its reach per chunk column.
     pub declares: Declares,
+    /// Whether its shafts straddle the lines every 8 blocks.
+    pub straddle: bool,
 }
 
 impl Entrances {
@@ -865,6 +876,7 @@ impl Entrances {
             one_in: 3,
             depth,
             declares,
+            straddle: false,
         }
     }
 
@@ -883,9 +895,15 @@ impl Entrances {
             .any(|i| (area.z0 >> s..=area.z1 >> s).any(|j| self.region(seed, (i, j))))
     }
 
-    /// Whether column `(x, z)` is a shaft's under `seed`.
+    /// Whether column `(x, z)` is a shaft's under `seed`: in the region of the column itself, or
+    /// with `straddle` of the shaft's column on the line (`x` at 7 or 0 modulo 8 takes the one at
+    /// 0).
     pub fn shaft(&self, seed: u64, x: i64, z: i64) -> bool {
-        x & 7 < 2 && z & 7 < 2 && self.region(seed, (x >> self.shift, z >> self.shift))
+        let o = i64::from(self.straddle);
+        let anchor = |v: i64| if self.straddle { (v + 1) & !7 } else { v };
+        (x + o) & 7 < 2
+            && (z + o) & 7 < 2
+            && self.region(seed, (anchor(x) >> self.shift, anchor(z) >> self.shift))
     }
 }
 
@@ -895,7 +913,8 @@ impl HashParams for Entrances {
             .write(&self.shift)
             .write(&self.one_in)
             .write(&self.depth)
-            .write(&(self.declares as u8));
+            .write(&(self.declares as u8))
+            .write(&self.straddle);
     }
 }
 
@@ -919,6 +938,15 @@ impl<Cx: Context> CarverStage<Cx> for Entrances {
             Declares::Regional if self.touches(seed, area) => surface,
             Declares::Regional | Declares::Roof => self.holes.roof,
             Declares::Over => surface + 1,
+            Declares::Own => {
+                let a = i64::from(self.holes.reads);
+                let own = Rect::new(area.x0 + a, area.z0 + a, area.x1 - a, area.z1 - a);
+                if self.touches(seed, own) {
+                    surface
+                } else {
+                    self.holes.roof
+                }
+            }
         }
     }
     fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask {

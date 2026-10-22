@@ -14,13 +14,15 @@
 //! - the reach per chunk column (#135): a carver whose entrances lie in some regions only gives a
 //!   smaller reach away from them, the deep bound moves up there and only there, more chunks take
 //!   the deep path, and the world is the same block for block, near the entrances and away, near
-//!   and far from the origin, in any order on any thread with any memo;
+//!   and far from the origin, in any order on any thread with any memo; a rule decided in the
+//!   apron (a shaft on a chunk's border decided in the next region) counts, with a second carver
+//!   of a wider apron;
 //! - every debug check: a column bound under the heights, a column bound right over every chunk
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
 //!   whose rules read the surface deeper than its reach (and not one whose masks only spell the
-//!   same voxels two ways), a reach per chunk column under the rules or over the declared one, a
-//!   kind or a modifier steeper than it declares.
+//!   same voxels two ways), a reach per chunk column under the rules (one that misses its apron
+//!   too) or over the declared one, a kind or a modifier steeper than it declares.
 #[path = "support/region.rs"]
 mod support;
 
@@ -1542,4 +1544,93 @@ fn a_column_reach_under_the_rules_or_over_the_declared_one_fails() {
         message.contains("test:entrances") && message.contains("over its declared surface reach"),
         "{message}"
     );
+}
+
+/// [`shafts`] straddling the lines every 8 blocks: the shafts on a chunk column's +x and +z
+/// borders are decided in the next chunk columns.
+const fn straddling(declares: Declares) -> Entrances {
+    Entrances {
+        straddle: true,
+        ..shafts(declares)
+    }
+}
+
+/// The test world with the valleys and two carvers of different aprons: `first` as
+/// `test:entrances`, and holes under a roof of 2 over an apron of 16 as `test:wide`, so the deep
+/// bound takes the wide apron's lowest ground and the larger reach of the two.
+fn two_carvers(first: Arc<dyn CarverStage<TestContext>>) -> RegionGenerator<TestContext> {
+    try_open(
+        &test_world(true),
+        with_valleys()
+            .with_carver(id("test:entrances"), first)
+            .with_carver(id("test:wide"), Arc::new(Holes::new(7, 2, 16))),
+        RegionSettings::default(),
+    )
+    .expect("opens")
+}
+
+/// Chunk columns on the +x or +z edge of a region without shafts whose next region along that
+/// axis holds them: their shafts on that border are decided in the next region, which only the
+/// apron reaches.
+fn edge_columns() -> Vec<(i64, i64)> {
+    let (e, seed) = (straddling(Declares::Regional), shafts_seed());
+    let mut edges = Vec::new();
+    for (i, j) in (0..200).map(|n| (n % 20 - 10, n / 20 - 5)) {
+        if e.region(seed, (i, j)) {
+            continue;
+        }
+        if e.region(seed, (i + 1, j)) {
+            edges.push((8 * i + 7, 8 * j + 3));
+        }
+        if e.region(seed, (i, j + 1)) {
+            edges.push((8 * i + 4, 8 * j + 7));
+        }
+    }
+    edges.truncate(8);
+    assert_eq!(edges.len(), 8);
+    edges
+}
+
+#[test]
+fn a_rule_decided_in_the_apron_counts_in_the_reach_per_chunk_column() {
+    let registry = registry();
+    let regional = two_carvers(Arc::new(straddling(Declares::Regional)));
+    // The same holes without the shafts: what the shafts carve is the difference.
+    let holes = two_carvers(Arc::new(Holes::new(5, 6, 3)));
+    let mut shafted = 0;
+    for (cx, cz) in edge_columns() {
+        // The chunk column holds no region with shafts, its apron does: the shafts' reach.
+        let b = regional.local_bounds(cx, cz);
+        assert_eq!(b.deep, b.apron_lo - i64::from(SHAFTS), "({cx}, {cz})");
+        for y in (b.deep >> 5) - 2..=(b.top >> 5) + 1 {
+            let k = key(cx, y, cz);
+            let chunk = regional.generate(k, &registry);
+            assert_eq!(chunk, regional.generate_full(k, &registry), "{k:?}");
+            shafted += usize::from(chunk != holes.generate(k, &registry));
+        }
+    }
+    assert!(shafted >= 8, "{shafted} chunks with shafts");
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_reach_per_chunk_column_that_misses_its_apron_fails() {
+    let registry = registry();
+    // The chunk column alone: on the edges, the roof's reach under the shafts on its border.
+    let own = two_carvers(Arc::new(straddling(Declares::Own)));
+    let mut caught = 0;
+    for (cx, cz) in edge_columns() {
+        let b = own.local_bounds(cx, cz);
+        assert_eq!(b.deep, b.apron_lo - 6, "({cx}, {cz})");
+        let message = ((b.deep >> 5) - 1..=b.top >> 5)
+            .find_map(|y| panic_of(|| drop(own.generate_full(key(cx, y, cz), &registry))));
+        if let Some(message) = message {
+            assert!(
+                message.contains("test:entrances") && message.contains("deeper than its reach"),
+                "{message}"
+            );
+            caught += 1;
+        }
+    }
+    assert!(caught >= 4, "{caught} of 8 chunk columns caught");
 }
