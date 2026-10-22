@@ -430,11 +430,18 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   - Declaran su alcance (`CarveReach`): `surface`, hasta cuántos bloques bajo el suelo más bajo que
     leen sus reglas miran la superficie (desvanecidos por profundidad, entradas, un techo), y
     `apron`, cuántos bloques alrededor del chunk leen columnas, a lo sumo 32.
+  - Dan también su alcance por columna de chunk (`column_reach`, desde WG-CAVEREACH, #135): hasta
+    dónde miran la superficie sus reglas en los chunks de esa columna. Lo calculan sobre la columna
+    de chunk y su apron, y nunca pasa `surface`; por defecto es `surface`. Las entradas de las
+    cuevas están solo en algunas regiones: lejos de ellas el alcance baja (en las cuevas del juego,
+    de 67 a unos 27) y el camino hondo empieza más arriba (sección 14). El mundo sale igual bloque
+    por bloque.
   - Corren también en el camino hondo, sin columnas (sección 14). Roca uniforme y una máscara dan
     un chunk de 1 bit, sin array denso.
-  - En debug, un chunk que queda `surface` o más bajo todo suelo que el carver puede leer comprueba
-    que su máscara con columnas es la de sin columnas. Un carver que mira la superficie más hondo
-    que lo que declara falla ahí, en vez de dar otro chunk en el camino hondo.
+  - En debug, un chunk que queda su `column_reach` o más bajo todo suelo que el carver puede leer
+    comprueba que su máscara con columnas es la de sin columnas. Un carver que mira la superficie
+    más hondo que lo que dice en esa columna de chunk falla ahí, en vez de dar otro chunk en el
+    camino hondo. Un `column_reach` mayor que `surface` también falla.
 - **Columnas de alrededor**: una etapa lee el suelo y el tope del fluido de columnas fuera de su
   chunk con `ChunkColumns::tops`, calculadas a pedido con el mismo Context, tipos (cada columna con
   la ventana de su celda de retícula), mezcla, modificadores y regla de fluido que su propio chunk,
@@ -723,7 +730,9 @@ problemas salen en el mismo error. Solo una pila de reinos que no se arma la dej
   no es aire queda dentro de las cotas de columna del reino y bajo la cota local de aire, que la
   etapa de superficie escribe solo dentro de su alcance declarado (si no, deja costuras entre
   chunks), que una feature escribe solo sobre el suelo de cada columna hasta su altura y que su
-  `column_height` no pasa esa altura, y que los bloques de volumen están solo donde `d_f >= K`.
+  `column_height` no pasa esa altura, que un carver no mira la superficie más hondo que su
+  `column_reach` y que este no pasa su `surface`, y que los bloques de volumen están solo donde
+  `d_f >= K`.
   Los tests del motor corren en debug, así un tipo o un mod con una cota mal hecha falla sus
   tests.
 - **Lado de consultas.** `WorldQuery { height_at(x, z), realm_at(y), biome_at(x, y, z),
@@ -748,24 +757,25 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
   estructuras (las cajas de sus piezas) se suman cuando lleguen. Son enteros exactos.
 - El memo guarda la última columna de chunk con sus cotas, y los puntos y los tipos de su celda de
   retícula: otra columna de chunk de la misma celda solo llama a los ganchos (una llamada por tipo
-  presente, por modificador y por feature, y otra por celda de retícula que toca el apron de los
-  carvers).
+  presente, por modificador, por feature y por carver, y otra por celda de retícula que toca el
+  apron de los carvers).
 - Las mismas lecturas dan `ground_lo`, una cota de abajo del suelo: la cota más baja de los tipos
   menos los cortes de los modificadores (río o término de núcleo). Los carvers no la mueven: bajan
   el camino hondo. El piso del cielo (sección 15) tendrá que contar también su alcance.
 - Un chunk sobre la cota local de arriba es aire `Uniform` tras las lecturas de selección (unos
   2 us). Un chunk bajo la cota local de abajo (`deep`) toma el camino hondo, sin la etapa de
   columna: el relleno y los carvers sin columnas. `deep` queda bajo `ground_lo` menos el alcance de
-  la superficie y bajo `apron_lo` menos el `surface` de los carvers. `apron_lo` es una cota de abajo
-  del suelo de la columna de chunk y del apron de los carvers (`ground_lo` sin carvers); el apron
-  que cruza a otra celda de retícula lee la ventana de esa celda. Los carvers la reciben en
-  `CarveChunk::apron_lo`, también en el camino hondo: así un carver de cuevas sabe sin leer su apron
-  si puede tener una columna mojada (ninguna si `apron_lo` queda en el nivel del fluido o más
-  arriba) y decide el anillo de su cáscara de agua.
+  la superficie y bajo `apron_lo` menos el mayor `column_reach` de los carvers en esa columna de
+  chunk (WG-CAVEREACH): lejos de las entradas de las cuevas, el camino hondo empieza más arriba.
+  `apron_lo` es una cota de abajo del suelo de la columna de chunk y del apron de los carvers
+  (`ground_lo` sin carvers); el apron que cruza a otra celda de retícula lee la ventana de esa
+  celda. Los carvers la reciben en `CarveChunk::apron_lo`, también en el camino hondo: así un
+  carver de cuevas sabe sin leer su apron si puede tener una columna mojada (ninguna si `apron_lo`
+  queda en el nivel del fluido o más arriba) y decide el anillo de su cáscara de agua.
 - En debug, el chequeo de spans hace cumplir los ganchos: el suelo de cada columna queda entre las
   cotas de su columna de chunk, y cada modificador dentro de su efecto en ella. El apron no es una
   columna de chunk: cada chunk de la etapa de columna con carvers comprueba que todo suelo de su
-  apron queda sobre `apron_lo`, así un chunk bajo `deep` queda bajo todos su `surface` o más.
+  apron queda sobre `apron_lo`, así un chunk bajo `deep` queda bajo todos su `column_reach` o más.
 - Esto hace barato generar el aire de la banda, no transmitirlo: cada chunk de la banda sigue
   siendo una slot y un job de generación.
 
@@ -1098,6 +1108,15 @@ no como tiempo de frame.
     y +128 us). Con los árboles y plantas de test, el chunk del suelo cuesta 28,0 us contra 23,3
     sin ellos, y el de arriba, que los árboles pueden alcanzar, 15,2 us de etapa de columna en vez
     de los 37 ns del camino de aire: un `column_height` de 0 donde nada crece lo evita.
+  - Medido en WG-CAVEREACH (criterion `region`, una corrida por lado contra main, con la máquina
+    ocupada): la selección y los chunks quedan dentro del ruido (en frío amortizado 51,5 contra
+    50,8 ns por columna de chunk; superficie interior 23,7 contra 24,4 us, el gemelo 25,0 contra
+    23,3; chunk hondo con carver 2,40 contra 2,28 us). Dos corridas sueltas pasan el 5 % y no se
+    repiten en la segunda corrida (la consulta de columna en caliente, 464 contra 522 ns y después
+    459 contra 465), y la grilla del Context, que no cambia, se mueve hasta un 6 %. Con un carver de
+    test con pozos de 40 bloques en una región de cada 3 (`Entrances`), en una columna lejos de los
+    pozos el chunk que pasa al camino hondo cuesta 2,3 us en vez de 37,0 us por la etapa de columna,
+    y sobre 32 x 32 columnas de chunk la etapa de columna arma 8460 chunks en vez de 9024.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
@@ -1111,7 +1130,8 @@ no como tiempo de frame.
   selección y los chunks contra el gemelo antes y después, y un carver (chunk hondo y de superficie);
   `headless_world` sigue igual en el demo. WG-FEATURES mide la fuente y el job de la lejanía en los
   niveles 1, 4 y 6 con y sin tramos de features, y los chunks antes y después y con features de
-  test. No hay ronda de control
+  test. WG-CAVEREACH mide la selección y los chunks antes y después, y la banda que pasa al camino
+  hondo con un carver de test por regiones. No hay ronda de control
   hasta terminar la generación y el trabajo de bloques del motor.
 
 ## Cómo se prueba
