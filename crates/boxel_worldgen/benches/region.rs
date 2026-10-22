@@ -16,6 +16,12 @@
 //! fill and the mask, 1 bit), the ground's chunk (the column stage, the carver reading its apron),
 //! and the carver's own mask without columns (what the deep chunk pays for the carver itself).
 //!
+//! `carve_band_*` (#135): the same holes and shafts 40 blocks deep in one region of 256 x 256
+//! blocks in 3 (`Entrances`), on an interior column away from the shafts: the chunks between the
+//! deep bound of the carver's global reach and that of its reach per chunk column, which the
+//! first builds through the column stage and the second through the deep path. The bench also
+//! prints how many chunks of 32 x 32 chunk columns each builds through the column stage.
+//!
 //! `feature_*` (#134): the test world with the test trees (one cell of 16 x 16 columns in 12,
 //! canopies across chunk borders through an apron of 2) and plants (one dry column in 9) on the
 //! interior column: the ground's chunk and the chunk over it.
@@ -217,6 +223,51 @@ fn bench(c: &mut Criterion) {
         });
     });
     eprintln!("carved interior column ({cx}, {cz}): ground {ground}, {bounds:?}");
+
+    // The carver with shafts in some regions only, its reach global or per chunk column.
+    let shafts = |declares| {
+        generator_with(
+            &world,
+            SEED,
+            RegionSettings::default(),
+            decoration().with_carver(
+                id("test:entrances"),
+                Arc::new(Entrances::new(holes, 40, declares)),
+            ),
+        )
+    };
+    let (global, regional) = (shafts(Declares::Global), shafts(Declares::Regional));
+    let (cx, cz) = (0..)
+        .map(|n| find(&regional, (40 + 9 * n, -40), 1))
+        .find(|&(x, z)| regional.local_bounds(x, z).deep > global.local_bounds(x, z).deep)
+        .expect("an interior column away from the shafts");
+    let (g, r) = (global.local_bounds(cx, cz), regional.local_bounds(cx, cz));
+    let band: Vec<ChunkKey> = (((g.deep - 31) >> 5) + 1..=(r.deep - 31) >> 5)
+        .map(|y| key(cx, y, cz))
+        .collect();
+    c.bench_function("carve_band_global", |b| {
+        b.iter(|| {
+            for &k in &band {
+                black_box(global.generate(black_box(k), &registry));
+            }
+        });
+    });
+    c.bench_function("carve_band_regional", |b| {
+        b.iter(|| {
+            for &k in &band {
+                black_box(regional.generate(black_box(k), &registry));
+            }
+        });
+    });
+    eprintln!(
+        "shafts away at ({cx}, {cz}): {} chunks between the deep bounds {} and {}; column stage \
+         chunks of 32 x 32 chunk columns: {} global, {} per chunk column",
+        band.len(),
+        g.deep,
+        r.deep,
+        column_stage_chunks(&global, (cx - 16, cz - 16)),
+        column_stage_chunks(&regional, (cx - 16, cz - 16)),
+    );
 
     // The feature stages, on the interior column.
     let featured = generator_with(
