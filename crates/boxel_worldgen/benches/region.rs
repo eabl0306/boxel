@@ -16,6 +16,13 @@
 //! fill and the mask, 1 bit), the ground's chunk (the column stage, the carver reading its apron),
 //! and the carver's own mask without columns (what the deep chunk pays for the carver itself).
 //!
+//! `carve_dry_under`, `carve_flood_*` and `carve_surface_sea` (E-C): the same holes with their
+//! voids flooded (`Flooded`, a shell of 12 under wet grounds): a deep chunk of the interior
+//! column under the level (y -64 to -33) with the holes dry, all its voids flooded (rock and
+//! fluid, 1 bit) and flooded under a water table at y -48 (rock, fluid and air: dense); and the
+//! ground's chunk of a column under the sea with the holes dry and flooded under that table
+//! (the column stage, the flood reading the apron's fluid tops).
+//!
 //! `carve_band_*` (#135): the same holes and shafts 40 blocks deep in one region of 256 x 256
 //! blocks in 3 (`Entrances`), on an interior column away from the shafts: the chunks between the
 //! deep bound of the carver's global reach and that of its reach per chunk column, which the
@@ -224,6 +231,43 @@ fn bench(c: &mut Criterion) {
         });
     });
     eprintln!("carved interior column ({cx}, {cz}): ground {ground}, {bounds:?}");
+
+    // The same holes with their voids flooded (E-C).
+    let flooded = |table| {
+        generator_with(
+            &world,
+            SEED,
+            RegionSettings::default(),
+            decoration().with_carver(id("test:holes"), Arc::new(Flooded::new(holes, table, 12))),
+        )
+    };
+    let (all, across) = (flooded(i64::MAX), flooded(-48));
+    let under = key(cx, -2, cz);
+    c.bench_function("carve_dry_under", |b| {
+        b.iter(|| carved.generate(black_box(under), &registry));
+    });
+    c.bench_function("carve_flood_deep", |b| {
+        b.iter(|| all.generate(black_box(under), &registry));
+    });
+    c.bench_function("carve_flood_across", |b| {
+        b.iter(|| across.generate(black_box(under), &registry));
+    });
+    let (sx, sz) = (0..1 << 16)
+        .map(|n| (cx + n * 3, cz + (n % 7) * 5))
+        .find(|&(x, z)| carved.column_info(x << 5, z << 5).fluid_top.is_some())
+        .expect("a column under the sea");
+    let sea_ground = carved.column_info(sx << 5, sz << 5).ground;
+    let sea = key(sx, sea_ground >> 5, sz);
+    c.bench_function("carve_surface_sea", |b| {
+        b.iter(|| carved.generate(black_box(sea), &registry));
+    });
+    c.bench_function("carve_flood_surface", |b| {
+        b.iter(|| across.generate(black_box(sea), &registry));
+    });
+    eprintln!(
+        "flooded chunk under the level {under:?}; column under the sea ({sx}, {sz}): ground \
+         {sea_ground}"
+    );
 
     // The carver with shafts in some regions only, its reach global or per chunk column.
     let shafts = |declares| {
