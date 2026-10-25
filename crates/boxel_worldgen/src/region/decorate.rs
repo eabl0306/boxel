@@ -1175,37 +1175,52 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
     /// the realm's fluid where `wet` holds it, unless it holds air or the fluid.
     fn states(&self, mask: &CarveMask, wet: Option<&Occupancy>, states: &mut [BlockState]) {
         let fluid = self.stages.fluid;
-        // State `i` is voxel `(lx, ly, lz)` at `ly << 10 | lx << 5 | lz`: bit `lz` of word
-        // `ly * 32 + lx`, word `i >> 5`.
-        let void = |i: usize| match wet {
-            Some(wet) if wet[i >> CHUNK_SHIFT] & (1 << (i & 31)) != 0 => fluid,
-            _ => BlockState::AIR,
-        };
-        let keep = match mask {
-            CarveMask::Solid => return,
-            CarveMask::Air => {
-                for (i, s) in states.iter_mut().enumerate() {
-                    if *s != fluid && *s != BlockState::AIR {
-                        *s = void(i);
-                    }
+        match wet {
+            None => carve_states(mask, states, |s, _| {
+                if *s != fluid {
+                    *s = BlockState::AIR;
                 }
-                return;
-            }
-            CarveMask::Mixed(keep) => keep,
-        };
-        for (i, &word) in keep.iter().enumerate() {
-            // Word `ly * 32 + lx`, bit z; the state of `(lx, ly, lz)` is at `ly << 10 | lx << 5 |
-            // lz`.
-            let base = i << CHUNK_SHIFT;
-            let mut carved = !word;
-            while carved != 0 {
-                let lz = carved.trailing_zeros() as usize;
-                carved &= carved - 1;
-                let s = &mut states[base | lz];
+            }),
+            // State `i` is voxel `(lx, ly, lz)` at `ly << 10 | lx << 5 | lz`: bit `lz` of word
+            // `ly * 32 + lx`, word `i >> 5`.
+            Some(wet) => carve_states(mask, states, |s, i| {
                 if *s != fluid && *s != BlockState::AIR {
-                    *s = void(base | lz);
+                    *s = if wet[i >> CHUNK_SHIFT] & (1 << (i & 31)) != 0 {
+                        fluid
+                    } else {
+                        BlockState::AIR
+                    };
                 }
+            }),
+        }
+    }
+}
+
+/// `carve` on every state of `states` (`y << 10 | x << 5 | z`) that `mask` carves, with its
+/// index.
+fn carve_states(
+    mask: &CarveMask,
+    states: &mut [BlockState],
+    mut carve: impl FnMut(&mut BlockState, usize),
+) {
+    let keep = match mask {
+        CarveMask::Solid => return,
+        CarveMask::Air => {
+            for (i, s) in states.iter_mut().enumerate() {
+                carve(s, i);
             }
+            return;
+        }
+        CarveMask::Mixed(keep) => keep,
+    };
+    for (i, &word) in keep.iter().enumerate() {
+        // Word `ly * 32 + lx`, bit z; the state of `(lx, ly, lz)` is at `ly << 10 | lx << 5 | lz`.
+        let base = i << CHUNK_SHIFT;
+        let mut carved = !word;
+        while carved != 0 {
+            let lz = carved.trailing_zeros() as usize;
+            carved &= carved - 1;
+            carve(&mut states[base | lz], base | lz);
         }
     }
 }
