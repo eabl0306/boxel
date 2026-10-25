@@ -421,7 +421,8 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
   id y su línea `carver_stage` en el digest. Quedan fuera de la lejanía.
   - Dan una máscara (`CarveMask`: `Solid`, `Air` o `Mixed`, un bit por vóxel, 1 donde el vóxel
     queda), la forma del demo. El motor vacía solo vóxeles sólidos: nunca el aire ni el fluido del
-    reino. Así ninguna máscara agrega un bloque ni borra el fluido, y el plan pedía un chequeo en
+    reino. Un vóxel vaciado queda en aire, o en el fluido del reino donde lo marca una inundación
+    (abajo). Así ninguna máscara agrega un bloque ni borra el fluido, y el plan pedía un chequeo en
     debug de "solo vuelve aire lo sólido" que con una máscara no tiene caso: se cumple por
     construcción. Que el agua no caiga a una cueva (el fondo del mar abierto bajo el agua, o un
     bloque de la superficie dentro de ella) es regla del carver, la cáscara de agua: lee el tope
@@ -438,6 +439,25 @@ context -> select -> alturas de los tipos -> mezcla -> MODIFICADORES DE FORMA ->
     por bloque.
   - Corren también en el camino hondo, sin columnas (sección 14). Roca uniforme y una máscara dan
     un chunk de 1 bit, sin array denso.
+  - Pueden inundar sus vacíos (`CarverStage::flood`, una `FloodMask`, desde E-C del estudio de
+    TFC): TFC llena de agua las cuevas cerca del mar y bajo los ríos con su acuífero del nivel del
+    mar. La inundación marca una parte de ese acuífero, no los vacíos de un carver: las de todos
+    los carvers se juntan (o) y valen para los vacíos de todos, así una sola regla de acuífero
+    inunda las cuevas de todos. El motor pone el fluido del reino en un vóxel sólido que algún
+    carver vacía y que alguna inundación marca, solo en el nivel del fluido o debajo
+    (`CarveChunk::level`); más arriba queda aire, y en un reino sin fluido no se pregunta. Nunca
+    toca el aire ni el fluido: no agrega bloques donde no se vacía nada y no borra el fluido.
+    - Por defecto es seca. Se pregunta solo en un chunk que algún carver vacía, con algún vóxel en
+      el nivel o debajo, así un carver seco no paga nada.
+    - Sigue el contrato de la máscara: es pura y queda dentro del alcance. En debug, un chunk que
+      queda su `column_reach` bajo todo suelo que el carver puede leer comprueba que su inundación
+      con columnas es la de sin columnas, en el nivel o debajo. Así el camino hondo da el mismo
+      chunk que la etapa de columna.
+    - No cambia las cotas locales: el fluido solo llena vacíos bajo el tope de cada columna. Un
+      chunk hondo con todos sus vacíos inundados sigue en 1 bit (roca y fluido); con roca, fluido y
+      aire, el chunk es denso.
+    - Unir un vacío inundado con uno seco es decisión del carver: TFC los separa con una barrera de
+      roca, y aquí el carver deja esa roca sin vaciar.
   - En debug, un chunk que queda su `column_reach` o más bajo todo suelo que el carver puede leer
     comprueba que su máscara con columnas es la de sin columnas. Un carver que mira la superficie
     más hondo que lo que dice en esa columna de chunk falla ahí, en vez de dar otro chunk en el
@@ -638,6 +658,28 @@ niveles que se le piden (el plan pide 1 a 4):
 
 `lod_corners` da las esquinas de la pasada, para comparar con las columnas de chunk.
 
+**Harness de la costura** (`check_seam`, también en `test-support`, desde S1 del estudio de TFC):
+donde el detalle completo se junta con el nivel 1 en el borde de carga. Un chunk se mallea contra
+sus vecinos reales, así su costado no tiene cara donde el chunk de enfrente es suelo, y solo las
+celdas gruesas de enfrente lo pueden tapar. `check_lod` compara celda por celda y no ve esa
+costura. No cambia el generador. Sobre las columnas de chunk que se le pasan:
+
+- en los 4 planos de cada una, cada celda de nivel 1 de los dos lados: su tope sólido grueso queda
+  en o sobre todo tope real de su fila de borde (sus 2 columnas junto al plano), salvo donde las
+  dos están mojadas. Las fallas salen por clase: celdas bajadas (una forma lejana bajo el suelo
+  real, como un río que baja la esquina seca de una orilla) y franjas mojadas (la celda está mojada
+  donde el suelo real de su fila de borde está seco: la regla de mojado de la lejanía, E-D);
+- rayos a través de la frontera, contra las mallas que dibuja el render: la columna de chunk con
+  `boxel_mesh` y sus vecinos reales, y su columna de nodos de nivel 1 con sus faldas, paredes y
+  bancos y los octantes de la columna de chunk ocultos, como los tests `lod_cracks` del demo. Un
+  rayo que llega a un punto dentro del suelo sin tocar una cara deja ver el cielo a través del
+  suelo. Con los chunks como se dibujan (carvers y features), también salen rayos de las cuevas
+  cerca del plano: las cuevas en la costura.
+
+Por eso `test-support` depende de `boxel_mesh`: los rayos solo valen contra las mallas que se
+dibujan. Una capa de arriba transparente (vidrio), que la lejanía dibuja sólida, deja ver el cielo
+en toda costura, y el harness lo cuenta.
+
 El juego y cualquier tipo de un mod lo llaman con sus propias columnas, así un `lod_heights` escrito
 a mano queda probado sin tests de lejanía a medida.
 
@@ -731,8 +773,8 @@ problemas salen en el mismo error. Solo una pila de reinos que no se arma la dej
   etapa de superficie escribe solo dentro de su alcance declarado (si no, deja costuras entre
   chunks), que una feature escribe solo sobre el suelo de cada columna hasta su altura y que su
   `column_height` no pasa esa altura, que un carver no mira la superficie más hondo que su
-  `column_reach` y que este no pasa su `surface`, y que los bloques de volumen están solo donde
-  `d_f >= K`.
+  `column_reach` (ni con su máscara ni con su inundación) y que este no pasa su `surface`, y que
+  los bloques de volumen están solo donde `d_f >= K`.
   Los tests del motor corren en debug, así un tipo o un mod con una cota mal hecha falla sus
   tests.
 - **Lado de consultas.** `WorldQuery { height_at(x, z), realm_at(y), biome_at(x, y, z),
@@ -771,7 +813,8 @@ Dentro del generador, sin cambiar el motor (desde WG-DECOR, #133):
   (`ground_lo` sin carvers); el apron que cruza a otra celda de retícula lee la ventana de esa
   celda. Los carvers la reciben en `CarveChunk::apron_lo`, también en el camino hondo: así un
   carver de cuevas sabe sin leer su apron si puede tener una columna mojada (ninguna si `apron_lo`
-  queda en el nivel del fluido o más arriba) y decide el anillo de su cáscara de agua.
+  queda en el nivel del fluido o más arriba) y decide el anillo de su cáscara de agua. La
+  inundación de los carvers (sección 9) no mueve ninguna cota: llena vacíos bajo el tope.
 - En debug, el chequeo de spans hace cumplir los ganchos: el suelo de cada columna queda entre las
   cotas de su columna de chunk, y cada modificador dentro de su efecto en ella. El apron no es una
   columna de chunk: cada chunk de la etapa de columna con carvers comprueba que todo suelo de su
@@ -1118,6 +1161,16 @@ no como tiempo de frame.
     cada 3 (`Entrances`), en una columna lejos de los pozos el chunk que pasa al camino hondo cuesta
     2,3 us en vez de 37,0 us por la etapa de columna, y sobre 32 x 32 columnas de chunk la etapa de
     columna arma 8460 chunks en vez de 9024.
+  - Medido en E-C (criterion `region`, una corrida por lado contra main con la máquina quieta, sin
+    compilar nada): los caminos de los carvers secos quedan dentro del ruido (chunk hondo 2,25
+    contra 2,23 us, chunk del suelo 42,5 contra 42,0, la banda 35,2 contra 34,6, la máscara sola
+    2,08 contra 2,11). Una primera corrida daba +4 % en los chunks de la etapa de columna: era el
+    carver de test, que pasaba por el recorrido del apron con la marca de mojado; con su recorrido
+    de antes desaparece. Con los vacíos inundados, en un chunk hondo bajo el nivel: 2,78 us con
+    todos los vacíos inundados (roca y fluido en 1 bit) contra 2,26 secos, y 37,8 us con el agua
+    hasta la mitad del chunk (roca, fluido y aire: denso). En el chunk del suelo de una columna bajo el mar,
+    116 us contra 81 secos: la inundación de test lee el anillo del apron otra vez y arma su
+    máscara vóxel por vóxel, así es una cota de arriba del costo, no el del juego.
 - WG4: a lo sumo 2 us en frío y 1 us en caliente por columna de chunk; unas 100 lecturas de retícula
   por columna de nodos.
 - Consultas: `biome_at` en la columna de la cámara, a lo sumo 20 us en frío y 2 us en caliente, una
@@ -1132,7 +1185,8 @@ no como tiempo de frame.
   `headless_world` sigue igual en el demo. WG-FEATURES mide la fuente y el job de la lejanía en los
   niveles 1, 4 y 6 con y sin tramos de features, y los chunks antes y después y con features de
   test. WG-CAVEREACH mide la selección y los chunks antes y después, y la banda que pasa al camino
-  hondo con un carver de test por regiones. No hay ronda de control
+  hondo con un carver de test por regiones. E-C mide los caminos de los carvers antes y después, y
+  los chunks con vacíos inundados. No hay ronda de control
   hasta terminar la generación y el trabajo de bloques del motor.
 
 ## Cómo se prueba
@@ -1164,11 +1218,15 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
    el mar tiene fluido hasta el nivel.
 8. **Cotas**: las cotas locales y las de WG4 cubren todo bloque que no es aire (proptest cerca de
    bordes, volúmenes, features, estructuras y planos). El camino hondo se toma solo bajo toda regla
-   de superficie y todo corte. El chequeo de spans está encendido en todo test del motor.
+   de superficie y todo corte. Con vacíos inundados, el fluido queda en el nivel o debajo, nunca
+   se borra, y el camino hondo da el chunk de la etapa de columna. El chequeo de spans está
+   encendido en todo test del motor.
 9. **Lejanía**, por el harness exportado: celdas gruesas contra la regla de la celda en los niveles
    1 a 4, en nodos de borde de 2 y 3 tipos. Una divisoria entre dos valles cortados dentro de una
    celda deja el tope grueso sobre el real. Bandas conservadoras y tramos de volumen dentro de su
-   cota. Los tramos de las features, sobre el suelo, bajo su altura y dentro de la banda.
+   cota. Los tramos de las features, sobre el suelo, bajo su altura y dentro de la banda. La costura
+   (`check_seam`): una forma sana pasa, una que baja una esquina seca en el nivel 1 falla, y las
+   franjas mojadas y las cuevas en la costura salen con su clase.
 10. **Guardado**: ida y vuelta de `boxel:worldgen`; `FORMAT_VERSION` sin cambios; un mundo sin la
     clave abre como legado con su generador viejo; una versión de entrada cambiada, un reino
     agregado y un mod quitado dan el `WorldgenDiff` esperado.
@@ -1271,3 +1329,6 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
   empezar) y qué formas de relieve de W2 pasan a ser tipos con borde (por defecto, ninguna).
 - La forma de la distancia del `ContactField` (cuadrado de Chebyshev de 5,6 km o disco redondo de
   unos 7,9 km) se elige en V3, sobre imágenes de las agujas.
+- E-C: el agua de las cuevas inundadas sale de la generación, como la del mar, y la luz y la física
+  ya tratan el agua. Nadie miró todavía la luz con agua bajo tierra (la luz es zona protegida): lo
+  mira S18 en el juego.
