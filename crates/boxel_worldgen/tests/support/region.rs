@@ -725,13 +725,50 @@ impl Holes {
     /// columns, and the ring of its apron through [`ChunkColumns::tops`], 4 strips (as a cave
     /// stage asks for its water shell).
     fn lowest<Cx: Context>(&self, columns: &ChunkColumns<'_, Cx>) -> Vec<i64> {
-        self.ring(columns).into_iter().map(|(g, _)| g).collect()
+        let (o, r) = (columns.origin, i64::from(self.reads));
+        let side = 32 + 2 * r;
+        let mut ground = vec![0; (side * side) as usize];
+        for (c, &g) in columns.ground.iter().enumerate() {
+            let (x, z) = (r + (c >> 5) as i64, r + (c & 31) as i64);
+            ground[(x * side + z) as usize] = g;
+        }
+        if r > 0 {
+            // The -x and +x strips over the whole side, then the -z and +z ones between them.
+            let strips = [
+                (0, r, 0, side),
+                (32 + r, side, 0, side),
+                (r, 32 + r, 0, r),
+                (r, 32 + r, 32 + r, side),
+            ];
+            for (x0, x1, z0, z1) in strips {
+                let xs: Vec<i64> = (x0..x1).map(|x| o.x - r + x).collect();
+                let zs: Vec<i64> = (z0..z1).map(|z| o.z - r + z).collect();
+                let n = xs.len() * zs.len();
+                let (mut g, mut f) = (vec![0; n], vec![0; n]);
+                columns.tops(&xs, &zs, &mut g, &mut f);
+                for (i, x) in (x0..x1).enumerate() {
+                    for (j, z) in (z0..z1).enumerate() {
+                        ground[(x * side + z) as usize] = g[i * zs.len() + j];
+                    }
+                }
+            }
+        }
+        let at = |x: i64, z: i64| ground[(x * side + z) as usize];
+        (0..CHUNK_AREA as i64)
+            .map(|c| {
+                let (x, z) = (r + (c >> 5), r + (c & 31));
+                at(x, z)
+                    .min(at(x - r, z))
+                    .min(at(x + r, z))
+                    .min(at(x, z - r))
+                    .min(at(x, z + r))
+            })
+            .collect()
     }
 
-    /// Per column of the chunk of `columns`, the lowest ground of the column and of its 4
-    /// neighbors `reads` blocks away, and whether one of them is wet (its fluid top over its
-    /// ground): its chunk's own columns, and the ring of its apron through
-    /// [`ChunkColumns::tops`], 4 strips.
+    /// [`Holes::lowest`] with, per column, whether one of the columns its rule reads is wet (its
+    /// fluid top over its ground), for [`Flooded`]. The holes keep their own walk, so their
+    /// benches stay comparable.
     fn ring<Cx: Context>(&self, columns: &ChunkColumns<'_, Cx>) -> Vec<(i64, bool)> {
         let (o, r) = (columns.origin, i64::from(self.reads));
         let side = 32 + 2 * r;
