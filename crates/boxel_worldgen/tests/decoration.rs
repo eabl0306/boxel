@@ -11,6 +11,11 @@
 //!   mask give a 1-bit chunk; no mask adds a block or drains the fluid; the digest line, the
 //!   order, duplicates, block names and the apron cap; carvers get the lowest ground of their
 //!   apron (`apron_lo`) in the column stage and in the deep path;
+//! - flooded voids (E-C): a carver's flood fills its voids and the other carvers' with the
+//!   realm's fluid only at or under its level, keeps the fluid and adds no block, and never runs
+//!   in a realm without fluid; the local bounds stay the same; the deep path equals the column
+//!   stage with a flood under a water table and around wet columns (rock and fluid in 1 bit under
+//!   the table), near and far from the origin, in any order on any thread with any memo;
 //! - the reach per chunk column (#135): a carver whose entrances lie in some regions only gives a
 //!   smaller reach away from them, the deep bound moves up there and only there, more chunks take
 //!   the deep path, and the world is the same block for block, near the entrances and away, near
@@ -21,14 +26,15 @@
 //!   column and under the heights over a carver's apron, a column effect under the cut or outside
 //!   the modifier's effect, a read past the apron (a carver's, the surface stage's), a carver
 //!   whose rules read the surface deeper than its reach (and not one whose masks only spell the
-//!   same voxels two ways), a reach per chunk column under the rules (one that misses its apron
-//!   too) or over the declared one, a kind or a modifier steeper than it declares.
+//!   same voxels two ways), a flood that reads it deeper than its reach, a reach per chunk column
+//!   under the rules (one that misses its apron too) or over the declared one, a kind or a
+//!   modifier steeper than it declares.
 #[path = "support/region.rs"]
 mod support;
 
 use boxel_voxel::{
     BlockPos, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos,
-    LocalPos, MAX_BLOCK_COORD, Paletted,
+    LocalPos, MAX_BLOCK_COORD, Occupancy, Paletted,
 };
 use boxel_worldgen::WorldGenerator;
 use boxel_worldgen::field::{Rect, Slope, Span};
@@ -36,9 +42,9 @@ use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::realm::{FluidRule, RealmSpec};
 use boxel_worldgen::region::{
     CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, Context, Decoration, Entry,
-    FlatKind, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, LocalBounds, MAX_APRON,
-    NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope, SelectorRule,
-    ShapeEffect, ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, block_of,
+    FlatKind, FloodMask, FloorFill, HEIGHT_ONE, HeightQ, KindGrid, KindLimits, LocalBounds,
+    MAX_APRON, NoSurface, RegionGenerator, RegionSettings, RegionSpec, RuleEntry, Scope,
+    SelectorRule, ShapeEffect, ShapeModifier, SurfaceReach, SurfaceStage, TerrainKind, block_of,
     clear_worker_memo,
 };
 use boxel_worldgen::registry::{
@@ -385,7 +391,10 @@ fn the_apron_and_the_deep_path_agree_far_from_the_origin() {
     );
     let holes = carved(true, RegionSettings::default());
     let regional = entrances(Declares::Regional, RegionSettings::default());
+    let flooded = flooded(FLOODED, RegionSettings::default());
     let registry = registry();
+    let fluid = registry.by_name("test:fluid").unwrap();
+    let mut wet = 0;
     let far = MAX_BLOCK_COORD - (1 << 14);
     for origin in [1 << 31, -(1 << 31), 1 << 40, far, -far] {
         // A chunk column at the +x +z corner of its lattice cell, toward the origin so the chunk
@@ -417,20 +426,19 @@ fn the_apron_and_the_deep_path_agree_far_from_the_origin() {
             }
         }
         assert_eq!(heights.len(), 9);
-        // The carved chunks across the deep bound, with a reach per chunk column too: the deep
-        // path gives the column stage's.
-        for g in [&holes, &regional] {
+        // The carved chunks across the deep bound, with a reach per chunk column too and with
+        // flooded voids (down to the flood's table): the deep path gives the column stage's.
+        for g in [&holes, &regional, &flooded] {
             let b = g.local_bounds(cx, cz);
-            for y in (b.deep >> 5) - 1..=(b.top >> 5) + 1 {
+            for y in ((b.deep >> 5) - 1).min((FLOODED.table >> 5) - 1)..=(b.top >> 5) + 1 {
                 let k = key(cx, y, cz);
-                assert_eq!(
-                    g.generate(k, &registry),
-                    g.generate_full(k, &registry),
-                    "{k:?}"
-                );
+                let chunk = g.generate(k, &registry);
+                assert_eq!(chunk, g.generate_full(k, &registry), "{k:?}");
+                wet += usize::from(holds(&chunk, fluid));
             }
         }
     }
+    assert!(wet >= 10, "{wet} chunks with fluid far from the origin");
 }
 
 // ---- Carvers ----------------------------------------------------------------------------------
@@ -441,6 +449,20 @@ fn carved(hooked: bool, settings: RegionSettings) -> RegionGenerator<TestContext
     try_open(
         &test_world(hooked),
         with_valleys().with_carver(id("test:holes"), Arc::new(Holes::new(5, 6, 3))),
+        settings,
+    )
+    .expect("opens")
+}
+
+/// The test world with its kinds' bounds per chunk column, the valleys and `carver` as
+/// `test:holes` (the holes of [`carved`] under the same seed).
+fn carved_as(
+    carver: Arc<dyn CarverStage<TestContext>>,
+    settings: RegionSettings,
+) -> RegionGenerator<TestContext> {
+    try_open(
+        &test_world(true),
+        with_valleys().with_carver(id("test:holes"), carver),
         settings,
     )
     .expect("opens")
@@ -577,20 +599,23 @@ fn dry(
     kind: Arc<dyn TerrainKind<()>>,
     decoration: Decoration<()>,
 ) -> Result<RegionGenerator<()>, String> {
+    one_kind(kind, FluidRule::None, decoration)
+}
+
+/// A realm of the one kind `kind` under `()`, on `test:solid`, with `fluid` and `decoration`.
+fn one_kind(
+    kind: Arc<dyn TerrainKind<()>>,
+    fluid: FluidRule,
+    decoration: Decoration<()>,
+) -> Result<RegionGenerator<()>, String> {
     let mut checks = Checks::new();
     let mut realms = GenRegistryBuilder::new("realm");
-    realms.register(
-        id("test:dry"),
-        RealmSpec {
-            fluid: FluidRule::None,
-            ..realm()
-        },
-    );
+    realms.register(id("test:one"), RealmSpec { fluid, ..realm() });
     let mut rules = GenRegistryBuilder::new("selector_rule");
     rules.register(
         id("test:all"),
         SelectorRule {
-            realm: id("test:dry"),
+            realm: id("test:one"),
             priority: 0,
             condition: Vec::new(),
             scope: Scope::CELL,
@@ -612,7 +637,7 @@ fn dry(
         RegionSpec {
             seed: SEED,
             dimension: &id("test:overworld"),
-            realm: &id("test:dry"),
+            realm: &id("test:one"),
             realms: &realms,
             rules: &rules,
             entries: &entries,
@@ -1633,4 +1658,347 @@ fn a_reach_per_chunk_column_that_misses_its_apron_fails() {
         }
     }
     assert!(caught >= 4, "{caught} of 8 chunk columns caught");
+}
+
+// ---- Flooded voids (E-C) ----------------------------------------------------------------------
+
+/// The test world with the valleys and `flood` (its holes those of [`carved`]).
+fn flooded(flood: Flooded, settings: RegionSettings) -> RegionGenerator<TestContext> {
+    carved_as(Arc::new(flood), settings)
+}
+
+/// The flood of the tests: the holes of [`carved`], every void under y -40 and those within 12
+/// blocks under the grounds around a wet column.
+const FLOODED: Flooded = Flooded::new(Holes::new(5, 6, 3), -40, 12);
+
+/// The first `n` chunk columns of a long diagonal with a wet column at their lowest corner (the
+/// sea over a basin or a low plain).
+fn wet_columns(g: &RegionGenerator<TestContext>, n: usize) -> Vec<(i64, i64)> {
+    let columns: Vec<(i64, i64)> = (0..4096)
+        .map(|n| (n * 7 % 400 - 200, n * 11 % 400 - 200))
+        .filter(|&(cx, cz)| g.column_info(cx << 5, cz << 5).fluid_top.is_some())
+        .take(n)
+        .collect();
+    assert_eq!(columns.len(), n, "wet chunk columns");
+    columns
+}
+
+/// Whether `chunk` holds `state` (its palette does: encoded chunks hold only the states in use).
+fn holds(chunk: &ChunkData, state: BlockState) -> bool {
+    match chunk.blocks() {
+        Paletted::Uniform(s) => *s == state,
+        Paletted::Packed { palette, .. } => palette.contains(&state),
+        Paletted::Direct(states) => states.contains(&state),
+    }
+}
+
+/// Whether `state` is a block a carver may carve: neither air nor the fluid.
+fn solid(state: BlockState, fluid: BlockState) -> bool {
+    state != BlockState::AIR && state != fluid
+}
+
+#[test]
+fn flooded_voids_take_the_fluid_only_at_or_under_the_level_and_keep_it() {
+    let registry = registry();
+    let fluid = registry.by_name("test:fluid").unwrap();
+    let settings = RegionSettings::default();
+    let dry = carved(true, settings);
+    // Every void flooded: the engine keeps the fluid at or under the level, y 0.
+    let wet = flooded(Flooded::new(Holes::new(5, 6, 3), i64::MAX, 0), settings);
+    let uncarved = open(&test_world(true), with_valleys());
+    let mut columns = sample_columns();
+    columns.extend(wet_columns(&uncarved, 3));
+    let (mut flooded, mut over, mut kept, mut chunks) = (0, 0, 0, 0);
+    for (cx, cz) in columns {
+        // The same bounds: the fluid fills voids, under every column's top.
+        let b = wet.local_bounds(cx, cz);
+        assert_eq!(b, dry.local_bounds(cx, cz), "({cx}, {cz})");
+        for y in (b.deep >> 5) - 2..=(b.top >> 5) + 1 {
+            let k = key(cx, y, cz);
+            let (a, w, u) = (
+                dry.generate(k, &registry),
+                wet.generate(k, &registry),
+                uncarved.generate(k, &registry),
+            );
+            assert_eq!(w, wet.generate_full(k, &registry), "{k:?}");
+            assert_air_over(&w, y, b.top);
+            chunks += 1;
+            if a == w {
+                continue;
+            }
+            for i in 0..32 * 32 * 32u32 {
+                let p = LocalPos::new(i >> 10, (i >> 5) & 31, i & 31);
+                let (sa, sw, su) = (a.get(p), w.get(p), u.get(p));
+                let at = (y << 5) + i64::from(p.y());
+                // A void of the dry carver: the fluid at or under the level, air over it.
+                if sa == BlockState::AIR && solid(su, fluid) {
+                    let expect = if at <= 0 { fluid } else { BlockState::AIR };
+                    assert_eq!(sw, expect, "{k:?} {p:?}");
+                    flooded += usize::from(at <= 0);
+                    over += usize::from(at > 0);
+                } else {
+                    // Anything else as the dry carver leaves it: the fluid kept, no block added.
+                    assert_eq!(sw, sa, "{k:?} {p:?}");
+                    kept += usize::from(sa == fluid);
+                }
+            }
+        }
+    }
+    assert!(chunks > 100, "{chunks} chunks");
+    assert!(flooded > 10_000, "{flooded} voxels flooded");
+    assert!(
+        over > 1000 && kept > 1000,
+        "{over} voids over the level, {kept} fluid kept"
+    );
+}
+
+#[test]
+fn the_deep_path_equals_the_column_stage_with_flooded_voids() {
+    let registry = registry();
+    let fluid = registry.by_name("test:fluid").unwrap();
+    let settings = RegionSettings::default();
+    let g = flooded(FLOODED, settings);
+    // The same holes and the same reach, dry.
+    let holes = Holes {
+        reach: FLOODED.reach,
+        ..Holes::new(5, 6, 3)
+    };
+    let dry = carved_as(Arc::new(holes), settings);
+    let mut columns = sample_columns();
+    columns.extend(wet_columns(&g, 4));
+    let (mut deep, mut deep_flooded, mut one_bit, mut across) = (0, 0, 0, 0);
+    let mut column_flooded = 0;
+    for (cx, cz) in columns {
+        let b = g.local_bounds(cx, cz);
+        assert_eq!(b, dry.local_bounds(cx, cz), "({cx}, {cz})");
+        for y in ((b.deep >> 5) - 4).min(-3)..=(b.top >> 5) + 1 {
+            let k = key(cx, y, cz);
+            let chunk = g.generate(k, &registry);
+            assert_eq!(chunk, g.generate_full(k, &registry), "{k:?}");
+            assert_air_over(&chunk, y, b.top);
+            let wet = chunk != dry.generate(k, &registry);
+            if (y << 5) + 31 <= b.deep {
+                deep += 1;
+                deep_flooded += usize::from(wet);
+                if !wet {
+                    continue;
+                }
+                // Wholly under the table every void is the fluid: rock and fluid in 1 bit.
+                // Across it, rock, fluid and air.
+                let Paletted::Packed { bits, palette, .. } = chunk.blocks() else {
+                    panic!("{k:?}: {:?}", chunk.blocks());
+                };
+                assert!(palette.contains(&fluid), "{k:?}");
+                if *bits == 1 {
+                    assert!((y << 5) + 31 <= FLOODED.table, "{k:?}");
+                    one_bit += 1;
+                } else {
+                    assert!(palette.contains(&BlockState::AIR), "{k:?}");
+                    assert!((y << 5) <= FLOODED.table, "{k:?}");
+                    across += 1;
+                }
+            } else {
+                column_flooded += usize::from(wet);
+            }
+        }
+    }
+    assert!(
+        deep >= 60 && deep_flooded >= 50 && one_bit >= 40 && across >= 2,
+        "{deep_flooded} of {deep} deep chunks flooded, {one_bit} in 1 bit, {across} across the \
+         table"
+    );
+    assert!(
+        column_flooded >= 100,
+        "{column_flooded} chunks flooded by the column stage"
+    );
+}
+
+#[test]
+fn flooded_chunks_are_the_same_in_any_order_on_any_thread_with_any_memo() {
+    let column = wet_columns(&flooded(FLOODED, RegionSettings::default()), 1)[0];
+    same_in_any_order(|settings| flooded(FLOODED, settings), column);
+}
+
+/// A carver that gives every chunk `mask` and floods `flood`, in the test world (fluid level 0).
+struct Pours(CarveMask, FloodMask);
+
+impl HashParams for Pours {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&matches!(self.0, CarveMask::Air))
+            .write(&matches!(self.1, FloodMask::Wet));
+    }
+}
+
+impl GenEntry for Pours {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> CarverStage<Cx> for Pours {
+    fn reach(&self) -> CarveReach {
+        CarveReach::default()
+    }
+    fn carve(&self, _: &CarveChunk<'_, Cx>) -> CarveMask {
+        self.0.clone()
+    }
+    fn flood(&self, chunk: &CarveChunk<'_, Cx>) -> FloodMask {
+        // Asked only in a realm with fluid, at or under its level, where something is carved.
+        assert_eq!(chunk.level, Some(0));
+        assert!(chunk.origin.y <= 0, "{:?}", chunk.origin);
+        self.1.clone()
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn a_flood_fills_only_the_carved_solid_voxels_and_keeps_the_fluid() {
+    let registry = registry();
+    let fluid = registry.by_name("test:fluid").unwrap();
+    let world = test_world(false);
+    let plain = open(&world, decoration());
+    let pours = |mask: CarveMask, flood: FloodMask| {
+        open(
+            &world,
+            decoration().with_carver(id("test:pours"), Arc::new(Pours(mask, flood))),
+        )
+    };
+    let all = pours(CarveMask::Air, FloodMask::Wet);
+    // Two carvers: one carves everything dry, the other carves nothing and floods everything
+    // (the realm's aquifer): the voids of the first take the fluid.
+    let split = open(
+        &world,
+        decoration()
+            .with_carver(id("test:dry"), Arc::new(Gives(CarveMask::Air)))
+            .with_carver(
+                id("test:aquifer"),
+                Arc::new(Pours(CarveMask::Solid, FloodMask::Wet)),
+            ),
+    );
+    let none = pours(CarveMask::Solid, FloodMask::Wet);
+    // Columns under the sea and dry ones: the chunks across the ground, the level and under.
+    let wet: Vec<(i64, i64)> = (0..20_000)
+        .map(|n| (n * 37 % 9000 - 4500, n * 53 % 9000 - 4500))
+        .filter(|&(x, z)| plain.column_info(x, z).fluid_top.is_some())
+        .take(3)
+        .collect();
+    let dry: Vec<(i64, i64)> = (0..20_000)
+        .map(|n| (n * 37 % 9000 - 4500, n * 53 % 9000 - 4500))
+        .filter(|&(x, z)| (1..20).contains(&plain.column_info(x, z).ground))
+        .take(3)
+        .collect();
+    assert_eq!((wet.len(), dry.len()), (3, 3), "basin and plain columns");
+    for (x, z) in wet.into_iter().chain(dry) {
+        let ground = plain.column_info(x, z).ground;
+        for y in [ground >> 5, -2, -1, 0, 1] {
+            let k = key(x >> 5, y, z >> 5);
+            let before = plain.generate(k, &registry);
+            // Nothing carved: the same chunk, the flood adds no block.
+            assert_eq!(none.generate(k, &registry), before, "{k:?}");
+            let after = all.generate(k, &registry);
+            assert_eq!(after, all.generate_full(k, &registry), "{k:?}");
+            assert_eq!(after, split.generate(k, &registry), "{k:?}");
+            for i in 0..32 * 32 * 32u32 {
+                let p = LocalPos::new(i >> 10, (i >> 5) & 31, i & 31);
+                let at = (y << 5) + i64::from(p.y());
+                let b = before.get(p);
+                // Every solid voxel at or under the level takes the fluid, the fluid stays, the
+                // rest is air.
+                let expect = if b == fluid || (b != BlockState::AIR && at <= 0) {
+                    fluid
+                } else {
+                    BlockState::AIR
+                };
+                assert_eq!(after.get(p), expect, "{k:?} {p:?}");
+            }
+            // Wholly under the level and the grounds: the fluid alone.
+            if (y << 5) + 31 <= ground.min(0) {
+                assert_eq!(after.as_uniform(), Some(fluid), "{k:?}");
+            }
+        }
+    }
+    // In a realm without fluid the flood is never asked (`Pours` would fail) and voids are air.
+    let carved = flat(
+        40,
+        bare().with_carver(
+            id("test:pours"),
+            Arc::new(Pours(CarveMask::Air, FloodMask::Wet)),
+        ),
+    )
+    .expect("opens");
+    for y in [-3, 0, 1] {
+        assert_eq!(
+            carved.generate(key(2, y, 5), &registry).as_uniform(),
+            Some(BlockState::AIR)
+        );
+    }
+    // The floods or-ed, the masks and-ed.
+    let mut half: Box<Occupancy> = Box::new([0; CHUNK_AREA]);
+    half[..CHUNK_AREA / 2].fill(u32::MAX);
+    let other: Box<Occupancy> = Box::new(std::array::from_fn(|i| {
+        if i < CHUNK_AREA / 2 { 0 } else { u32::MAX }
+    }));
+    assert_eq!(FloodMask::of(half.clone()), FloodMask::Mixed(half.clone()));
+    assert_eq!(
+        FloodMask::of(half.clone()).or(FloodMask::of(other)),
+        FloodMask::Wet
+    );
+    assert_eq!(
+        FloodMask::Dry.or(FloodMask::Mixed(half.clone())),
+        FloodMask::Mixed(half)
+    );
+    assert_eq!(FloodMask::of(Box::new([0; CHUNK_AREA])), FloodMask::Dry);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_flood_reading_the_surface_past_its_reach_fails() {
+    let registry = registry();
+    // A flat ground at y 40 under a sea up to y 50, every cube a hole under a roof of 6: the
+    // flood fills the voids within 12 blocks under a wet ground (from y 29 up). Declared 6 deep,
+    // chunk layer 0 (up to y 31) lies the reach under the ground, but its flood reads the
+    // surface: the column stage sees it flood y 29 to 31, the deep path would not.
+    let sea = FluidRule::SeaLevel {
+        level: 50,
+        fluid: "test:fluid".into(),
+    };
+    let of = |flood: Flooded| {
+        one_kind(
+            Arc::new(FlatKind::blocks(40)),
+            sea.clone(),
+            bare().with_carver(id("test:flooded"), Arc::new(flood)),
+        )
+        .expect("opens")
+    };
+    let holes = Holes::new(1, 6, 0);
+    let right = of(Flooded::new(holes, i64::MIN, 12));
+    let fluid = registry.by_name("test:fluid").unwrap();
+    for y in [-1, 0, 1] {
+        let k = key(0, y, 0);
+        assert_eq!(
+            right.generate(k, &registry),
+            right.generate_full(k, &registry),
+            "{k:?}"
+        );
+    }
+    let chunk = right.generate(key(0, 0, 0), &registry);
+    for (y, expect) in [(28, BlockState::AIR), (29, fluid), (31, fluid)] {
+        assert_eq!(chunk.get(LocalPos::new(3, y, 7)), expect, "y {y}");
+    }
+    let wrong = of(Flooded {
+        reach: CarveReach {
+            surface: 6,
+            apron: 0,
+        },
+        ..Flooded::new(holes, i64::MIN, 12)
+    });
+    let message = panic_of(|| drop(wrong.generate_full(key(0, 0, 0), &registry))).expect("caught");
+    assert!(
+        message.contains("test:flooded")
+            && message.contains("flooded the chunk")
+            && message.contains("deeper than its reach"),
+        "{message}"
+    );
 }

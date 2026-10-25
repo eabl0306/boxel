@@ -1063,8 +1063,9 @@ impl<Cx: Context> RegionGenerator<Cx> {
     }
 
     /// The stages of a chunk, with the realm's floor and fluid states (the fluid only where the
-    /// chunk may hold it: a deep chunk reads it only to carve around it). The feature stages never
-    /// run in a deep chunk (nothing they write lies under a ground).
+    /// chunk may hold it: a deep chunk reads it only to carve around it or to flood the voids of
+    /// its carvers) and its fluid level. The feature stages never run in a deep chunk (nothing
+    /// they write lies under a ground).
     fn stages(&self, registry: &BlockRegistry, deep: bool) -> Stages<'_, Cx> {
         let spec = self.spec();
         let fluid = match &spec.fluid {
@@ -1073,6 +1074,10 @@ impl<Cx: Context> RegionGenerator<Cx> {
             }
             _ => BlockState::AIR,
         };
+        let level = match spec.fluid {
+            FluidRule::SeaLevel { level, .. } => Some(level),
+            FluidRule::None => None,
+        };
         Stages {
             fill: &*self.fill,
             surface: &*self.surface,
@@ -1080,6 +1085,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             features: &self.features,
             floor: block(registry, &spec.floor, NAME),
             fluid,
+            level,
         }
     }
 

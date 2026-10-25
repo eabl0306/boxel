@@ -2,9 +2,9 @@
 //! `tests/region_lod.rs`, `tests/decoration.rs`, `tests/features.rs` and the benches: a `test:`
 //! Context with a base height, two parameters and a warp, test kinds that add relief to that base
 //! (also with bounds per chunk column), valleys carved by a shape modifier, a carver of holes
-//! under a roof and one with entrances in some regions only, trees whose canopies cross chunk
-//! borders and plants (feature stages), the registries of a test world, and the hand-fused
-//! single-kind twin the bench compares against.
+//! under a roof, one whose holes take the fluid and one with entrances in some regions only,
+//! trees whose canopies cross chunk borders and plants (feature stages), the registries of a test
+//! world, and the hand-fused single-kind twin the bench compares against.
 #![allow(dead_code, reason = "each user takes part of it")]
 
 use boxel_voxel::{
@@ -13,7 +13,7 @@ use boxel_voxel::{
 use boxel_worldgen::field::{Add, Field, LatticeField, NoiseField, Q16, Rect, Slope, Span};
 use boxel_worldgen::noise::{Basis, Fbm, Frequency, Warp, mix_seed, splitmix64};
 use boxel_worldgen::realm::{FluidRule, RealmForm, RealmLod, RealmSky, RealmSpan, RealmSpec};
-use boxel_worldgen::region::{CarveChunk, CarveMask, CarveReach, CarverStage};
+use boxel_worldgen::region::{CarveChunk, CarveMask, CarveReach, CarverStage, FloodMask};
 use boxel_worldgen::region::{CarveCorner, ShapeEffect, ShapeModifier, divide_tops};
 use boxel_worldgen::region::{
     ChunkColumns, ColumnsAround, Context, Decoration, Entry, FillStage, FloorFill, HeightQ,
@@ -725,12 +725,20 @@ impl Holes {
     /// columns, and the ring of its apron through [`ChunkColumns::tops`], 4 strips (as a cave
     /// stage asks for its water shell).
     fn lowest<Cx: Context>(&self, columns: &ChunkColumns<'_, Cx>) -> Vec<i64> {
+        self.ring(columns).into_iter().map(|(g, _)| g).collect()
+    }
+
+    /// Per column of the chunk of `columns`, the lowest ground of the column and of its 4
+    /// neighbors `reads` blocks away, and whether one of them is wet (its fluid top over its
+    /// ground): its chunk's own columns, and the ring of its apron through
+    /// [`ChunkColumns::tops`], 4 strips.
+    fn ring<Cx: Context>(&self, columns: &ChunkColumns<'_, Cx>) -> Vec<(i64, bool)> {
         let (o, r) = (columns.origin, i64::from(self.reads));
         let side = 32 + 2 * r;
-        let mut ground = vec![0; (side * side) as usize];
-        for (c, &g) in columns.ground.iter().enumerate() {
+        let mut ground = vec![(0, false); (side * side) as usize];
+        for (c, (&g, &w)) in columns.ground.iter().zip(columns.fluid_top).enumerate() {
             let (x, z) = (r + (c >> 5) as i64, r + (c & 31) as i64);
-            ground[(x * side + z) as usize] = g;
+            ground[(x * side + z) as usize] = (g, w > g);
         }
         if r > 0 {
             // The -x and +x strips over the whole side, then the -z and +z ones between them.
@@ -748,7 +756,8 @@ impl Holes {
                 columns.tops(&xs, &zs, &mut g, &mut f);
                 for (i, x) in (x0..x1).enumerate() {
                     for (j, z) in (z0..z1).enumerate() {
-                        ground[(x * side + z) as usize] = g[i * zs.len() + j];
+                        let k = i * zs.len() + j;
+                        ground[(x * side + z) as usize] = (g[k], f[k] > g[k]);
                     }
                 }
             }
@@ -757,11 +766,15 @@ impl Holes {
         (0..CHUNK_AREA as i64)
             .map(|c| {
                 let (x, z) = (r + (c >> 5), r + (c & 31));
-                at(x, z)
-                    .min(at(x - r, z))
-                    .min(at(x + r, z))
-                    .min(at(x, z - r))
-                    .min(at(x, z + r))
+                [
+                    at(x, z),
+                    at(x - r, z),
+                    at(x + r, z),
+                    at(x, z - r),
+                    at(x, z + r),
+                ]
+                .into_iter()
+                .fold((i64::MAX, false), |(lo, wet), (g, w)| (lo.min(g), wet || w))
             })
             .collect()
     }
@@ -815,6 +828,96 @@ impl<Cx: Context> CarverStage<Cx> for Holes {
             }
         }
         CarveMask::of(keep)
+    }
+    fn block_names(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+/// A test carver whose voids take the realm's fluid: the holes of [`Holes`], and a flood under a
+/// water table at `table` (every void at or under it, with no column read, so the deep path floods
+/// too) and within `shell` blocks under the lowest ground its holes read where one of those
+/// columns is wet (its fluid top over its ground), as a cave next to the sea fills with it. So its
+/// flood reads the surface `shell` blocks deep over the holes' apron; it declares `reach`, right
+/// or wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Flooded {
+    /// The holes.
+    pub holes: Holes,
+    /// Every void at or under this `y` takes the fluid.
+    pub table: i64,
+    /// How deep under the lowest ground of a wet column and its neighbors the voids take it.
+    pub shell: u32,
+    /// What it declares.
+    pub reach: CarveReach,
+}
+
+impl Flooded {
+    /// The holes `holes` flooded under `table` and within `shell` under wet grounds, declared
+    /// right: the deeper of the roof and the shell, over the holes' apron.
+    pub const fn new(holes: Holes, table: i64, shell: u32) -> Self {
+        let surface = if shell > holes.roof {
+            shell
+        } else {
+            holes.roof
+        };
+        Self {
+            holes,
+            table,
+            shell,
+            reach: CarveReach {
+                surface,
+                apron: holes.reads,
+            },
+        }
+    }
+}
+
+impl HashParams for Flooded {
+    fn hash_params(&self, h: &mut ParamsHasher) {
+        h.write(&self.holes)
+            .write(&self.table)
+            .write(&self.shell)
+            .write(&self.reach.surface)
+            .write(&self.reach.apron);
+    }
+}
+
+impl GenEntry for Flooded {
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+impl<Cx: Context> CarverStage<Cx> for Flooded {
+    fn reach(&self) -> CarveReach {
+        self.reach
+    }
+    fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask {
+        CarverStage::<Cx>::carve(&self.holes, chunk)
+    }
+    fn flood(&self, chunk: &CarveChunk<'_, Cx>) -> FloodMask {
+        let o = chunk.origin;
+        let ring = chunk.columns.map(|c| self.holes.ring(c));
+        let shell = i64::from(self.shell);
+        let mut wet: Box<Occupancy> = Box::new([0; CHUNK_AREA]);
+        for ly in 0..32 {
+            let y = o.y + ly as i64;
+            for lx in 0..32 {
+                let mut word = 0;
+                for lz in 0..32 {
+                    let near = ring.as_ref().is_some_and(|r| {
+                        let (low, wet) = r[lx * 32 + lz];
+                        wet && y > low - shell
+                    });
+                    if y <= self.table || near {
+                        word |= 1 << lz;
+                    }
+                }
+                wet[ly * 32 + lx] = word;
+            }
+        }
+        FloodMask::of(wet)
     }
     fn block_names(&self) -> Vec<&str> {
         Vec::new()
@@ -1358,6 +1461,7 @@ impl Twin {
             features: &[],
             floor: solid,
             fluid: registry.by_name("test:fluid").expect("test:fluid"),
+            level: Some(level),
         };
         let columns = ChunkColumns::new(origin, &ground, &fluid_top, &self.cx, &fields, &NoApron);
         decorate(&columns, &stages, registry)

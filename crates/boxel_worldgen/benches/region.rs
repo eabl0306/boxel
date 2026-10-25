@@ -217,6 +217,7 @@ fn bench(c: &mut Criterion) {
                 apron_lo: bounds.apron_lo,
                 floor: solid,
                 fluid,
+                level: Some(0),
                 registry: &registry,
             };
             CarverStage::<TestContext>::carve(&holes, &chunk)

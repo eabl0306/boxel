@@ -293,11 +293,12 @@ pub struct CarveReach {
 /// Which voxels of a chunk a carver leaves: bit `z` of word `y * 32 + x` (the layout of
 /// [`ChunkData::from_occupancy`]) is 1 where the voxel stays, 0 where it is carved.
 ///
-/// A carver only turns solid voxels into air: the chunk path carves a voxel only where it holds
-/// neither air nor the realm's fluid, so no mask adds a block or removes the fluid. Keeping the
-/// fluid out of a cave (a sea floor opened under it, a surface stage's block inside it turned to
-/// air) is the carver's own rule, a water shell: it reads the fluid tops of its columns and of its
-/// apron ([`ChunkColumns::tops`]).
+/// A carver only turns solid voxels into air, or into the realm's fluid where a flood holds them
+/// ([`CarverStage::flood`]): the chunk path carves a voxel only where it holds neither air nor the
+/// realm's fluid, so no mask adds a block or removes the fluid. Keeping the fluid out of a dry cave
+/// (a sea floor opened under it, a surface stage's block inside it turned to air) is the carver's
+/// own rule, a water shell: it reads the fluid tops of its columns and of its apron
+/// ([`ChunkColumns::tops`]). A flood lets the fluid in instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CarveMask {
     /// No voxel is carved.
@@ -337,6 +338,64 @@ impl CarveMask {
     }
 }
 
+/// Which voids of a chunk take the realm's fluid ([`CarverStage::flood`]): bit `z` of word
+/// `y * 32 + x` (the layout of [`CarveMask`]) is 1 where a voxel the carvers carve becomes the
+/// fluid instead of air.
+///
+/// It marks a part of the realm's sea-level aquifer (the voids that the sea, a river or a lake
+/// reaches), not a carver's own voids: a voxel that any carver carves takes the fluid where any
+/// carver's flood holds it (the floods or-ed), and only at or under the realm's fluid level
+/// ([`CarveChunk::level`]); over the level, or in a realm without fluid, the void stays air. Only a
+/// carved solid voxel takes it, so a flood never adds a block where nothing is carved, never
+/// fills the air and never removes the fluid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FloodMask {
+    /// No void takes the fluid.
+    Dry,
+    /// Every void takes it (at or under the level).
+    Wet,
+    /// Some voids take it.
+    Mixed(Box<Occupancy>),
+}
+
+impl FloodMask {
+    /// The flood of `occupancy`: [`FloodMask::Dry`] or [`FloodMask::Wet`] when all its bits are
+    /// equal.
+    pub fn of(occupancy: Box<Occupancy>) -> Self {
+        if occupancy.iter().all(|&w| w == 0) {
+            Self::Dry
+        } else if occupancy.iter().all(|&w| w == u32::MAX) {
+            Self::Wet
+        } else {
+            Self::Mixed(occupancy)
+        }
+    }
+
+    /// Both floods at once: a void takes the fluid where either holds it.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Wet, _) | (_, Self::Wet) => Self::Wet,
+            (Self::Dry, m) | (m, Self::Dry) => m,
+            (Self::Mixed(mut a), Self::Mixed(b)) => {
+                for (a, b) in a.iter_mut().zip(b.iter()) {
+                    *a |= b;
+                }
+                Self::of(a)
+            }
+        }
+    }
+
+    /// Word `i` of the flood.
+    fn word(&self, i: usize) -> u32 {
+        match self {
+            Self::Dry => 0,
+            Self::Wet => u32::MAX,
+            Self::Mixed(wet) => wet[i],
+        }
+    }
+}
+
 /// What a carver gets for a chunk ([`CarverStage::carve`]).
 pub struct CarveChunk<'a, Cx: Context> {
     /// The realm's Context.
@@ -367,19 +426,24 @@ pub struct CarveChunk<'a, Cx: Context> {
     pub floor: BlockState,
     /// The realm's fluid state (air for a realm without fluid): the carve never drains it.
     pub fluid: BlockState,
+    /// The realm's fluid level, the highest `y` its fluid fills (`None` for a realm without
+    /// fluid): a flooded void takes the fluid only at or under it ([`CarverStage::flood`]).
+    pub level: Option<i64>,
     /// The blocks, for the names the carver declares ([`CarverStage::block_names`]).
     pub registry: &'a BlockRegistry,
 }
 
 /// A carver of a realm (ADR 0039 sec. 9, CARVERS): caves, ravines. It runs after the surface
 /// stage in every chunk that holds a solid voxel, the deep path's included, and turns solid
-/// voxels into air. The far LOD leaves carvers out.
+/// voxels into air, or into the realm's fluid where a flood holds them ([`CarverStage::flood`]).
+/// The far LOD leaves carvers out.
 ///
-/// Its mask must be a pure function of its seed, the chunk, the Context and the columns it reads
-/// (its chunk's and its apron's), so a chunk and its neighbors agree; and it may read the surface
-/// only down to its reach over the chunk's column ([`CarverStage::column_reach`], at most its
-/// declared [`CarveReach::surface`]): in debug builds a chunk that lies that far under every
-/// ground it may read checks that its mask with columns is its mask without them.
+/// Its mask and its flood must be pure functions of its seed, the chunk, the Context and the
+/// columns it reads (its chunk's and its apron's), so a chunk and its neighbors agree; and it may
+/// read the surface only down to its reach over the chunk's column
+/// ([`CarverStage::column_reach`], at most its declared [`CarveReach::surface`]): in debug builds
+/// a chunk that lies that far under every ground it may read checks that its mask and its flood
+/// with columns are those without them.
 pub trait CarverStage<Cx: Context>: GenEntry + Send + Sync {
     /// How far it reads the surface.
     fn reach(&self) -> CarveReach;
@@ -404,6 +468,24 @@ pub trait CarverStage<Cx: Context>: GenEntry + Send + Sync {
 
     /// The voxels of `chunk` it leaves.
     fn carve(&self, chunk: &CarveChunk<'_, Cx>) -> CarveMask;
+
+    /// The voxels of `chunk` whose voids take the realm's fluid, its part of the realm's
+    /// sea-level aquifer ([`FloodMask`]): every carver's flood holds for the voids of all of them,
+    /// and the chunk path fills a carved solid voxel with the fluid where one holds it, at or under
+    /// [`CarveChunk::level`] only. Called only for a chunk the carvers carve, with a voxel at or
+    /// under the level, in a realm with fluid. Pure and inside the reach as the mask is: in debug
+    /// builds a chunk that lies the column reach under every ground it may read checks that its
+    /// flood with columns is its flood without them, at or under the level.
+    ///
+    /// A void it floods next to a dry one is the carver's own choice: the engine does not join
+    /// them (TFC walls a cave lake off from a dry cave with a barrier of rock; here a carver
+    /// leaves that rock by not carving it).
+    ///
+    /// By default none: every void is air.
+    fn flood(&self, chunk: &CarveChunk<'_, Cx>) -> FloodMask {
+        let _ = chunk;
+        FloodMask::Dry
+    }
 
     /// Every block name the carver looks up in the registry it gets, so the world open checks
     /// them and a typo fails at load ([`RegionGenerator::build`](super::RegionGenerator::build)),
@@ -771,19 +853,23 @@ pub struct Stages<'a, Cx: Context> {
     /// The realm's fluid state, where a column's fluid top is over its ground (air for a realm
     /// without fluid): the carvers never carve it.
     pub fluid: BlockState,
+    /// The realm's fluid level, the highest `y` its fluid fills (`None` without fluid): the
+    /// carvers' flooded voids take the fluid at or under it ([`CarverStage::flood`]).
+    pub level: Option<i64>,
 }
 
 /// The chunk of `columns`: the rock of the fill at and under each column's ground, the fluid up to
 /// its fluid top, air above, the surface stage over it where its reach touches the chunk, the
 /// carvers' masks over all of it (a voxel they carve turns to air where it is neither air nor the
-/// fluid), and the feature stages over the grounds where their reach touches the chunk.
+/// fluid, or to the fluid where their floods hold it at or under the level), and the feature
+/// stages over the grounds where their reach touches the chunk.
 ///
 /// From the cheapest answer to the dearest: `Uniform` air over every column's reach and fluid;
 /// only the fill's rock under every column's reach (`Uniform` when the rock is one state and no
-/// carver carves the chunk, 1-bit when one does); a 1-bit chunk ([`ChunkData::from_occupancy`])
-/// when the rock is one state and neither the fluid, the surface nor a feature stage touches the
-/// chunk (the carvers' masks and-ed onto the ground's); else a dense chunk
-/// ([`ChunkData::from_dense`]).
+/// carver carves the chunk, 1-bit when one does and its voids are all air or all the fluid); a
+/// 1-bit chunk ([`ChunkData::from_occupancy`]) when the rock is one state, neither the fluid, the
+/// surface nor a feature stage touches the chunk and no void takes the fluid (the carvers' masks
+/// and-ed onto the ground's); else a dense chunk ([`ChunkData::from_dense`]).
 pub fn decorate<Cx: Context>(
     columns: &ChunkColumns<'_, Cx>,
     stages: &Stages<'_, Cx>,
@@ -849,7 +935,17 @@ pub fn decorate<Cx: Context>(
                 }
             }
             if carve.carves(state) {
-                match carve.mask() {
+                let (keep, wet) = carve.carved();
+                // The carved voxels under the grounds that take the fluid: a third state.
+                let flooded = wet.map(|mut wet| {
+                    let mut any = 0;
+                    for (w, &ground) in wet.iter_mut().zip(occupancy.iter()) {
+                        *w &= ground;
+                        any |= *w;
+                    }
+                    (any != 0).then_some(wet)
+                });
+                match keep {
                     CarveMask::Solid => {}
                     CarveMask::Air => occupancy = [0; CHUNK_AREA],
                     CarveMask::Mixed(keep) => {
@@ -857,6 +953,9 @@ pub fn decorate<Cx: Context>(
                             *word &= keep;
                         }
                     }
+                }
+                if let Some(wet) = flooded.flatten() {
+                    return three_states(&occupancy, state, &wet, stages.fluid);
                 }
             }
             return ChunkData::from_occupancy(&occupancy, state, BlockState::AIR);
@@ -894,7 +993,8 @@ pub fn decorate<Cx: Context>(
     }
     // Only the rock and the surface stage's blocks over the grounds can be carved.
     if !stages.carvers.is_empty() && (rock.is_some() || (touched && rise > 0)) {
-        carve.states(&carve.mask(), &mut states);
+        let (keep, wet) = carve.carved();
+        carve.states(&keep, wet.as_deref(), &mut states);
     }
     if grown {
         for f in stages.features {
@@ -960,6 +1060,25 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
         !self.stages.carvers.is_empty() && state != BlockState::AIR && state != self.stages.fluid
     }
 
+    /// The carvers' masks, and-ed ([`CarveMask::Solid`] without carvers), and the voxels they
+    /// carve that take the fluid: their floods, or-ed, at or under the realm's level (`None` if
+    /// none, and without asking the floods where nothing is carved or the chunk lies over the
+    /// level).
+    fn carved(&self) -> (CarveMask, Option<Box<Occupancy>>) {
+        let keep = self.mask();
+        let wet = match self.stages.level {
+            Some(level)
+                if !matches!(keep, CarveMask::Solid)
+                    && self.origin.y <= level
+                    && self.stages.fluid != BlockState::AIR =>
+            {
+                wet_voxels(&keep, &self.flood(level), self.origin.y, level)
+            }
+            _ => None,
+        };
+        (keep, wet)
+    }
+
     /// The carvers' masks, and-ed: [`CarveMask::Solid`] without carvers.
     fn mask(&self) -> CarveMask {
         let mut mask = CarveMask::Solid;
@@ -976,6 +1095,7 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
                 apron_lo: self.apron_lo,
                 floor: self.stages.floor,
                 fluid: self.stages.fluid,
+                level: self.stages.level,
                 registry: self.registry,
             };
             let m = c.stage.carve(&chunk);
@@ -989,33 +1109,85 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
         mask
     }
 
+    /// The carvers' floods, or-ed, for a chunk with a voxel at or under the realm's `level`.
+    fn flood(&self, level: i64) -> FloodMask {
+        let mut flood = FloodMask::Dry;
+        for c in self.stages.carvers {
+            let reach = c.stage.reach();
+            let columns = self
+                .columns
+                .map(|cols| cols.read_by(c.id.as_str(), reach.apron));
+            let chunk = CarveChunk {
+                cx: self.cx,
+                seed: c.seed,
+                origin: self.origin,
+                columns: columns.as_ref(),
+                apron_lo: self.apron_lo,
+                floor: self.stages.floor,
+                fluid: self.stages.fluid,
+                level: self.stages.level,
+                registry: self.registry,
+            };
+            let f = c.stage.flood(&chunk);
+            if cfg!(debug_assertions)
+                && let Some(columns) = &columns
+            {
+                check_flood_reach(c, reach, columns, &chunk, &f, level);
+            }
+            flood = flood.or(f);
+        }
+        flood
+    }
+
     /// The rock alone, carved: the deep path, or a chunk under every column's surface reach.
     fn rock(&self, rock: Rock, buf: &mut [BlockState]) -> ChunkData {
+        let fluid = self.stages.fluid;
         match rock {
             Rock::Uniform(state) if !self.carves(state) => ChunkData::uniform(state),
-            Rock::Uniform(state) => match self.mask() {
-                CarveMask::Solid => ChunkData::uniform(state),
-                CarveMask::Air => ChunkData::uniform(BlockState::AIR),
-                CarveMask::Mixed(keep) => ChunkData::from_occupancy(&keep, state, BlockState::AIR),
+            Rock::Uniform(state) => match self.carved() {
+                (CarveMask::Solid, _) => ChunkData::uniform(state),
+                (CarveMask::Air, None) => ChunkData::uniform(BlockState::AIR),
+                (CarveMask::Air, Some(wet)) => {
+                    ChunkData::from_occupancy(&wet, fluid, BlockState::AIR)
+                }
+                (CarveMask::Mixed(keep), None) => {
+                    ChunkData::from_occupancy(&keep, state, BlockState::AIR)
+                }
+                // Every void flooded (a chunk under the sea's aquifer): still 1 bit.
+                (CarveMask::Mixed(keep), Some(wet))
+                    if keep.iter().zip(wet.iter()).all(|(&k, &w)| !k == w) =>
+                {
+                    ChunkData::from_occupancy(&keep, state, fluid)
+                }
+                (CarveMask::Mixed(keep), Some(wet)) => three_states(&keep, state, &wet, fluid),
             },
             Rock::Dense => {
                 if !self.stages.carvers.is_empty() {
-                    self.states(&self.mask(), buf);
+                    let (keep, wet) = self.carved();
+                    self.states(&keep, wet.as_deref(), buf);
                 }
                 ChunkData::from_dense(buf)
             }
         }
     }
 
-    /// `mask` over `states` (`y << 10 | x << 5 | z`): every voxel it carves turns to air, unless
-    /// it holds air or the realm's fluid.
-    fn states(&self, mask: &CarveMask, states: &mut [BlockState]) {
+    /// `mask` over `states` (`y << 10 | x << 5 | z`): every voxel it carves turns to air, or to
+    /// the realm's fluid where `wet` holds it, unless it holds air or the fluid.
+    fn states(&self, mask: &CarveMask, wet: Option<&Occupancy>, states: &mut [BlockState]) {
         let fluid = self.stages.fluid;
+        // State `i` is voxel `(lx, ly, lz)` at `ly << 10 | lx << 5 | lz`: bit `lz` of word
+        // `ly * 32 + lx`, word `i >> 5`.
+        let void = |i: usize| match wet {
+            Some(wet) if wet[i >> CHUNK_SHIFT] & (1 << (i & 31)) != 0 => fluid,
+            _ => BlockState::AIR,
+        };
         let keep = match mask {
             CarveMask::Solid => return,
             CarveMask::Air => {
-                for s in states.iter_mut().filter(|s| **s != fluid) {
-                    *s = BlockState::AIR;
+                for (i, s) in states.iter_mut().enumerate() {
+                    if *s != fluid && *s != BlockState::AIR {
+                        *s = void(i);
+                    }
                 }
                 return;
             }
@@ -1024,17 +1196,118 @@ impl<Cx: Context> Carve<'_, '_, Cx> {
         for (i, &word) in keep.iter().enumerate() {
             // Word `ly * 32 + lx`, bit z; the state of `(lx, ly, lz)` is at `ly << 10 | lx << 5 |
             // lz`.
-            let base = ((i >> CHUNK_SHIFT) << (2 * CHUNK_SHIFT)) | ((i & 31) << CHUNK_SHIFT);
+            let base = i << CHUNK_SHIFT;
             let mut carved = !word;
             while carved != 0 {
                 let lz = carved.trailing_zeros() as usize;
                 carved &= carved - 1;
                 let s = &mut states[base | lz];
-                if *s != fluid {
-                    *s = BlockState::AIR;
+                if *s != fluid && *s != BlockState::AIR {
+                    *s = void(base | lz);
                 }
             }
         }
+    }
+}
+
+/// The voxels `keep` carves that `flood` fills, at or under `level`, in the chunk whose lowest
+/// layer is `y0`: `None` if there is none.
+fn wet_voxels(keep: &CarveMask, flood: &FloodMask, y0: i64, level: i64) -> Option<Box<Occupancy>> {
+    // Layer `ly` is words `ly * 32..ly * 32 + 32`.
+    let layers = level
+        .saturating_sub(y0)
+        .saturating_add(1)
+        .clamp(0, i64::from(CHUNK_SIZE));
+    let words = layers as usize * CHUNK_SIZE as usize;
+    if words == 0 || matches!(flood, FloodMask::Dry) {
+        return None;
+    }
+    let mut wet: Box<Occupancy> = Box::new([0; CHUNK_AREA]);
+    let mut any = 0;
+    for (i, w) in wet[..words].iter_mut().enumerate() {
+        let carved = match keep {
+            CarveMask::Solid => 0,
+            CarveMask::Air => u32::MAX,
+            CarveMask::Mixed(keep) => !keep[i],
+        };
+        *w = carved & flood.word(i);
+        any |= *w;
+    }
+    (any != 0).then_some(wet)
+}
+
+/// The chunk of three states: `state` where `rock` holds a voxel, else `fluid` where `wet` does,
+/// else air (both in the layout of [`CarveMask`]).
+fn three_states(
+    rock: &Occupancy,
+    state: BlockState,
+    wet: &Occupancy,
+    fluid: BlockState,
+) -> ChunkData {
+    let mut states = vec![BlockState::AIR; CHUNK_VOLUME];
+    for (i, (&r, &w)) in rock.iter().zip(wet.iter()).enumerate() {
+        if r | w == 0 {
+            continue;
+        }
+        let base = i << CHUNK_SHIFT;
+        for (lz, s) in states[base..base + CHUNK_SIZE as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            if r & (1 << lz) != 0 {
+                *s = state;
+            } else if w & (1 << lz) != 0 {
+                *s = fluid;
+            }
+        }
+    }
+    ChunkData::from_dense(&states)
+}
+
+/// The lowest ground `carver` may read around the chunk of `columns` (its chunk's and its
+/// apron's) and its reach over the chunk's column ([`CarverStage::column_reach`]), if the chunk
+/// lies that reach or more under it: the chunk the deep path would build without columns. `None`
+/// otherwise.
+fn under_reach<Cx: Context>(
+    carver: &RealmCarver<Cx>,
+    reach: CarveReach,
+    columns: &ChunkColumns<'_, Cx>,
+    cx: &Cx,
+) -> Option<(i64, i64)> {
+    let origin = columns.origin;
+    let y1 = origin.y + i64::from(CHUNK_SIZE) - 1;
+    let column = (origin.x >> CHUNK_SHIFT, origin.z >> CHUNK_SHIFT);
+    let surface = i64::from(carver.column_reach(cx, column));
+    let mut lowest = columns.ground.iter().copied().min().expect("1024 columns");
+    if y1 > lowest.saturating_sub(surface) {
+        return None;
+    }
+    if reach.apron > 0 {
+        let (a, size) = (i64::from(reach.apron), i64::from(CHUNK_SIZE));
+        let xs: Vec<i64> = (origin.x - a..origin.x + size + a).collect();
+        let zs: Vec<i64> = (origin.z - a..origin.z + size + a).collect();
+        let (mut ground, mut fluid) = (vec![0; xs.len() * zs.len()], vec![0; xs.len() * zs.len()]);
+        columns.tops(&xs, &zs, &mut ground, &mut fluid);
+        lowest = lowest.min(ground.iter().copied().min().expect("columns"));
+        if y1 > lowest.saturating_sub(surface) {
+            return None;
+        }
+    }
+    Some((surface, lowest))
+}
+
+/// `chunk` without its columns, as the deep path gives it to a carver.
+fn without_columns<'a, Cx: Context>(chunk: &CarveChunk<'a, Cx>) -> CarveChunk<'a, Cx> {
+    CarveChunk {
+        cx: chunk.cx,
+        seed: chunk.seed,
+        origin: chunk.origin,
+        columns: None,
+        apron_lo: chunk.apron_lo,
+        floor: chunk.floor,
+        fluid: chunk.fluid,
+        level: chunk.level,
+        registry: chunk.registry,
     }
 }
 
@@ -1050,41 +1323,50 @@ fn check_carve_reach<Cx: Context>(
     chunk: &CarveChunk<'_, Cx>,
     mask: &CarveMask,
 ) {
-    let origin = columns.origin;
-    let y1 = origin.y + i64::from(CHUNK_SIZE) - 1;
-    let column = (origin.x >> CHUNK_SHIFT, origin.z >> CHUNK_SHIFT);
-    let surface = i64::from(carver.column_reach(chunk.cx, column));
-    let mut lowest = columns.ground.iter().copied().min().expect("1024 columns");
-    if y1 > lowest.saturating_sub(surface) {
+    let Some((surface, lowest)) = under_reach(carver, reach, columns, chunk.cx) else {
         return;
-    }
-    if reach.apron > 0 {
-        let (a, size) = (i64::from(reach.apron), i64::from(CHUNK_SIZE));
-        let xs: Vec<i64> = (origin.x - a..origin.x + size + a).collect();
-        let zs: Vec<i64> = (origin.z - a..origin.z + size + a).collect();
-        let (mut ground, mut fluid) = (vec![0; xs.len() * zs.len()], vec![0; xs.len() * zs.len()]);
-        columns.tops(&xs, &zs, &mut ground, &mut fluid);
-        lowest = lowest.min(ground.iter().copied().min().expect("columns"));
-        if y1 > lowest.saturating_sub(surface) {
-            return;
-        }
-    }
-    let without = CarveChunk {
-        cx: chunk.cx,
-        seed: chunk.seed,
-        origin: chunk.origin,
-        columns: None,
-        apron_lo: chunk.apron_lo,
-        floor: chunk.floor,
-        fluid: chunk.fluid,
-        registry: chunk.registry,
     };
+    let origin = columns.origin;
     assert!(
-        same_voxels(&carver.stage.carve(&without), mask),
+        same_voxels(&carver.stage.carve(&without_columns(chunk)), mask),
         "span check: carver {} carved the chunk at ({}, {}, {}), {surface} or more blocks under \
          every ground it may read (the lowest at y {lowest}), one way with its columns and \
          another without: its rules read the surface deeper than its reach there (column reach \
          {surface}, declared surface {}), so the deep path would carve it otherwise",
+        carver.id,
+        origin.x,
+        origin.y,
+        origin.z,
+        reach.surface,
+    );
+}
+
+/// The debug check of a carver's flood, as [`check_carve_reach`] for its mask: in a chunk at
+/// least its column reach under every ground it may read, its flood with the columns is its
+/// flood without them, at or under the realm's `level` (over it no void takes the fluid).
+fn check_flood_reach<Cx: Context>(
+    carver: &RealmCarver<Cx>,
+    reach: CarveReach,
+    columns: &ChunkColumns<'_, Cx>,
+    chunk: &CarveChunk<'_, Cx>,
+    flood: &FloodMask,
+    level: i64,
+) {
+    let Some((surface, lowest)) = under_reach(carver, reach, columns, chunk.cx) else {
+        return;
+    };
+    let origin = columns.origin;
+    let layers = level
+        .saturating_sub(origin.y)
+        .saturating_add(1)
+        .clamp(0, i64::from(CHUNK_SIZE));
+    let without = carver.stage.flood(&without_columns(chunk));
+    assert!(
+        (0..layers as usize * CHUNK_SIZE as usize).all(|i| without.word(i) == flood.word(i)),
+        "span check: carver {} flooded the chunk at ({}, {}, {}), {surface} or more blocks under \
+         every ground it may read (the lowest at y {lowest}), one way with its columns and \
+         another without: its flood reads the surface deeper than its reach there (column reach \
+         {surface}, declared surface {}), so the deep path would fill it otherwise",
         carver.id,
         origin.x,
         origin.y,
