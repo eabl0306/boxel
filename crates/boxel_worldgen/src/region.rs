@@ -19,7 +19,9 @@
 //! - [`DimensionGenerator`]: a dimension's realm stack, one generator per realm.
 //! - With the `test-support` feature, `check_lod`: the exported harness that checks a realm's far
 //!   LOD against its real terrain (the chunks without carvers and features,
-//!   `RegionGenerator::generate_terrain`) and the runs of its feature stages.
+//!   `RegionGenerator::generate_terrain`) and the runs of its feature stages; and `check_seam`,
+//!   the seam between full detail and level 1: the coarse tops over the real ones on the chunk
+//!   planes, and rays across the boundary meshed as the renderer draws it.
 //!
 //! Every per-worker memo is keyed by its generator's [`BuildKey`](crate::registry::BuildKey), so a
 //! world opened after another on the same workers never reads the first one's.
@@ -33,6 +35,8 @@ pub mod blend;
 mod check;
 #[cfg(feature = "test-support")]
 mod check_lod;
+#[cfg(feature = "test-support")]
+mod check_seam;
 mod decorate;
 mod dimension;
 mod generator;
@@ -45,6 +49,8 @@ mod select;
 pub use check::{border_relief, check_kinds, check_modifiers, slope_passes};
 #[cfg(feature = "test-support")]
 pub use check_lod::{CORNER_STEP, LodReport, check_lod, lod_corners, lod_memo_bytes};
+#[cfg(feature = "test-support")]
+pub use check_seam::{SeamOptions, SeamReport, check_seam};
 pub use decorate::{
     CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, ColumnsAround, Decoration,
     FeatureReach, FeatureStage, FillStage, FloodMask, FloorFill, LOD_TOP_RUNS, LodColumns, LodTop,

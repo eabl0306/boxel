@@ -8,12 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# The exported harness of a realm's far LOD (`region::check_lod`, ADR 0039 sec. 10), for the
-# tests of a game's or a mod's kinds.
-test-support = []
+# The exported harnesses of a realm's far LOD (`region::check_lod` and `region::check_seam`, ADR
+# 0039 sec. 10), for the tests of a game's or a mod's kinds. The seam harness meshes chunks and
+# LOD nodes as the renderer draws them.
+test-support = ["dep:boxel_mesh"]
 
 [dependencies]
 boxel_voxel.workspace = true
+# The meshes of the seam harness (`test-support` only).
+boxel_mesh = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Enables `test-support` for the crate's own integration tests.

@@ -55,22 +55,22 @@ pub struct LodReport {
 
 /// A node as the source emitted it.
 #[derive(Clone, Debug)]
-enum Node {
+pub(super) enum Node {
     Uniform(BlockState),
     Cells(Box<LodCells>),
 }
 
 /// A column of nodes of one level, with its band.
-struct Coarse {
-    band: LodColumn,
-    nodes: HashMap<i64, Node>,
+pub(super) struct Coarse {
+    pub(super) band: LodColumn,
+    pub(super) nodes: HashMap<i64, Node>,
     shift: u32,
 }
 
 impl Coarse {
     /// The node column `column` of `level` as the pass draws its terrain alone (its feature runs
     /// left out), every layer of its band.
-    fn terrain<Cx: Context>(
+    pub(super) fn terrain<Cx: Context>(
         generator: &RegionGenerator<Cx>,
         registry: &BlockRegistry,
         level: u8,
@@ -105,7 +105,12 @@ impl Coarse {
     }
 
     /// The node column `column` of `level`, every layer of its band.
-    fn of(source: &dyn LodSource, registry: &BlockRegistry, level: u8, column: [i64; 2]) -> Self {
+    pub(super) fn of(
+        source: &dyn LodSource,
+        registry: &BlockRegistry,
+        level: u8,
+        column: [i64; 2],
+    ) -> Self {
         let mut req = LodRequest {
             dim: DimensionId(0),
             level,
@@ -136,7 +141,7 @@ impl Coarse {
 
     /// The cell `(x, y, z)` (`-1..=32` each) of layer `layer`; `None` inside a node of the band
     /// emitted uniform but not air (it draws nothing: its cells are ground, their states unknown).
-    fn get(&self, layer: i64, x: i32, y: i32, z: i32) -> Option<BlockState> {
+    pub(super) fn get(&self, layer: i64, x: i32, y: i32, z: i32) -> Option<BlockState> {
         if let Some(state) = self.band.uniform_at(layer) {
             return Some(state);
         }
