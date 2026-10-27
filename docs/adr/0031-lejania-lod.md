@@ -532,7 +532,42 @@ la cobertura no vigila chunks vacíos bajo ellos.
 **El arnés de la costura** (`check_seam`, ADR 0039) mallea los chunks con sus paredes (las de los
 bordes hacia los octantes de enfrente) y apunta los rayos hacia el suelo del chunk solo a bloques
 opacos (un punto dentro de una cueva no es suelo). Con las dos cosas, los rayos que ven el cielo
-quedan en cero en los lugares de prueba de TFC, y el juego lo exige.
+quedan en cero en los lugares de prueba de TFC, y el juego lo exige. Antes eran 70 en el origen
+solo con el terreno, hasta 496 por lugar con lo dibujado y 1.718 de 13.500 en las cuevas.
+
+**Costo.** Medido el 2026-10-27 en la RTX, con la máquina tranquila y nada compilando, contra
+269e34d (y el juego en 9d2ad88). Una corrida por lado salvo donde se dice.
+
+`headless_world --view-distance 16` (sin GPU; las paredes son quads de 8 bytes, en la arena y en
+la subida):
+
+| mundo | quads de los chunks | paredes | mallas con paredes |
+|---|---:|---:|---:|
+| `overworld` (cuevas mc) | 4.714.389 -> 5.023.105 (+6,5 %) | 308.716 (2,5 MB) | 6.554 de 6.719 |
+| `forest` | 918.998 -> 933.665 (+1,6 %) | 14.667 (0,1 MB) | 932 de 1.951 |
+
+Con `--lod far` el LOD tiene 8.841 -> 9.096 nodos con malla (los 255 nodos uniformes con sus
+faldones) y 8,69 M -> 8,81 M quads (+1,4 %). El trabajo queda igual (p50 340 -> 320 us, p99
+600 -> 610 us) y el llenado también (1,06 -> 1,09 s). Las paredes solo se dibujan en el borde de
+lo dibujado: en el resto el recorte las salta.
+
+`just perf-smoke` (r16, sin tope):
+
+| caso | fps | p99 ms | frames > 6,94 ms |
+|---|---:|---:|---:|
+| motor, superficie | 2168 -> 2163 (-0,2 %) | 1,02 -> 1,02 | 0 -> 0 |
+| motor, cueva con ruta | 2608 -> 2593 (-0,6 %) | 0,88 -> 0,88 | 0 -> 0 |
+| motor, superficie `--lod far` | 905 -> 915 (+1,1 %) | 2,77 -> 2,64 | 0 -> 0 |
+| TFC, superficie (`far`, par repetido) | 563 -> 556 (-1,2 %) | 4,30 -> 4,65 | 1 -> 3 |
+| TFC, bajo tierra (`far`) | 1175 -> 1150 (-2,2 %) | 2,46 -> 2,56 | 0 -> 0 |
+| TFC, superficie `--lod off` (dos pares) | 971 -> 918 y 971 -> 973 | 2,67 -> 2,87 y 2,65 -> 2,70 | 1 -> 0 y 0 -> 0 |
+
+Lo que sí cuesta es la fuente lejana de TFC en el nivel 1 (alturas exactas, árboles y rocas).
+Con `just bench lod_source` del juego, una columna de nodos de nivel 1 tarda de 5,0 a 14,5 ms en
+vez de 2,0 a 4,8 ms (de 2,2 a 3 veces más, según el lugar). Los niveles 2 a 4 no cambian, y el 5
+y el 6 suben hasta un 7 %. Por eso, con `far` a r16, el mundo de TFC tarda en asentarse de 25,2 a
+25,6 s en vez de 15,6 a 15,7 s, y bajo tierra 21,7 s en vez de 13,9 s. Sin LOD tarda lo mismo
+(5,4 y 5,5 s). Bajar ese costo queda pendiente.
 
 ## Números medidos
 
