@@ -12,6 +12,9 @@
 //! and fonts it wants, as it passes a [`LayerRecipe`] per texture layer; `boxel_ui` (feature
 //! `pack`) puts them in its atlas and font.
 //!
+//! [`entity_texture`] reads an entity texture (a skin, a mob's texture) by its id, also on
+//! demand, for the renderer's entity models (ADR 0040).
+//!
 //! Supported pack formats: roughly 64 through 120. [`ResourcePack`] skips other asset kinds
 //! (sounds, lang, fonts, GUI textures, shaders, texts, optifine, emissive, …) with a
 //! [`PackWarning`].
@@ -37,6 +40,7 @@
 mod animation;
 mod blockstate;
 mod builtin_models;
+mod entity;
 mod error;
 mod font;
 mod gui;
@@ -55,6 +59,7 @@ pub use blockstate::{
     BlockState, Condition, MultipartCase, VariantList, VariantModel, condition_matches,
     parse_variant_key,
 };
+pub use entity::{EntityTexture, entity_texture};
 pub use error::{PackError, PackWarning};
 pub use font::{BitmapProvider, FontProvider, PackFont, SpaceProvider};
 pub use gui::{GuiPack, GuiScaling, GuiTexture};

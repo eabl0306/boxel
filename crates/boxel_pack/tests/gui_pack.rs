@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use boxel_pack::{
-    BitmapProvider, FontProvider, GuiPack, GuiScaling, GuiTexture, OpenOptions, PackError,
-    ResourceId,
+    BitmapProvider, EntityTexture, FontProvider, GuiPack, GuiScaling, GuiTexture, OpenOptions,
+    PackError, ResourceId, entity_texture,
 };
 
 /// A pack directory under Cargo's temporary directory for tests, emptied first.
@@ -764,4 +764,47 @@ fn a_font_referenced_again_is_read_once() {
         .collect();
     assert_eq!(chars, ["c", "a", "b"]);
     assert!(font.warnings.is_empty(), "{:?}", font.warnings);
+}
+
+/// An entity texture (a skin, ADR 0040) by its id under `textures/`, after overlays; a missing
+/// one is `Ok(None)`, so the game keeps its own image.
+#[test]
+fn entity_textures_are_read_by_id_after_overlays() {
+    let pack = TempPack::new(
+        "entity",
+        r#"{"pack": {"pack_format": 64, "description": "test"},
+            "overlays": {"entries": [{"directory": "late", "formats": [60, 70]}]}}"#,
+    );
+    let skins = "assets/game/textures/entity/figure";
+    pack.png(&format!("{skins}/plain.png"), 4, 2, |x, y| {
+        [x as u8 * 10, y as u8 * 20, 7, 255 - x as u8]
+    });
+    pack.png(&format!("{skins}/over.png"), 2, 2, |_, _| [1, 2, 3, 4]);
+    pack.png(&format!("late/{skins}/over.png"), 2, 2, |_, _| [9, 8, 7, 6]);
+    let plain = entity_texture(&pack.root, &id("game:entity/figure/plain"))
+        .expect("reads")
+        .expect("exists");
+    assert_eq!((plain.width, plain.height), (4, 2));
+    assert_eq!(&plain.rgba[..8], &[0, 0, 7, 255, 10, 0, 7, 254]);
+    assert_eq!(&plain.rgba[16..20], &[0, 20, 7, 255], "row 1 follows row 0");
+    let over = entity_texture(&pack.root, &id("game:entity/figure/over"))
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(
+        over,
+        EntityTexture {
+            width: 2,
+            height: 2,
+            rgba: [9, 8, 7, 6].repeat(4),
+        },
+        "the overlay wins"
+    );
+    assert_eq!(
+        entity_texture(&pack.root, &id("game:entity/figure/missing")).expect("reads"),
+        None
+    );
+    assert!(matches!(
+        entity_texture(&pack.root.join("nowhere"), &id("game:entity/figure/plain")),
+        Err(PackError::NotADirectory(_))
+    ));
 }
