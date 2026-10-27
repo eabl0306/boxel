@@ -24,8 +24,8 @@ use boxel_worldgen::lod::{LodNode, LodRequest, LodScratch, LodSource};
 use boxel_worldgen::noise::splitmix64;
 use boxel_worldgen::region::{
     ChunkColumns, Context, Decoration, Entry, FeatureReach, FeatureStage, FlatKind, FloorFill,
-    HEIGHT_ONE, LodColumns, LodReport, NoSurface, RegionGenerator, RegionSettings, RegionSpec,
-    RuleEntry, Scope, SelectorRule, TerrainKind, check_lod, clear_worker_memo,
+    HEIGHT_ONE, LodColumns, LodReport, LodRun, NoSurface, RegionGenerator, RegionSettings,
+    RegionSpec, RuleEntry, Scope, SelectorRule, TerrainKind, check_lod, clear_worker_memo,
 };
 use boxel_worldgen::registry::{
     Checks, GenEntry, GenRegistryBuilder, HashParams, Order, ParamsHasher,
@@ -677,13 +677,13 @@ impl FeatureStage<TestContext> for NodeRuns {
         columns: &LodColumns<'_, TestContext>,
         _: u64,
         registry: &BlockRegistry,
-        out: &mut [(BlockState, u32)],
+        out: &mut [LodRun],
     ) {
         let leaves = registry.by_name("test:cutout").expect("test:cutout");
         let dry = columns.ground.iter().zip(columns.fluid_top);
         for (at, (o, (&g, &f))) in out.iter_mut().zip(dry).enumerate() {
             if f == g && at % 3 == 0 {
-                *o = (leaves, 6);
+                *o = LodRun::grounded(leaves, 6);
             }
         }
     }

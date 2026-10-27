@@ -589,13 +589,13 @@ pub trait FeatureStage<Cx: Context>: GenEntry + Send + Sync {
     /// not in a worker.
     fn block_names(&self) -> Vec<&str>;
 
-    /// The far LOD form (ADR 0039 sec. 10): per cell column of a node, a run of `(state,
-    /// blocks)` stacked over the cell column's coarse ground (a canopy), into `out` (one per cell
-    /// column, in `columns`' order, all `(AIR, 0)` on entry). The far LOD draws it as cells
-    /// over the ground, never as margin, and inside the band; a run of 0 blocks, or of a state
-    /// that is not Solid far away, draws nothing. Of the runs the stages give a cell column, the
-    /// tallest is drawn. It should be a pure function of the cell column (hashed per cell, not
-    /// per node), so two nodes and two jobs of a column agree, and at most
+    /// The far LOD form (ADR 0039 sec. 10): per cell column of a node, a run ([`LodRun`]) over
+    /// the cell column's coarse ground (a canopy, with the air under it), into `out` (one per
+    /// cell column, in `columns`' order, all [`LodRun::NONE`] on entry). The far LOD draws it as
+    /// cells over the ground, never as margin, and inside the band; a run of 0 blocks, or of a
+    /// state that is not Solid far away, draws nothing. Of the runs the stages give a cell
+    /// column, the tallest is drawn. It should be a pure function of the cell column (hashed per
+    /// cell, not per node), so two nodes and two jobs of a column agree, and at most
     /// [`FeatureReach::height`] blocks (the exported harness checks both ends of each run).
     ///
     /// The default gives none: the stage is not seen far away.
@@ -604,9 +604,37 @@ pub trait FeatureStage<Cx: Context>: GenEntry + Send + Sync {
         columns: &LodColumns<'_, Cx>,
         seed: u64,
         registry: &BlockRegistry,
-        out: &mut [(BlockState, u32)],
+        out: &mut [LodRun],
     ) {
         let _ = (columns, seed, registry, out);
+    }
+}
+
+/// A feature stage's far run over a cell column ([`FeatureStage::lod_runs`]): `state` in the
+/// blocks `air + 1..=top` over the cell column's coarse ground. The far LOD fills the blocks
+/// under it with air (a canopy over a forest floor); with `air` 0 it stands on the ground (a
+/// trunk, a rock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LodRun {
+    /// Its state, Solid far away to be drawn.
+    pub state: BlockState,
+    /// Its highest block, in blocks over the coarse ground (0: no run).
+    pub top: u32,
+    /// The blocks of air between the coarse ground and its lowest block (`top` at most).
+    pub air: u32,
+}
+
+impl LodRun {
+    /// No run.
+    pub const NONE: Self = Self {
+        state: BlockState::AIR,
+        top: 0,
+        air: 0,
+    };
+
+    /// A run of `state` from the ground up to `top` blocks over it.
+    pub const fn grounded(state: BlockState, top: u32) -> Self {
+        Self { state, top, air: 0 }
     }
 }
 

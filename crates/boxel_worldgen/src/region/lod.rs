@@ -26,7 +26,8 @@
 //!    under the level, so coasts do not move with the level), then the surface stage's
 //!    [`SurfaceStage::lod_top`](super::SurfaceStage::lod_top), then the feature stages'
 //!    [`FeatureStage::lod_runs`](super::FeatureStage::lod_runs): the tallest Solid run of a cell
-//!    column stands over its coarse ground (its margin and rise included), as cells of its own. A
+//!    column stands over its coarse ground (its margin and rise included), as cells of its own,
+//!    with the air the run asks for under it (over the lowest ground of the column). A
 //!    wet cell's ground is its highest corner's, without margin, so under the level: with a margin
 //!    a shallow floor would reach the surface row far away and the sea would show as land.
 //! 7. One pass of the cell rule (the demo's surface, generalized): a cell holding a feature run
@@ -50,7 +51,7 @@
 //! ([`RegionSettings::memo`](super::RegionSettings::memo)), every call starts empty.
 
 use super::blend::{self, Counts, Window};
-use super::decorate::{LodColumns, LodTop};
+use super::decorate::{LodColumns, LodRun, LodTop};
 use super::generator::RegionGenerator;
 use super::kind::{Context, HEIGHT_SHIFT, HeightQ, KindGrid, block_of};
 use crate::block;
@@ -99,8 +100,12 @@ pub(crate) struct Col {
     pub(crate) wet: i64,
     /// Its surface stage's runs from `h` down: an index into [`Slots::runs`] (columns share them).
     runs: u32,
-    /// The `y` of the top of its feature run (`t + 1..=canopy_top`), `t` without one.
+    /// The `y` of the top of its feature run (`canopy_lo..=canopy_top`), `t` without one.
     pub(crate) canopy_top: i64,
+    /// The `y` of the lowest block of its feature run, `t + 1` or more: the air under the run
+    /// over `h`, its lowest ground (the run slides down with the ground, so a cell that may hold
+    /// any of it is the run's).
+    pub(crate) canopy_lo: i64,
     /// Its feature run's state (Solid), air without one.
     pub(crate) canopy: BlockState,
 }
@@ -143,6 +148,7 @@ impl Col {
         wet: i64::MIN,
         runs: 0,
         canopy_top: 0,
+        canopy_lo: 1,
         canopy: BlockState::AIR,
     };
 
@@ -219,7 +225,7 @@ struct Look {
     fluid_top: Vec<i64>,
     tops: Vec<LodTop>,
     /// One feature stage's runs.
-    canopies: Vec<(BlockState, u32)>,
+    canopies: Vec<LodRun>,
 }
 
 /// What one generator keeps on a LOD worker (module docs).
@@ -278,6 +284,7 @@ impl<Cx: Context> Slots<Cx> {
     pub(crate) fn without_canopies(&mut self) {
         for c in &mut self.cols {
             c.canopy_top = c.t;
+            c.canopy_lo = c.t + 1;
             c.canopy = BlockState::AIR;
         }
         self.at = None;
@@ -351,7 +358,7 @@ impl<Cx: Context> LodMemo<Cx> {
             + s.look.corner.capacity() * size_of::<u32>()
             + (s.look.ground.capacity() + s.look.fluid_top.capacity()) * size_of::<i64>()
             + s.look.tops.capacity() * size_of::<LodTop>()
-            + s.look.canopies.capacity() * size_of::<(BlockState, u32)>()
+            + s.look.canopies.capacity() * size_of::<LodRun>()
             + s.blocks.as_ref().map_or(0, |(_, b)| {
                 b.classes.len() * size_of::<(LodClass, BlockState)>()
             })
@@ -861,6 +868,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
                 col.t = t;
                 col.wet = wet;
                 col.canopy_top = t;
+                col.canopy_lo = t + 1;
             }
         }
         let columns = LodColumns {
@@ -879,13 +887,15 @@ impl<Cx: Context> RegionGenerator<Cx> {
         // The feature stages' runs over the coarse grounds: the tallest Solid one of each column.
         for f in &self.features {
             canopies.clear();
-            canopies.resize(EDGE * EDGE, (BlockState::AIR, 0));
+            canopies.resize(EDGE * EDGE, LodRun::NONE);
             f.stage.lod_runs(&columns, f.seed, registry, canopies);
-            for (col, &(state, n)) in slots.cols.iter_mut().zip(canopies.iter()) {
-                let top = col.t.saturating_add(i64::from(n));
-                if top > col.canopy_top && blocks.classes.class(state) == LodClass::Solid {
+            for (col, run) in slots.cols.iter_mut().zip(canopies.iter()) {
+                let top = col.t.saturating_add(i64::from(run.top));
+                if top > col.canopy_top && blocks.classes.class(run.state) == LodClass::Solid {
                     col.canopy_top = top;
-                    col.canopy = state;
+                    col.canopy = run.state;
+                    let air = i64::from(run.air.min(run.top.saturating_sub(1)));
+                    col.canopy_lo = (col.h + 1 + air).clamp(col.t + 1, top);
                 }
             }
         }
@@ -937,9 +947,12 @@ impl<Cx: Context> RegionGenerator<Cx> {
         if y1 <= c.rock {
             return blocks.floor;
         }
-        if y0 > c.canopy_top {
+        // Over the ground and the run, or over the ground under a run with air under it.
+        let under = y0 > c.t && y1 < c.canopy_lo;
+        if y0 > c.canopy_top || under {
             // No ground and no feature run: the fluid if it fills half of the cell.
-            return if c.is_wet() && 2 * (c.wet.min(y1) - y0.max(c.canopy_top + 1) + 1) >= s {
+            let from = if under { c.t + 1 } else { c.canopy_top + 1 };
+            return if c.is_wet() && 2 * (c.wet.min(y1) - y0.max(from) + 1) >= s {
                 blocks.fluid
             } else {
                 BlockState::AIR
@@ -950,7 +963,7 @@ impl<Cx: Context> RegionGenerator<Cx> {
             return blocks.fluid;
         }
         // A feature run in the cell: its blocks lie over every block of the ground.
-        if c.canopy_top > c.t && y1 > c.t {
+        if c.canopy_top > c.t && y1 > c.t && y1 >= c.canopy_lo {
             return c.canopy;
         }
         // The highest Solid block that may lie in `y0..=min(y1, t)`. A column's ground may stand

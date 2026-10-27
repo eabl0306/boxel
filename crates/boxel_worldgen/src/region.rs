@@ -53,9 +53,9 @@ pub use check_lod::{CORNER_STEP, LodReport, check_lod, lod_corners, lod_memo_byt
 pub use check_seam::{SeamOptions, SeamReport, check_seam};
 pub use decorate::{
     CarveChunk, CarveMask, CarveReach, CarverStage, ChunkColumns, ColumnsAround, Decoration,
-    FeatureReach, FeatureStage, FillStage, FloodMask, FloorFill, LOD_TOP_RUNS, LodColumns, LodTop,
-    MAX_APRON, NoSurface, RealmCarver, RealmFeature, Rock, Stages, SurfaceReach, SurfaceStage,
-    TopLayers, decorate,
+    FeatureReach, FeatureStage, FillStage, FloodMask, FloorFill, LOD_TOP_RUNS, LodColumns, LodRun,
+    LodTop, MAX_APRON, NoSurface, RealmCarver, RealmFeature, Rock, Stages, SurfaceReach,
+    SurfaceStage, TopLayers, decorate,
 };
 pub use dimension::{DimensionGenerator, REALM_GENERATOR};
 pub use generator::{LocalBounds, RegionGenerator, RegionSettings, RegionSpec, check_realm_blocks};

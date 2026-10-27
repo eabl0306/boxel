@@ -20,7 +20,7 @@ use boxel_worldgen::region::{
     Interval, KindGrid, KindLimits, RegionGenerator, RegionSettings, RegionSpec, Rock, RuleEntry,
     Scope, SelectorRule, Stages, SurfaceStage, TerrainKind, TopLayers, block_of, decorate,
 };
-use boxel_worldgen::region::{FeatureReach, FeatureStage, LodColumns};
+use boxel_worldgen::region::{FeatureReach, FeatureStage, LodColumns, LodRun};
 use boxel_worldgen::registry::{
     Checks, FreezeError, GenEntry, GenId, GenRegistry, GenRegistryBuilder, HashParams, ParamsHasher,
 };
@@ -1303,7 +1303,7 @@ impl<Cx: Context> FeatureStage<Cx> for Groves {
         columns: &LodColumns<'_, Cx>,
         _seed: u64,
         registry: &BlockRegistry,
-        out: &mut [(BlockState, u32)],
+        out: &mut [LodRun],
     ) {
         if self.run == 0 {
             return;
@@ -1311,7 +1311,7 @@ impl<Cx: Context> FeatureStage<Cx> for Groves {
         let leaves = registry.by_name("test:cutout").expect("test:cutout");
         for ((o, &g), &f) in out.iter_mut().zip(columns.ground).zip(columns.fluid_top) {
             if self.wet_runs || (f == g && g >= self.min_ground) {
-                *o = (leaves, self.run);
+                *o = LodRun::grounded(leaves, self.run);
             }
         }
     }

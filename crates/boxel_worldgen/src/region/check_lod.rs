@@ -520,7 +520,7 @@ pub fn check_lod<Cx: Context>(
             // The run of the feature stages.
             if col.canopy_top > col.t {
                 report.runs += 1;
-                let (from, to) = (col.t + 1, col.canopy_top);
+                let (from, to) = (col.canopy_lo, col.canopy_top);
                 let ground = real.solid(s, [cx, cz]);
                 if from <= ground {
                     failures.push(format!(
