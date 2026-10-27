@@ -1167,3 +1167,47 @@ fn golden_raster_of_the_list_the_text_field_and_the_tabs() {
 /// FNV-1a 64 of the 640x480 raster. A deliberate change of the widgets, the skin or the font
 /// updates it; run with `BOXEL_UI_DUMP=dir` to write the raw RGBA image and look at it.
 const GOLDEN: u64 = 0xb515_6a94_46b7_c225;
+
+fn always_typed_tester() -> UiTester {
+    let mut t = UiTester::new(UVec2::new(1280, 720));
+    t.app.init_resource::<Lone>();
+    t.add_systems(|mut ui: Ui, mut lone: ResMut<Lone>| {
+        let mut p = ui.layer(UiLayer::Screen, Modal::Yes);
+        p.focus()
+            .frameless()
+            .text_field(NAME, "test:search", &mut lone.0, 16, "");
+        // The flags are for one widget only: this field has its frame and no focus.
+        p.text_field(
+            UiRect::new(NAME.x, NAME.y + 40, NAME.w, NAME.h),
+            "test:other",
+            &mut String::new(),
+            16,
+            "",
+        );
+    });
+    t.frame();
+    t
+}
+
+#[test]
+fn a_frameless_field_draws_only_its_text_and_focus_keeps_it_typed_in() {
+    let mut t = always_typed_tester();
+    // Focused at once (its caret, 2 quads) without a frame; the other field's frame (9).
+    assert_eq!(t.focused().as_deref(), Some("test:search"));
+    assert_eq!(quads(&t), 2 + 9);
+    t.type_text("roble");
+    assert_eq!(t.app.world().resource::<Lone>().0, "roble");
+    // A press elsewhere takes the focus away for a frame; the field takes it back.
+    t.move_to(IVec2::new(300, 300))
+        .press()
+        .frame()
+        .release()
+        .frame();
+    assert_eq!(t.focused().as_deref(), Some("test:search"));
+    t.type_text("s");
+    assert_eq!(t.app.world().resource::<Lone>().0, "robles");
+    // A click on the other field gives it the focus only until the next frame.
+    t.click("test:other");
+    t.frame();
+    assert_eq!(t.focused().as_deref(), Some("test:search"));
+}

@@ -76,6 +76,8 @@ impl<'w> Ui<'w> {
             clip: None,
             next_enabled: true,
             next_id: None,
+            next_frameless: false,
+            next_focus: false,
             scopes: Vec::new(),
             rows: Vec::new(),
         }
@@ -110,6 +112,10 @@ pub struct Painter<'a> {
     clip: Option<UiRect>,
     pub(crate) next_enabled: bool,
     pub(crate) next_id: Option<WidgetId>,
+    /// The next text field draws no frame ([`Painter::frameless`]).
+    pub(crate) next_frameless: bool,
+    /// The next widget takes the keyboard focus ([`Painter::focus`]).
+    pub(crate) next_focus: bool,
     pub(crate) scopes: Vec<WidgetId>,
     /// The lists and rows being drawn, innermost last.
     pub(crate) rows: Vec<(WidgetId, usize)>,
@@ -173,6 +179,8 @@ pub(crate) struct Interaction {
     pub nudge_y: i32,
     pub shift: bool,
     pub cursor: Option<IVec2>,
+    /// [`Painter::frameless`] was asked for this widget.
+    pub frameless: bool,
 }
 
 impl<'a> Painter<'a> {
@@ -189,6 +197,20 @@ impl<'a> Painter<'a> {
     /// The next widget is enabled or not (one widget only; then it is enabled again).
     pub fn enabled(&mut self, on: bool) -> &mut Self {
         self.next_enabled = on;
+        self
+    }
+
+    /// The next text field draws without its frame: only its text, selection and caret, for a
+    /// field that sits on a picture of its own (one widget only).
+    pub fn frameless(&mut self) -> &mut Self {
+        self.next_frameless = true;
+        self
+    }
+
+    /// The next widget takes the keyboard focus if it can (enabled and focusable; one widget
+    /// only). Declared every frame, it keeps it: a field that is always typed in.
+    pub fn focus(&mut self) -> &mut Self {
+        self.next_focus = true;
         self
     }
 
@@ -322,6 +344,8 @@ impl<'a> Painter<'a> {
     /// Registers a widget's rectangle and returns what input it gets this frame.
     pub(crate) fn interact(&mut self, rect: UiRect, kind: WidgetKind, label: &str) -> Interaction {
         let enabled = std::mem::replace(&mut self.next_enabled, true);
+        let frameless = std::mem::take(&mut self.next_frameless);
+        let take_focus = std::mem::take(&mut self.next_focus);
         let base = self.next_id.take().unwrap_or_else(|| {
             WidgetId::ROOT
                 .mix(&[self.layer.index() as u8, kind as u8])
@@ -346,6 +370,10 @@ impl<'a> Painter<'a> {
             label: label.to_owned(),
         });
         self.state.dirty = true;
+        if take_focus && enabled && kind.focusable() && self.state.memory.focused != Some(id) {
+            self.state.memory.focused = Some(id);
+            self.state.memory.focus_visible = false;
+        }
         let mem = &self.state.memory;
         let hovered = mem.hovered == Some((self.layer, id));
         let focused = enabled && mem.focused == Some(id);
@@ -366,6 +394,7 @@ impl<'a> Painter<'a> {
             nudge_y: steps(&mem.nudge_y),
             shift: mem.shift,
             cursor: mem.cursor,
+            frameless,
         }
     }
 

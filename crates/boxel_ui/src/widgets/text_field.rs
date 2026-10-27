@@ -292,7 +292,9 @@ impl<'a> Painter<'a> {
         } else {
             SkinSlot::TextField
         };
-        self.skin(slot, rect);
+        if !it.frameless {
+            self.skin(slot, rect);
+        }
         let caret_x = text_x + width(font, &chars[first..edit.caret]);
         let blink_on = (now.saturating_sub(data.moved).as_millis() / CARET_BLINK.as_millis())
             .is_multiple_of(2);

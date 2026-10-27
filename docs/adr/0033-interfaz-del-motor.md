@@ -146,6 +146,10 @@ el pase (E-UI2) y llega antes de los menús, así que no hay puente.
   campo lo tuvo en ese frame: elegir un candidato con una flecha no salta al widget de abajo.
   Las parejas se arman desde el final del frame, porque las teclas del IME llegan antes de lo
   que confirma y de las teclas reales que siguen.
+- `frameless()` y `focus()` valen para el widget siguiente. Con `frameless()` un campo de texto
+  no dibuja su marco, solo el texto, la selección y el cursor: es para un campo que va sobre un
+  dibujo propio, como la búsqueda del inventario creativo de Minecraft. Con `focus()` el widget
+  toma el foco del teclado; si se declara así cada frame, lo conserva y siempre se escribe ahí.
 - `tabs`: una pestaña por etiqueta, cada una con su foco. Izquierda y derecha abren la vecina;
   Ctrl+Tab y Ctrl+Shift+Tab recorren las de la capa modal.
 - El tiempo real sale de `Time`: el doble clic y el parpadeo del cursor (cada 300 ms). `UiTester`
