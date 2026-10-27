@@ -24,7 +24,7 @@ use super::edits::{self, Pyramid, nodes_touching};
 use super::fallback::{self, FallbackInput};
 use super::plan::Span;
 use crate::jobs::JobExecutor;
-use boxel_mesh::lod::{LodMaterials, fits, mesh_node, octant_of};
+use boxel_mesh::lod::{LodMaterials, Seam, fits, mesh_node, octant_of, seam_of, uniform_skirts};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
 use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos};
 use boxel_worldgen::WorldGenerator;
@@ -65,11 +65,13 @@ pub(crate) struct JobInput {
 /// One node of a finished job.
 #[derive(Clone, Debug)]
 pub(crate) enum Built {
-    /// The source emitted it uniform: nothing to draw.
+    /// The source emitted it uniform, of air or a fluid: nothing to draw. (Uniform ground has
+    /// its deep skirts, [`uniform_node`].)
     Uniform,
     /// Its cells meshed to nothing.
     Blank,
-    /// Its mesh, and the octants its quads lie in (bit `x | y << 1 | z << 2`).
+    /// Its mesh, and the octants its surface quads lie in (bit `x | y << 1 | z << 2`; its seam
+    /// quads left out).
     Mesh(Arc<ChunkMesh>, u8),
     /// A face bucket passed the renderer's limit: the node is lost (its parent draws there).
     TooBig,
@@ -173,6 +175,20 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// A node whose cells are all `state`: of ground, its deep skirts alone
+/// (`boxel_mesh::lod::uniform_skirts`, ADR 0031 sec. 13), drawn only next to finer detail or a
+/// node that does not draw its cells by them; else nothing. Its octants count as holding no
+/// quads: it draws no surface, so the coverage watches no empty chunk under it (an empty chunk
+/// there is rock, and its neighbors' edge walls close it).
+pub(crate) fn uniform_node(materials: &LodMaterials, state: BlockState) -> Built {
+    let mesh = uniform_skirts(materials, state);
+    if mesh.is_empty() {
+        Built::Uniform
+    } else {
+        Built::Mesh(Arc::new(mesh), 0)
+    }
+}
+
 /// One node's cells meshed (no light, no AO, the LOD post-passes).
 pub(crate) fn mesh_cells(
     materials: &LodMaterials,
@@ -189,7 +205,14 @@ pub(crate) fn mesh_cells(
     } else if !fits(mesh) {
         Built::TooBig
     } else {
-        let octants = mesh.quads.iter().fold(0u8, |o, &q| o | 1 << octant_of(q));
+        // The octants of its surface: the seam quads (skirts, deep down the x and z planes since
+        // ADR 0031 sec. 13) show only next to finer detail, so an empty chunk under an octant
+        // that holds only them needs no watching.
+        let octants = mesh
+            .quads
+            .iter()
+            .filter(|&&q| seam_of(q) == Seam::None)
+            .fold(0u8, |o, &q| o | 1 << octant_of(q));
         Built::Mesh(Arc::new(mesh.clone()), octants)
     }
 }
@@ -217,8 +240,9 @@ impl Nodes<'_> {
         if self.cancelled {
             return;
         }
-        if cells.uniform().is_some() {
-            self.nodes.push((layer, Built::Uniform));
+        if let Some(state) = cells.uniform() {
+            let built = uniform_node(&self.input.materials, state);
+            self.nodes.push((layer, built));
             return;
         }
         if self.input.cancel.load(Ordering::Relaxed) {
@@ -299,7 +323,9 @@ pub(crate) fn run_column(input: &JobInput) -> LodMessage {
                             return;
                         }
                         match node {
-                            LodNode::Uniform(_) => out.nodes.push((layer, Built::Uniform)),
+                            LodNode::Uniform(state) => out
+                                .nodes
+                                .push((layer, uniform_node(&input.materials, state))),
                             LodNode::Cells(c) => out.build(layer, c, padded, mesher, mesh),
                         }
                     });

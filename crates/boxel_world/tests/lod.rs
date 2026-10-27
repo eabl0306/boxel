@@ -4,7 +4,7 @@
 use boxel_app::App;
 use boxel_demo::worldgen::ForestGenerator;
 use boxel_math::DVec3;
-use boxel_mesh::lod::{LodMaterials, mesh_node};
+use boxel_mesh::lod::{LodMaterials, mesh_node, uniform_skirts};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
 use boxel_transform::Transform;
 use boxel_voxel::{ChunkKey, DimensionId};
@@ -87,11 +87,18 @@ fn fresh_mesh(key: ChunkKey) -> Option<ChunkMesh> {
         layers: key.pos.y..=key.pos.y,
     };
     source.column(&req, &registry, &mut scratch, &mut |y, node| {
-        if let (true, LodNode::Cells(cells)) = (y == key.pos.y, node) {
-            let mut mesh = ChunkMesh::default();
-            materials.fill(&cells.0[..], &mut padded);
-            mesh_node(&mut mesher, &padded, &materials, key.lod, &mut mesh);
-            out = Some(mesh);
+        if y != key.pos.y {
+            return;
+        }
+        match node {
+            LodNode::Cells(cells) => {
+                let mut mesh = ChunkMesh::default();
+                materials.fill(&cells.0[..], &mut padded);
+                mesh_node(&mut mesher, &padded, &materials, key.lod, &mut mesh);
+                out = Some(mesh);
+            }
+            // Uniform ground: its deep skirts alone (ADR 0031 sec. 13).
+            LodNode::Uniform(state) => out = Some(uniform_skirts(&materials, state)),
         }
     });
     out
@@ -120,7 +127,7 @@ fn the_forest_fills_its_rings_with_the_meshes_of_its_source() {
         // Sample nodes of every level against a fresh job.
         for level in 1..=3u8 {
             for (key, (mesh, _)) in nodes.iter().filter(|(k, _)| k.lod == level).take(4) {
-                let fresh = fresh_mesh(*key).expect("the node has cells");
+                let fresh = fresh_mesh(*key).expect("the node is in the band");
                 assert_eq!(mesh.quads, fresh.quads, "{key:?}");
                 assert_eq!(mesh.bucket_counts, fresh.bucket_counts, "{key:?}");
             }

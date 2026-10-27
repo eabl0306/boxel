@@ -6,7 +6,7 @@ mod common;
 use boxel_mesh::lod::{
     LOD_PALETTE, LodMaterials, MAX_DARK, Seam, add_banks, add_fluid_walls, add_skirts,
     add_underwater, dark_of, fits, is_bank, mesh_node, octant_of, seam_counts, seam_of,
-    split_octants, water_seams,
+    split_octants, uniform_skirts, water_seams,
 };
 use boxel_mesh::{
     AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PADDED_VOLUME, PackedQuad,
@@ -546,7 +546,7 @@ proptest! {
     }
 
     #[test]
-    fn skirts_sit_on_ground_near_air_and_on_the_top_of_the_water(
+    fn skirts_sit_on_ground_deep_or_near_air_and_on_the_top_of_the_water(
         scene in scene_strategy(),
         smooth in 1usize..9,
     ) {
@@ -559,15 +559,17 @@ proptest! {
         add_skirts(&padded, &m, 1, &mut mesh);
         let state = |c: [i32; 3]| cells[index(c[0], c[1], c[2])];
         let material = |c: [i32; 3]| m.canonical(state(c));
+        // On an x or z plane every ground cell with ground across (deep skirts), on a y plane
+        // those near the air.
         let expected: BTreeSet<([u32; 3], Face)> = plane_cells()
             .into_iter()
-            .filter(|&(c, _, across)| {
+            .filter(|&(c, f, across)| {
                 if clear_state(&m, state(c)) {
                     material(across) != 0 && material([c[0], c[1] + 1, c[2]]) == 0
                 } else {
                     ground_state(&m, state(c))
                         && ground_state(&m, state(across))
-                        && near_air(&cells, &m, c)
+                        && (f.axes().0 != 1 || near_air(&cells, &m, c))
                 }
             })
             .map(|(c, f, _)| (c.map(|a| a as u32), f))
@@ -607,10 +609,12 @@ proptest! {
         let before = mesh.clone();
         add_fluid_walls(&padded, &m, level, &mut mesh);
         let state = |c: [i32; 3]| cells[index(c[0], c[1], c[2])];
+        // On the y planes: the deep skirts of the x and z planes hold the rest.
         let expected: BTreeSet<([u32; 3], Face)> = plane_cells()
             .into_iter()
-            .filter(|&(c, _, across)| {
-                ground_state(&m, state(c))
+            .filter(|&(c, f, across)| {
+                f.axes().0 == 1
+                    && ground_state(&m, state(c))
                     && ground_state(&m, state(across))
                     && near(&cells, c, |s| clear_state(&m, s))
                     && !near_air(&cells, &m, c)
@@ -830,8 +834,8 @@ fn a_sea_gets_its_bed_skirts_on_its_top_and_walls_under_it() {
         .collect();
     assert_eq!(bed.iter().map(|q| q.w() * q.h()).sum::<u32>(), 32 * 32);
     assert!(bed.iter().all(|&q| q.pos()[1] == 4 && dark_of(q) == 7));
-    // On the plane x = 16: the water's skirt on its top cell, walls on the ground within 2
-    // cells of it (cells 3 and 4), lit as deep as the ground across: (8 - 3 + 1) * 2 - 1.
+    // On the plane x = 16: the water's skirt on its top cell, and deep skirts down the ground
+    // (cells 0 to 4), lit as deep as the ground across: (8 - y + 1) * 2 - 1, at most 15.
     let on_plane = |b: usize, seam: Seam| -> BTreeSet<(u32, u8)> {
         mesh.bucket(b)
             .iter()
@@ -844,7 +848,7 @@ fn a_sea_gets_its_bed_skirts_on_its_top_and_walls_under_it() {
     assert_eq!(on_plane(TRANSLUCENT_BUCKET, Seam::Middle), [(8, 0)].into());
     assert_eq!(
         on_plane(Face::PosX.index(), Seam::Middle),
-        [(3, 11), (4, 9)].into()
+        [(0, 15), (1, 15), (2, 13), (3, 11), (4, 9)].into()
     );
     // Deeper: 6 cells of 2 blocks (11 blocks) and more saturate at sky light 0.
     let deep = node_cells(|_, y, _| match y {
@@ -1458,4 +1462,50 @@ fn a_wet_cutout_cube_looks_like_the_dry_one_far_away() {
     assert_eq!(m.canonical(wet), m.canonical(dry));
     assert_eq!(m.canonical(dry), m.canonical(by(&r, "test:cutout")));
     assert_eq!(m.class(m.canonical(wet)), LodClass::Solid);
+}
+
+#[test]
+fn a_uniform_node_of_ground_has_its_deep_skirts_alone() {
+    // ADR 0031 sec. 13: under the meshed layers, a column's uniform nodes of ground carry the
+    // deep skirts of their x and z planes, so finer detail by such a plane (a cave, a valley)
+    // meets a face there; the same faces a mesh of the node's cells would put on those planes.
+    let r = testing::registry();
+    let m = LodMaterials::from_registry(&r);
+    let solid = by(&r, "test:solid");
+    let mesh = uniform_skirts(&m, solid);
+    // 8 sides of the x and z planes, a quad per octant on each.
+    assert_eq!(mesh.quads.len(), 32);
+    let seams = seam_counts(&mesh);
+    for f in Face::ALL {
+        let b = f.index();
+        let quads = mesh.bucket(b);
+        if f.axes().0 == 1 {
+            assert!(quads.is_empty(), "{f:?}");
+            continue;
+        }
+        assert_eq!(quads.len(), 8, "{f:?}");
+        assert_eq!(seams[b][0] + seams[b][1], 8, "{f:?}: all seam quads");
+        for q in quads {
+            assert_eq!((q.w(), q.h()), (16, 16), "{q:?}");
+            assert_eq!(q.layer(), m.table().layer(m.canonical(solid), f));
+        }
+    }
+    // The same faces as the skirts the post-pass gives a node of those cells.
+    let cells = node_cells(|_, _, _| solid);
+    let (padded, mut plain) = plain_mesh(&m, &cells);
+    split_octants(&mut plain);
+    let before = plain.clone();
+    add_skirts(&padded, &m, 1, &mut plain);
+    let sides = |mesh: &ChunkMesh| -> BTreeSet<([u32; 3], Face)> {
+        mesh.quads
+            .iter()
+            .filter(|q| q.face().axes().0 != 1)
+            .flat_map(|q| q.unit_faces())
+            .collect()
+    };
+    let skirts: BTreeSet<_> = sides(&plain).difference(&sides(&before)).copied().collect();
+    assert_eq!(sides(&mesh), skirts);
+    // Air, a fluid or nothing far away: no mesh.
+    assert!(uniform_skirts(&m, BlockState::AIR).is_empty());
+    assert!(uniform_skirts(&m, by(&r, "test:fluid")).is_empty());
 }

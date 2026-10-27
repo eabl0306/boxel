@@ -44,7 +44,7 @@ use boxel_gfx::{
     gpu_tests_required, read_texture_rgba8, run_in_error_scopes, submit_and_wait, tier_request,
 };
 use boxel_math::{DVec3, I64Vec3, UVec2};
-use boxel_mesh::lod::{LodMaterials, mesh_node, octant_of};
+use boxel_mesh::lod::{LodMaterials, mesh_node, octant_of, seam_counts, water_seams};
 use boxel_mesh::{
     BUCKET_COUNT, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk,
     TRANSLUCENT_BUCKET,
@@ -802,15 +802,30 @@ fn every_tier_draws_the_lod_scene_alike() {
     report.finish();
 }
 
-/// `mesh` without the quads of the octants in `mask`, and without seam marks: what is left is
-/// drawn whole, as the seams by the hidden octants are (`boxel_mesh::lod::Seam`).
+/// `mesh` without the quads of the octants in `mask` and the seam quads the renderer leaves out
+/// with them hidden (`boxel_mesh::lod::Seam`), and without seam marks: what is left is drawn
+/// whole.
 fn without_octants(mesh: &ChunkMesh, mask: u8) -> ChunkMesh {
+    use boxel_shaders::gpu::lod::{bucket_quads, water_quads};
+    let (seams, water) = (seam_counts(mesh), water_seams(mesh));
     let mut quads = Vec::new();
     let mut counts = [0; BUCKET_COUNT];
     for (b, count) in counts.iter_mut().enumerate() {
-        for &q in mesh.bucket(b) {
+        // The quads the renderer draws of the bucket with `mask` hidden (the seam quads only
+        // where a hidden octant or a missing neighbor exposes them; there is no neighbor here).
+        let all = mesh.bucket(b);
+        let n = all.len() as u32;
+        let drawn = if b < 6 {
+            bucket_quads(n, seams[b], b, mask, false)
+        } else if b == TRANSLUCENT_BUCKET {
+            water_quads(n, water, mask, 0)
+        } else {
+            n
+        };
+        for &q in &all[..drawn as usize] {
             if mask >> octant_of(q) & 1 == 0 {
-                quads.push(q.with_light_index(0));
+                // Its seam bits cleared (drawn always), its darkness under water kept.
+                quads.push(q.with_light_index(q.light_index() & !3));
                 *count += 1;
             }
         }
@@ -825,10 +840,12 @@ fn without_octants(mesh: &ChunkMesh, mask: u8) -> ChunkMesh {
 /// and not those of the whole node.
 #[test]
 fn hidden_octants_draw_nothing() {
-    // The level-1 node with quads in the most octants, and three of them to hide.
+    // The level-1 node with quads in the most octants, and three of them to hide. One without
+    // water: the reference drops the seam marks, and a water skirt's marks change its shape
+    // (it starts at the near surface's height), so it would not draw the same.
     let (key, mesh) = lod_nodes()
         .iter()
-        .filter(|(k, _)| k.lod == 1)
+        .filter(|(k, m)| k.lod == 1 && m.bucket_counts[TRANSLUCENT_BUCKET] == 0)
         .max_by_key(|(_, m)| {
             let octants: u8 = m.quads.iter().fold(0, |a, &q| a | 1 << octant_of(q));
             (octants.count_ones(), m.total_quads())
@@ -1567,7 +1584,8 @@ fn render_seam(
 /// translucent (issue #50), so a hole under it only tints the sky: each scene is drawn under two
 /// skies, and no ground pixel may follow the sky's color. The sea scene holds LOD water, and the
 /// tiers of an adapter draw it alike. Searched with the camera's far plane instead, the last two
-/// poses show holes: the search must reach the horizon.
+/// poses lose pixels: the search must reach the horizon. (Lost chunks under hidden octants show
+/// holes, or since the deep skirts, ADR 0031 sec. 13, the coarse sides behind them.)
 #[test]
 fn full_detail_and_lod_meet_without_holes() {
     let mut scenes: Option<&[SeamScene]> = None;
@@ -1597,13 +1615,20 @@ fn full_detail_and_lod_meet_without_holes() {
             let lost = format!("{name}_camera_far_plane");
             let sky = format!("{name}_green");
             report.keep(&[(&name, &with_lod), (&sky, &green), (&lost, &without)]);
-            let (found, found_without) = (
-                sky_shows(&with_lod, &green, &scene.ground),
-                holes(&without, &scene.ground),
-            );
+            let found = sky_shows(&with_lod, &green, &scene.ground);
+            let found_without = holes(&without, &scene.ground)
+                + with_lod
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(without.data.as_chunks::<4>().0)
+                    .zip(&scene.ground)
+                    .filter(|((a, b), g)| **g && a != b)
+                    .count();
             eprintln!(
-                "gpu_lod: {what}: {found} pixels show the sky, {found_without} holes with the \
-                 camera's far plane"
+                "gpu_lod: {what}: {found} pixels show the sky, {found_without} ground pixels \
+                 lost with the camera's far plane"
             );
             if found > 0 {
                 report.fail(
@@ -1613,7 +1638,7 @@ fn full_detail_and_lod_meet_without_holes() {
             }
             if scene.loses && found_without == 0 {
                 report.fail(
-                    format!("{what}: the camera's far plane in the search shows no hole"),
+                    format!("{what}: the camera's far plane in the search loses no pixel"),
                     &[(&lost, &without)],
                 );
             }

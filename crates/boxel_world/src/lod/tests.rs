@@ -2162,8 +2162,9 @@ fn assert_feed_matches_map(app: &App) {
 #[test]
 fn the_coverage_follows_the_worlds_messages() {
     // Ground at 33 on one tile in five: the chunks under it are solid and enclosed (empty
-    // meshes, no event), and the lod-1 skirts at the node's middle plane put quads in their
-    // octant, so the poll has to find them.
+    // meshes, no event). The poll finds those whose octant holds a lod-1 node's surface quads;
+    // an octant with only its skirts (seam quads, drawn next to finer detail alone, deep down
+    // the x and z planes since ADR 0031 sec. 13) is not looked for.
     let mut app = app(Steps::new(33), small());
     spawn(&mut app, DVec3::new(10.0, 60.0, 10.0));
     let mut model = Model::default();
@@ -2179,25 +2180,21 @@ fn the_coverage_follows_the_worlds_messages() {
     // Air over the ground: covered by its data.
     let air = ChunkPos::new(0, 2, 0);
     assert!(map.id_at(air).is_some() && cov.covered(air) && !cov.published(air));
-    // Enclosed chunks with LOD quads in their octant: covered through the poll.
-    let polled: Vec<ChunkPos> = map
+    // Enclosed chunks: covered through the poll where their octant holds LOD surface quads.
+    let enclosed: Vec<ChunkPos> = map
         .iter()
         .filter(|(_, s)| {
             matches!(s.mesh(), crate::MeshState::Empty)
                 && !matches!(s.data(), crate::DataState::Ready(d) if d.as_uniform() == Some(BlockState::AIR))
         })
         .map(|(_, s)| s.pos)
-        .filter(|&c| {
-            let (p, bit) = octant_of_chunk(c);
-            lod.tree.lod1_octants(p) & bit != 0
-        })
         .collect();
-    assert!(
-        !polled.is_empty(),
-        "the scene has empty chunks under LOD quads"
-    );
-    for c in polled {
-        assert!(cov.covered(c), "{c:?}");
+    assert!(!enclosed.is_empty(), "the scene has enclosed chunks");
+    for c in enclosed {
+        let (p, bit) = octant_of_chunk(c);
+        if lod.tree.lod1_octants(p) & bit != 0 {
+            assert!(cov.covered(c), "{c:?}");
+        }
     }
     // Still watched: loaded chunks without a mesh yet (the data ring), under LOD quads.
     let watched = app.world().resource::<LodCoverage>().watch_list();

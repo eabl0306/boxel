@@ -9,13 +9,16 @@
 //! 2. [`add_underwater`]: the faces of every cell that is not see-through against a see-through
 //!    fluid (water), lit darker the deeper they lie ([`dark_of`]): the bed under far water.
 //! 3. [`add_skirts`]: on the 6 node faces and the 3 planes at cell 16, a face toward the plane on
-//!    every ground cell near the surface whose cell across is ground too, and on the top cell of
-//!    a see-through fluid whose cell across is not air. Where the octant across is drawn by
-//!    finer, lower terrain, the skirt closes the step; where it is drawn by this node, the skirt
-//!    lies inside solid cells (or inside the water, behind its surface) and is never seen.
-//! 4. [`add_fluid_walls`]: the same planes, a face on every ground cell next to a plane that lies
+//!    every ground cell whose cell across is ground too (on the x and z planes the whole depth
+//!    of the node, on the y planes near the surface), and on the top cell of a see-through fluid
+//!    whose cell across is not air. Where the octant across is drawn by finer, lower terrain (a
+//!    coarse top over the true one, a cave or a valley of full detail by the plane), the skirt
+//!    closes the step; where it is drawn by this node, the skirt lies inside solid cells (or
+//!    inside the water, behind its surface) and is never seen.
+//! 4. [`add_fluid_walls`]: the y planes, a face on every ground cell next to a plane that lies
 //!    near a see-through fluid, so that a ray under the water (near or far) meets the ground's
-//!    side instead of the sky, even where the cell rule rounded the cell across up to ground.
+//!    side instead of the sky, even where the cell rule rounded the cell across up to ground (on
+//!    the x and z planes the skirts already cover them).
 //! 5. [`add_banks`]: the same planes seen from the other side, a face into every see-through fluid
 //!    cell on its ground that is next to a plane, so that a ray through the far water that
 //!    crosses into finer detail inside the ground the cell rule dropped (a sea over its bed keeps
@@ -328,6 +331,28 @@ pub fn mesh_node(
     append(out, extra);
 }
 
+/// The mesh of a node of ground whose cells, border included, are all solid (a uniform node in
+/// its column's band, `state` its cells' state): nothing of the mesher, no bed, wall or bank, only
+/// the deep skirts of its x and z planes ([`add_skirts`]), 4 quads (one per octant) on each of
+/// the 8 sides of those planes, of `state`'s material and marked with their [`Seam`]. So the
+/// whole depth of a column has skirts next to finer detail, under the meshed layers too: a cave
+/// or a valley of full detail by the plane, lower than the cells, meets them. Empty for a state
+/// that is not Solid far away.
+pub fn uniform_skirts(materials: &LodMaterials, state: BlockState) -> ChunkMesh {
+    let m = materials.canonical(state);
+    let mut mesh = ChunkMesh::default();
+    if m == 0 || materials.class(m) != LodClass::Solid || materials.see_through(m) {
+        return mesh;
+    }
+    let grid = Box::new([[face_key(m, 0); 32]; 32]);
+    let mut extra = Vec::new();
+    for (face, n) in plane_faces().filter(|(f, _)| f.axes().0 != 1) {
+        merge_grid(&grid, face, n, materials.table(), seam(n), &mut extra);
+    }
+    append(&mut mesh, extra);
+    mesh
+}
+
 /// True if every bucket of `mesh` is within the renderer's limits
 /// ([`MAX_QUADS_PER_FACE_BUCKET`] for a face bucket, [`MAX_QUADS_PER_BUCKET`] for the others).
 pub fn fits(mesh: &ChunkMesh) -> bool {
@@ -375,8 +400,11 @@ pub fn add_underwater(
 /// Post-pass 3 (every level): skirts. On the 6 node faces and the planes x, y, z = 16, a face
 /// toward the plane on:
 /// - every ground cell (not air, not see-through) next to the plane whose cell across is ground
-///   too (a see-through fluid across already has the bed's face) and with an air cell within 2
-///   cells (Chebyshev, inside the padded grid);
+///   too (a see-through fluid across already has the bed's face): on an x or z plane all of
+///   them, down the node's whole depth (deep skirts: full detail across can lie any depth under
+///   the coarse top, by its margin, a valley the coarse form fills or a cave by the plane, and
+///   the faces it leaves out against its real neighbors are not there), on a y plane those with
+///   an air cell within 2 cells (Chebyshev, inside the padded grid);
 /// - every top cell of a see-through fluid (air right above it) next to the plane whose cell
 ///   across is not air: a coarser fluid top can stand above a finer one, inside its own top cell
 ///   (each level rounds the true top to its cells), and the skirt closes that step. Lower down,
@@ -402,10 +430,11 @@ pub fn add_skirts(padded: &PaddedChunk, materials: &LodMaterials, level: u8, mes
     append(mesh, extra);
 }
 
-/// Post-pass 4 (every level): walls. On the planes of [`add_skirts`], every ground cell (not air,
-/// not see-through) whose cell across is ground too, with a see-through fluid cell within 2 cells
-/// (Chebyshev) and not a skirt (no air within 2 cells), gets a face toward the plane, lit as deep
-/// as the cell it faces: the sides of the ground under the fluid. A ray that goes under the
+/// Post-pass 4 (every level): walls. On the y planes of [`add_skirts`] (its deep skirts hold them
+/// on the x and z planes), every ground cell (not air, not see-through) whose cell across is
+/// ground too, with a see-through fluid cell within 2 cells (Chebyshev) and not a skirt (no air
+/// within 2 cells), gets a face toward the plane, lit as deep as the cell it faces: the ground
+/// under the fluid. A ray that goes under the
 /// surface of a finer fluid (the translucent full-detail one, or a finer LOD level's) and crosses
 /// into this node below its bed meets a side there instead of the sky, even where the cell rule
 /// rounded the cell across up to ground; where the node draws the cells across, the walls lie
@@ -599,6 +628,8 @@ fn skirts(
 ) {
     for (face, n) in plane_faces() {
         let step = face_step(face);
+        // Deep on the x and z planes, near the surface on the y planes.
+        let deep = face.axes().0 != 1;
         let grid = face_grid(face, n, padded, |c, across| {
             let m = padded.get(c[0], c[1], c[2]);
             if m == 0 || across == 0 {
@@ -606,7 +637,7 @@ fn skirts(
             } else if materials.see_through(m) {
                 // The top cell of the fluid: air right above it.
                 (padded.get(c[0], c[1] + 1, c[2]) == 0).then(|| face_key(m, 0))
-            } else if !materials.see_through(across) && is_near(near_air, c) {
+            } else if !materials.see_through(across) && (deep || is_near(near_air, c)) {
                 let dark = water.map_or(0, |w| w.dark(add(c, step)));
                 Some(face_key(m, dark))
             } else {
@@ -633,7 +664,8 @@ fn walls(
         .map(|(&w, &a)| w & !a)
         .collect();
     for (face, n) in plane_faces() {
-        if !on_plane(&candidates, face, n) {
+        // The deep skirts of the x and z planes hold these cells already.
+        if face.axes().0 != 1 || !on_plane(&candidates, face, n) {
             continue;
         }
         let step = face_step(face);
