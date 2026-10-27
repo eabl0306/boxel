@@ -540,7 +540,10 @@ nunca le pasa un nodo a un solo tipo. Por llamada, para las 35 x 35 esquinas del
    una columna de celdas queda sobre su suelo grueso (con su margen y la subida de la superficie),
    como celdas propias y nunca como margen, y la banda lo cubre. Una celda con un tramo es sólida
    con su estado, salvo que el fluido del reino lo cubra dentro de la celda. Un tramo que no es
-   sólido de lejos no se dibuja.
+   sólido de lejos no se dibuja. Un tramo (`LodRun`) puede pedir aire debajo: una copa sobre el
+   suelo del bosque, no una columna de hojas hasta el suelo. Ese aire se mide desde el suelo más
+   bajo de la columna (el de su esquina más alta, sin margen), así una celda que puede tener
+   parte de la copa es copa.
 7. Volúmenes y volúmenes de núcleo: `lod_runs` da hasta 4 tramos sólidos por columna de celdas,
    que se unen a los de la superficie.
 8. Una pasada genérica de la regla de la celda (del motor: la `Surface` del demo, generalizada)
@@ -670,11 +673,14 @@ costura. No cambia el generador. Sobre las columnas de chunk que se le pasan:
   real, como un río que baja la esquina seca de una orilla) y franjas mojadas (la celda está mojada
   donde el suelo real de su fila de borde está seco: la regla de mojado de la lejanía, E-D);
 - rayos a través de la frontera, contra las mallas que dibuja el render: la columna de chunk con
-  `boxel_mesh` y sus vecinos reales, y su columna de nodos de nivel 1 con sus faldas, paredes y
-  bancos y los octantes de la columna de chunk ocultos, como los tests `lod_cracks` del demo. Un
-  rayo que llega a un punto dentro del suelo sin tocar una cara deja ver el cielo a través del
-  suelo. Con los chunks como se dibujan (carvers y features), también salen rayos de las cuevas
-  cerca del plano: las cuevas en la costura.
+  `boxel_mesh` y sus vecinos reales, con sus paredes de borde hacia los octantes de enfrente
+  (ADR 0031 sección 13), y su columna de nodos de nivel 1 con sus faldas, paredes y bancos y los
+  octantes de la columna de chunk ocultos, como los tests `lod_cracks` del demo. Un rayo que
+  llega a un punto dentro del suelo sin tocar una cara deja ver el cielo a través del suelo; los
+  rayos hacia el suelo del chunk apuntan solo a bloques opacos. Con los chunks como se dibujan
+  (carvers y features), también salen rayos de las cuevas cerca del plano: las cuevas en la
+  costura. Desde las paredes de borde y los faldones hondos del ADR 0031 (sección 13) ningún
+  rayo ve el cielo en los lugares de prueba de TFC, y el juego lo exige.
 
 Por eso `test-support` depende de `boxel_mesh`: los rayos solo valen contra las mallas que se
 dibujan. Una capa de arriba transparente (vidrio), que la lejanía dibuja sólida, deja ver el cielo

@@ -481,6 +481,59 @@ Las capas del ejemplo empiezan en y 46 y su borde de abajo la anula ahí, y el a
 
 Sin LOD no cambia nada: las pipelines y los buffers nuevos son de `LodPass`.
 
+### 13. El borde de lo dibujado (E-D, estudio de TFC)
+
+Un chunk se mallea contra sus vecinos reales: donde el chunk de enfrente es suelo, su costado no
+tiene cara. Si ese vecino no se dibuja (pasa la distancia de vista, no está mallado todavía o lo
+dibuja el LOD), lo que queda abierto se ve:
+
+- una cueva del chunk del borde muestra el cielo por su pared de afuera, con o sin LOD;
+- con LOD, los faldones cubrían solo dos celdas bajo el aire: donde el detalle completo queda
+  más hondo que el tope grueso (por el margen de la fuente, un valle que la forma gruesa llena o
+  una cueva junto al plano), se veía una grieta de cielo en el borde.
+
+**Paredes de borde (en el chunk).** El mallador agrega al final de cada balde de caras las caras
+que el chunk de enfrente dibujaría hacia este: en cada uno de los 6 bordes, cada cubo opaco del
+borde acolchado cuyo vóxel de adentro no es un cubo opaco (`MeshOptions::walls`, forma
+`SHAPE_WALL`, código 3). Llevan el material, la luz y el AO que les daría ese vecino (la luz y el
+AO salen del vóxel de adentro y su capa) y se funden por material, luz y AO. Las de un balde de
+caras cierran el borde opuesto a su normal. Se dibujan sobre el plano del borde, 1/512 de bloque
+hacia adentro: así quedan delante de una cara del LOD en el mismo plano, sin z-fighting, y detrás
+de lo que tiene la celda. El mundo las pide siempre; las pruebas y herramientas no, salvo que
+lo digan. Un chunk de aire no tiene (su camino rápido sigue igual).
+
+**Tapas.** Una cueva que sigue en el chunk de enfrente no tiene pared ahí: los dos vóxeles del
+borde son aire. En los 4 bordes de costado, si sobre el vóxel de enfrente hay un cubo opaco en su
+misma columna del borde acolchado (el techo de la cueva, o un alero), ese vóxel lleva una tapa:
+la misma cara, con el material del cubo opaco más cercano de arriba (también en el chunk de
+encima del vecino, que el mallador ya recibe: `PaddedChunk::above`). Así la cueva termina en roca
+en el borde, con o sin LOD. Una cueva abierta al cielo, o con el techo más de 32 bloques sobre el
+chunk, queda sin tapa; con LOD la cierra el faldón hondo si su nodo se mallea. Bajo las hojas no
+hay tapa (no son cubos opacos).
+
+El render las dibuja solo mientras el chunk de enfrente no está en el renderer. La tabla de
+chunks lleva, por chunk, cuántas paredes tiene cada balde y 6 bits de vecino presente (los
+mantiene al entrar y salir cada chunk, y marca para subir las entradas que cambian). En High
+viajan en `ChunkGpu`: la cuenta de un balde de caras va en sus 21 bits bajos y sus paredes desde
+el bit 21; los bits de vecino van en `flags`, bits 1 a 6. `cull.wgsl` dibuja el balde sin sus
+paredes si el bit está. Mid y Low hacen lo mismo en el recorte de CPU (`ChunkRecord::drawn`). Así
+nada se vuelve a mallar cuando se mueve lo dibujado. Un vecino recortado por la búsqueda de
+cuevas cuenta como dibujado: si la cámara viera su cara, la búsqueda lo vería.
+
+**Faldones hondos (en el LOD).** En los planos x y z, el faldón de suelo va en toda celda de
+suelo con suelo enfrente, en toda la altura del nodo, no solo cerca del aire. En los planos y
+siguen como antes. Las paredes de agua (pasada 4) quedan solo en los planos y: en los otros las
+cubren los faldones. Un nodo uniforme de suelo dentro de la banda (sin aire ni fluido, antes sin
+malla) lleva ahora solo esos faldones (`uniform_skirts`: 4 quads por lado de los 8 planos x y z,
+32 en total), así la columna entera tiene faldones bajo las capas malladas: una cueva abierta
+hondo junto al borde los encuentra. Sus octantes cuentan como sin quads (no dibujan superficie):
+la cobertura no vigila chunks vacíos bajo ellos.
+
+**El arnés de la costura** (`check_seam`, ADR 0039) mallea los chunks con sus paredes (las de los
+bordes hacia los octantes de enfrente) y apunta los rayos hacia el suelo del chunk solo a bloques
+opacos (un punto dentro de una cueva no es suelo). Con las dos cosas, los rayos que ven el cielo
+quedan en cero en los lugares de prueba de TFC, y el juego lo exige.
+
 ## Números medidos
 
 La campaña completa (RTX y 780M, r16 y r32, con y sin tope, boost, cuevas, spans, cada ronda)
@@ -891,8 +944,8 @@ intención del plan:
 - **Agua de un bloque sólido inundado.** No se cuenta: una losa inundada es sólida, sin su agua.
 - **Cuevas y plantas.** Lejos, las cuevas se cierran y las plantas no están. Las hojas son opacas,
   con el color medio de sus píxeles opacos: los bosques lejanos se ven algo más densos.
-- **Acantilados.** Los faldones cubren pendientes de hasta 3 a 1; un acantilado vertical puede
-  dejar una grieta de un píxel.
+- **Acantilados.** Los faldones de los planos x y z bajan hasta el fondo del nodo, así que un
+  acantilado o un tope grueso más alto que el detalle completo ya no deja grieta en el borde.
 - **Varios viewers.** El LOD se refina alrededor de la cámara: otro viewer lejos queda como una
   isla con huecos cortos en su borde. `voxel_world` tiene uno solo.
 - **Huecos cortos.** Un octante de nivel 2 o más con chunks publicados espera a su hijo de nivel 1:
