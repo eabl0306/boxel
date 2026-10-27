@@ -47,9 +47,38 @@ pub(crate) struct ChunkRecord {
     pub light_base: u32,
     /// Light palette entries in the page (at least 1).
     pub light_len: u32,
+    /// Per face bucket, its edge walls (`ChunkMesh::wall_counts`): the last quads of the bucket,
+    /// at most its count.
+    pub walls: [u16; 6],
+    /// Bit `f` set while a chunk is resident across the border the walls of face bucket `f`
+    /// close (at `origin` minus 32 along `f`'s normal): those walls are left out. The table keeps
+    /// it ([`ChunkTable::insert`] sets it from the table, whatever the caller gave).
+    pub neighbors: u8,
 }
 
+/// Chunk origin offsets along each face's normal, in face bucket order (`Face::ALL`): the chunk
+/// across the walls of face bucket `f` is at `origin - NORMALS[f]`.
+pub(crate) const NORMALS: [I64Vec3; 6] = [
+    I64Vec3::new(0, 32, 0),
+    I64Vec3::new(0, -32, 0),
+    I64Vec3::new(32, 0, 0),
+    I64Vec3::new(-32, 0, 0),
+    I64Vec3::new(0, 0, 32),
+    I64Vec3::new(0, 0, -32),
+];
+
 impl ChunkRecord {
+    /// The quads of face bucket `f` (`0..6`) every tier draws: all of them, less its edge walls
+    /// while the chunk across their border is resident (ADR 0031, E-D).
+    pub fn drawn(&self, f: usize) -> u32 {
+        let n = self.counts[f];
+        if self.neighbors >> f & 1 != 0 {
+            n - u32::from(self.walls[f]).min(n)
+        } else {
+            n
+        }
+    }
+
     /// The origin as the GPU stores it: its low 32 bits ([`wrap_to_i32`]). The shaders only use
     /// it minus the (equally wrapped) render origin, exact for chunks nearer than `2^31` voxels.
     pub fn gpu_origin(&self) -> IVec3 {
@@ -58,11 +87,20 @@ impl ChunkRecord {
 
     /// The GPU mirror of this record, flagged live if `live` ([`ChunkTable::gpu_entry`] decides).
     pub fn gpu(&self, live: bool) -> ChunkGpu {
+        let mut counts = self.counts;
+        for (c, &walls) in counts.iter_mut().zip(&self.walls) {
+            // The cull reads the count in the low bits and the walls above (a mesh holds fewer
+            // quads than the count bits, the walls at most 32 x 32).
+            debug_assert!(*c < 1 << ChunkGpu::COUNT_BITS && walls <= 1024);
+            *c = (*c).min((1 << ChunkGpu::COUNT_BITS) - 1)
+                | u32::from(walls).min(1024) << ChunkGpu::WALL_SHIFT;
+        }
+        let live = if live { ChunkGpu::FLAG_LIVE } else { 0 };
         ChunkGpu {
             origin: self.gpu_origin().to_array(),
             quad_base: self.alloc.alloc.offset,
-            counts: self.counts,
-            flags: if live { ChunkGpu::FLAG_LIVE } else { 0 },
+            counts,
+            flags: live | u32::from(self.neighbors) << ChunkGpu::NEIGHBOR_SHIFT,
             light_base: self.light_base,
             light_len: self.light_len,
             page: u32::from(self.alloc.page),
@@ -83,6 +121,10 @@ pub(crate) struct ChunkTable {
     /// tier, so only these are visited for it).
     translucent: BTreeSet<u32>,
     by_id: HashMap<u64, u32, foldhash::fast::FixedState>,
+    /// Per chunk origin, the slot of a record there and how many records share it (more than
+    /// one only for callers that put two chunks at one place): the neighbor bits of the edge
+    /// walls ([`ChunkRecord::neighbors`]).
+    origins: HashMap<I64Vec3, (u32, u32), foldhash::fast::FixedState>,
     capacity: u32,
     /// Center of the GPU window (a recent render origin).
     window: I64Vec3,
@@ -115,6 +157,7 @@ impl ChunkTable {
             free: BTreeSet::new(),
             translucent: BTreeSet::new(),
             by_id: HashMap::default(),
+            origins: HashMap::default(),
             capacity,
             window: I64Vec3::ZERO,
             drawable: 0,
@@ -238,8 +281,9 @@ impl ChunkTable {
         (next < self.capacity).then_some(next)
     }
 
-    /// Inserts or replaces the record of `record.id`; returns its slot (`None` if full).
-    pub fn insert(&mut self, record: ChunkRecord) -> Option<u32> {
+    /// Inserts or replaces the record of `record.id`; returns its slot (`None` if full). Its
+    /// neighbor bits come from the table, and the chunks around a new place get theirs.
+    pub fn insert(&mut self, mut record: ChunkRecord) -> Option<u32> {
         let slot = self.slot_for(record.id)?;
         self.touch(slot);
         self.free.remove(&slot);
@@ -247,6 +291,14 @@ impl ChunkTable {
             self.records.push(None);
         }
         self.high_water = self.high_water.max(slot + 1);
+        let moved = self.records[slot as usize].map(|r| r.origin);
+        if moved != Some(record.origin) {
+            if let Some(origin) = moved {
+                self.leave(origin, slot);
+            }
+            self.enter(record.origin, slot);
+        }
+        record.neighbors = self.neighbor_bits(record.origin);
         let old = self.records[slot as usize].replace(record);
         if old.is_some_and(|r| self.in_window(r.origin)) {
             self.drawable -= 1;
@@ -268,6 +320,7 @@ impl ChunkTable {
     pub fn remove(&mut self, id: u64) -> Option<(u32, ChunkRecord)> {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
+        self.leave(record.origin, slot);
         self.touch(slot);
         self.free.insert(slot);
         self.translucent.remove(&slot);
@@ -295,7 +348,96 @@ impl ChunkTable {
         self.free.clear();
         self.translucent.clear();
         self.by_id.clear();
+        self.origins.clear();
         self.drawable = 0;
+    }
+
+    /// The neighbor bits of a chunk at `origin` ([`ChunkRecord::neighbors`]).
+    fn neighbor_bits(&self, origin: I64Vec3) -> u8 {
+        (0..6).fold(0, |bits, f| {
+            let across = origin.wrapping_sub(NORMALS[f]);
+            bits | u8::from(self.origins.contains_key(&across)) << f
+        })
+    }
+
+    /// Slot `slot` now holds a chunk at `origin`: the first one there sets the neighbor bit
+    /// facing it in the chunks around.
+    fn enter(&mut self, origin: I64Vec3, slot: u32) {
+        let first = match self.origins.get_mut(&origin) {
+            Some((_, n)) => {
+                *n += 1;
+                false
+            }
+            None => {
+                self.origins.insert(origin, (slot, 1));
+                true
+            }
+        };
+        if first {
+            for (f, normal) in NORMALS.into_iter().enumerate() {
+                self.set_neighbor(origin.wrapping_add(normal), f, true);
+            }
+        }
+    }
+
+    /// Slot `slot` no longer holds a chunk at `origin`: the last one there clears the neighbor
+    /// bit facing it in the chunks around.
+    fn leave(&mut self, origin: I64Vec3, slot: u32) {
+        let Some(&(kept, n)) = self.origins.get(&origin) else {
+            return;
+        };
+        if n > 1 {
+            // Another record stays there (odd callers only): keep one of their slots.
+            let other = if kept == slot {
+                self.iter()
+                    .find(|&(s, r)| s != slot && r.origin == origin)
+                    .map_or(kept, |(s, _)| s)
+            } else {
+                kept
+            };
+            self.origins.insert(origin, (other, n - 1));
+            return;
+        }
+        self.origins.remove(&origin);
+        for (f, normal) in NORMALS.into_iter().enumerate() {
+            self.set_neighbor(origin.wrapping_add(normal), f, false);
+        }
+    }
+
+    /// Sets bit `f` of the neighbor bits of every chunk at `at` to `on` (its GPU entry goes
+    /// stale where that changes it).
+    fn set_neighbor(&mut self, at: I64Vec3, f: usize, on: bool) {
+        let Some(&(slot, n)) = self.origins.get(&at) else {
+            return;
+        };
+        if n == 1 {
+            self.set_neighbor_bit(slot, f, on);
+            return;
+        }
+        let slots: Vec<u32> = self
+            .iter()
+            .filter(|(_, r)| r.origin == at)
+            .map(|(s, _)| s)
+            .collect();
+        for s in slots {
+            self.set_neighbor_bit(s, f, on);
+        }
+    }
+
+    /// Sets bit `f` of the neighbor bits of the chunk in `slot` to `on`.
+    fn set_neighbor_bit(&mut self, slot: u32, f: usize, on: bool) {
+        let Some(record) = self.records.get_mut(slot as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        let bits = if on {
+            record.neighbors | 1 << f
+        } else {
+            record.neighbors & !(1 << f)
+        };
+        if bits != record.neighbors {
+            record.neighbors = bits;
+            self.mark_stale(slot);
+        }
     }
 
     /// Live records in slot order.
@@ -426,12 +568,15 @@ mod tests {
         let alloc = arena.allocate(4).expect("arena");
         ChunkRecord {
             id,
-            origin: I64Vec3::new(id as i64 * 32, 0, 0),
+            // Apart: no two are neighbors (their edge wall bits would change each other).
+            origin: I64Vec3::new(id as i64 * 64, 0, 0),
             alloc: PagedAlloc { page: 0, alloc },
             counts,
             // 3 quads, then 1 palette entry
             light_base: alloc.offset + 3,
             light_len: 1,
+            walls: [0; 6],
+            neighbors: 0,
         }
     }
 
@@ -504,7 +649,7 @@ mod tests {
         let _gap = arena.allocate(10).expect("gap");
         let r = record(&mut arena, 3);
         let gpu = r.gpu(true);
-        assert_eq!(gpu.origin, [96, 0, 0]);
+        assert_eq!(gpu.origin, [192, 0, 0]);
         assert_eq!(gpu.quad_base, r.alloc.alloc.offset);
         assert_eq!(gpu.counts, r.counts);
         assert_eq!(gpu.flags, ChunkGpu::FLAG_LIVE);
@@ -826,7 +971,7 @@ mod tests {
             table.follow(camera);
             let mut live = Vec::new();
             for ((entry, origin), k) in table.gpu_entries().iter().zip(&origins).zip(-6i64..) {
-                if entry.flags == ChunkGpu::FLAG_LIVE {
+                if entry.flags & ChunkGpu::FLAG_LIVE != 0 {
                     live.push(k);
                     let wrapped = IVec3::from_array(entry.origin).wrapping_sub(wrap_to_i32(camera));
                     assert_eq!(
@@ -838,5 +983,79 @@ mod tests {
             }
             assert_eq!(live, expected, "camera at {camera}");
         }
+    }
+
+    /// Edge walls (ADR 0031, E-D): a chunk's neighbor bits say which chunks across its borders
+    /// are resident, whatever order they come and go in; the GPU entry packs the walls with the
+    /// counts and the bits with the flags, and every tier draws a face bucket less its walls
+    /// while the chunk across them is resident.
+    #[test]
+    fn neighbor_bits_follow_the_chunks_across_each_border() {
+        let mut arena = ArenaAllocator::new(1024, 64);
+        let mut table = ChunkTable::new(64);
+        let mut gpu = vec![ChunkGpu::default(); 64];
+        let at = |arena: &mut ArenaAllocator, id: u64, origin: I64Vec3| ChunkRecord {
+            origin,
+            counts: [5, 5, 5, 5, 5, 5, 1, 0],
+            walls: [1, 2, 3, 4, 5, 0],
+            neighbors: 0b11_1111,
+            ..record(arena, id)
+        };
+        let center = I64Vec3::new(-64, 32, 96);
+        table.insert(at(&mut arena, 0, center));
+        // The caller's bits do not count: nothing is around yet.
+        let bits = |t: &ChunkTable, id: u64| t.get(id).map(|(_, r)| r.neighbors);
+        assert_eq!(bits(&table, 0), Some(0));
+        // One chunk across each border, in face bucket order: the walls of face bucket `f` lie
+        // on the border opposite to `f`'s normal.
+        for (f, normal) in NORMALS.into_iter().enumerate() {
+            table.insert(at(&mut arena, 1 + f as u64, center - normal));
+            assert_eq!(bits(&table, 0), Some((1u8 << (f + 1)) - 1), "{f}");
+            // The one across sees the center on its opposite border.
+            let opposite = f ^ 1;
+            assert_eq!(bits(&table, 1 + f as u64), Some(1 << opposite), "{f}");
+        }
+        sync(&mut table, &mut gpu, 0);
+        assert_mirrored(&table, &gpu);
+        let (slot, r) = table.get(0).map(|(s, r)| (s, *r)).expect("center");
+        let entry = gpu[slot as usize];
+        assert_eq!(
+            entry.flags,
+            ChunkGpu::FLAG_LIVE | 0b11_1111 << ChunkGpu::NEIGHBOR_SHIFT
+        );
+        for f in 0..6 {
+            assert_eq!(entry.counts[f] & ((1 << ChunkGpu::COUNT_BITS) - 1), 5);
+            assert_eq!(
+                entry.counts[f] >> ChunkGpu::WALL_SHIFT,
+                u32::from(r.walls[f])
+            );
+            assert_eq!(r.drawn(f), 5 - u32::from(r.walls[f]));
+        }
+        assert_eq!(entry.counts[6], 1);
+        // A chunk replaced in place keeps its bits; one that goes clears the bit facing it, and
+        // the center's entry goes stale for it.
+        table.insert(at(&mut arena, 3, center - NORMALS[2]));
+        assert_eq!(bits(&table, 0), Some(0b11_1111));
+        sync(&mut table, &mut gpu, 0);
+        table.remove(3);
+        assert_eq!(bits(&table, 0), Some(0b11_1011));
+        assert_eq!(table.get(0).map(|(_, r)| r.drawn(2)), Some(5));
+        sync(&mut table, &mut gpu, 0);
+        assert_mirrored(&table, &gpu);
+        // Two chunks at one place (an odd caller): the bit stays until both are gone.
+        table.insert(at(&mut arena, 20, center - NORMALS[2]));
+        table.insert(at(&mut arena, 21, center - NORMALS[2]));
+        table.remove(20);
+        assert_eq!(bits(&table, 0), Some(0b11_1111));
+        table.remove(21);
+        assert_eq!(bits(&table, 0), Some(0b11_1011));
+        // A chunk that moves (the same id at a new origin) leaves its old place.
+        table.insert(at(&mut arena, 4, center + I64Vec3::new(0, 0, 320)));
+        assert_eq!(bits(&table, 0), Some(0b11_0011));
+        assert_eq!(bits(&table, 4), Some(0));
+        // Clearing forgets every place.
+        table.clear();
+        table.insert(at(&mut arena, 0, center));
+        assert_eq!(bits(&table, 0), Some(0));
     }
 }

@@ -30,6 +30,10 @@ struct CullState { counts: array<atomic<u32>, 512>, visible: array<u32> };
 const MAX_QUADS_PER_BUCKET: u32 = 98304u;
 // Page ids are below this (boxel_shaders::gpu::chunk_memory::MAX_PAGES; CullState holds 2 per page).
 const MAX_PAGES: u32 = 256u;
+// A face bucket's count word (boxel_shaders::gpu::ChunkGpu::COUNT_BITS, WALL_SHIFT): its quads in
+// the low 21 bits, its edge walls (the last quads of the bucket) from bit 21.
+const COUNT_MASK: u32 = 0x1FFFFFu;
+const WALL_SHIFT: u32 = 21u;
 
 fn in_frustum(mn: vec3<f32>, mx: vec3<f32>) -> bool {
   for (var k = 0u; k < 6u; k++) {
@@ -71,12 +75,16 @@ fn cull_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
   let stride = view.counts.z;
   var start = ch.quad_base;
   for (var f = 0u; f < 6u; f++) {
-    let n = ch.counts[f];
-    if (n > 0u && bucket_visible(f, mn, mx, view.camera_rel.xyz)) {
+    // Edge walls (ADR 0031, E-D): left out while the chunk across their border is resident
+    // (bit 1 + f of the flags).
+    let n = ch.counts[f] & COUNT_MASK;
+    let across = ((ch.flags >> (1u + f)) & 1u) != 0u;
+    let drawn = n - select(0u, min(ch.counts[f] >> WALL_SHIFT, n), across);
+    if (drawn > 0u && bucket_visible(f, mn, mx, view.camera_rel.xyz)) {
       let s = atomicAdd(&cull.counts[p], 1u);
       if (s < stride) {
         let i = p * stride + s;
-        draw_args[i] = DrawArgs(min(n, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, i);
+        draw_args[i] = DrawArgs(min(drawn, MAX_QUADS_PER_BUCKET) * 6u, 1u, 0u, 0, i);
         draw_refs[i] = vec2(slot, start);
       } else {
         atomicSub(&cull.counts[p], 1u);

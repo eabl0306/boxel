@@ -163,9 +163,14 @@ pub struct ChunkGpu {
     /// First quad of bucket 0 in the chunk's page (buckets are contiguous, `boxel_mesh` order).
     /// Page-local: the draws of a chunk bind its page ([`ChunkGpu::page`]).
     pub quad_base: u32,
-    /// Quad counts per bucket: `[0..6)` opaque faces, `[6]` cutout, `[7]` translucent.
+    /// Quad counts per bucket: `[0..6)` opaque faces, `[6]` cutout, `[7]` translucent. A face
+    /// bucket's count is its low [`ChunkGpu::COUNT_BITS`] bits; the bits from
+    /// [`ChunkGpu::WALL_SHIFT`] hold how many of its quads, at its end, are edge walls
+    /// (`boxel_mesh::layout::SHAPE_WALL`).
     pub counts: [u32; 8],
-    /// Bit 0 = [`ChunkGpu::FLAG_LIVE`].
+    /// Bit 0 = [`ChunkGpu::FLAG_LIVE`]; bit `1 + f` ([`ChunkGpu::NEIGHBOR_SHIFT`]) set while
+    /// the chunk across the border the walls of face bucket `f` close is resident: the cull
+    /// leaves those walls out.
     pub flags: u32,
     /// First entry of the chunk's light palette in its page (`quad_base` + total quads): High
     /// and Mid read a quad's 4 corner lights at `light_base` + its palette index.
@@ -183,6 +188,14 @@ impl ChunkGpu {
     /// for chunks near enough to the camera for the wrapped origin difference to be exact. Only
     /// the High cull reads it (Mid tests the same window on the CPU, and its flags may lag).
     pub const FLAG_LIVE: u32 = 1;
+    /// The bits of a face bucket's count in [`ChunkGpu::counts`]: 2^21 quads, more than a chunk
+    /// mesh holds.
+    pub const COUNT_BITS: u32 = 21;
+    /// Where a face bucket's edge walls start in its [`ChunkGpu::counts`] word (11 bits: at most
+    /// 32 x 32, one per border voxel).
+    pub const WALL_SHIFT: u32 = Self::COUNT_BITS;
+    /// Where the neighbor bits start in [`ChunkGpu::flags`] (6 bits, face bucket order).
+    pub const NEIGHBOR_SHIFT: u32 = 1;
 }
 
 /// Per-draw reference read as an instance-step `Uint32x2` vertex attribute (location 0) by

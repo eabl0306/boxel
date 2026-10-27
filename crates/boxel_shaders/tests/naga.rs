@@ -306,6 +306,7 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_SHAPE_MASK", l::GEO_SHAPE_MASK),
         ("SHAPE_TURNED", u32::from(l::SHAPE_TURNED)),
         ("SHAPE_FLUID_CUBE", u32::from(l::SHAPE_FLUID_CUBE)),
+        ("SHAPE_WALL", u32::from(l::SHAPE_WALL)),
         ("GEO_FLUID_INSET_BIT", l::GEO_FLUID_INSET_BIT),
         ("SHAPE_CROSS", u32::from(l::SHAPE_CROSS)),
         ("SHAPE_FLUID_SURFACE", u32::from(l::SHAPE_FLUID_SURFACE)),
@@ -320,6 +321,7 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
     for (name, v) in [
         ("FLUID_SURFACE", l::FLUID_SURFACE),
         ("FLUID_INSET", l::FLUID_INSET),
+        ("WALL_INSET", l::WALL_INSET),
     ] {
         assert_eq!(const_f32(&module, name), v, "{name}");
     }
@@ -356,6 +358,12 @@ fn cull_clamps_to_the_index_buffer_of_boxel_mesh() {
         const_u32(&module, "MAX_QUADS_PER_BUCKET"),
         boxel_mesh::MAX_QUADS_PER_BUCKET
     );
+    let wall_shift = ChunkGpu::WALL_SHIFT;
+    assert_eq!(const_u32(&module, "WALL_SHIFT"), wall_shift);
+    assert_eq!(const_u32(&module, "COUNT_MASK"), (1 << wall_shift) - 1);
+    // A face bucket's quads and its walls (at most one per border voxel) fit their bits.
+    assert!(boxel_mesh::MAX_QUADS_PER_BUCKET < 1 << wall_shift);
+    assert!(32 * 32 < 1u64 << (32 - wall_shift));
     assert_eq!(
         const_u32(&module, "MAX_PAGES"),
         boxel_shaders::gpu::chunk_memory::MAX_PAGES

@@ -46,6 +46,10 @@ const GEO_SHAPE_SHIFT: u32 = 29u;
 const GEO_SHAPE_MASK: u32 = 7u;
 const SHAPE_TURNED: u32 = 1u;      // cube face, texture transposed (logs along X or Z)
 const SHAPE_FLUID_CUBE: u32 = 2u;  // cube face of a fluid cell under its fluid or a block (greedy)
+// An edge wall (ADR 0031, E-D): the face of the block across the chunk's border, on its cell's
+// side away from the normal, WALL_INSET into the cell (greedy).
+const SHAPE_WALL: u32 = 3u;
+const WALL_INSET: f32 = 0.001953125; // 1/512
 const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
 const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
 const SHAPE_FLUID_SLOPE: u32 = 7u; // fluid cell with a height per top corner (w = h = 1, no AO)
@@ -99,8 +103,8 @@ struct View {
 struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::ChunkGpu
   origin: vec3<i32>,               // world voxel min corner of the chunk, low 32 bits (wraps; only used minus render_origin)
   quad_base: u32,                  // first quad of bucket 0 in the chunk's page
-  counts: array<u32, 8>,           // [0..6) opaque face buckets, [6] cutout, [7] translucent
-  flags: u32,                      // bit0 = live
+  counts: array<u32, 8>,           // [0..6) opaque face buckets (quads in bits 0..21, edge walls at the end from bit 21), [6] cutout, [7] translucent
+  flags: u32,                      // bit0 = live, bit 1 + f = the chunk across the border of face bucket f's walls is resident
   light_base: u32,                 // first light palette entry in the chunk's page (= quad_base + total quads)
   light_len: u32,                  // light palette entries (>= 1); a quad index not below it reads open sky
   page: u32,                       // the page holding the chunk (< MAX_PAGES); only the High cull reads it
@@ -180,7 +184,11 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.ao = select((mat >> MAT_AO_SHIFT) & 0xFFu, 0xFFu, sloped);
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
-  if (shape == SHAPE_BOX) {
+  if (shape == SHAPE_WALL) {
+    // The cube face moved to the cell's far side, then WALL_INSET back toward its normal: in
+    // front of a far LOD face on the border plane, behind whatever the cell holds.
+    o.local = o.local - n * (1.0 - WALL_INSET);
+  } else if (shape == SHAPE_BOX) {
     // A face of one model box (ADR 0020): the quad's (w-1, h-1) bits index the View's box
     // table. The face lies on the box's side toward the face's normal and spans the box along
     // u and v; its light/AO coordinates (s, t) are its place on the cube face, so it shades like

@@ -19,7 +19,7 @@ pub(crate) use high::{HighInputs, HighPath, ListPair};
 pub(crate) use low::LowPath;
 pub(crate) use mid::MidPath;
 
-use crate::chunk_table::ChunkTable;
+use crate::chunk_table::{ChunkTable, NORMALS};
 use crate::memory::PageSet;
 use crate::renderer::ViewParams;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
@@ -542,13 +542,15 @@ impl CpuCull {
             }
             let mut start = record.alloc.alloc.offset;
             for (face, &n) in record.counts[..6].iter().enumerate() {
-                if n > 0 && bucket_visible(face, min, max, view.eye_rel) {
+                // Without its edge walls while the chunk across them is resident.
+                let drawn = record.drawn(face);
+                if drawn > 0 && bucket_visible(face, min, max, view.eye_rel) {
                     self.opaque[p].push(BucketDraw {
                         slot,
                         origin: record.gpu_origin(),
                         page,
                         quad_start: start,
-                        count: n.min(MAX_QUADS_PER_BUCKET),
+                        count: drawn.min(MAX_QUADS_PER_BUCKET),
                     });
                 }
                 start += n;
@@ -621,8 +623,9 @@ pub(crate) fn translucent_draws(
 
 /// What every tier draws for a set of chunks, counted on the CPU with the culling rules of Mid
 /// and Low (the same as `cull.wgsl`): chunks in the frustum, then their non-empty face buckets
-/// that pass the per-face test, their cutout and translucent buckets. With `visible` (cave
-/// culling, ADR 0022), a chunk it does not hold as visible draws nothing.
+/// that pass the per-face test (without their edge walls where the set holds the chunk across
+/// them), their cutout and translucent buckets. With `visible` (cave culling, ADR 0022), a chunk
+/// it does not hold as visible draws nothing.
 ///
 /// Deterministic, with no GPU: tools count the draws and faces of a camera with and without cave
 /// culling (`examples/headless_world.rs --cull`).
@@ -655,6 +658,8 @@ pub fn cull_counts<'a>(
     visible: Option<&VisibleSet>,
 ) -> CullCounts {
     let mut out = CullCounts::default();
+    let chunks: Vec<(I64Vec3, &ChunkMesh)> = chunks.into_iter().collect();
+    let resident: std::collections::HashSet<I64Vec3> = chunks.iter().map(|&(o, _)| o).collect();
     for (origin, mesh) in chunks {
         if visible.is_some_and(|v| !v.is_visible(ChunkPos::from_i64vec3(origin >> CHUNK_SHIFT))) {
             continue;
@@ -666,10 +671,13 @@ pub fn cull_counts<'a>(
         }
         out.chunks += 1;
         let counts = &mesh.bucket_counts;
+        let walls = mesh.wall_counts();
         for (face, &n) in counts[..6].iter().enumerate() {
-            if n > 0 && bucket_visible(face, min, max, view.eye_rel) {
+            let across = resident.contains(&origin.wrapping_sub(NORMALS[face]));
+            let drawn = if across { n - walls[face].min(n) } else { n };
+            if drawn > 0 && bucket_visible(face, min, max, view.eye_rel) {
                 out.buckets += 1;
-                out.quads += u64::from(n.min(MAX_QUADS_PER_BUCKET));
+                out.quads += u64::from(drawn.min(MAX_QUADS_PER_BUCKET));
             }
         }
         for n in [counts[CUTOUT_BUCKET], counts[TRANSLUCENT_BUCKET]] {
@@ -726,6 +734,8 @@ mod tests {
                 counts: [1, 1, 1, 1, 1, 1, 2, 1],
                 light_base: alloc.offset + 9,
                 light_len: 1,
+                walls: [0; 6],
+                neighbors: 0,
             });
         }
         table
@@ -745,6 +755,8 @@ mod tests {
                 counts: [1, 1, 1, 1, 1, 1, 2, 1],
                 light_base: alloc.offset + 9,
                 light_len: 1,
+                walls: [0; 6],
+                neighbors: 0,
             });
         }
         table

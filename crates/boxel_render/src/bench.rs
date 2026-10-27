@@ -67,6 +67,8 @@ impl CullBench {
                 counts: bucket_counts(mesh),
                 light_base: alloc.offset + mesh.total_quads(),
                 light_len: light_entries(mesh),
+                walls: crate::memory::wall_counts(mesh, &bucket_counts(mesh)),
+                neighbors: 0,
             });
         }
         Self {

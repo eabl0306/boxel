@@ -815,6 +815,23 @@ pub(crate) fn bucket_counts(mesh: &ChunkMesh) -> [u32; BUCKET_COUNT] {
     trim_counts(mesh.bucket_counts, mesh.total_quads())
 }
 
+/// Per face bucket of `mesh` with the (trimmed) bucket `counts`, its edge walls
+/// (`boxel_mesh::layout::SHAPE_WALL`): the quads of that shape at its end, at most 32 x 32.
+pub(crate) fn wall_counts(mesh: &ChunkMesh, counts: &[u32; BUCKET_COUNT]) -> [u16; 6] {
+    let mut start = 0usize;
+    std::array::from_fn(|f| {
+        let end = (start + counts[f] as usize).min(mesh.quads.len());
+        let bucket = &mesh.quads[start.min(end)..end];
+        start = end;
+        let walls = bucket
+            .iter()
+            .rev()
+            .take_while(|q| q.shape() == boxel_mesh::layout::SHAPE_WALL)
+            .count();
+        walls.min(32 * 32) as u16
+    })
+}
+
 /// Trims bucket counts from the last bucket so they never cover more than `total` quads (a
 /// malformed mesh must not make draws read other chunks' quads).
 pub(crate) fn trim_counts(mut counts: [u32; BUCKET_COUNT], total: u32) -> [u32; BUCKET_COUNT] {
@@ -873,6 +890,8 @@ pub(crate) fn upsert_resident(
         counts,
         light_base: alloc.alloc.offset + mesh.total_quads(),
         light_len: light_entries(mesh),
+        walls: wall_counts(mesh, &counts),
+        neighbors: 0,
     };
     let inserted = chunks.insert(record);
     // `slot_for` succeeded above, so this cannot fail

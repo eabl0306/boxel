@@ -1283,6 +1283,8 @@ mod tests {
                 counts: mesh.bucket_counts,
                 light_base: alloc.offset + mesh.total_quads(),
                 light_len: 1,
+                walls: [0; 6],
+                neighbors: 0,
             });
         }
         table

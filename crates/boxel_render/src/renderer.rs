@@ -2071,6 +2071,8 @@ mod tests {
                 counts: [1, 0, 0, 0, 0, 0, 0, 0],
                 light_base: alloc.offset + 1,
                 light_len: 1,
+                walls: [0; 6],
+                neighbors: 0,
             });
         };
         // A closed world seen from chunk (0, 0, 0): its 6 neighbors are visible, the rest of
