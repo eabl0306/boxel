@@ -415,6 +415,43 @@ const _: () = assert!(chunk_memory::MAX_PAGES <= u16::MAX as u32);
 const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);
 const _: () = assert!(size_of::<LodNodeGpu>() == 64);
 
+/// One vertex of a posed entity model (`model.wgsl`, ADR 0040): 32 bytes in one vertex-step
+/// buffer, attributes `Float32x3`, `Float32x2`, `Uint16x4` and `Uint32` at locations 0 to 3
+/// ([`model::ATTRIBUTE_OFFSETS`]). The CPU writes the positions already posed and relative to the
+/// render origin, so every tier draws the same bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct ModelVertex {
+    /// Position relative to the render origin, blocks.
+    pub pos: [f32; 3],
+    /// Texel coordinates on the skin (not normalized).
+    pub uv: [f32; 2],
+    /// The face's texels on the skin, `[min u, min v, end u, end v)`: the fragment clamps its
+    /// texel into them.
+    pub rect: [u16; 4],
+    /// The instance's light (`boxel_voxel::LightValue` bits) in the low 16 bits, the face's shade
+    /// (`0..=255`, 255 = 1) at [`model::SHADE_SHIFT`].
+    pub data: u32,
+}
+
+/// Constants of the entity model pipeline (`model.wgsl`, ADR 0040).
+pub mod model {
+    /// Where the face's shade sits in [`super::ModelVertex::data`].
+    pub const SHADE_SHIFT: u32 = 16;
+    /// Group of the skin texture (binding 0, `texture_2d<f32>` read with `textureLoad`). The
+    /// `View` uniform stays in [`super::bindings::GROUP_VIEW`].
+    pub const GROUP_SKIN: u32 = 0;
+    /// Byte offsets of the four attributes of [`super::ModelVertex`].
+    pub const ATTRIBUTE_OFFSETS: [u64; 4] = [0, 12, 20, 28];
+}
+
+const _: () = assert!(size_of::<ModelVertex>() == 32);
+const _: () = assert!(std::mem::offset_of!(ModelVertex, uv) as u64 == model::ATTRIBUTE_OFFSETS[1]);
+const _: () =
+    assert!(std::mem::offset_of!(ModelVertex, rect) as u64 == model::ATTRIBUTE_OFFSETS[2]);
+const _: () =
+    assert!(std::mem::offset_of!(ModelVertex, data) as u64 == model::ATTRIBUTE_OFFSETS[3]);
+
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]

@@ -616,6 +616,133 @@ fn ui_binds_one_texture_and_nothing_else() {
     assert_eq!(attributes, 4);
 }
 
+/// The entity model pipeline (ADR 0040) runs on every tier, the Low one on GL included: one
+/// uniform block (the View) and one texture read with `textureLoad` (the skin), no sampler,
+/// storage buffer or immediates; the vertex is four attributes of one vertex-step buffer, of the
+/// types `ModelVertex` gives them, and the face's rectangle and the light reach the fragment
+/// flat.
+#[test]
+fn model_binds_one_uniform_block_and_one_texture() {
+    let id = ShaderModuleId::Model;
+    let (module, info) = load(id);
+    assert!(!id.uses_immediates());
+    assert_eq!(id.min_gl(), (3, 3));
+    let mut seen = Vec::new();
+    for (i, ep) in module.entry_points.iter().enumerate() {
+        let ep_info = info.get_entry_point(i);
+        let (mut uniforms, mut textures) = (0, 0);
+        for (handle, g) in module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            match g.space {
+                naga::AddressSpace::Uniform => {
+                    uniforms += 1;
+                    assert_eq!(
+                        g.binding.as_ref().map(|b| b.group),
+                        Some(1),
+                        "View in group 1"
+                    );
+                }
+                naga::AddressSpace::Immediate => panic!("{}: immediates", ep.name),
+                naga::AddressSpace::Storage { .. } => panic!("{}: storage buffer", ep.name),
+                naga::AddressSpace::Handle => match module.types[g.ty].inner {
+                    naga::TypeInner::Image { .. } => {
+                        textures += 1;
+                        assert_eq!(
+                            g.binding,
+                            Some(naga::ResourceBinding {
+                                group: boxel_shaders::gpu::model::GROUP_SKIN,
+                                binding: 0
+                            })
+                        );
+                    }
+                    naga::TypeInner::Sampler { .. } => panic!("{}: a sampler", ep.name),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        seen.push((ep.name.as_str(), (uniforms, textures)));
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        [
+            ("fs_model_cutout", (1, 1)),
+            ("fs_model_opaque", (1, 1)),
+            ("vs_model", (1, 0)),
+        ]
+    );
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_model")
+        .expect("vs_model");
+    let mut attributes = Vec::new();
+    for arg in &vs.function.arguments {
+        if let Some(naga::Binding::Location { location, .. }) = arg.binding {
+            attributes.push((location, module.types[arg.ty].inner.clone()));
+        }
+    }
+    let float = naga::Scalar::F32;
+    let uint = naga::Scalar::U32;
+    assert_eq!(
+        attributes,
+        [
+            (
+                0,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Tri,
+                    scalar: float
+                }
+            ),
+            (
+                1,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Bi,
+                    scalar: float
+                }
+            ),
+            (
+                2,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Quad,
+                    scalar: uint
+                }
+            ),
+            (3, naga::TypeInner::Scalar(uint)),
+        ]
+    );
+    // The face's rectangle and the light are flat in every fragment entry point.
+    for name in ["fs_model_opaque", "fs_model_cutout"] {
+        let fs = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == name)
+            .expect(name);
+        let naga::TypeInner::Struct { members, .. } =
+            &module.types[fs.function.arguments[0].ty].inner
+        else {
+            panic!("{name} takes the vertex output struct");
+        };
+        let flat: Vec<u32> = members
+            .iter()
+            .filter_map(|m| match m.binding {
+                Some(naga::Binding::Location {
+                    location,
+                    interpolation: Some(naga::Interpolation::Flat),
+                    ..
+                }) => Some(location),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flat, [1, 2], "{name}");
+    }
+    assert_eq!(const_u32(&module, "LIGHT_SKY_SHIFT"), 12);
+    assert_eq!(boxel_shaders::gpu::model::SHADE_SHIFT, 16);
+}
+
 #[test]
 fn low_tier_takes_the_quad_and_its_light_as_two_instance_attributes() {
     let (module, _) = load(ShaderModuleId::VoxelInstanced);
