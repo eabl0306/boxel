@@ -185,6 +185,11 @@ pub struct WorldSettings {
     /// a chunk's work, on the job threads), so turning it on in the middle of a game culls at
     /// once instead of waiting for every loaded chunk to be generated or meshed again.
     pub cave_culling: bool,
+    /// Edge walls and caps in the meshes (`MeshOptions::walls`, ADR 0031 sec. 13): a chunk
+    /// carries the faces the chunk across each border would draw toward it, which the renderer
+    /// draws only while that chunk is not drawn, so a cave by the edge of what is drawn keeps
+    /// its outer wall. A change applies to the meshes built after it. Default on.
+    pub edge_walls: bool,
 }
 
 impl Default for WorldSettings {
@@ -204,6 +209,7 @@ impl Default for WorldSettings {
             light_cache_radius: 8,
             edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
             cave_culling: true,
+            edge_walls: true,
         }
     }
 }

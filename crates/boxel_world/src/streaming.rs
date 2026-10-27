@@ -615,7 +615,8 @@ pub(crate) struct WorldJobs {
     executor: Arc<dyn JobExecutor>,
     /// Mesh job body (always [`mesh_with_thread_mesher`] outside unit tests).
     pub(crate) mesh_fn: MeshFn,
-    /// Mesher options of new mesh jobs (from `WorldSettings::ao_policy`, every frame).
+    /// Mesher options of new mesh jobs (from `WorldSettings::ao_policy` and `edge_walls`, every
+    /// frame).
     mesh_options: MeshOptions,
     /// `WorldSettings::light_cache_radius`, squared (every frame).
     light_cache_sq: u32,
@@ -2095,7 +2096,14 @@ impl WorldJobs {
     /// the mesher options of the jobs it starts. `now` is the frame's time: the edit batch hold
     /// is measured with it.
     pub(crate) fn begin_frame(&mut self, settings: &WorldSettings, now: Instant) {
-        self.mesh_options = MeshOptions::with_ao(settings.ao_policy);
+        // Edge walls (ADR 0031, E-D): a chunk keeps the outer wall of its caves while the
+        // chunk across is not drawn; the renderer leaves them out where it is.
+        let options = MeshOptions::with_ao(settings.ao_policy);
+        self.mesh_options = if settings.edge_walls {
+            options.with_walls()
+        } else {
+            options
+        };
         self.light_cache_sq = light_cache_radius(settings).pow(2);
         self.hold = settings.edit_batch_hold;
         self.now = now;

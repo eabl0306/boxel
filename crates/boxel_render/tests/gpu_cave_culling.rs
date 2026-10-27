@@ -1230,6 +1230,10 @@ impl TunnelWorld {
                 interest_budget: Duration::MAX,
                 job_budget: Duration::MAX,
                 edit_batch_hold,
+                // The meshes as they were before edge walls: their caps close the tunnel where a
+                // chunk is not drawn, and these states would lose no pixel without `XRAY` (the
+                // links stay as conservative with them).
+                edge_walls: false,
                 ..WorldSettings::default()
             },
             executor: steps.clone(),

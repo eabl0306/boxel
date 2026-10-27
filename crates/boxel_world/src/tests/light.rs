@@ -128,7 +128,13 @@ fn assert_matches_reference(app: &App) -> usize {
     let map = app.world().resource::<ChunkMap>();
     let sky = app.world().resource::<SkyMap>();
     let content = app.world().resource::<WorldContent>();
-    let options = MeshOptions::with_ao(app.world().resource::<WorldSettings>().ao_policy);
+    let settings = app.world().resource::<WorldSettings>();
+    let options = MeshOptions::with_ao(settings.ao_policy);
+    let options = if settings.edge_walls {
+        options.with_walls()
+    } else {
+        options
+    };
     let mut reference = Reference::new(map, sky, content);
     let mut compared = 0;
     for (_, slot) in map.iter() {

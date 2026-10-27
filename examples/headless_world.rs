@@ -6,8 +6,9 @@
 //! Output (stdout): once settled, `chunks=N ready=N meshed=N empty=N quads=N elapsed=S frames=N
 //! max_update_ms=X p99_update_ms=X`, where `quads` is the sum of the ready mesh quads and the
 //! update times are the longest and 99th percentile `App::update` while loading, and `world:
-//! meshed_fraction=X quads_per_mesh_p50=N p99=N max=N voxel_mib=X`: the share of the meshed
-//! chunks with a non-empty mesh, the quads of those meshes, and the heap bytes of the voxel data;
+//! meshed_fraction=X quads_per_mesh_p50=N p99=N max=N walls=N walled_meshes=N voxel_mib=X`: the
+//! share of the meshed chunks with a non-empty mesh, the quads of those meshes, their edge walls
+//! (ADR 0031, E-D) and how many meshes have some, and the heap bytes of the voxel data;
 //! `light: ao=MODE palette_p50=N p99=N max=N requantized=N arena_entries=N`: the AO policy
 //! (`--ao`), the light palette entries of the non-empty meshes, how many of them overflowed the
 //! palette and were requantized, and the renderer arena entries they take (quads plus palettes,
@@ -870,12 +871,17 @@ fn cull_lines(
     out
 }
 
-/// The `world:` line: meshed fraction, quads per non-empty mesh and voxel memory.
+/// The `world:` line: meshed fraction, quads per non-empty mesh, the edge walls of all the meshes
+/// (ADR 0031, E-D: the meshes without them are `quads` less `walls`) and voxel memory.
 fn world_line(map: &ChunkMap) -> String {
     let mut quads: Vec<u32> = map
         .ready_meshes()
         .map(|(_, _, mesh)| mesh.total_quads())
         .collect();
+    let (walls, walled): (u64, usize) = map.ready_meshes().fold((0, 0), |(n, c), (_, _, mesh)| {
+        let w: u32 = mesh.wall_counts().iter().sum();
+        (n + u64::from(w), c + usize::from(w > 0))
+    });
     quads.sort_unstable();
     let stats = map.stats();
     let meshed = stats.mesh_ready + stats.mesh_empty;
@@ -898,7 +904,8 @@ fn world_line(map: &ChunkMap) -> String {
         })
         .sum();
     format!(
-        "world: meshed_fraction={fraction:.3} quads_per_mesh_p50={} p99={} max={} voxel_mib={:.1}",
+        "world: meshed_fraction={fraction:.3} quads_per_mesh_p50={} p99={} max={} walls={walls} \
+         walled_meshes={walled} voxel_mib={:.1}",
         at(50),
         at(99),
         quads.last().copied().unwrap_or(0),
