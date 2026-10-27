@@ -8,6 +8,7 @@ use crate::memory::{
     CHUNK_GPU_BYTES, ChunkMemory, ChunkMemorySettings, ChunkMemoryStats, DeviceFacts, MemoryLayout,
     PageClass, PageSet, Refusal, create_page, remove_resident, upsert_resident,
 };
+use crate::model::{ModelDraw, ModelLayer, ModelPass, ModelStats};
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
@@ -21,7 +22,7 @@ use crate::textures::BlockTextureData;
 use crate::upload::{GpuSink, UploadKinds, Uploads};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
-use boxel_math::{Frustum, I64Vec3, Mat4, UVec2, Vec3, wrap_to_i32};
+use boxel_math::{Frustum, I64Vec3, Mat4, Quat, UVec2, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, pack_model_box};
 use boxel_shaders::gpu::{
     VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
@@ -220,6 +221,8 @@ pub struct RenderStats {
     pub lod_arena_capacity_quads: u32,
     /// Chunk memory: pages, use, bytes (ADR 0035).
     pub chunk_memory: ChunkMemoryStats,
+    /// Entity models (ADR 0040; all 0 before the first instance).
+    pub models: ModelStats,
 }
 
 /// Renderer errors.
@@ -296,6 +299,11 @@ pub struct VoxelRenderer {
     refused: Refused,
     /// The block outline (ADR 0026).
     outline: OutlinePass,
+    /// The entity models (ADR 0040), from the first [`VoxelRenderer::set_models`] with an
+    /// instance.
+    models: Option<ModelPass>,
+    /// The model pipelines could not be created on this device: no model is drawn.
+    models_failed: bool,
     /// The fog passes (ADR 0030), from the first [`VoxelRenderer::set_fog`] with input.
     fog: Option<FogPass>,
     /// The fog passes could not be created on this device: fog stays off.
@@ -800,6 +808,8 @@ impl VoxelRenderer {
             occlusion: Occlusion::default(),
             refused: Refused::default(),
             outline,
+            models: None,
+            models_failed: false,
             fog: None,
             fog_failed: false,
             materials_layout: layouts.materials,
@@ -1062,6 +1072,55 @@ impl VoxelRenderer {
     /// [`crate::BlockOutline`] does this from the render plugin.
     pub fn set_outline(&mut self, outline: Option<Outline>) {
         self.outline.set(outline);
+    }
+
+    /// Sets the entity model instances of the next [`VoxelRenderer::render`] calls (ADR 0040)
+    /// and the camera's rotation (the view layer follows it); gives back the previous list,
+    /// emptied, to fill again without allocating. [`crate::model::ModelInstance`] does this from
+    /// the render plugin.
+    ///
+    /// The first instance creates the pipelines (inside error scopes: if they fail, an error is
+    /// logged and no model is drawn on this renderer). Until then nothing of it exists, and with
+    /// no instances nothing is drawn or uploaded: frames are what they are without models. World
+    /// instances are drawn in the main pass after the opaque and cutout terrain and the far LOD,
+    /// before the block outline and the water; view instances after the fog, over a cleared
+    /// depth. Each `render` poses only the instances whose draw changed and uploads the
+    /// vertices only when anything moved them ([`crate::model::ModelScene`]).
+    pub fn set_models(
+        &mut self,
+        device: &wgpu::Device,
+        models: Vec<ModelDraw>,
+        camera: Quat,
+    ) -> Vec<ModelDraw> {
+        if self.models.is_none() {
+            if models.is_empty() || self.models_failed {
+                let mut models = models;
+                models.clear();
+                return models;
+            }
+            let mut pass = None;
+            let built = boxel_gfx::run_in_error_scopes(device, || {
+                pass = Some(ModelPass::new(device, &self.view_layout));
+                Ok(())
+            });
+            match (built, pass) {
+                (Ok(()), Some(pass)) => self.models = Some(pass),
+                (result, _) => {
+                    tracing::error!(
+                        "entity model pipelines: {}; no model is drawn",
+                        result.err().unwrap_or_default()
+                    );
+                    self.models_failed = true;
+                    let mut models = models;
+                    models.clear();
+                    return models;
+                }
+            }
+        }
+        match &mut self.models {
+            Some(pass) => pass.set(models, camera),
+            None => Vec::new(),
+        }
     }
 
     /// Sets the chunks the camera may see (cave culling, ADR 0022): from the next
@@ -1481,6 +1540,10 @@ impl VoxelRenderer {
             .prepare(queue, &self.chunks, cull_view, visibility);
         let hidden = if used { self.occlusion.hidden } else { 0 };
         self.outline.prepare(device, queue, view, self.targets.size);
+        if let Some(models) = &mut self.models {
+            let _span = frame_span!("render.models");
+            models.prepare(device, queue, view);
+        }
         if let Some(lod) = &mut self.lod {
             let _span = frame_span!("render.lod");
             // Underground the cave culling search often reaches no chunk on the border of its
@@ -1510,6 +1573,7 @@ impl VoxelRenderer {
                 let _span = frame_span!("render.lod");
                 lod.draw(&mut pass);
             }
+            draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
             self.outline.draw(&mut pass);
             // The far water (one layer, a depth prepass then its color) before the near water,
             // which blends over it where it is in front.
@@ -1526,6 +1590,9 @@ impl VoxelRenderer {
                 let _span = frame_span!("render.lod");
                 lod.draw(&mut pass);
             }
+            // The entity models with the solid terrain, before the outline (an edge behind a
+            // model stays hidden) and the water (which tints a model behind it).
+            draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
             // The far water before the near water, as above.
@@ -1555,6 +1622,17 @@ impl VoxelRenderer {
             }
             None => (0, 0),
         };
+        // The view layer (a first-person hand) over the whole world, the fog included, on a
+        // cleared depth: it never sinks into a wall.
+        if let Some(models) = self
+            .models
+            .as_ref()
+            .filter(|m| m.draws_in(ModelLayer::View))
+        {
+            let mut pass = self.targets.begin_overlay_depth_pass(encoder);
+            pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
+            models.draw(&mut pass, ModelLayer::View);
+        }
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
         self.stats.occluded_chunks = hidden;
@@ -1589,6 +1667,11 @@ impl VoxelRenderer {
             texture_layer_uploads: self.animator.counters.layers,
             texture_upload_bytes: self.animator.counters.bytes,
             textures_behind: self.animator.counters.behind,
+            models: self
+                .models
+                .as_ref()
+                .map(ModelPass::stats)
+                .unwrap_or_default(),
             ..self.lod_stats(self.stats)
         }
     }
@@ -1795,6 +1878,20 @@ fn border_seen(set: &VisibleSet) -> bool {
 
 /// Moves the far plane of `frustum` (camera-relative, eye at `eye`) to `distance` along its
 /// normal, as `Frustum::set_max_distance` places it; an infinite far plane stays infinite.
+/// The world layer's models (ADR 0040) into the main pass, then group 0 back to the block
+/// textures (`materials`) for the draws after them (the water).
+fn draw_world_models(
+    models: Option<&ModelPass>,
+    materials: &wgpu::BindGroup,
+    pass: &mut wgpu::RenderPass<'_>,
+) {
+    if let Some(models) = models.filter(|m| m.draws_in(ModelLayer::World)) {
+        let _span = frame_span!("render.models");
+        models.draw(pass, ModelLayer::World);
+        pass.set_bind_group(bindings::GROUP_MATERIALS, materials, &[]);
+    }
+}
+
 pub(crate) fn far_plane_at(frustum: &mut Frustum, eye: Vec3, distance: f32) {
     let plane = frustum.planes[5];
     let forward = -plane.truncate();

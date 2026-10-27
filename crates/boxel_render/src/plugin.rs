@@ -33,7 +33,7 @@ use boxel_gfx::{
     build_fingerprint, configure_surface, create_gl_instance, create_instance,
     install_lkg_panic_hook, read_texture_rgba8, select_gpu,
 };
-use boxel_math::UVec2;
+use boxel_math::{Quat, UVec2};
 use boxel_mesh::MaterialTable;
 use boxel_transform::Transform;
 use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, ChunkPos};
@@ -420,6 +420,9 @@ impl Plugin for RenderPlugin {
                 (extract, extract_visibility)
                     .chain()
                     .in_set(RenderSystems::Extract),
+                crate::model::extract_models
+                    .after(extract)
+                    .in_set(RenderSystems::Extract),
                 prepare.in_set(RenderSystems::Prepare),
                 draw.in_set(RenderSystems::Draw),
                 cleanup.in_set(RenderSystems::Cleanup),
@@ -716,6 +719,8 @@ pub(crate) struct ExtractedFrame {
     pub(crate) ui: crate::ui::UiExtract,
     /// The block outline of `BlockOutline`, as the world has the block this frame.
     outline: Option<Outline>,
+    /// The entity model instances of this frame (`crate::model::extract_models`).
+    pub(crate) models: Vec<crate::model::ModelDraw>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
     visibility: Option<Arc<VisibleSet>>,
     /// This frame's fog (`crate::fog::FogPlugin`'s extract), `None` without the plugin.
@@ -1713,6 +1718,9 @@ fn prepare(
         warnings.record(e);
     }
     ready.renderer.set_outline(frame.outline.take());
+    let camera = frame.camera.map_or(Quat::IDENTITY, |(_, t)| t.rotation);
+    let models = std::mem::take(&mut frame.models);
+    frame.models = ready.renderer.set_models(&ready.ctx.device, models, camera);
     ready.renderer.set_visibility(frame.visibility.clone());
     let fog = frame.fog.take();
     if fog.is_some() && !ready.fog_ok {

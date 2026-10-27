@@ -66,5 +66,9 @@ criterion.workspace = true
 name = "chunk_memory"
 harness = false
 
+[[bench]]
+name = "models"
+harness = false
+
 [lints]
 workspace = true

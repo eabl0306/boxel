@@ -38,6 +38,7 @@ mod distance_fog;
 pub mod fog;
 mod light;
 pub mod lod;
+pub mod model;
 mod outline;
 mod overlay;
 mod pack_textures;
@@ -102,6 +103,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub mod prelude {
     pub use crate::fog::FogPlugin;
     pub use crate::lod::{LodPlugin, LodSettings};
+    pub use crate::model::{ModelInstance, ModelLayer, ModelTexture};
     pub use crate::{
         BlockOutline, DistanceFog, PresentSettings, RenderInfo, RenderPlugin, RenderSettings,
         RequestScreenshot, ScreenshotSaved,

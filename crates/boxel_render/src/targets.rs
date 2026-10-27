@@ -92,6 +92,38 @@ impl Targets {
         self.main_pass(encoder, None)
     }
 
+    /// A pass over the finished frame on a cleared depth (0, reverse-Z): the color is loaded,
+    /// so what it draws covers the world and is depth tested only against itself (the entity
+    /// models' view layer, ADR 0040).
+    pub fn begin_overlay_depth_pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+    ) -> wgpu::RenderPass<'e> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("boxel view models"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        })
+    }
+
     /// The main pass, cleared to `clear` (and depth 0), or loading both without it.
     fn main_pass<'e>(
         &self,
