@@ -14,6 +14,8 @@
 //! run). `--world-dir DIR` loads the world saved there and saves it after the shots (ADR 0024):
 //! a run with edits and a later run without them give the same pixels. `--outline X,Y,Z` draws
 //! the outline of that block, as `voxel_world` outlines the targeted block (ADR 0026).
+//! `--figure X,Y,Z,YAW` stands the demo figure (an entity model, ADR 0040) with its feet there,
+//! mid-stride and lit by the world's light at its head.
 //!
 //! Output (stdout): `gpu: <adapter summary>`, `textures: <source, size, pack load time>`; with
 //! edits, one `drop:` line per `--drop` (where the block landed) and `edits: set=N skipped=N
@@ -38,6 +40,8 @@
 
 #[path = "shared/clock.rs"]
 mod clock;
+#[path = "shared/figure.rs"]
+mod figure;
 #[path = "shared/fog.rs"]
 mod fog;
 #[path = "shared/lod.rs"]
@@ -62,7 +66,7 @@ use boxel::render::{
     Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
     block_outline_edges, light_curve, load_block_textures, texture_tick,
 };
-use boxel::voxel::{BlockRegistry, MAX_BLOCK_COORD};
+use boxel::voxel::{BlockRegistry, LightValue, MAX_BLOCK_COORD};
 use boxel::world::lod::{LodOps, LodStats, LodWorldPlugin};
 use boxel::world::persist::{PersistPlugin, WorldStore};
 use boxel::world::{
@@ -109,6 +113,8 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
                        the shots, edits included
   --outline X,Y,Z      draw the outline of the block at X,Y,Z, as voxel_world outlines the
                        targeted block (default color and width)
+  --figure X,Y,Z,YAW   stand the demo figure (an entity model) with its feet at X,Y,Z facing
+                       YAW (degrees, as --camera), mid-stride; repeat for more figures
   --fov DEG            vertical field of view in degrees (default 70; voxel_world widens it
                        1.1 times while sprinting: 77)
   --fog-tick N         ticks of the fog clock (64 a second) in the shots: where the wind has
@@ -182,6 +188,8 @@ struct Options {
     world_dir: Option<PathBuf>,
     /// `--outline`: the block whose outline the shots draw (ADR 0026).
     outline: Option<I64Vec3>,
+    /// `--figure`: the feet (x, y, z) and yaw (degrees) of each demo figure (ADR 0040).
+    figures: Vec<[f64; 4]>,
     /// `--fov`: the vertical field of view, degrees.
     fov: f32,
     /// `--fog`.
@@ -222,6 +230,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fluid_time: 0.0,
         world_dir: None,
         outline: None,
+        figures: Vec::new(),
         // `Camera::default`'s (70 degrees): the same pixels as before the flag.
         fov: 70.0,
         fog: fog::FogPreset::Off,
@@ -325,6 +334,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--world-dir" => o.world_dir = Some(PathBuf::from(value()?)),
             "--outline" => o.outline = Some(parse_cell(flag, &value()?)?),
+            "--figure" => {
+                let v = value()?;
+                let figure = numbers::<4>(&v)
+                    .filter(|f| f[..3].iter().all(|c| c.abs() <= MAX_BLOCK_COORD as f64))
+                    .ok_or_else(|| format!("{flag}: {v:?} is not x,y,z,yaw within the world"))?;
+                o.figures.push(figure);
+            }
             "--fov" => {
                 let v = value()?;
                 o.fov = v
@@ -1001,6 +1017,33 @@ fn run(
             color: style.color,
             width: style.width,
         }));
+    }
+    // `--figure`: what the render plugin hands the renderer for a `ModelInstance` there.
+    if !o.figures.is_empty() {
+        let figure = figure::Figure::new();
+        let skin = figure::skin();
+        let draws = o
+            .figures
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let feet = DVec3::new(f[0], f[1], f[2]);
+                let light = map
+                    .light_at(BlockPos::from_world(feet + DVec3::Y * 1.6))
+                    .unwrap_or(LightValue::FULL_SKY);
+                let pose = figure.walk(2.4, 0.7, (0.3, -0.2));
+                figure.draw(
+                    i as u64,
+                    &skin,
+                    feet,
+                    (f[3] as f32).to_radians(),
+                    pose,
+                    light,
+                )
+            })
+            .collect();
+        renderer.set_models(&gpu.device, draws, transform.rotation);
+        println!("figures: {}", o.figures.len());
     }
     // `--lod`: its nodes, drawn to its horizon (the renderer moves the far plane and the terrain
     // fog out to it).

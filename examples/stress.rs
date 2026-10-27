@@ -30,6 +30,9 @@
 //! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
 //! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
 //!
+//! `--models N` adds N demo figures (entity models, ADR 0040) walking in front of the camera, all
+//! posed every frame (see [`models`]): what entity models add to the frame.
+//!
 //! `--water Y` fills every air block at or below world height `Y` with water and puts a glass
 //! block on the surface of about one water column in 29 (see [`WaterGenerator`]): chunks with
 //! translucent quads, for the translucent pass and its sort (ADR 0018). `--sort off` keeps the
@@ -83,12 +86,16 @@ mod cave;
 mod clock;
 #[path = "stress/edits.rs"]
 mod edits;
+#[path = "shared/figure.rs"]
+mod figure;
 #[path = "shared/fog.rs"]
 mod fog;
 #[path = "shared/lod.rs"]
 mod lod;
 #[path = "stress/memory.rs"]
 mod memory;
+#[path = "stress/models.rs"]
+mod models;
 #[path = "shared/pack.rs"]
 mod pack;
 #[path = "stress/probe.rs"]
@@ -215,9 +222,10 @@ exit codes: 0 ok, 1 usage error, 2 no usable GPU, 3 output not written, 4 timeou
 /// The whole help: [`USAGE`], the physics options and the world options.
 fn usage() -> String {
     format!(
-        "{USAGE}\n{}\n{}\nphysics options:\n{}\nworld options:\n{}",
+        "{USAGE}\n{}\n{}\n{}\nphysics options:\n{}\nworld options:\n{}",
         fog::USAGE,
         lod::USAGE,
+        models::USAGE,
         bodies::USAGE,
         world::usage(World::Forest)
     )
@@ -335,6 +343,8 @@ struct Options {
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
     bodies: BodyOptions,
+    /// `--models`: demo figures walking in front of the camera (ADR 0040).
+    models: u32,
     /// `--water`: the water level.
     water: Option<i64>,
     /// `--sort`.
@@ -411,6 +421,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         no_distance_fog: false,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
+        models: 0,
         water: None,
         sort: TranslucentSort::Background,
         cave: false,
@@ -436,7 +447,10 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 .or_else(|| it.next().cloned())
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
-        if o.world.parse_flag(flag, &mut value)? || o.bodies.parse_flag(flag, &mut value)? {
+        if o.world.parse_flag(flag, &mut value)?
+            || o.bodies.parse_flag(flag, &mut value)?
+            || models::parse_flag(&mut o.models, flag, &mut value)?
+        {
             continue;
         }
         match flag {
@@ -1945,6 +1959,11 @@ fn main() -> AppExit {
     #[cfg(feature = "ui")]
     if options.ui {
         app.add_plugins(UiPlugin);
+    }
+    if options.models > 0 {
+        app.add_plugins(models::ModelsPlugin {
+            count: options.models,
+        });
     }
     if options.bodies.enabled() {
         let [x, y, z, ..] = options.camera;
