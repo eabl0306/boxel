@@ -45,6 +45,18 @@ pub mod layout {
     /// opaque block; ADR 0025): drawn as [`SHAPE_CUBE`], but its side faces carry the fluid's
     /// flow texture, which the shader scrolls down with the time (a waterfall). Greedy quads.
     pub const SHAPE_FLUID_CUBE: u8 = 2;
+    /// An edge wall (ADR 0031, E-D): a cube face of the neighbor block across the chunk's border,
+    /// as that neighbor would draw it toward this chunk (or a cap where a cave goes on across a
+    /// side border: the face of the rock over it there). The quad's cell is this chunk's voxel
+    /// in front of it, so the face lies on that cell's side away from its normal (the plane of
+    /// the chunk's border), moved [`WALL_INSET`] into the cell. Greedy quads, the last ones of
+    /// their face bucket ([`ChunkMesh::wall_counts`](crate::ChunkMesh::wall_counts)): the
+    /// renderer draws them only while the chunk across that border is not drawn.
+    pub const SHAPE_WALL: u8 = 3;
+    /// How far inside its cell an edge wall ([`SHAPE_WALL`]) sits: 1/512 of a block, so it
+    /// stays in front of a far LOD face on the same border plane (no z-fighting) and behind
+    /// everything the cell holds.
+    pub const WALL_INSET: f32 = 1.0 / 512.0;
     /// A cross plant quad through the cell's diagonal, full height: face `PosX` is the one from
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
@@ -82,8 +94,8 @@ pub mod layout {
     /// 0020): the quad's `w - 1` and `h - 1` bits hold the box's index in the model box table
     /// (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from its view
     /// uniform. The face lies on the box's side toward the quad's face, spans the box along u
-    /// and v, and shades like that part of the cube face. Code 3 (a slab half of ADR 0018) is
-    /// free: slabs are boxes too.
+    /// and v, and shades like that part of the cube face. (Code 3, a slab half in ADR 0018, is
+    /// the edge wall's now: slabs are boxes.)
     pub const SHAPE_BOX: u8 = 6;
     /// Shift of the model box index of a [`SHAPE_BOX`] quad (the `w - 1` and `h - 1` fields).
     pub const GEO_BOX_SHIFT: u32 = GEO_W_SHIFT;
@@ -468,6 +480,19 @@ impl ChunkMesh {
     pub fn bucket(&self, b: usize) -> &[PackedQuad] {
         let r = self.bucket_range(b);
         &self.quads[r.start as usize..r.end as usize]
+    }
+    /// Per face bucket, its edge walls ([`layout::SHAPE_WALL`]): the quads of that shape at the
+    /// end of the bucket, where the mesher puts them. The walls of face bucket `f` lie on the
+    /// chunk's border opposite to `f`'s normal (a `NegX` wall closes the `+X` border), and the
+    /// renderer leaves them out while the chunk across that border is drawn.
+    pub fn wall_counts(&self) -> [u32; 6] {
+        std::array::from_fn(|f| {
+            self.bucket(f)
+                .iter()
+                .rev()
+                .take_while(|q| q.shape() == layout::SHAPE_WALL)
+                .count() as u32
+        })
     }
     /// The 4 corner lights of `quad` (open sky if its index is outside the palette).
     pub fn corner_light(&self, quad: PackedQuad) -> [LightValue; 4] {

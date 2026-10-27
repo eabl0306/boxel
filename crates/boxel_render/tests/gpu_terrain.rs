@@ -1109,7 +1109,7 @@ fn lit_scene(shift: I64Vec3, light: bool) -> LitScene {
         let options = if light {
             MeshOptions::default()
         } else {
-            MeshOptions { ao: AoPolicy::Off }
+            MeshOptions::with_ao(AoPolicy::Off)
         };
         let mesh = mesher.mesh_chunk(&input, &materials, options);
         if !mesh.is_empty() {

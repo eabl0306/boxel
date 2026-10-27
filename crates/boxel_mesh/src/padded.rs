@@ -57,6 +57,12 @@ pub struct PaddedChunk {
     /// `clear` set it, so a chunk filled by hand is always looked at. When it is false the
     /// mesher never asks a voxel whether it is one.
     pub lit_emitters: bool,
+    /// Per side border (-X, +X, -Z, +Z) and column of its padded layer (along z for the x
+    /// borders, along x for the z ones): the material of the lowest opaque cube over the padded
+    /// row on top, in the chunk over the neighbor across (its rows 1 to 31; 0: none). The edge
+    /// walls' caps read it (`MeshOptions::walls`): a cave across the border whose ceiling stands
+    /// over the padding. Gather sets it; `new` and `clear` zero it.
+    pub above: [[u16; 32]; 4],
 }
 
 impl Default for PaddedChunk {
@@ -77,6 +83,7 @@ impl PaddedChunk {
             fluid_levels: Vec::new(),
             waterlogged: Vec::new(),
             lit_emitters: true,
+            above: [[0; 32]; 4],
         }
     }
     /// Resets to empty.
@@ -89,6 +96,7 @@ impl PaddedChunk {
         self.fluid_levels.clear();
         self.waterlogged.clear();
         self.lit_emitters = true;
+        self.above = [[0; 32]; 4];
     }
     /// Linear index of chunk-local `(x, y, z)`, each in `-1..=32`.
     #[inline]

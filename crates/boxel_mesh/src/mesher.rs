@@ -38,12 +38,26 @@ pub enum AoPolicy {
 pub struct MeshOptions {
     /// Ambient occlusion policy.
     pub ao: AoPolicy,
+    /// Edge walls (ADR 0031, E-D): at the end of each face bucket, the faces the chunk across
+    /// each border would draw toward this one ([`layout::SHAPE_WALL`]), and caps where a cave
+    /// goes on across a side border, so a cave of this chunk keeps its outer wall while that
+    /// neighbor is not drawn. Off by default (tests and tools see the plain mesh); the world
+    /// turns them on.
+    pub walls: bool,
 }
 
 impl MeshOptions {
-    /// Options with this AO policy.
+    /// Options with this AO policy, without edge walls.
     pub const fn with_ao(ao: AoPolicy) -> Self {
-        Self { ao }
+        Self { ao, walls: false }
+    }
+
+    /// These options with edge walls on.
+    pub const fn with_walls(self) -> Self {
+        Self {
+            walls: true,
+            ..self
+        }
     }
 }
 
@@ -696,7 +710,8 @@ impl Mesher {
     /// `MaterialTable::layer` of its material and face (and [`layout::FLAG_EMISSIVE`] if
     /// `MaterialTable::emissive`) and is routed to `MaterialTable::bucket`.
     /// Corner lights go to the palette in first-seen order; past 4096 distinct entries the chunk
-    /// is meshed again at the next [`LightQuantization`] level.
+    /// is meshed again at the next [`LightQuantization`] level. With `options.walls`, each face
+    /// bucket ends with its edge walls ([`MeshOptions::walls`], [`ChunkMesh::wall_counts`]).
     pub fn mesh(
         &mut self,
         padded: &PaddedChunk,
@@ -773,6 +788,39 @@ fn gather_into(
     }
     if materials.marks_fluid_surfaces() {
         mark_fluid_surfaces(materials, out);
+    }
+    gather_above(input, materials, out);
+}
+
+/// [`PaddedChunk::above`]: per side border, the lowest opaque cube of each column of the
+/// neighbor's border layer in the chunk over that neighbor (the edge neighbor one up), rows 1 to
+/// 31 (row 0 is the padding's top row).
+fn gather_above(input: &MeshInput<'_>, materials: &MaterialTable, out: &mut PaddedChunk) {
+    for (side, (dx, dz)) in [(-1, 0), (1, 0), (0, -1), (0, 1)].into_iter().enumerate() {
+        let Some(chunk) = NEIGHBOR_OFFSETS
+            .iter()
+            .position(|o| (o.x, o.y, o.z) == (dx, 1, dz))
+            .and_then(|i| input.neighbors[i])
+        else {
+            continue;
+        };
+        if let Some(state) = chunk.as_uniform() {
+            let (m, class) = materials.resolve(state);
+            out.above[side] = [if class == VoxelClass::Opaque { m } else { 0 }; 32];
+            continue;
+        }
+        let edge = |d: i32| if d < 0 { 31 } else { 0 };
+        for u in 0..32u32 {
+            let (x, z) = if dx != 0 {
+                (edge(dx), u)
+            } else {
+                (u, edge(dz))
+            };
+            out.above[side][u as usize] = (1..32)
+                .map(|y| materials.resolve(chunk.get(LocalPos::new(x, y, z))))
+                .find(|&(_, class)| class == VoxelClass::Opaque)
+                .map_or(0, |(m, _)| m);
+        }
     }
 }
 
@@ -1047,13 +1095,14 @@ fn mesh_into(
                     s.greedy.merge_face(face, &padded.voxels);
                 }
             }
-            // Never fails: no palette here.
-            let _ = emit_specials(padded, materials, &mut s.specials, |_, _, _, nb9| {
+            let shade = |_, _, _, nb9: Option<u32>| {
                 Ok(match nb9 {
                     Some(nb9) if ao => (AO_TABLE[neighborhood8(nb9)], 0),
                     _ => (AO_OPEN_BYTE, 0),
                 })
-            });
+            };
+            // Never fails: no palette here.
+            let _ = emit_specials(padded, materials, &mut s.specials, shade);
             let _ = emit_sloped(
                 &s.fluid.cells,
                 padded,
@@ -1061,6 +1110,9 @@ fn mesh_into(
                 &mut s.specials,
                 |_, _, _, _| Ok((AO_OPEN_BYTE, 0)),
             );
+            if options.walls {
+                let _ = emit_walls(padded, materials, &mut s.specials, shade);
+            }
             if s.greedy.quads.iter().any(|q| !q.is_empty()) || !s.specials.is_empty() {
                 out.palette.push(palette_entry([v; 4]));
             }
@@ -1077,9 +1129,9 @@ fn mesh_into(
                 s.palette.clear();
                 s.key_table.clear();
                 let meshed = if glow {
-                    mesh_lit::<true>(s, padded, values, materials, options.ao, elide, level)
+                    mesh_lit::<true>(s, padded, values, materials, options, elide, level)
                 } else {
-                    mesh_lit::<false>(s, padded, values, materials, options.ao, elide, level)
+                    mesh_lit::<false>(s, padded, values, materials, options, elide, level)
                 };
                 if meshed.is_ok() {
                     out.light_quantization = level;
@@ -1111,7 +1163,7 @@ fn mesh_into(
 }
 
 /// Fills the keys and merges every face under full light at quantization `level`, then adds the
-/// quads of the non-cube blocks. `Err` when the palette overflows (the caller tries the next
+/// quads of the non-cube blocks and, with `options.walls`, the edge walls. `Err` when the palette overflows (the caller tries the next
 /// level). With `GLOW` (the chunk may hold a lit emitter), the faces of the lit emitters are
 /// flat ([`flat_shading`]); without it no face asks, so the hot path stays as it was.
 fn mesh_lit<const GLOW: bool>(
@@ -1119,10 +1171,11 @@ fn mesh_lit<const GLOW: bool>(
     padded: &PaddedChunk,
     light: &[u16; PADDED_VOLUME],
     materials: &MaterialTable,
-    ao: AoPolicy,
+    options: MeshOptions,
     elide: bool,
     level: LightQuantization,
 ) -> Result<(), PaletteFull> {
+    let ao = options.ao;
     for face in 0..6 {
         let (keys, palette, table) = (&mut s.keys, &mut s.palette, &mut s.key_table);
         visit_face(face, &s.greedy, padded, |i, front, nb9| {
@@ -1165,7 +1218,11 @@ fn mesh_lit<const GLOW: bool>(
         materials,
         &mut s.specials,
         &mut shade,
-    )
+    )?;
+    if options.walls {
+        emit_walls(padded, materials, &mut s.specials, &mut shade)?;
+    }
+    Ok(())
 }
 
 /// AO byte and corner lights of a unit face under full light: `front` is the padded index of
@@ -1215,6 +1272,155 @@ fn flat_shading(
 ) -> (u8, [LightValue; 4]) {
     let flat = LightValue(light[cell]).max(emission);
     (AO_OPEN_BYTE, level.apply([flat; 4]))
+}
+
+/// The edge walls ([`layout::SHAPE_WALL`], [`MeshOptions::walls`]) into `out` with their
+/// buckets, after what is there. On each of the 6 borders, every opaque cube of the padded
+/// border layer whose voxel inside (the chunk's border voxel in front of it) is not an opaque
+/// cube gets the face the chunk across would draw toward it: its material's layer and
+/// full-bright flag, shaded by `shade(material, cell, face, nb9)` with that voxel inside as
+/// `cell` and the opacity of its layer as `nb9`, as the chunk across shades it. On the 4 side
+/// borders a voxel of the border layer that is not an opaque cube either, but has one over it
+/// in the layer (a cave, or the ground under an overhang, going on across the border; up to the
+/// chunk over the neighbor, [`PaddedChunk::above`]), gets a cap: the same face with the
+/// material of the nearest opaque cube over it, so the cave ends in rock there instead of the
+/// sky. They merge greedily per border by material, AO and light,
+/// in the bucket of their material and face (a face bucket: an opaque cube's).
+fn emit_walls(
+    padded: &PaddedChunk,
+    materials: &MaterialTable,
+    out: &mut Vec<(u8, PackedQuad)>,
+    mut shade: impl FnMut(u16, usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
+) -> Result<(), PaletteFull> {
+    const BORDER: i32 = CHUNK_SIZE;
+    let opaque = |[x, y, z]: [i32; 3]| padded.opaque[mask_row(x, y)] >> (z + 1) & 1 != 0;
+    for face in Face::ALL {
+        let (na, ua, va) = face.axes();
+        let n = face.normal();
+        // A wall of `face` looks back into the chunk: one of a positive face lies on the low
+        // border (the neighbor voxel at -1, the voxel inside at 0), one of a negative face on
+        // the high border.
+        let (border, inner) = if n.x + n.y + n.z > 0 {
+            (-1, 0)
+        } else {
+            (BORDER, BORDER - 1)
+        };
+        // Per row v, bit u: the walls of this border (most chunks have none), and the material
+        // of each. On a side border v is y: a column of the border layer is scanned down from
+        // the padded row over the chunk, and a cap takes the nearest opaque cube over it.
+        let side = na != 1;
+        // The side border's slot in `PaddedChunk::above` (-X, +X, -Z, +Z).
+        let slot = usize::from(na == 2) * 2 + usize::from(border > 0);
+        let mut rows = [0u32; 32];
+        let mut mats = [[0u16; 32]; 32];
+        for u in 0..32 {
+            let mut at = [0; 3];
+            at[na] = border;
+            at[ua] = u;
+            at[va] = BORDER;
+            let mut over = if !side {
+                0
+            } else if opaque(at) {
+                padded.get(at[0], at[1], at[2])
+            } else {
+                padded.above[slot][u as usize]
+            };
+            for v in (0..32).rev() {
+                at[va] = v;
+                let mut cell = at;
+                cell[na] = inner;
+                let m = if opaque(at) {
+                    over = padded.get(at[0], at[1], at[2]);
+                    over
+                } else if side {
+                    over
+                } else {
+                    0
+                };
+                if m != 0 && !opaque(cell) {
+                    rows[v as usize] |= 1 << u;
+                    mats[v as usize][u as usize] = m;
+                }
+            }
+        }
+        if rows.iter().all(|&r| r == 0) {
+            continue;
+        }
+        let mut keys = [[0u64; 32]; 32];
+        for (v, &row) in rows.iter().enumerate() {
+            let mut bits = row;
+            while bits != 0 {
+                let u = bits.trailing_zeros() as i32;
+                bits &= bits - 1;
+                let mut at = [0; 3];
+                at[na] = border;
+                at[ua] = u;
+                at[va] = v as i32;
+                let mut cell = at;
+                cell[na] = inner;
+                let m = mats[v][u as usize];
+                // The opacity of the cell's layer around it, bit (dv + 1) * 3 + (du + 1).
+                let mut nb9 = 0;
+                for dv in -1..=1 {
+                    for du in -1..=1 {
+                        let mut p = cell;
+                        p[ua] += du;
+                        p[va] += dv;
+                        nb9 |= u32::from(opaque(p)) << ((dv + 1) * 3 + du + 1);
+                    }
+                }
+                let i = PaddedChunk::index(cell[0], cell[1], cell[2]);
+                let (ao, light) = shade(m, i, face, Some(nb9))?;
+                keys[v][u as usize] =
+                    1 << 63 | u64::from(m) | u64::from(ao) << 16 | u64::from(light) << 24;
+            }
+        }
+        // Greedy rectangles of equal keys: along u, then down v while the whole run matches.
+        let mut used = [0u32; 32];
+        for v0 in 0..32 {
+            let mut u0 = 0;
+            while u0 < 32 {
+                let key = keys[v0][u0];
+                if key == 0 || used[v0] & (1 << u0) != 0 {
+                    u0 += 1;
+                    continue;
+                }
+                let mut u1 = u0 + 1;
+                while u1 < 32 && keys[v0][u1] == key && used[v0] & (1 << u1) == 0 {
+                    u1 += 1;
+                }
+                let run = (((1u64 << (u1 - u0)) - 1) << u0) as u32;
+                let mut v1 = v0 + 1;
+                while v1 < 32 && used[v1] & run == 0 && keys[v1][u0..u1].iter().all(|&k| k == key) {
+                    v1 += 1;
+                }
+                for row in &mut used[v0..v1] {
+                    *row |= run;
+                }
+                let (m, ao, light) = (key as u16, (key >> 16) as u8, (key >> 24) as u16 & 0xFFF);
+                let mut pos = [0u32; 3];
+                pos[na] = inner as u32;
+                pos[ua] = u0 as u32;
+                pos[va] = v0 as u32;
+                let mut quad = PackedQuad::new(
+                    pos,
+                    (u1 - u0) as u32,
+                    (v1 - v0) as u32,
+                    face,
+                    materials.layer(m, face),
+                )
+                .with_ao_byte(ao)
+                .with_light_index(light)
+                .with_shape(layout::SHAPE_WALL);
+                if materials.emissive(m) {
+                    quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+                }
+                out.push((materials.bucket(m, face) as u8, quad));
+                u0 = u1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The quads of the non-cube blocks of the inner 32^3 (ADR 0018, ADR 0020), one block at a time,
@@ -1539,7 +1745,8 @@ fn front_neighborhood<const F: usize>(opaque: &[u64], x: usize, y: usize, z: usi
 
 /// Converts the merged quads to [`PackedQuad`]s and writes them bucket-contiguous into `out`
 /// (its palette already set), decoding each quad's key with `decode`; each bucket ends with the
-/// quads of the non-cube blocks (`specials`) routed to it.
+/// quads of `specials` routed to it, in their order: the non-cube blocks', then the edge walls
+/// ([`emit_walls`], last in their face bucket).
 fn assemble(
     greedy: &Greedy,
     specials: &[(u8, PackedQuad)],
