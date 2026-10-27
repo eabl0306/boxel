@@ -3,14 +3,16 @@
 //! real neighbors, so where the chunk across the plane is ground the side has no face, and only
 //! the coarse cells across can hide it. [`check_seam`] checks that their top stands at or over
 //! every real top of the plane's edge row, and casts rays across the near/far boundary as the
-//! renderer draws it (the chunks meshed with their real neighbors, the node with its skirts,
-//! walls and banks and the chunks' octants hidden, as the `lod_cracks` tests of the demo do),
-//! counting the rays that reach a point inside the ground without meeting a face: the sky seen
-//! through the ground.
+//! renderer draws it (the chunks meshed with their real neighbors and their edge walls toward
+//! the octants across, the node with its skirts, walls and banks (a uniform node of ground with
+//! its deep skirts) and the chunks' octants hidden,
+//! as the `lod_cracks` tests of the demo do), counting the rays that reach a point inside the
+//! ground without meeting a face: the sky seen through the ground.
 //!
-//! It changes nothing in the generator: a game runs it on its recipe's columns, keeps the cases
-//! its recipe can fix out of its far forms (a dry corner lowered at level 1), and logs the ones it
-//! cannot (wet slivers, cave voids at the seam) for the engine.
+//! It changes nothing in the generator: a game runs it on its recipe's columns and keeps every
+//! class empty from its far forms (a dry corner lowered at level 1 is the far form's to fix; the
+//! engine's edge walls and deep skirts close the caves at the seam and the ground under a coarse
+//! top, ADR 0031 sec. 13), and logs the wet slivers for the engine.
 
 use super::check_lod::{Coarse, Node};
 use super::generator::RegionGenerator;
@@ -18,12 +20,12 @@ use super::kind::Context;
 use crate::WorldGenerator;
 use crate::lod::{LodClass, LodClasses};
 use crate::noise::splitmix64;
-use boxel_mesh::lod::{LodMaterials, is_bank, mesh_node, octant_of};
+use boxel_mesh::lod::{LodMaterials, is_bank, mesh_node, octant_of, uniform_skirts};
 use boxel_mesh::{
     ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk, layout,
 };
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, LocalPos,
+    BlockRegistry, BlockState, CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, Face, LocalPos,
     NEIGHBOR_OFFSETS,
 };
 use std::collections::{HashMap, HashSet};
@@ -384,7 +386,8 @@ impl<'a, Cx: Context> Chunks<'a, Cx> {
             .unwrap_or_else(|| panic!("check_seam: no opaque block under ({x}, {top}, {z})"))
     }
 
-    /// The mesh of chunk `c` with its neighbors, as full detail draws it.
+    /// The mesh of chunk `c` with its neighbors, as full detail draws it, edge walls included
+    /// ([`MeshOptions::walls`]).
     fn mesh(&mut self, c: [i64; 3], table: &MaterialTable) -> ChunkMesh {
         let at = |d: [i64; 3]| [c[0] + d[0], c[1] + d[1], c[2] + d[2]];
         let offsets: Vec<[i64; 3]> = NEIGHBOR_OFFSETS
@@ -403,7 +406,7 @@ impl<'a, Cx: Context> Chunks<'a, Cx> {
             neighbors,
             light: None,
         };
-        Mesher::new().mesh_chunk(&input, table, MeshOptions::default())
+        Mesher::new().mesh_chunk(&input, table, MeshOptions::default().with_walls())
     }
 }
 
@@ -422,8 +425,9 @@ struct Rect {
 
 impl Rect {
     /// `q` of a mesh whose cell `(0, 0, 0)` starts at `origin`, cells `cell` blocks wide. A fluid
-    /// surface quad of full detail has its top `FLUID_SURFACE` up its cell. A LOD bank lies on
-    /// its cell's side away from its normal, and one on a side is drawn only for an eye above its
+    /// surface quad of full detail has its top `FLUID_SURFACE` up its cell, and an edge wall lies
+    /// on its cell's side away from its normal, `WALL_INSET` inside. A LOD bank lies on its
+    /// cell's side away from its normal, and one on a side is drawn only for an eye above its
     /// top; drawn behind everything, it stops a ray only where nothing else would.
     fn of(q: PackedQuad, origin: [f64; 3], cell: f64) -> Self {
         let face = q.face();
@@ -433,7 +437,15 @@ impl Rect {
         let p = q.pos().map(f64::from);
         let surface = q.shape() == layout::SHAPE_FLUID_SURFACE;
         let bank = is_bank(q);
+        let inset = f64::from(layout::WALL_INSET);
         let positive = match (sign > 0.0, surface && n == 1) {
+            _ if q.shape() == layout::SHAPE_WALL && cell == 1.0 => {
+                if sign > 0.0 {
+                    inset
+                } else {
+                    1.0 - inset
+                }
+            }
             _ if bank => f64::from(u8::from(sign < 0.0)),
             (true, true) => f64::from(layout::FLUID_SURFACE),
             (true, false) => 1.0,
@@ -519,9 +531,17 @@ struct Scene {
     near: Vec<(f64, f64, bool)>,
     /// Per level-1 cell column: the coarse top and ground, from the scene's origin.
     coarse: Vec<(f64, f64)>,
+    /// Per cell of the node column over the band's bottom (`(row * 32 + x) * 32 + z`, rows of
+    /// cells from the bottom): whether it is not Empty (a uniform node's cells are its state's).
+    /// A ray into the coarse ground aims at such a cell: a floating run (a canopy) has air under
+    /// it.
+    filled: Vec<bool>,
     /// With the chunks as drawn, the voxels of the chunk column under its opaque top (at most
     /// 48 deep) that are not opaque: its caves, the rays of the fourth kind start in them.
     voids: Vec<[f64; 3]>,
+    /// The same voxels, by position: a ray into the chunk column's ground aims at none of them
+    /// (a point inside a cave is no point inside the ground).
+    void_at: HashSet<[i64; 3]>,
 }
 
 /// The scene of chunk column `(cx, cz)`.
@@ -545,23 +565,45 @@ fn scene<Cx: Context>(
     let at = |v: [i64; 3]| [0, 1, 2].map(|a| (v[a] - origin[a]) as f64);
     let octant = [cx.rem_euclid(2), cz.rem_euclid(2)];
     let mut faces = Vec::new();
-    // The chunk column at full detail, every chunk of the band.
+    // The chunk column at full detail, every chunk of the band, with the edge walls of the two
+    // borders it shares with the octants across (the chunks there are not drawn): a wall of face
+    // bucket `f` closes the border opposite to `f`'s normal. The chunks over and under it and
+    // past the node are drawn, so their walls are not.
+    let across = [
+        if octant[0] == 0 {
+            Face::NegX
+        } else {
+            Face::PosX
+        },
+        if octant[1] == 0 {
+            Face::NegZ
+        } else {
+            Face::PosZ
+        },
+    ];
     for cy in band.lo * 2..band.hi * 2 {
         let mesh = near.mesh([cx, cy, cz], table);
         let o = at([cx << CHUNK_SHIFT, cy << CHUNK_SHIFT, cz << CHUNK_SHIFT]);
-        opaque(&mesh, o, 1.0, |_| false, &mut faces);
+        let left_out =
+            |q: PackedQuad| q.shape() == layout::SHAPE_WALL && !across.contains(&q.face());
+        opaque(&mesh, o, 1.0, left_out, &mut faces);
     }
     // The node column coarse, the chunk column's octants hidden.
     let low = octant[0] | (octant[1] << 2);
     let hidden = (1u8 << low) | (1u8 << (low | 2));
     let mut padded = PaddedChunk::new();
     for layer in band.lo..band.hi {
-        let Some(Node::Cells(cells)) = coarse.nodes.get(&layer) else {
-            continue;
+        // A uniform node of ground has its deep skirts alone, as the LOD jobs mesh it.
+        let mesh = match coarse.nodes.get(&layer) {
+            Some(Node::Cells(cells)) => {
+                lod.fill(&cells.0[..], &mut padded);
+                let mut mesh = ChunkMesh::default();
+                mesh_node(&mut Mesher::new(), &padded, lod, LEVEL, &mut mesh);
+                mesh
+            }
+            Some(Node::Uniform(state)) => uniform_skirts(lod, *state),
+            None => continue,
         };
-        lod.fill(&cells.0[..], &mut padded);
-        let mut mesh = ChunkMesh::default();
-        mesh_node(&mut Mesher::new(), &padded, lod, LEVEL, &mut mesh);
         let o = at([node[0] * NODE, layer * NODE, node[1] * NODE]);
         opaque(
             &mesh,
@@ -597,6 +639,19 @@ fn scene<Cx: Context>(
             }
         }
     }
+    let mut filled = Vec::new();
+    for layer in band.lo..band.hi {
+        for y in 0..32 {
+            for x in 0..32 {
+                for z in 0..32 {
+                    let class = coarse
+                        .get(layer, x, y, z)
+                        .map_or(LodClass::Solid, |s| classes.class(s));
+                    filled.push(class != LodClass::Empty);
+                }
+            }
+        }
+    }
     let cells = Tops::of(&coarse, classes);
     let coarse_tops = cells
         .0
@@ -610,6 +665,8 @@ fn scene<Cx: Context>(
         faces,
         near: tops,
         coarse: coarse_tops,
+        filled,
+        void_at: voids.iter().map(|v| v.map(|c| c as i64)).collect(),
         voids,
     }
 }
@@ -629,10 +686,38 @@ impl Scene {
         self.near[(x as usize) * NODE as usize + z as usize]
     }
 
+    /// Whether the coarse cell at `p` is not Empty (from the scene's origin).
+    fn coarse_filled(&self, p: [f64; 3]) -> bool {
+        let c = CELL as f64;
+        let [x, y, z] = p.map(|v| (v / c).floor() as usize);
+        self.filled
+            .get((y * 32 + x.min(31)) * 32 + z.min(31))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// The coarse top and ground at `(x, z)`.
     fn coarse_at(&self, x: f64, z: f64) -> (f64, f64) {
         let c = CELL as f64;
         self.coarse[((x / c) as usize) * 32 + (z / c) as usize]
+    }
+
+    /// Where the ray `o + t d` crosses the middle plane of `axis`, and what lies on either side
+    /// of it there: the real tops of the two edge columns and the coarse tops of the two cells.
+    fn crossing(&self, o: [f64; 3], d: [f64; 3], axis: usize) -> String {
+        let a = axis * 2;
+        let t = (32.0 - o[a]) / d[a];
+        let p = [0, 1, 2].map(|i| o[i] + t * d[i]);
+        let w = p[2 - a].clamp(0.0, 63.0);
+        let at = |u: f64| if axis == 0 { (u, w) } else { (w, u) };
+        let (lo, hi) = (at(31.0), at(32.0));
+        let (lo_real, hi_real) = (self.near_at(lo.0, lo.1), self.near_at(hi.0, hi.1));
+        let (lo_cell, hi_cell) = (self.coarse_at(lo.0, lo.1), self.coarse_at(hi.0, hi.1));
+        format!(
+            "; crosses at y {:.2}, w {w:.2}: real tops {:.1} | {:.1}, coarse (top, ground) \
+             {lo_cell:?} | {hi_cell:?}",
+            p[1], lo_real.0, hi_real.0,
+        )
     }
 
     /// Casts the rays of each kind on both planes the chunk column shares with the octants
@@ -679,7 +764,8 @@ impl Scene {
                             let ty = n.between((ground - 8.0).max(0.5), ground - 0.01);
                             Some((o, [tx, ty, tz]))
                         }
-                        // From over the coarse terrain into the chunk column's ground.
+                        // From over the coarse terrain into the chunk column's ground (an
+                        // opaque block of it: not into a cave).
                         1 => {
                             let (x, z) = point(&mut n, far_u);
                             let (top, _) = self.coarse_at(x, z);
@@ -687,7 +773,8 @@ impl Scene {
                             let (tx, tz) = point(&mut n, near_u);
                             let (_, ground, _) = self.near_at(tx, tz);
                             let ty = n.between((ground - 8.0).max(0.5), ground - 0.01);
-                            Some((o, [tx, ty, tz]))
+                            let voxel = [tx, ty, tz].map(|c| c.floor() as i64);
+                            (!self.void_at.contains(&voxel)).then_some((o, [tx, ty, tz]))
                         }
                         // From under the chunk column's fluid into the coarse ground across.
                         2 => {
@@ -710,13 +797,16 @@ impl Scene {
                             (lo < hi).then(|| (o, [tx, n.between(lo, hi), tz]))
                         }
                     };
+                    // Into the coarse ground: a cell that holds something (not the air under a
+                    // floating run).
+                    let ray = ray.filter(|&(_, t)| kind == 1 || self.coarse_filled(t));
                     let Some((o, target)) = ray else { continue };
                     cast += 1;
                     let d = [target[0] - o[0], target[1] - o[1], target[2] - o[2]];
                     if self.slips(o, d) {
                         report.sky_hits.push(format!(
                             "chunk column {:?}, plane {}, from {}: {o:?} to {target:?} (from the \
-                             node column's lowest corner at the band's bottom)",
+                             node column's lowest corner at the band's bottom){}",
                             self.column,
                             ["x", "z"][axis],
                             [
@@ -725,6 +815,7 @@ impl Scene {
                                 "under the chunk's fluid",
                                 "a cave of the chunk",
                             ][kind],
+                            self.crossing(o, d, axis),
                         ));
                     }
                 }

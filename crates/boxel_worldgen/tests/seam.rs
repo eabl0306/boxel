@@ -5,7 +5,8 @@
 //! - a far form that lowers a dry corner at level 1 fails, as lowered edge columns and as sky
 //!   hits from over the cells into the chunks;
 //! - ground that rises over the fluid between the cell corners is a wet sliver, its own class;
-//! - caves at the seam show only with the chunks as drawn (carvers in).
+//! - caves at the seam stay closed with the chunks as drawn (carvers in): the chunks' edge walls
+//!   and the cells' deep skirts hide them, and the rays from the caves see no sky.
 #[path = "support/region.rs"]
 mod support;
 
@@ -281,7 +282,7 @@ fn ground_over_the_fluid_between_the_corners_is_a_wet_sliver() {
 }
 
 #[test]
-fn caves_at_the_seam_show_only_with_the_chunks_as_drawn() {
+fn caves_at_the_seam_stay_closed_with_the_chunks_as_drawn() {
     let registry = registry();
     // Holes of 4 blocks in one cube of 2 right under the ground (a roof of 1), inland.
     let g = generator_with(
@@ -298,15 +299,9 @@ fn caves_at_the_seam_show_only_with_the_chunks_as_drawn() {
         ..SeamOptions::default()
     };
     let caves = check_seam(&g, &registry, chunks, drawn);
-    // Part A compares the terrain alone either way; the rays reach the holes through the sides
-    // the chunks leave out.
-    assert!(caves.lowered.is_empty() && caves.wet_slivers.is_empty());
-    assert!(caves.sky_hits.len() > 100, "{caves}");
-    assert!(
-        caves
-            .sky_hits
-            .iter()
-            .all(|h| h.contains("from a cave of the chunk")),
-        "{caves}"
-    );
+    // Part A compares the terrain alone either way; the rays from the holes by the planes (more
+    // rays than the terrain alone casts) meet the chunks' edge walls or the cells' deep skirts,
+    // where before (E-D) they went through the sides the chunks leave out.
+    assert_eq!(caves.failures(), 0, "{caves}");
+    assert!(caves.rays > terrain.rays + 1000, "{caves}");
 }
