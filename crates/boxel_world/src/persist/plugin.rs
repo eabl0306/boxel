@@ -188,6 +188,7 @@ fn teardown_persist(world: &mut World) {
     world.resource_mut::<SavedLog>().clear();
     if let Some(mut board) = world.get_resource_mut::<DiagnosticsBoard>() {
         board.remove("save");
+        board.remove("cache");
     }
 }
 
@@ -305,10 +306,37 @@ fn publish_save_stats(
     epoch: Res<WorldEpoch>,
     board: Option<ResMut<DiagnosticsBoard>>,
     mut last: Local<Option<(WorldEpoch, super::PersistStats, usize)>>,
+    mut last_cache: Local<Option<(WorldEpoch, super::GenCacheStats)>>,
 ) {
     let (Some(mut board), Some(store)) = (board, store) else {
         return;
     };
+    // The generation cache's line (ADR 0042), while the world has one.
+    let now = store.cache().map(|c| (*epoch, c.stats()));
+    if now.is_none() && last_cache.take().is_some() {
+        board.remove("cache");
+    }
+    if let Some(now) = now.filter(|&now| *last_cache != Some(now)) {
+        *last_cache = Some(now);
+        let s = now.1;
+        board.set(
+            "cache",
+            format!(
+                "chunks={}/{} lod={}/{} written={} dropped={} damaged={} errors={} \
+                 evicted={} mb={:.1}",
+                s.chunk_hits,
+                s.chunk_hits + s.chunk_misses,
+                s.lod_hits,
+                s.lod_hits + s.lod_misses,
+                s.written,
+                s.dropped,
+                s.damaged,
+                s.errors,
+                s.evicted,
+                s.bytes as f64 / f64::from(1 << 20)
+            ),
+        );
+    }
     let now = (
         *epoch,
         store.stats(),

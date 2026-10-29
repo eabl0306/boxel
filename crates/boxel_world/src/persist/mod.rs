@@ -13,6 +13,9 @@
 //!   the world clock. Chunks nobody edited are never saved: they come from the seed again. The
 //!   exit closes the store after its save ([`WorldShutdownSystems`], [`WorldStore::close`]); so
 //!   does closing the world while the app runs ([`crate::lifecycle`]).
+//! - [`GenCache`]: the generation cache (ADR 0042), a file of its own next to the world's with
+//!   what the generator made (chunks and the far LOD's source output), attached to the world's
+//!   store ([`WorldStore::attach_cache`]). Never part of the world: deleting it loses nothing.
 //! - [`Saved`] entities: what the registered [`EntityCodec`]s write of them (physics saves its
 //!   bodies) is saved with the chunk they are in, when it unloads (they are despawned then),
 //!   with the autosave and on exit, and they come back when the chunk loads.
@@ -41,6 +44,7 @@
 //! // and a `lifecycle::WorldSpec` with the store.
 //! ```
 mod backend;
+mod cache;
 mod entities;
 pub mod format;
 mod plugin;
@@ -52,6 +56,7 @@ mod tests;
 pub use backend::{
     ChunkStore, MemoryStore, NullChunkStore, REDB_CACHE_BYTES, RedbStore, SaveBatch,
 };
+pub use cache::{CACHE_FILE, GenCache, GenCacheSettings, GenCacheStats};
 #[cfg(test)]
 pub(crate) use entities::SavedLog;
 pub(crate) use entities::put_away_all;

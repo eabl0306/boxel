@@ -1131,6 +1131,7 @@ fn a_busy_world_runs_only_class_0_columns() {
         overlays: Vec::new(),
         edit_layers: None,
         fallback: None,
+        cache: None,
     };
     state.jobs.hand_off(job, 2);
     assert!(state.jobs.handed_off_columns().contains(&(c, 2)));
@@ -1993,6 +1994,7 @@ fn lod_jobs_hand_the_mesher_cells_from_the_source() {
         overlays: Vec::new(),
         edit_layers: None,
         fallback: None,
+        cache: None,
     };
     let LodMessage::Built { id, column, nodes } = jobs::run_column(&input) else {
         panic!("a built column");

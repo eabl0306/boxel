@@ -1,5 +1,6 @@
 //! [`WorldStore`]: an open world, shared by the main thread and the jobs (ADR 0024).
 use super::backend::{ChunkStore, RedbStore, SaveBatch, closed_error};
+use super::cache::GenCache;
 use super::format::{
     self, FORMAT_VERSION, FormatError, IdMap, decode_chunk, decode_clock, decode_names,
     decode_ticks, decode_worldgen, encode_chunk, encode_names, encode_worldgen, open_entity,
@@ -282,6 +283,8 @@ struct Inner {
     closed: AtomicBool,
     /// Which opening of the process this is (increasing), taken before the index was read.
     opened_seq: u64,
+    /// The generation cache, once attached ([`WorldStore::attach_cache`]).
+    cache: std::sync::OnceLock<GenCache>,
 }
 
 /// An open world (ADR 0024): its store, its [`IdMap`] and the chunks waiting to be written.
@@ -483,6 +486,7 @@ impl WorldStore {
                 })),
                 closed: AtomicBool::new(false),
                 opened_seq,
+                cache: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -503,6 +507,10 @@ impl WorldStore {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // The cache's last records are made durable and its file released too.
+        if let Some(cache) = self.inner.cache.get() {
+            cache.close();
+        }
         let result = self.inner.backend.close();
         // Nothing writes them any more: a clone kept after the close holds no chunk data. Taken
         // under their locks, which `stage` and `stage_entity` check the flag under.
@@ -511,6 +519,20 @@ impl WorldStore {
             std::mem::take(&mut *self.inner.pending_entities.lock().expect("pending lock"));
         drop((pending, entities));
         result
+    }
+
+    /// Attaches the world's generation cache (ADR 0042): from then on the world's chunk jobs read
+    /// a chunk nobody saved from it before generating it (and offer it back after), and the far
+    /// LOD's jobs read a column's source output from it. Attach it right after opening, before
+    /// the store serves a world: jobs already running do not see it. The world's close closes it
+    /// ([`WorldStore::close`]). A world has one cache: a second one is refused (handed back).
+    pub fn attach_cache(&self, cache: GenCache) -> Result<(), GenCache> {
+        self.inner.cache.set(cache)
+    }
+
+    /// The generation cache attached to this world, if any.
+    pub fn cache(&self) -> Option<&GenCache> {
+        self.inner.cache.get()
     }
 
     /// The world's file was not closed cleanly (a crash) and was repaired when it opened

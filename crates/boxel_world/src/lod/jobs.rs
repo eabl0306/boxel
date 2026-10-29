@@ -24,6 +24,7 @@ use super::edits::{self, Pyramid, nodes_touching};
 use super::fallback::{self, FallbackInput};
 use super::plan::Span;
 use crate::jobs::JobExecutor;
+use crate::persist::GenCache;
 use boxel_mesh::lod::{LodMaterials, Seam, fits, mesh_node, octant_of, seam_of, uniform_skirts};
 use boxel_mesh::{ChunkMesh, Mesher, PaddedChunk};
 use boxel_voxel::{BlockRegistry, BlockState, ChunkKey, ChunkPos};
@@ -60,6 +61,9 @@ pub(crate) struct JobInput {
     pub(crate) edit_layers: Option<Span>,
     /// The fallback's input, for a generator without a source.
     pub(crate) fallback: Option<FallbackInput>,
+    /// The world's generation cache (ADR 0042): the source's output for the request is read
+    /// from it, or recorded into it.
+    pub(crate) cache: Option<GenCache>,
 }
 
 /// One node of a finished job.
@@ -307,28 +311,43 @@ pub(crate) fn run_column(input: &JobInput) -> LodMessage {
         let column = match (source, &input.fallback) {
             (Some(source), _) => {
                 let mut emitted = Vec::new();
-                let from_source =
-                    source.column(req, &input.registry, scratch, &mut |layer, node| {
-                        if out.cancelled || !wanted(layer) {
-                            return;
-                        }
-                        emitted.push(layer);
-                        if edited(layer) {
-                            match node {
-                                LodNode::Uniform(state) => cells.fill(state),
-                                LodNode::Cells(c) => cells.0.copy_from_slice(&c.0[..]),
-                            }
-                            edits::overlay(cells, level, req.key(layer).pos, &input.overlays);
-                            out.build(layer, cells, padded, mesher, mesh);
-                            return;
-                        }
+                let mut on_node = |layer: i64, node: LodNode<'_>| {
+                    if out.cancelled || !wanted(layer) {
+                        return;
+                    }
+                    emitted.push(layer);
+                    if edited(layer) {
                         match node {
-                            LodNode::Uniform(state) => out
-                                .nodes
-                                .push((layer, uniform_node(&input.materials, state))),
-                            LodNode::Cells(c) => out.build(layer, c, padded, mesher, mesh),
+                            LodNode::Uniform(state) => cells.fill(state),
+                            LodNode::Cells(c) => cells.0.copy_from_slice(&c.0[..]),
                         }
-                    });
+                        edits::overlay(cells, level, req.key(layer).pos, &input.overlays);
+                        out.build(layer, cells, padded, mesher, mesh);
+                        return;
+                    }
+                    match node {
+                        LodNode::Uniform(state) => out
+                            .nodes
+                            .push((layer, uniform_node(&input.materials, state))),
+                        LodNode::Cells(c) => out.build(layer, c, padded, mesher, mesh),
+                    }
+                };
+                // The source's output comes from the generation cache when it has all of it
+                // (exactly what the source emits, in its order); else the source runs and what
+                // it emits is recorded for the cache. The edits go over it either way.
+                let cached = input.cache.as_ref().and_then(|cache| {
+                    cache.source_column(
+                        &*input.generator,
+                        req,
+                        &input.registry,
+                        scratch,
+                        &mut on_node,
+                    )
+                });
+                let from_source = match cached {
+                    Some(band) => band,
+                    None => source.column(req, &input.registry, scratch, &mut on_node),
+                };
                 // The layers the edits added to the band, which the source left out.
                 let band = edits::widen(from_source, input.edit_layers);
                 let first = (*req.layers.start()).max(band.lo);

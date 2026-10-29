@@ -2203,6 +2203,17 @@ impl WorldJobs {
             .as_ref()
             .filter(|p| p.is_saved(key))
             .map(|p| p.store.clone());
+        // A chunk nobody saved comes from the generation cache when it has it (ADR 0042), as
+        // its generation returned it; a miss generates it and offers it back.
+        let cache = match &store {
+            Some(_) => None,
+            None => self
+                .persist
+                .as_ref()
+                .and_then(|p| p.store.cache())
+                .filter(|c| c.settings().chunks && c.enabled())
+                .cloned(),
+        };
         // Its saved entities are read with it, so they come back with the chunk. A store that
         // fails leaves them saved for the next load.
         let entity_store = self
@@ -2219,7 +2230,10 @@ impl WorldJobs {
             move || {
                 let data = match store.map(|s| s.load_chunk(key)).transpose() {
                     Ok(Some(Some(saved))) => Arc::unwrap_or_clone(saved),
-                    Ok(_) => generator.generate(key, &registry),
+                    Ok(_) => match &cache {
+                        Some(cache) => cache.generate(&*generator, key, &registry),
+                        None => generator.generate(key, &registry),
+                    },
                     Err(e) => {
                         return JobMessage::Failed {
                             id: JobId::Chunk(id),

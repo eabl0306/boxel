@@ -14,6 +14,7 @@
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, DimensionId, Paletted,
 };
+use boxel_worldgen::lod::LOD_PADDED_VOLUME as LOD_CELLS;
 use boxel_worldgen::preset::{DimensionRecord, MAX_DIMENSIONS, SpecLine, WorldgenRecord};
 use boxel_worldgen::realm::RealmSpan;
 use boxel_worldgen::registry::{DigestEntry, DigestScope, GenId, RegistryDigest};
@@ -35,6 +36,12 @@ pub(crate) const META_MAGIC: [u8; 4] = *b"BXMT";
 pub(crate) const ENTITY_MAGIC: [u8; 4] = *b"BXEN";
 /// Magic of the world generation record (`boxel:worldgen`).
 pub(crate) const WORLDGEN_MAGIC: [u8; 4] = *b"BXWG";
+/// Magic of a generation cache record of a chunk (ADR 0042): the generator's storage as it is.
+pub(crate) const CACHE_CHUNK_MAGIC: [u8; 4] = *b"BXGC";
+/// Magic of a generation cache record of a far LOD node's cells (ADR 0042).
+pub(crate) const CACHE_NODE_MAGIC: [u8; 4] = *b"BXGN";
+/// Magic of a generation cache record of a far LOD column's band (ADR 0042).
+pub(crate) const CACHE_BAND_MAGIC: [u8; 4] = *b"BXGB";
 /// Version of the chunk record layout.
 pub(crate) const CHUNK_VERSION: u8 = 1;
 /// Version of the metadata blob layouts.
@@ -65,10 +72,15 @@ const LZ4_MAX_RATIO: usize = 255;
 /// metadata blob (a long pending tick list) or an entity record by the header's `u32` length
 /// alone. The reader takes whatever the writer can seal.
 fn max_payload(magic: [u8; 4]) -> usize {
-    if magic == CHUNK_MAGIC {
-        MAX_CHUNK_PAYLOAD
-    } else {
-        u32::MAX as usize
+    match magic {
+        CHUNK_MAGIC => MAX_CHUNK_PAYLOAD,
+        // A chunk's storage and its version (a varint of a `u32`).
+        CACHE_CHUNK_MAGIC => MAX_CHUNK_PAYLOAD + 5,
+        // A node's kind, a palette of at most every `u16` state, its width and its words.
+        CACHE_NODE_MAGIC => 1 + 3 * (1 << 16) + 4 + 2 * LOD_CELLS,
+        // Three numbers and the layers the source emitted, in its order.
+        CACHE_BAND_MAGIC => 4096,
+        _ => u32::MAX as usize,
     }
 }
 
@@ -107,12 +119,12 @@ impl std::error::Error for FormatError {}
 // ---- Keys ----------------------------------------------------------------------------------
 
 /// An `i64` as 8 big-endian bytes whose byte order is the numeric order (sign bit flipped).
-fn ordered(v: i64) -> [u8; 8] {
+pub(crate) fn ordered(v: i64) -> [u8; 8] {
     ((v as u64) ^ (1 << 63)).to_be_bytes()
 }
 
 /// The inverse of [`ordered`].
-fn unordered(b: [u8; 8]) -> i64 {
+pub(crate) fn unordered(b: [u8; 8]) -> i64 {
     (u64::from_be_bytes(b) ^ (1 << 63)) as i64
 }
 
@@ -146,7 +158,7 @@ pub fn decode_key(bytes: &[u8; KEY_LEN]) -> ChunkKey {
 // ---- Envelope ------------------------------------------------------------------------------
 
 /// FNV-1a, 64 bits: a stable checksum (the same in every build and on every platform).
-fn checksum(bytes: &[u8]) -> u64 {
+pub(crate) fn checksum(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= u64::from(b);
@@ -471,10 +483,31 @@ pub fn encode_chunk(data: &ChunkData, ids: &IdMap) -> Result<Vec<u8>, FormatErro
     let mut blocks = data.blocks().clone();
     blocks.compact();
     let mut payload = Vec::new();
-    match &blocks {
+    put_storage(&mut payload, &blocks, |s| ids.stored(s).map(u64::from))?;
+    Ok(seal(CHUNK_MAGIC, CHUNK_VERSION, &payload))
+}
+
+/// The blocks of a chunk record, with runtime states.
+pub fn decode_chunk(bytes: &[u8], ids: &IdMap) -> Result<ChunkData, FormatError> {
+    let payload = open(CHUNK_MAGIC, CHUNK_VERSION, bytes)?;
+    let mut r = Reader::new(&payload);
+    let blocks = read_storage(&mut r, |id| ids.runtime(id))?;
+    r.finish()?;
+    Ok(ChunkData::from_paletted(blocks))
+}
+
+/// Appends block storage `blocks` as it is (no compaction), each state as the id `id_of` gives
+/// it: the kind, then one id (uniform), the palette, bits and words (packed) or every voxel
+/// (direct).
+pub(crate) fn put_storage(
+    payload: &mut Vec<u8>,
+    blocks: &Paletted,
+    id_of: impl Fn(BlockState) -> Result<u64, FormatError>,
+) -> Result<(), FormatError> {
+    match blocks {
         Paletted::Uniform(s) => {
             payload.push(KIND_UNIFORM);
-            put_varint(&mut payload, u64::from(ids.stored(*s)?));
+            put_varint(payload, id_of(*s)?);
         }
         Paletted::Packed {
             palette,
@@ -482,9 +515,9 @@ pub fn encode_chunk(data: &ChunkData, ids: &IdMap) -> Result<Vec<u8>, FormatErro
             words,
         } => {
             payload.push(KIND_PACKED);
-            put_varint(&mut payload, palette.len() as u64);
+            put_varint(payload, palette.len() as u64);
             for &s in palette {
-                put_varint(&mut payload, u64::from(ids.stored(s)?));
+                put_varint(payload, id_of(s)?);
             }
             payload.push(*bits);
             payload.reserve(words.len() * 8);
@@ -495,23 +528,25 @@ pub fn encode_chunk(data: &ChunkData, ids: &IdMap) -> Result<Vec<u8>, FormatErro
         Paletted::Direct(states) => {
             payload.push(KIND_DIRECT);
             for &s in states.iter() {
-                put_varint(&mut payload, u64::from(ids.stored(s)?));
+                put_varint(payload, id_of(s)?);
             }
         }
     }
-    Ok(seal(CHUNK_MAGIC, CHUNK_VERSION, &payload))
+    Ok(())
 }
 
-/// The blocks of a chunk record, with runtime states.
-pub fn decode_chunk(bytes: &[u8], ids: &IdMap) -> Result<ChunkData, FormatError> {
-    let payload = open(CHUNK_MAGIC, CHUNK_VERSION, bytes)?;
-    let mut r = Reader::new(&payload);
-    let blocks = match r.u8()? {
-        KIND_UNIFORM => Paletted::Uniform(ids.runtime(r.varint()?)?),
+/// The inverse of [`put_storage`], with `state_of` turning ids back into states. Refuses a
+/// storage that would break its invariants (a bad width, an index past the palette).
+pub(crate) fn read_storage(
+    r: &mut Reader<'_>,
+    state_of: impl Fn(u64) -> Result<BlockState, FormatError>,
+) -> Result<Paletted, FormatError> {
+    Ok(match r.u8()? {
+        KIND_UNIFORM => Paletted::Uniform(state_of(r.varint()?)?),
         KIND_PACKED => {
             let n = r.count(256)?;
             let palette = (0..n)
-                .map(|_| ids.runtime(r.varint()?))
+                .map(|_| state_of(r.varint()?))
                 .collect::<Result<Vec<_>, _>>()?;
             let bits = r.u8()?;
             if !matches!(bits, 1 | 2 | 4 | 8) || n == 0 || n > 1 << bits {
@@ -537,14 +572,12 @@ pub fn decode_chunk(bytes: &[u8], ids: &IdMap) -> Result<ChunkData, FormatError>
         }
         KIND_DIRECT => {
             let states = (0..CHUNK_VOLUME)
-                .map(|_| ids.runtime(r.varint()?))
+                .map(|_| state_of(r.varint()?))
                 .collect::<Result<Vec<_>, _>>()?;
             Paletted::Direct(states.into_boxed_slice())
         }
         _ => return Err(FormatError::Damaged("unknown chunk kind")),
-    };
-    r.finish()?;
-    Ok(ChunkData::from_paletted(blocks))
+    })
 }
 
 // ---- Entities ------------------------------------------------------------------------------

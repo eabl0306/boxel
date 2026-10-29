@@ -69,6 +69,8 @@ mod plan;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_cache;
+#[cfg(test)]
 mod tests_edits;
 mod tree;
 
@@ -1392,6 +1394,12 @@ impl LodWorld {
                 cancel,
                 overlays,
                 edit_layers,
+                cache: self
+                    .store
+                    .as_ref()
+                    .and_then(WorldStore::cache)
+                    .filter(|c| c.settings().lod && c.enabled() && fallback.is_none())
+                    .cloned(),
                 fallback,
             };
             return Some((input, entry.class));
