@@ -23,11 +23,22 @@
 //! - A handler may also react at once to those changes ([`TickHandler::react`], lava meeting
 //!   water): right inside the write for a tick's writes, at the start of the next frame's ticks
 //!   for other edits.
+//! - Random ticks (ADR 0041, Minecraft's `randomTickSpeed`): every game tick, each loaded chunk
+//!   within [`BlockTickSettings::random_tick_radius`] of a `ChunkViewer` gets
+//!   [`BlockTickSettings::random_ticks_per_chunk`] picks of a random cell; a pick on a state with
+//!   a [`RandomTickHandler`] runs it through the same [`TickContext`], after the frame's due
+//!   ticks. A chunk whose palette holds no such state gets no picks. The picks hash the game
+//!   tick, the chunk and the pick's number, and [`TickContext::random`] the tick's block and
+//!   game tick, so a run is deterministic.
+use crate::streaming::ViewerChunks;
 use crate::{BlockChanged, BlockEdit, ChunkDataEvent, ChunkMap, EditQueue, WorldContent};
 use boxel_ecs::prelude::*;
-use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, Face};
+use boxel_voxel::{
+    BlockId, BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkPos, Face,
+    LocalPos, Paletted,
+};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 /// Game ticks per second (Minecraft's 20).
@@ -56,6 +67,18 @@ pub struct TickHandler {
     pub react: Option<fn(&mut TickContext<'_>, BlockPos, BlockState)>,
 }
 
+/// What a block does on a random tick (Minecraft's `randomTick`: a crop grows, farmland dries):
+/// `tick` runs on a block a random pick landed on, reading at most `reach` blocks away
+/// (`[horizontal, down, up]`). A pick whose reach is not all loaded is skipped (a random tick
+/// does not wait).
+#[derive(Clone, Copy, Debug)]
+pub struct RandomTickHandler {
+    /// How far the tick reads: `[horizontal, down, up]` blocks.
+    pub reach: [u32; 3],
+    /// The update.
+    pub tick: fn(&mut TickContext<'_>, BlockPos, BlockState),
+}
+
 /// Knobs of the block ticks. Read every frame.
 #[derive(Resource, Clone, Debug)]
 pub struct BlockTickSettings {
@@ -66,15 +89,28 @@ pub struct BlockTickSettings {
     pub min_ticks_per_frame: usize,
     /// Stops the game clock (no tick comes due; edits still schedule).
     pub paused: bool,
+    /// Random picks per chunk per game tick (Minecraft's `randomTickSpeed` of 3 per 16^3
+    /// section is 24 per 32^3 chunk); 0 turns random ticks off.
+    pub random_ticks_per_chunk: u32,
+    /// The chunks around each viewer's that random tick: `[horizontal, vertical]` radius in
+    /// chunks, a box (Minecraft's simulation distance; 4 is 128 blocks).
+    pub random_tick_radius: [u32; 2],
+    /// The most game ticks of random ticks one frame catches up after a stall (the rest are
+    /// skipped, as a server that falls behind skips them).
+    pub random_catch_up: u32,
 }
 
 impl Default for BlockTickSettings {
-    /// 1 ms per frame, at least 64 ticks, running.
+    /// 1 ms per frame, at least 64 ticks, running; 24 random picks per chunk within 4 chunks,
+    /// catching up 1 second.
     fn default() -> Self {
         Self {
             budget: Duration::from_millis(1),
             min_ticks_per_frame: 64,
             paused: false,
+            random_ticks_per_chunk: 24,
+            random_tick_radius: [4, 4],
+            random_catch_up: GAME_TICKS_PER_SECOND as u32,
         }
     }
 }
@@ -92,6 +128,8 @@ pub struct BlockTickStats {
     pub written: usize,
     /// Due ticks left for the next frame by the budget.
     pub behind: usize,
+    /// Random picks that ran a handler in the last frame.
+    pub random: usize,
 }
 
 /// The ordered tick queue and its index.
@@ -168,6 +206,10 @@ pub struct BlockTicks {
     queue: Queue,
     /// Handler per block state (empty until a handler is registered).
     handlers: Vec<Option<TickHandler>>,
+    /// Random tick handler per block state (empty until one is registered).
+    random: Vec<Option<RandomTickHandler>>,
+    /// The last game tick whose random ticks ran.
+    random_done: u64,
     /// The last frame's writes (final state per position), to tell their `BlockChanged`
     /// echoes from other edits.
     echoes: HashMap<BlockPos, BlockState, foldhash::fast::FixedState>,
@@ -193,6 +235,7 @@ impl BlockTicks {
         self.echoes.clear();
         self.reactions.clear();
         self.stats = BlockTickStats::default();
+        self.random_done = 0;
     }
 
     /// Nothing of a world: the clock at 0 and nothing queued, frozen or waiting to react.
@@ -204,6 +247,7 @@ impl BlockTicks {
             && self.queue.frozen.is_empty()
             && self.echoes.is_empty()
             && self.reactions.is_empty()
+            && self.random_done == 0
     }
 
     /// Moves the game clock `ticks` forward (tests and tools; the plugin advances it from the
@@ -256,6 +300,26 @@ impl BlockTicks {
     /// The handler of `state`, if any.
     pub fn handler(&self, state: BlockState) -> Option<TickHandler> {
         self.handlers.get(usize::from(state.0)).copied().flatten()
+    }
+
+    /// Registers the random tick `handler` for every state of `block` (replaces an earlier one).
+    pub fn register_random(
+        &mut self,
+        registry: &BlockRegistry,
+        block: BlockId,
+        handler: RandomTickHandler,
+    ) {
+        if self.random.len() < registry.len() {
+            self.random.resize(registry.len(), None);
+        }
+        for state in registry.states(block) {
+            self.random[usize::from(state.0)] = Some(handler);
+        }
+    }
+
+    /// The random tick handler of `state`, if any.
+    pub fn random_handler(&self, state: BlockState) -> Option<RandomTickHandler> {
+        self.random.get(usize::from(state.0)).copied().flatten()
     }
 
     /// Schedules a tick of `pos` `delay` game ticks from now (unless one already waits).
@@ -357,6 +421,8 @@ pub struct TickContext<'a> {
     tick: u64,
     /// The last chunk read (a tick reads many blocks of one or two chunks).
     cache: ChunkCache<'a>,
+    /// The state of [`TickContext::random`].
+    rng: u64,
 }
 
 /// The last chunk a [`TickContext`] read, so most reads skip the map's hash lookup.
@@ -450,6 +516,42 @@ impl<'a> TickContext<'a> {
     pub fn tick(&self) -> u64 {
         self.tick
     }
+
+    /// A random number in `0..n` (`0..1` for 0): from the tick's block and game tick and the
+    /// calls before it in the tick, so a run is deterministic.
+    pub fn random(&mut self, n: u32) -> u32 {
+        self.rng = mix(self.rng);
+        (((self.rng >> 32) * u64::from(n.max(1))) >> 32) as u32
+    }
+}
+
+/// Splitmix64's finalizer: the hash of the random picks and of [`TickContext::random`].
+fn mix(x: u64) -> u64 {
+    let mut x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// The seed of [`TickContext::random`] for a tick of `pos` at game tick `tick`.
+fn seed_of(pos: BlockPos, tick: u64) -> u64 {
+    mix(mix(mix(pos.x as u64) ^ pos.y as u64) ^ pos.z as u64) ^ mix(tick)
+}
+
+/// The seed of the random picks of `chunk` at game tick `tick`.
+fn chunk_seed(chunk: ChunkPos, tick: u64) -> u64 {
+    mix(mix(mix(mix(chunk.x as u64) ^ chunk.y as u64) ^ chunk.z as u64) ^ tick)
+}
+
+/// Whether `data` may hold a state with a random tick handler: a palette scan (a direct chunk
+/// always may).
+fn may_random_tick(data: &ChunkData, random: &[Option<RandomTickHandler>]) -> bool {
+    let ticks = |s: BlockState| random.get(usize::from(s.0)).is_some_and(Option::is_some);
+    match data.blocks() {
+        Paletted::Uniform(s) => ticks(*s),
+        Paletted::Packed { palette, .. } => palette.iter().any(|&s| ticks(s)),
+        Paletted::Direct(_) => true,
+    }
 }
 
 /// Adds [`BlockTicks`], [`BlockTickSettings`], the game clock (in `FixedUpdate`) and the
@@ -473,6 +575,9 @@ impl boxel_app::Plugin for BlockTicksPlugin {
                 (
                     run_ticks
                         .after(WorldSystems::Interest)
+                        .before(WorldSystems::Edits),
+                    run_random_ticks
+                        .after(run_ticks)
                         .before(WorldSystems::Edits),
                     schedule_from_edits
                         .after(WorldSystems::Edits)
@@ -501,13 +606,14 @@ fn publish_tick_stats(
     board.set(
         "ticks",
         format!(
-            "tick={} queued={} frozen={} ran={} written={} behind={}",
+            "tick={} queued={} frozen={} ran={} written={} behind={} random={}",
             ticks.now(),
             stats.queued,
             stats.frozen,
             stats.ran,
             stats.written,
-            stats.behind
+            stats.behind,
+            stats.random
         ),
     );
 }
@@ -590,6 +696,7 @@ fn run_ticks(
             ticks: &mut *ticks,
             tick: at,
             cache: Cell::new(None),
+            rng: seed_of(pos, at),
         };
         cx.react_around(pos);
     }
@@ -631,6 +738,7 @@ fn run_ticks(
             ticks: &mut *ticks,
             tick: due,
             cache: Cell::new(None),
+            rng: seed_of(pos, due),
         };
         (handler.tick)(&mut cx, pos, state);
     }
@@ -641,6 +749,103 @@ fn run_ticks(
         queue.set_block(edit.pos, edit.state);
     }
     ticks.echoes = overlay;
+}
+
+/// The random ticks of the game ticks since the last frame (at most
+/// [`BlockTickSettings::random_catch_up`] of them) in the loaded chunks around every
+/// `ChunkViewer` (see the [module docs](self)): they read the frame's due ticks' writes, and
+/// theirs join the same edit batch.
+fn run_random_ticks(
+    mut ticks: ResMut<BlockTicks>,
+    mut queue: ResMut<EditQueue>,
+    map: Res<ChunkMap>,
+    content: Res<WorldContent>,
+    settings: Res<BlockTickSettings>,
+    viewers: Option<Res<ViewerChunks>>,
+) {
+    let ticks = &mut *ticks;
+    let now = ticks.now;
+    if ticks.random.is_empty() || settings.random_ticks_per_chunk == 0 {
+        ticks.random_done = now;
+        ticks.stats.random = 0;
+        return;
+    }
+    if now <= ticks.random_done {
+        ticks.random_done = ticks.random_done.min(now);
+        ticks.stats.random = 0;
+        return;
+    }
+    let from = ticks
+        .random_done
+        .max(now.saturating_sub(u64::from(settings.random_catch_up)));
+    ticks.random_done = now;
+    let [h, v] = settings.random_tick_radius.map(i64::from);
+    let mut around = BTreeSet::new();
+    let centers = viewers
+        .iter()
+        .flat_map(|v| v.0.iter().map(|(_, viewer)| viewer.center));
+    for c in centers {
+        for y in -v..=v {
+            for z in -h..=h {
+                for x in -h..=h {
+                    around.insert(ChunkPos::new(c.x + x, c.y + y, c.z + z));
+                }
+            }
+        }
+    }
+    let chunks: Vec<ChunkPos> = around
+        .into_iter()
+        .filter(|&c| {
+            map.data_at(c)
+                .is_some_and(|d| may_random_tick(d, &ticks.random))
+        })
+        .collect();
+    let mut ran = 0usize;
+    if !chunks.is_empty() {
+        let mut overlay = std::mem::take(&mut ticks.echoes);
+        let mut writes = Vec::new();
+        let mut loaded = HashMap::with_hasher(foldhash::fast::FixedState::default());
+        for tick in from + 1..=now {
+            for &chunk in &chunks {
+                let Some(data) = map.data_at(chunk) else {
+                    continue;
+                };
+                let seed = chunk_seed(chunk, tick);
+                for i in 0..settings.random_ticks_per_chunk {
+                    let pick = mix(seed ^ u64::from(i));
+                    let local = LocalPos::from_index(pick as usize & (CHUNK_VOLUME - 1));
+                    let pos = BlockPos::from_parts(chunk, local);
+                    let state = overlay
+                        .get(&pos)
+                        .copied()
+                        .unwrap_or_else(|| data.get(local));
+                    let Some(handler) = ticks.random_handler(state) else {
+                        continue;
+                    };
+                    if missing_chunk(&map, pos, handler.reach, &mut loaded).is_some() {
+                        continue;
+                    }
+                    ran += 1;
+                    let mut cx = TickContext {
+                        map: &map,
+                        registry: &content.registry,
+                        overlay: &mut overlay,
+                        writes: &mut writes,
+                        ticks: &mut *ticks,
+                        tick,
+                        cache: Cell::new(None),
+                        rng: mix(pick),
+                    };
+                    (handler.tick)(&mut cx, pos, state);
+                }
+            }
+        }
+        for edit in writes {
+            queue.set_block(edit.pos, edit.state);
+        }
+        ticks.echoes = overlay;
+    }
+    ticks.stats.random = ran;
 }
 
 /// Schedules the blocks around the frame's other edits (players, tools): the `BlockChanged`
@@ -662,4 +867,163 @@ fn schedule_from_edits(
         });
     }
     ticks.echoes.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::InlineExecutor;
+    use crate::{ChunkViewer, WorldPlugin};
+    use boxel_app::App;
+    use boxel_math::DVec3;
+    use boxel_transform::Transform;
+    use boxel_voxel::{ChunkKey, testing};
+    use boxel_worldgen::WorldGenerator;
+    use std::sync::Arc;
+
+    /// Every chunk at y = 0 is solid at local y 0 with a plant on every cell above.
+    struct Plants;
+
+    impl WorldGenerator for Plants {
+        fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+            let mut data = ChunkData::uniform(BlockState::AIR);
+            if key.pos.y == 0 {
+                let solid = registry.by_name("test:solid").expect("solid");
+                let plant = registry.by_name("test:plant").expect("plant");
+                for z in 0..32 {
+                    for x in 0..32 {
+                        data.set(LocalPos::new(x, 0, z), solid);
+                        data.set(LocalPos::new(x, 1, z), plant);
+                    }
+                }
+            }
+            data
+        }
+        fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+            -1..=1
+        }
+        fn name(&self) -> &str {
+            "plants"
+        }
+    }
+
+    /// A random tick turns a plant into solid.
+    fn harden(cx: &mut TickContext<'_>, pos: BlockPos, _: BlockState) {
+        let solid = cx.registry().by_name("test:solid").expect("solid");
+        // Only half of the picks: `random` decides.
+        if cx.random(2) == 0 {
+            cx.set(pos, solid);
+        }
+    }
+
+    /// A world of [`Plants`] around a viewer at the origin's chunk, random ticks only there
+    /// (radius 0), with the plant's handler; settled.
+    fn planted() -> App {
+        let registry = Arc::new(testing::registry());
+        let mut app = App::new();
+        app.add_plugins(WorldPlugin {
+            generator: Arc::new(Plants),
+            registry: Arc::clone(&registry),
+            executor: Arc::new(InlineExecutor),
+            ..WorldPlugin::default()
+        })
+        .add_plugins(BlockTicksPlugin);
+        {
+            let mut settings = app.world_mut().resource_mut::<BlockTickSettings>();
+            settings.random_tick_radius = [0, 0];
+            settings.random_catch_up = 1000;
+            // The clock moves only by hand: a run does not depend on the frames' real time.
+            settings.paused = true;
+        }
+        let plant = registry.block_by_name("test:plant").expect("plant");
+        app.world_mut()
+            .resource_mut::<BlockTicks>()
+            .register_random(
+                &registry,
+                plant,
+                RandomTickHandler {
+                    reach: [0, 0, 0],
+                    tick: harden,
+                },
+            );
+        app.world_mut().spawn((
+            Transform::from_translation(DVec3::new(16.0, 8.0, 16.0)),
+            ChunkViewer::new(2).with_vertical_radius(1),
+        ));
+        for _ in 0..200 {
+            app.update();
+        }
+        app
+    }
+
+    /// The plants that hardened in the chunk at `cx`, `cz`.
+    fn hardened(app: &App, cx: i64, cz: i64) -> Vec<BlockPos> {
+        let map = app.world().resource::<ChunkMap>();
+        let solid = testing::registry().by_name("test:solid").expect("solid");
+        let mut out = Vec::new();
+        for z in 0..32 {
+            for x in 0..32 {
+                let pos = BlockPos::new(32 * cx + x, 1, 32 * cz + z);
+                assert!(map.block_at(pos).is_some(), "{pos:?} is loaded");
+                if map.block_at(pos) == Some(solid) {
+                    out.push(pos);
+                }
+            }
+        }
+        out
+    }
+
+    /// 100 game ticks of 24 picks in a chunk of 1024 plants (one cell in 32): about 75 picks
+    /// land on a plant and half of them harden it; the neighbor chunk, out of the radius, keeps
+    /// all its plants; and the run is the same every time.
+    #[test]
+    fn random_ticks_pick_cells_of_the_chunks_around_the_viewer() {
+        let mut app = planted();
+        assert!(
+            hardened(&app, 0, 0).is_empty(),
+            "nothing before the clock moves"
+        );
+        app.world_mut().resource_mut::<BlockTicks>().advance(100);
+        app.update();
+        app.update();
+        let first = hardened(&app, 0, 0);
+        assert!((15..=70).contains(&first.len()), "{} hardened", first.len());
+        assert!(hardened(&app, 1, 0).is_empty(), "out of the radius");
+        let ran = app.world().resource::<BlockTicks>().stats().random;
+        assert_eq!(ran, 0, "the last frame had no new game tick");
+        // Again: the same cells.
+        let mut again = planted();
+        again.world_mut().resource_mut::<BlockTicks>().advance(100);
+        again.update();
+        again.update();
+        assert_eq!(hardened(&again, 0, 0), first);
+        // Off: nothing more hardens.
+        app.world_mut()
+            .resource_mut::<BlockTickSettings>()
+            .random_ticks_per_chunk = 0;
+        app.world_mut().resource_mut::<BlockTicks>().advance(100);
+        app.update();
+        app.update();
+        assert_eq!(hardened(&app, 0, 0), first);
+    }
+
+    #[test]
+    fn tick_randoms_are_in_range_and_follow_the_seed() {
+        let a: Vec<u32> = (0..64)
+            .scan(seed_of(BlockPos::new(1, 2, 3), 9), |s, _| {
+                *s = mix(*s);
+                Some((((*s >> 32) * 7) >> 32) as u32)
+            })
+            .collect();
+        assert!(a.iter().all(|&n| n < 7));
+        assert!((0..7).all(|n| a.contains(&n)), "{a:?}");
+        assert_ne!(
+            seed_of(BlockPos::new(1, 2, 3), 9),
+            seed_of(BlockPos::new(1, 2, 3), 10)
+        );
+        assert_ne!(
+            chunk_seed(ChunkPos::new(0, 0, 0), 1),
+            chunk_seed(ChunkPos::new(1, 0, 0), 1)
+        );
+    }
 }

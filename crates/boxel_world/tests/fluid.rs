@@ -923,6 +923,7 @@ fn the_budget_only_delays_the_flood() {
         budget: Duration::ZERO,
         min_ticks_per_frame: 2,
         paused: false,
+        ..BlockTickSettings::default()
     };
     let mut sim = Sim::new();
     engine.edit(&edits);
