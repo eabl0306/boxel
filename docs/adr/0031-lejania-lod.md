@@ -31,7 +31,9 @@ recomendaciones del plan:
    bruma (`haze`) y desvanecido `Scene` llega al horizonte del LOD y se desvanece con él; las
    capas sin bruma conservan su alcance.
 7. LOD apagado en backends GL y en adaptadores de software.
-8. Nada del LOD generado se guarda en disco.
+8. Nada del LOD generado se guarda en disco. Revisada por ADR 0042: la salida de la fuente
+   (bandas y celdas de los nodos, nunca mallas) va a la caché de generación, un archivo aparte que
+   no es parte del mundo.
 9. La rama sale de `feat/fog`.
 10. El vacío bajo el piso del mundo cuenta como sólido.
 
