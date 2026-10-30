@@ -27,11 +27,17 @@ pub const DEFAULT_MAX_FPS: u32 = 144;
 ///   refresh rate (about 143.9 on a 143.88 Hz panel with a limit of 143, 144 or 240) and every
 ///   update presents unless the compositor skips a refresh. Above the refresh rate the limit
 ///   then changes nothing; only 0 (unlimited) runs more updates than the display shows.
-/// - A lower limit keeps its own grid. A due update whose gate is still closed waits a little
-///   for the callback and the pacing restarts there, so more updates present. The cost: with a
-///   renderer the update rate can land up to about 2 % under the limit (measured on a 144 Hz
-///   panel: 119 at 120, 127.5 at 130; 60 and 100 exact), and shown frames can be a few percent
-///   under the limit (111 to 119 at 120).
+/// - On Wayland a lower limit keeps its own grid, so the update rate is the limit, but each
+///   update runs at the compositor's refresh start nearest to its deadline (predicted from the
+///   latest frame callback) and waits for a late callback up to a refresh: the frame then gets
+///   a whole refresh before the compositor takes it, as unlimited or at the refresh rate. The
+///   time between updates is a whole number of refreshes (at 120 on a 144 Hz panel, five of
+///   6.95 ms and one of 13.9 ms), as the display shows them anyway. On the plain grid a frame
+///   presented late in the refresh cycle missed the compositor whenever the GPU was slow (the
+///   780M, which drops to its lowest clock under a limit, showed 82 to 118 frames of 120).
+/// - Elsewhere (X11, Windows, a window nothing presents to) a lower limit keeps its plain grid:
+///   a due update whose gate is still closed waits a little for the redraw and the pacing
+///   restarts there.
 /// - While the window is hidden the runner caps updates at 30 per second (a lower limit stays).
 ///
 /// Pacing is deadline based ([`FramePacer`]): each frame is due one period after the previous

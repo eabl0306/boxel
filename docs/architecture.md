@@ -1360,6 +1360,11 @@ presenta como mucho una vez por refresco del monitor.
   Solo si los redraws de verdad esperan al compositor (2 callbacks seguidos) y los callbacks
   llegan a la frecuencia que dice winit: una ventana sin render sigue con la grilla del límite. `FramePacingInfo` dice en
   cada update cómo se marcó el ritmo y el overlay F3 muestra `paced by the display`.
+- Con un límite más bajo en esas mismas condiciones (revisión de ADR 0017 del 2026-10-29), la
+  grilla del límite sigue mandando, pero cada update arranca en el comienzo de refresco más
+  cercano a su deadline, calculado desde el último frame callback, y una compuerta cerrada se
+  espera como al seguir al monitor. Así el frame tiene un refresco entero antes de que lo tome el
+  compositor. Con la grilla sola, la 780M mostraba 82 a 118 frames con tope 120; ahora 119 a 120.
 - La espera no es solo dormir (ADR 0023): si la app tiene sistemas en `Idle` y la update pidió
   pasos (`IdleWanted`), el runner corre pasos de 0.5 ms como máximo en las iteraciones de la
   espera, hasta 1 ms antes del deadline (o 0.7 ms antes de su propio despertar). La iteración de

@@ -1,7 +1,7 @@
 # ADR 0017: con el límite en la frecuencia del monitor, el ritmo lo marca el monitor
 
-- Estado: aceptado, con la revisión del 2026-10-07 (issue #2, ver "Revisión") y los pasos entre
-  frames de ADR 0023
+- Estado: aceptado, con la revisión del 2026-10-07 (issue #2, ver "Revisión"), los pasos entre
+  frames de ADR 0023 y los límites debajo del monitor (revisión del 2026-10-29)
 - Fecha: 2026-10-07
 - Revisa: ADR 0013 (la espera a la compuerta) y el punto 5 del contrato del runner (ADR 0008)
 
@@ -184,3 +184,41 @@ test sobre `RunnerCore`.
   Solo pasa con callbacks que llegan más de 1 ms antes de tiempo. Un test con un bucle de eventos
   simulado da las mismas updates, esperas, decisiones de enganche y muestras de cadencia con y
   sin pasos.
+
+## Revisión: límites debajo del monitor (2026-10-29)
+
+El juego en la 780M, con tope 120 en el panel de 143.88 Hz, mostraba unos 99 frames por segundo
+con 118 updates. Medido con `stress` (radio 2, LOD far) en las dos GPUs:
+
+- La compuerta deja un solo frame en camino al compositor. Con la grilla del límite, cada update
+  cae en cualquier punto del ciclo del refresco. Si cae tarde y la GPU no termina antes de que el
+  compositor arme su frame, el frame sale un refresco después, el callback llega tarde, la
+  update siguiente espera 2 ms, se rinde y corre sin presentar.
+- La 780M con tope baja a su reloj mínimo (800 MHz, contra 2400 sin tope), así que tarda más por
+  frame y pierde muchos: 82 a 118 mostrados con 120, 88 a 120 con 130. La RTX pierde menos (111 a
+  114 con 120). Sin tope o con 144 la update arranca justo en el callback y el frame tiene un
+  refresco entero: por eso ahí se muestran 144.
+- Con vsync pasa lo mismo, o peor (86 a 89 con 120 en la 780M).
+
+Decisión: en Wayland, cuando las updates podrían seguir al monitor pero el límite está debajo
+del 99 %, la grilla del límite sigue mandando (la cantidad de updates es la del límite) y cada
+update arranca en el comienzo de refresco más cercano a su deadline. Ese comienzo sale del
+último frame callback más un número entero de refrescos, desde medio refresco antes del deadline.
+Una compuerta cerrada se espera como al seguir al monitor (hasta un refresco y un cuarto). El
+tiempo entre updates pasa a ser un número entero de refrescos (con 120 en 144 Hz, cinco de
+6.95 ms y uno de 13.9 ms), que es lo que la pantalla muestra de todos modos.
+
+Medido, antes y después, en corridas intercaladas:
+
+| Caso | Antes (mostrados) | Después (mostrados) |
+|---|---:|---:|
+| 780M, 120 | 82 a 118 | 119 a 120 |
+| 780M, 130 | 91 a 120 | 129 a 130 |
+| 780M, 120, vsync | 86 a 89 | 97 a 120 |
+| RTX, 120 | 111 a 114 | 117 a 120 |
+| RTX, 130 | 114 a 116 | 127 a 130 |
+
+Sin tope, con 143 y 144, y con 60 y 72 no cambia nada. Lo que queda sin resolver: con radio 16
+la 780M a veces tarda dos refrescos por frame (callbacks cada 13.9 ms), y entonces cualquier
+límite muestra unos 72, antes y después. Sin tope muestra unos 125 porque la GPU sube el reloj.
+Arreglarlo pide dejar dos frames en camino, o que la GPU no baje de estado, y queda pendiente.

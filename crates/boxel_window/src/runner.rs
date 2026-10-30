@@ -193,6 +193,11 @@ impl Default for RunnerSettings {
 ///   is one long frame instead of an update that is never shown, a limit above the refresh
 ///   rate no longer runs updates that cannot be shown, and each frame gets the most time
 ///   before the compositor's deadline.
+/// - Refresh alignment (ADR 0017, revision of 2026-10-29): where updates could follow the
+///   display but [`FrameLimit`] is below 99 % of the refresh rate, the limit keeps its grid
+///   (its rate) and each update runs at the compositor refresh start nearest to its deadline,
+///   predicted from the latest frame callback, so every frame gets a whole refresh before the
+///   compositor takes it. A closed gate is waited for as when following the display.
 /// - Idle steps (ADR 0023): in `Continuous` mode, when the app has `Idle` systems and an update
 ///   ends with time to wait, the runner opens an idle slot that ends `IDLE_MARGIN` before the
 ///   earlier of the deadline's spin margin and the wait's own wake-up (a refresh plus a quarter
@@ -579,6 +584,25 @@ impl RunnerCore {
     /// callbacks come at that rate and the [`FrameLimit`] is at or above 99 % of it. `None`
     /// otherwise (the limit's grid).
     fn display_period(&self, world: &World) -> Option<Duration> {
+        self.limit_at_refresh(world)?
+            .then(|| self.refresh_period())
+            .flatten()
+    }
+
+    /// The refresh period when a [`FrameLimit`] below 99 % of the refresh rate aligns its
+    /// updates to the compositor's refresh cycle (see [`RunnerCore::plan`]): the same
+    /// conditions as [`RunnerCore::display_period`] but the limit, which is below it. `None`
+    /// otherwise (unlimited, the display lock, or the plain grid).
+    fn aligned_refresh(&self, world: &World) -> Option<Duration> {
+        (!self.limit_at_refresh(world)?)
+            .then(|| self.refresh_period())
+            .flatten()
+    }
+
+    /// Whether the [`FrameLimit`] is at or above 99 % of the refresh rate, where the gate
+    /// follows the compositor's frame callbacks at the reported rate and the window is visible
+    /// (`None`: it does not, the refresh rate is unknown, or no limit).
+    fn limit_at_refresh(&self, world: &World) -> Option<bool> {
         if self.occluded
             || !self.callback_gate
             || self.quick_gates >= QUICK_GATES_MAX
@@ -589,11 +613,7 @@ impl RunnerCore {
         let limit = u64::from(world.get_resource::<FrameLimit>()?.max_fps);
         let refresh = u64::from(self.refresh_millihertz?);
         // fps * 1000 is millihertz; compare per mille.
-        if limit > 0 && limit * 1_000_000 >= refresh * DISPLAY_MATCH_PER_MILLE {
-            self.refresh_period()
-        } else {
-            None
-        }
+        (limit > 0).then(|| limit * 1_000_000 >= refresh * DISPLAY_MATCH_PER_MILLE)
     }
 
     /// The reported refresh period (`None`: unknown).
@@ -645,6 +665,19 @@ impl RunnerCore {
     /// about a third fewer refreshes skipped than a regular grid at the refresh period), at the
     /// cost of frame times that follow the callbacks' jitter (0.25 ms standard deviation).
     ///
+    /// A lower limit where updates could follow the display (Wayland, the refresh rate known and
+    /// matching the callbacks; [`RunnerCore::aligned_refresh`]) keeps its grid but aligns each
+    /// update to the compositor's refresh cycle: it runs at the refresh start nearest to its
+    /// deadline, predicted from the latest frame callback ([`aligned_start`], from half a
+    /// refresh before the deadline on), and a closed gate is waited for as when following the
+    /// display. The renderer then presents right after the compositor's refresh, as it does
+    /// unlimited or at the refresh rate, so the GPU gets a whole refresh to finish the frame.
+    /// On the limit's own grid the update falls anywhere in the cycle, and a frame presented
+    /// late in it misses the compositor whenever the GPU takes longer than what is left (the
+    /// 780M at its lowest clock with a limit: 82 to 118 frames shown of 120). The rate is the
+    /// limit's; the time between updates is a whole number of refreshes (at 120 on a 144 Hz
+    /// panel, five of 6.95 ms and one of 13.9 ms), which is what the display shows anyway.
+    ///
     /// No wait while unlimited, occluded, or when no redraw is pending (no renderer, or X11,
     /// where the redraw arrives at once).
     fn plan(&self, world: &World, now: Instant) -> (FrameWait, Option<Instant>) {
@@ -666,6 +699,20 @@ impl RunnerCore {
                     Some(earliest) if now < earliest => (FrameWait::Sleep { wake: earliest }, None),
                     _ => (FrameWait::Ready, None),
                 };
+            }
+            return (self.pacer.wait(now, Some(period)), None);
+        }
+        if let Some(refresh) = self.aligned_refresh(world) {
+            if self.gate_closed(world) {
+                return hold(display_window(due, refresh, self.redraw_pending_since).1);
+            }
+            if self.gate_was_callback
+                && self.gate_fresh
+                && frame_ready(world)
+                && let Some(callback) = self.gate_opened_at
+            {
+                let start = aligned_start(due, refresh, callback);
+                return (wait_for(now, start, self.pacer.spin_margin()), None);
             }
             return (self.pacer.wait(now, Some(period)), None);
         }
@@ -967,6 +1014,7 @@ impl RunnerCore {
         }
         let period = self.frame_period(world);
         let display = self.display_period(world).is_some();
+        let aligned = self.aligned_refresh(world);
         let due = self.pacer.next_frame(period);
         let fresh = std::mem::take(&mut self.gate_fresh);
         self.publish_pacing(world, now, display);
@@ -974,8 +1022,14 @@ impl RunnerCore {
         // Phase lock (see `plan`): the grid restarts at the frame callback that opened this
         // update's gate since the previous update. Following the display, a callback inside the
         // display window; else one that came after the deadline, within the wait window (this
-        // update waited for it).
-        if let (Some(due), Some(period), Some(opened)) = (due, period, self.gate_opened_at)
+        // update waited for it). Aligned to the refresh cycle, no callback moves the grid: an
+        // update may start up to half a refresh before its deadline and the grid stays on the
+        // deadline (`start_frame` keeps it for a later start), so the rate is the limit's.
+        if let (Some(refresh), Some(due)) = (aligned, due) {
+            if now < due && due - now <= refresh / 2 {
+                self.pacer.reanchor(due);
+            }
+        } else if let (Some(due), Some(period), Some(opened)) = (due, period, self.gate_opened_at)
             && fresh
             && frame_ready(world)
         {
@@ -1154,6 +1208,38 @@ fn display_window(
         due.checked_sub(period / 2),
         from.checked_add(period + gate_window(period)),
     )
+}
+
+/// With a limit aligned to the refresh cycle: when the update due at `due` starts, given the
+/// latest frame callback (`callback`). The compositor starts a refresh every `refresh` from that
+/// callback on, and the update runs at the first of those starts from half a refresh before
+/// its deadline on: the one nearest to the deadline, or `callback` itself if it came later.
+fn aligned_start(due: Instant, refresh: Duration, callback: Instant) -> Instant {
+    let Some(earliest) = due.checked_sub(refresh / 2) else {
+        return callback;
+    };
+    if callback >= earliest || refresh.is_zero() {
+        return callback;
+    }
+    let behind = (earliest - callback).as_nanos();
+    let step = refresh.as_nanos();
+    let refreshes = u32::try_from(behind.div_ceil(step)).unwrap_or(u32::MAX);
+    refresh
+        .checked_mul(refreshes)
+        .and_then(|ahead| callback.checked_add(ahead))
+        .unwrap_or(due)
+}
+
+/// What to do at `now` before an update that starts at `at`: sleep for all but `spin_margin`,
+/// then spin (as [`FramePacer::wait`] does for a deadline).
+fn wait_for(now: Instant, at: Instant, spin_margin: Duration) -> FrameWait {
+    if at <= now {
+        return FrameWait::Ready;
+    }
+    match at.checked_sub(spin_margin) {
+        Some(wake) if wake > now => FrameWait::Sleep { wake },
+        _ => FrameWait::Spin { until: at },
+    }
 }
 
 /// The last `CADENCE_SAMPLES` intervals between frame callbacks (see `RunnerCore::gate_opened`).
@@ -2267,7 +2353,6 @@ mod tests {
     #[test]
     fn a_limit_changed_while_waiting_for_the_gate_paces_at_once() {
         let us = Duration::from_micros;
-        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
         let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
         let (mut app, mut core, t0) = display(144);
         present(&mut app, &mut core, t0);
@@ -2277,16 +2362,17 @@ mod tests {
             FrameWait::Sleep { .. }
         ));
         assert!(core.gate_hold.is_some());
-        // 60 fps: the limit's grid from the same anchor, and the old hold is gone.
+        // 60 fps: the limit's grid from the same anchor, aligned to the refresh cycle, so the
+        // closed gate is held from its own deadline for up to a refresh and a quarter.
         app.insert_resource(FrameLimit::new(60));
         let due60 = t0 + FrameLimit::new(60).period().expect("limited");
         assert_eq!(
             core.pace(app.world(), due + us(100)),
             FrameWait::Sleep {
-                wake: due60 - margin
+                wake: due60 + panel + gate_window(panel)
             }
         );
-        assert_eq!(core.gate_hold, None);
+        assert_eq!(core.gate_hold, Some(due60));
         // Its gate wait counts from its own deadline.
         assert!(matches!(
             core.pace(app.world(), due60),
@@ -2415,6 +2501,151 @@ mod tests {
         assert!(!app.world().resource::<FramePacingInfo>().display_locked);
         assert_eq!(core.display_period(app.world()), None);
         assert_eq!(now, t0 + Duration::from_millis(5) + period * 20);
+    }
+
+    #[test]
+    fn aligned_start_is_the_refresh_nearest_to_the_deadline() {
+        let refresh = Duration::from_micros(6950);
+        let t = Instant::now();
+        let due = t + Duration::from_millis(20);
+        // A callback three refreshes back: the refresh start within half a refresh of the
+        // deadline (20.85 ms, not 13.9 ms).
+        assert_eq!(aligned_start(due, refresh, t), t + refresh * 3);
+        // Exactly half a refresh before the deadline counts.
+        let back = due - refresh / 2 - refresh;
+        assert_eq!(aligned_start(due, refresh, back), due - refresh / 2);
+        // A callback from half a refresh before the deadline on: run at it.
+        for callback in [due - refresh / 3, due, due + Duration::from_millis(5)] {
+            assert_eq!(aligned_start(due, refresh, callback), callback);
+        }
+    }
+
+    #[test]
+    fn a_limit_under_the_refresh_rate_starts_at_the_compositor_refresh() {
+        let panel = Duration::from_nanos(1_000_000_000_000 / u64::from(PANEL_MHZ));
+        let period = FrameLimit::new(120).period().expect("limited");
+        let margin = FramePacer::DEFAULT_SPIN_MARGIN;
+        let (mut app, mut core, t) = display(144);
+        app.insert_resource(FrameLimit::new(120));
+        assert_eq!(core.aligned_refresh(app.world()), Some(panel));
+        assert_eq!(core.display_period(app.world()), None);
+        for (max_fps, aligned) in [(60, true), (142, true), (143, false), (0, false)] {
+            app.insert_resource(FrameLimit::new(max_fps));
+            assert_eq!(
+                core.aligned_refresh(app.world()).is_some(),
+                aligned,
+                "{max_fps}"
+            );
+        }
+        app.insert_resource(FrameLimit::new(120));
+        // The last present of `display` started one refresh before its callback at `t`, so the
+        // next update is due 8.33 ms after that start: 1.39 ms after the callback, which is the
+        // nearest refresh start. It runs at the callback, and the grid stays on the deadline.
+        let due = t - panel + period;
+        assert_eq!(core.pace(app.world(), t), FrameWait::Ready);
+        present(&mut app, &mut core, t);
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(due + period));
+        // Its callback comes a refresh later, 2.78 ms before the next deadline: still the
+        // nearest refresh start.
+        let callback = t + panel;
+        core.gate_opened(app.world_mut(), callback);
+        assert_eq!(core.pace(app.world(), callback), FrameWait::Ready);
+        present(&mut app, &mut core, callback);
+        let due = due + period;
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(due + period));
+        // Now the deadline is 4.17 ms past the callback: the update waits for the refresh after
+        // it (2.78 ms past the deadline), sleeping, then spinning the last fraction.
+        let callback = callback + panel;
+        core.gate_opened(app.world_mut(), callback);
+        let start = callback + panel;
+        assert_eq!(
+            core.pace(app.world(), callback),
+            FrameWait::Sleep {
+                wake: start - margin
+            }
+        );
+        assert_eq!(
+            core.pace(app.world(), start - margin),
+            FrameWait::Spin { until: start }
+        );
+        assert_eq!(core.pace(app.world(), start), FrameWait::Ready);
+        present(&mut app, &mut core, start);
+        let due = due + period;
+        assert_eq!(core.pacer.next_frame(Some(period)), Some(due + period));
+        // A closed gate is waited for up to a refresh and a quarter past the deadline (the GPU
+        // finished the frame after the compositor's refresh: the callback is one refresh late).
+        let due = due + period;
+        let latest = due + panel + gate_window(panel);
+        assert_eq!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { wake: latest }
+        );
+        let late = start + panel * 2;
+        core.gate_opened(app.world_mut(), late);
+        assert_eq!(core.pace(app.world(), late), FrameWait::Ready);
+        core.begin_update(app.world_mut(), late);
+        let info = *app.world().resource::<FramePacingInfo>();
+        assert_eq!((info.gate_wait, info.gate_missed), (late - due, false));
+        assert!(!info.display_locked);
+        // Without a callback at all (hidden), the update gives up at the end of that wait.
+        app.world_mut().resource_mut::<WindowState>().frame_ready = false;
+        assert!(core.end_update(app.world(), late).request_redraw);
+        let due = due + period;
+        let latest = due + panel + gate_window(panel);
+        assert!(matches!(
+            core.pace(app.world(), due),
+            FrameWait::Sleep { .. }
+        ));
+        assert_eq!(core.pace(app.world(), latest), FrameWait::Ready);
+    }
+
+    #[test]
+    fn aligned_updates_present_every_frame_at_the_limit_rate() {
+        // A compositor whose callbacks come at the first refresh after the GPU finished: 4 ms
+        // after the present (the 780M at its lowest clock, ADR 0017's revision of 2026-10-29).
+        // An update started at a refresh makes the next one; one started late in the cycle
+        // does not (on the plain grid, 48 of 240 updates at 120 ran without presenting).
+        let refresh = Duration::from_micros(6950);
+        let gpu = Duration::from_millis(4);
+        for max_fps in [120, 130, 100, 72, 60] {
+            let (mut app, mut core, t0) = display(144);
+            app.insert_resource(FrameLimit::new(max_fps));
+            let base = t0;
+            let callback = move |requested: Instant| {
+                let ready = (requested + gpu - base).as_nanos();
+                let refreshes = ready.div_ceil(refresh.as_nanos());
+                base + refresh * u32::try_from(refreshes).expect("short run")
+            };
+            let updates = 2 * max_fps as usize;
+            let (trace, _) = simulate(
+                &mut app,
+                &mut core,
+                t0,
+                updates,
+                IdleSystems::Without,
+                callback,
+            );
+            let missed = trace.pacing.iter().filter(|p| p.1).count();
+            assert_eq!(missed, 0, "max_fps={max_fps}");
+            // The rate is the limit's: the last start within a refresh of its deadline.
+            let period = FrameLimit::new(max_fps).period().expect("limited");
+            let span = trace.starts[updates - 1] - trace.starts[0];
+            let nominal = period * (updates as u32 - 1);
+            assert!(
+                span.abs_diff(nominal) <= refresh,
+                "max_fps={max_fps}: {span:?}"
+            );
+            // Every update starts at a frame callback or at a refresh start predicted from one
+            // (with winit's 144.002 Hz, a few microseconds off the 6.95 ms of the callbacks).
+            for start in &trace.starts {
+                let phase = start.as_nanos() % refresh.as_nanos();
+                let off = phase.min(refresh.as_nanos() - phase);
+                assert!(
+                    off < 50_000,
+                    "max_fps={max_fps}: {start:?} is {off} ns off a refresh"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2938,8 +3169,9 @@ mod tests {
         );
         assert_eq!(with, without);
 
-        // A limit under the refresh rate keeps its grid: callbacks may come during a step and
-        // are stamped late, but the updates and their gate waits are the same.
+        // A limit under the refresh rate, aligned to the refresh cycle: callbacks may come
+        // during a step and are stamped late, but the updates and their gate waits are the
+        // same.
         let run = |idle: IdleSystems| {
             let (mut app, mut core, t0) = display(144);
             app.insert_resource(FrameLimit::new(120));
