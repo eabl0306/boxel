@@ -1,14 +1,20 @@
 //! Fluid corner heights (ADR 0021): flowing and sloped water cells against the brute-force rule
-//! (`reference_fluid_heights`), crack-free shared corners across chunk borders, and a calm lake
-//! that costs the quads it did before.
+//! (`reference_fluid_heights`), crack-free shared corners across chunk borders, a calm lake
+//! that costs the quads it did before, and fluid surfaces in a registry of every `u16` state
+//! (ADR 0043).
 mod common;
 
+use boxel_mesh::lod::LodMaterials;
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT,
-    LightQuantization, MaterialTable, MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk,
-    TRANSLUCENT_BUCKET, layout, reference_fluid_heights,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, LightQuantization, MaterialTable,
+    MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, layout,
+    reference_fluid_heights,
 };
-use boxel_voxel::{BlockRegistry, BlockState, ChunkData, Face, NEIGHBOR_OFFSETS};
+use boxel_voxel::{
+    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, ChunkData, FLUID_LEVEL, Face,
+    FaceTextures, MAX_STATES, NEIGHBOR_OFFSETS, Property, RegistryError, RenderShape, TextureImage,
+    TextureSpec, testing,
+};
 use common::{LIGHT_FILLS, Repr, chunk_repr, dense_from, neighbor_slot, random_light, verify_mesh};
 use std::collections::BTreeMap;
 
@@ -297,7 +303,8 @@ fn a_calm_lake_stays_one_greedy_quad_and_a_waterfall_slopes_it() {
     let (padded, mesh) = mesh_of(&lake(&|x, y, z| {
         ((x, y, z) == (10, 4, 10)).then_some(flowing)
     }));
-    assert_eq!(padded.get(10, 4, 10), source.0 | FLUID_SURFACE_BIT);
+    assert_eq!(padded.get(10, 4, 10), source.0);
+    assert!(padded.is_surface(PaddedChunk::index(10, 4, 10)));
     assert_eq!(padded.fluid_levels.len(), 1);
     assert_eq!(mesh.bucket(TRANSLUCENT_BUCKET).len(), 1, "still one quad");
     // A waterfall: a source at y 6 over falling water at y 5 over the lake. The lake cell under
@@ -402,4 +409,239 @@ fn fluid_heights_round_trip_through_the_quad() {
         PackedQuad::new([0; 3], 1, 1, Face::PosY, 0).fluid_heights(),
         None
     );
+}
+
+/// The test blocks, then opaque fillers up to `test:twin`, a translucent cube whose id is the
+/// source of `test:fluid` with bit 15 set (how a surface cell of that fluid was marked before ADR
+/// 0043), then more fillers and `test:deep`, a second translucent fluid whose 16 levels end on
+/// the last id (`u16::MAX`, falling).
+struct FullRegistry {
+    registry: BlockRegistry,
+    stone: BlockState,
+    water: BlockState,
+    twin: BlockState,
+    /// The last filler state, the opaque id right under `deep`.
+    high: BlockState,
+    deep: [BlockState; 16],
+}
+
+fn full_registry() -> FullRegistry {
+    let start = testing::registry().len();
+    let mut b = testing::builder();
+    let water = b.by_name("test:fluid").expect("test:fluid");
+    let stone = b.by_name("test:solid").expect("test:solid");
+    let mut texture = |name: &str, color| {
+        b.add_texture(TextureSpec {
+            name: name.to_string(),
+            image: TextureImage::solid(testing::TEXTURE_SIZE, color),
+        })
+        .expect(name)
+    };
+    let filler = texture("test:filler", [90, 70, 50, 255]);
+    let glass = texture("test:twin", [220, 200, 240, 96]);
+    let (still, flow) = (
+        texture("test:deep", [20, 60, 160, 170]),
+        texture("test:deep_flow", [30, 70, 170, 170]),
+    );
+    let cube = |name: &str, shape, t| BlockDef {
+        name: name.to_string(),
+        shape,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 15,
+        textures: FaceTextures::all(t),
+    };
+    let counted = |n: usize| vec![Property::new("n", (0..n).map(|v| v.to_string()))];
+    let twin_id = usize::from(water.0 | 0x8000);
+    b.add_block_with_states(
+        cube("test:filler_a", RenderShape::Opaque, filler),
+        counted(twin_id - start),
+        |_, _| {},
+    )
+    .expect("test:filler_a");
+    let twin = b
+        .add_block(BlockDef {
+            light_opacity: 0,
+            ..cube("test:twin", RenderShape::Translucent, glass)
+        })
+        .expect("test:twin");
+    assert_eq!(usize::from(twin.0), twin_id);
+    let deep_id = MAX_STATES - 16;
+    let first_b = b
+        .add_block_with_states(
+            cube("test:filler_b", RenderShape::Opaque, filler),
+            counted(deep_id - twin_id - 1),
+            |_, _| {},
+        )
+        .expect("test:filler_b");
+    let high = BlockState(deep_id as u16 - 1);
+    assert!(first_b < high);
+    let fluid = BlockDef {
+        model: BlockModel::Fluid,
+        collision: BlockCollision::None,
+        light_opacity: 1,
+        textures: FaceTextures {
+            top: still,
+            bottom: still,
+            side: flow,
+        },
+        ..cube("test:deep", RenderShape::Translucent, still)
+    };
+    let source = b
+        .add_block_with_states(fluid, vec![Property::int(FLUID_LEVEL, 0..=15)], |_, _| {})
+        .expect("test:deep");
+    assert_eq!(usize::from(source.0), deep_id);
+    let block = b.block_by_name("test:deep").expect("test:deep");
+    b.add_fluid(block, testing::FLUID).expect("test:deep");
+    assert_eq!(
+        b.add_block(cube("test:more", RenderShape::Opaque, filler)),
+        Err(RegistryError::Full("block states"))
+    );
+    let registry = b.build();
+    assert_eq!(registry.len(), MAX_STATES);
+    FullRegistry {
+        registry,
+        stone,
+        water,
+        twin,
+        high,
+        deep: std::array::from_fn(|l| BlockState(source.0 + l as u16)),
+    }
+}
+
+/// A random world of pools of `test:deep` (every level, the last id among them) on a stone floor,
+/// with `test:twin`, the highest filler, `test:fluid` sources and air among it and a sparse
+/// cover, like [`world`].
+fn full_world(r: &FullRegistry, seed: u64) -> impl Fn(i64, i64, i64) -> BlockState + '_ {
+    move |x, y, z| {
+        let floor = 2 + (hash(seed, x, 0, z) % 3) as i64;
+        let roll = hash(seed ^ 1, x, y, z) % 100;
+        let level = || {
+            let l = hash(seed ^ 2, x, y, z) % 10;
+            r.deep[match l {
+                0..5 => 0,
+                5..8 => (hash(seed ^ 3, x, y, z) % 7 + 1) as usize,
+                8 => 15,
+                _ => (hash(seed ^ 4, x, y, z) % 8 + 8) as usize,
+            }]
+        };
+        if y < floor {
+            r.stone
+        } else if y < floor + 3 {
+            match roll {
+                0..62 => level(),
+                62..74 => BlockState::AIR,
+                74..82 => r.twin,
+                82..88 => r.high,
+                88..94 => r.water,
+                _ => r.stone,
+            }
+        } else if y < floor + 5 {
+            match roll {
+                0..10 => r.twin,
+                10..20 => level(),
+                _ => BlockState::AIR,
+            }
+        } else {
+            BlockState::AIR
+        }
+    }
+}
+
+/// With every `u16` id a state, the fluids still mark their surface cells (before ADR 0043 a
+/// registry past `2^15` kept every fluid top full height): the corner heights follow the
+/// brute-force rule, the meshes and their light match the oracles, a surface cell next to the
+/// id that once marked it draws the faces between them, and no other id reads as a surface.
+#[test]
+fn fluid_surfaces_hold_with_every_u16_state() {
+    let full = full_registry();
+    let table = MaterialTable::from_registry(&full.registry);
+    let water = full.water.0;
+    let (mut sloped, mut beside_twin) = (0, 0);
+    for seed in 0..3u64 {
+        let f = full_world(&full, seed);
+        // Near the origin, across it and far from it (ADR 0014; the mesher is chunk-local).
+        for c in [[0, 0, 0], [-1, 0, 2], [1 << 35, 0, -(1 << 35)]] {
+            let (center, neighbors) = neighborhood(&f, c);
+            let input = input(&center, &neighbors);
+            let mut mesher = Mesher::new();
+            let mut padded = PaddedChunk::new();
+            mesher.gather(&input, &table, &mut padded);
+            let mesh = mesher.mesh_chunk(&input, &table, OPTIONS);
+            verify_mesh(&padded, &table, &mesh);
+            let want = reference_fluid_heights(&padded, &table);
+            assert!(
+                want.len() > 100,
+                "seed {seed} chunk {c:?}: few surface cells"
+            );
+            assert_eq!(drawn_heights(&mesh), want, "seed {seed} chunk {c:?}");
+            sloped += want.values().filter(|h| **h != [FLUID_FLAT; 4]).count();
+            for x in -1..33 {
+                for y in -1..33 {
+                    for z in -1..33 {
+                        let i = PaddedChunk::index(x, y, z);
+                        let inner = [x, y, z].iter().all(|c| (0..32).contains(c));
+                        let m = padded.voxels[i];
+                        if padded.is_surface(i) {
+                            assert!(inner, "{x} {y} {z}: a mark in the padding");
+                            assert_eq!(table.model(m), BlockModel::Fluid, "{x} {y} {z}");
+                        }
+                    }
+                }
+            }
+            // The faces between a surface cell of `test:fluid` and `test:twin` beside it.
+            let faces: std::collections::BTreeSet<([u32; 3], Face)> =
+                mesh.quads.iter().flat_map(|q| q.unit_faces()).collect();
+            for (x, y, z) in
+                (0..31).flat_map(|x| (0..32).flat_map(move |y| (0..32).map(move |z| (x, y, z))))
+            {
+                let i = PaddedChunk::index(x, y, z);
+                let next = PaddedChunk::index(x + 1, y, z);
+                if padded.voxels[i] == water
+                    && padded.is_surface(i)
+                    && padded.voxels[next] == full.twin.0
+                {
+                    let p = [x as u32, y as u32, z as u32];
+                    assert!(faces.contains(&(p, Face::PosX)), "{p:?}: the water's side");
+                    let q = [p[0] + 1, p[1], p[2]];
+                    assert!(faces.contains(&(q, Face::NegX)), "{q:?}: the twin's side");
+                    beside_twin += 1;
+                }
+            }
+            // Every key path: the material alone and with AO (uniform light), and the key table.
+            for policy in [AoPolicy::Off, AoPolicy::Baked] {
+                let unlit = mesher.mesh_chunk(&input, &table, MeshOptions::with_ao(policy));
+                verify_mesh(&padded, &table, &unlit);
+                common::verify_shading(&padded, &table, None, policy, &unlit);
+                assert_eq!(drawn_heights(&unlit), want, "{policy:?} changes no height");
+            }
+            for (k, fill) in LIGHT_FILLS.into_iter().enumerate() {
+                let light = random_light(fill, seed * 8 + k as u64);
+                let lit = mesher.mesh_chunk(
+                    &MeshInput {
+                        light: light.as_ref(),
+                        ..input
+                    },
+                    &table,
+                    OPTIONS,
+                );
+                common::verify_shading(
+                    &padded,
+                    &table,
+                    light.as_ref(),
+                    AoPolicy::BakedLitOnly,
+                    &lit,
+                );
+                assert_eq!(drawn_heights(&lit), want, "the light changes no height");
+            }
+        }
+    }
+    assert!(sloped > 300, "the scenes slope too little ({sloped} cells)");
+    assert!(beside_twin > 0, "no water surface beside test:twin");
+    // The far LOD's materials see every state too: the last one is the deep fluid, see-through.
+    let lod = LodMaterials::from_registry(&full.registry);
+    let deep = lod.canonical(BlockState(u16::MAX));
+    assert_eq!(deep, lod.canonical(full.deep[0]));
+    assert!(lod.see_through(deep));
 }

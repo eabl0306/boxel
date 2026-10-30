@@ -20,15 +20,10 @@ pub enum VoxelClass {
     Special,
 }
 
-/// Bit of a voxel id that marks a fluid's surface cell (`BlockModel::Fluid` under neither its own
-/// fluid nor an opaque block): its top sits lower (`layout::SHAPE_FLUID_SURFACE`). Set by the
-/// mesher's gather on the inner voxels when every material id is below it; culling ignores it
-/// ([`PaddedChunk::cull_mask`]), merging does not.
-pub const FLUID_SURFACE_BIT: u16 = 0x8000;
-
 /// The mesher's padded input: material ids for x, y, z in `-1..=32` plus the two column masks
-/// binary-greedy-meshing needs and a third one of the non-cube blocks. Layout = bgm `pad_linearize`: index `(z+1) + (x+1)*34 + (y+1)*34^2`;
-/// mask row `(x+1) + (y+1)*34`, bit `z+1`.
+/// binary-greedy-meshing needs, a third one of the non-cube blocks and a fourth one of the fluid
+/// surface cells. Layout = bgm `pad_linearize`: index `(z+1) + (x+1)*34 + (y+1)*34^2`;
+/// mask row `(x+1) + (y+1)*34`, bit `z+1` (so the row of index `i` is `i / 34`, its bit `i % 34`).
 #[derive(Clone, Debug)]
 pub struct PaddedChunk {
     /// Material ids (`0` = empty).
@@ -39,10 +34,12 @@ pub struct PaddedChunk {
     pub transparent: Box<[u64]>,
     /// Special (non-cube) column masks.
     pub special: Box<[u64]>,
-    /// The bits of a voxel id that tell two transparent voxels apart for face culling: all of
-    /// them, or all but [`FLUID_SURFACE_BIT`] once the surface cells are marked (a surface cell
-    /// and the rest of its fluid hide the faces between them).
-    pub cull_mask: u16,
+    /// Fluid surface cell column masks: a fluid (`BlockModel::Fluid`) of the inner 32^3 under
+    /// neither its own fluid nor an opaque block, whose top sits lower
+    /// (`layout::SHAPE_FLUID_SURFACE`). Set by the mesher's gather (ADR 0043; before, the top bit
+    /// of the voxel id). Culling ignores it (a surface cell and the rest of its fluid hide the
+    /// faces between them), merging does not.
+    pub surface: Box<[u64]>,
     /// The fluid cells whose level is not 0 (flowing or falling water, ADR 0021): padded index
     /// and level. Every level of a fluid has the material of its source in `voxels` (so they
     /// cull and merge as one fluid); the mesher reads the levels here for the corner heights.
@@ -79,7 +76,7 @@ impl PaddedChunk {
             opaque: vec![0; PADDED_AREA].into_boxed_slice(),
             transparent: vec![0; PADDED_AREA].into_boxed_slice(),
             special: vec![0; PADDED_AREA].into_boxed_slice(),
-            cull_mask: u16::MAX,
+            surface: vec![0; PADDED_AREA].into_boxed_slice(),
             fluid_levels: Vec::new(),
             waterlogged: Vec::new(),
             lit_emitters: true,
@@ -92,7 +89,7 @@ impl PaddedChunk {
         self.opaque.fill(0);
         self.transparent.fill(0);
         self.special.fill(0);
-        self.cull_mask = u16::MAX;
+        self.surface.fill(0);
         self.fluid_levels.clear();
         self.waterlogged.clear();
         self.lit_emitters = true;
@@ -113,6 +110,7 @@ impl PaddedChunk {
         self.opaque[row] &= !bit;
         self.transparent[row] &= !bit;
         self.special[row] &= !bit;
+        self.surface[row] &= !bit;
         match class {
             VoxelClass::Empty => self.voxels[i] = 0,
             VoxelClass::Opaque => self.opaque[row] |= bit,
@@ -163,5 +161,14 @@ impl PaddedChunk {
     #[inline]
     pub fn get(&self, x: i32, y: i32, z: i32) -> u16 {
         self.voxels[Self::index(x, y, z)]
+    }
+    /// True if padded index `i` is a fluid surface cell ([`PaddedChunk::surface`]).
+    #[inline]
+    pub fn is_surface(&self, i: usize) -> bool {
+        self.surface[i / PADDED] >> (i % PADDED) & 1 != 0
+    }
+    /// True if some cell is a fluid surface cell ([`PaddedChunk::surface`]).
+    pub fn has_surface(&self) -> bool {
+        self.surface.iter().any(|&row| row != 0)
     }
 }

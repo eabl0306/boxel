@@ -345,33 +345,112 @@ fn many_states_come_from_one_function() {
     );
 }
 
+/// A block of `count` states: one property `n` with the values `0..count`.
+fn counted(count: usize) -> Vec<Property> {
+    vec![Property::new("n", (0..count).map(|v| v.to_string()))]
+}
+
+/// Every `u16` id is a state (ADR 0043): a block of `2^16` states does not fit after air, two of
+/// `2^15` minus air's one do, to the last id, and nothing more.
 #[test]
-fn the_registry_stays_below_the_mesher_surface_bit() {
+fn the_registry_fills_every_u16_state() {
+    assert_eq!(MAX_STATES, 1 << 16);
     let mut b = BlockRegistryBuilder::new();
     let t = texture(&mut b);
-    // 8 * 8 * 8 * 8 * 8 = 32768 states: one more than room is left after air.
-    let wide = || {
-        (0..5)
-            .map(|i| Property::int(format!("p{i}"), 0..=7))
-            .collect::<Vec<_>>()
-    };
     assert_eq!(
-        b.add_block_with_states(cube("test:wide", t), wide(), |_, _| {}),
+        b.add_block_with_states(cube("test:wide", t), counted(1 << 16), |_, _| {}),
         Err(RegistryError::Full("block states"))
     );
-    // 2^14 fits, twice does not.
-    let half = || {
-        (0..2)
-            .map(|i| Property::int(format!("p{i}"), 0..=127))
-            .collect::<Vec<_>>()
-    };
-    b.add_block_with_states(cube("test:a", t), half(), |_, _| {})
+    let a = b
+        .add_block_with_states(cube("test:a", t), counted((1 << 15) - 1), |_, _| {})
         .unwrap();
+    assert_eq!(a, BlockState(1));
+    // The last block holds water (a cutout cube does), so the waterlogged flags reach the last
+    // id too.
+    let last = vec![
+        Property::int("p", 0..=127),
+        Property::int("q", 0..=127),
+        Property::boolean(WATERLOGGED),
+    ];
+    let cutout = BlockDef {
+        shape: RenderShape::Cutout,
+        light_opacity: 1,
+        ..cube("test:b", t)
+    };
+    let first_b = b.add_block_with_states(cutout, last, |_, _| {}).unwrap();
+    assert_eq!(first_b, BlockState(1 << 15));
     assert_eq!(
-        b.add_block_with_states(cube("test:b", t), half(), |_, _| {}),
+        b.add_block(cube("test:c", t)),
         Err(RegistryError::Full("block states"))
     );
     let r = b.build();
-    assert_eq!(r.len(), 1 + (1 << 14));
-    assert!(r.len() <= MAX_STATES);
+    assert_eq!(r.len(), MAX_STATES);
+    assert_eq!(r.blocks().len(), 3);
+    let block_b = r.block_by_name("test:b").unwrap();
+    assert_eq!(r.blocks().last(), Some(block_b));
+    let states: Vec<BlockState> = r.states(block_b).collect();
+    assert_eq!(states.len(), 1 << 15);
+    assert_eq!(states.first(), Some(&BlockState(1 << 15)));
+    let top = BlockState(u16::MAX);
+    assert_eq!(states.last(), Some(&top));
+    assert_eq!(r.block(top), Some(block_b));
+    let name = "test:b[p=127,q=127,waterlogged=true]";
+    assert_eq!(r.state_name(top).to_string(), name);
+    assert_eq!(r.parse_state(name), Ok(top));
+    assert!(r.is_waterlogged(top));
+    assert_eq!(r.with_water(top, false), Some(BlockState(u16::MAX - 1)));
+    assert_eq!(r.material(top), u16::MAX);
+    assert_eq!(r.shape(top), RenderShape::Cutout);
+    let block_a = r.block_by_name("test:a").unwrap();
+    assert_eq!(r.states(block_a).last(), Some(BlockState((1 << 15) - 1)));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Blocks of any sizes register while they fit in [`MAX_STATES`], contiguous and in order,
+    /// past `2^15`; the first one that does not fit is refused and leaves the rest as they were.
+    #[test]
+    fn blocks_register_up_to_the_cap(
+        counts in prop::collection::vec(1usize..30_000, 1..6),
+        fill in any::<bool>(),
+    ) {
+        let mut b = BlockRegistryBuilder::new();
+        let t = texture(&mut b);
+        let mut counts = counts;
+        if fill {
+            // End exactly on the last id.
+            let used: usize = counts.iter().sum();
+            if 1 + used < MAX_STATES {
+                counts.push(MAX_STATES - 1 - used);
+            }
+        }
+        let mut next = 1usize;
+        let mut kept = Vec::new();
+        for (i, &count) in counts.iter().enumerate() {
+            let name = format!("test:b{i}");
+            let got = b.add_block_with_states(cube(&name, t), counted(count), |_, _| {});
+            if next + count <= MAX_STATES {
+                prop_assert_eq!(got, Ok(BlockState(next as u16)));
+                kept.push((name, next, count));
+                next += count;
+            } else {
+                prop_assert_eq!(got, Err(RegistryError::Full("block states")));
+            }
+        }
+        let r = b.build();
+        prop_assert_eq!(r.len(), next);
+        prop_assert_eq!(r.blocks().len(), 1 + kept.len());
+        for (name, first, count) in kept {
+            let block = r.block_by_name(&name).unwrap();
+            let states: Vec<BlockState> = r.states(block).collect();
+            prop_assert_eq!(states.len(), count);
+            prop_assert_eq!(usize::from(states[0].0), first);
+            let last = *states.last().unwrap();
+            prop_assert_eq!(usize::from(last.0), first + count - 1);
+            prop_assert_eq!(r.block(last), Some(block));
+            let text = r.state_name(last).to_string();
+            prop_assert_eq!(r.parse_state(&text), Ok(last));
+        }
+    }
 }

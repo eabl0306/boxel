@@ -8,9 +8,9 @@ mod common;
 
 use boxel_light::PaddedLight;
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, FLUID_SURFACE_BIT, MaterialTable,
-    MeshInput, MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
-    fluid_flow, layout, reference_fluid_heights, reference_visible_faces,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_FLAT, MaterialTable, MeshInput,
+    MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, fluid_flow,
+    layout, reference_fluid_heights, reference_visible_faces,
 };
 use boxel_voxel::{
     Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel, CHUNK_SIZE,
@@ -116,7 +116,8 @@ fn a_waterlogged_slab_in_a_lake_is_part_of_the_lake() {
     });
     let i = PaddedChunk::index(10, 4, 10);
     assert_eq!(padded.waterlogged, vec![(i as u32, wet.0)]);
-    assert_eq!(padded.voxels[i], source.0 | FLUID_SURFACE_BIT);
+    assert_eq!(padded.voxels[i], source.0);
+    assert!(padded.is_surface(i));
     assert_eq!(padded.waterlogged_at(i), Some(wet.0));
     // Its water: the top only (the lake hides the rest), level with the lake, inset, the still
     // texture.

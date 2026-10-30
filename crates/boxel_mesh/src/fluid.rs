@@ -36,8 +36,7 @@ use crate::mesher::{class_from_masks, front_nb9, mask_row, padded_pos};
 use crate::packed::layout;
 use crate::shading::PaletteFull;
 use crate::{
-    FLUID_SURFACE_BIT, MaterialTable, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad, PaddedChunk,
-    VoxelClass,
+    MaterialTable, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad, PaddedChunk, VoxelClass,
 };
 use boxel_voxel::{BlockModel, CHUNK_SIZE, Face};
 use std::collections::BTreeMap;
@@ -129,9 +128,9 @@ impl Heights<'_> {
     /// Height of padded cell `(x, y, z)` (y in `0..32`) seen from fluid `fluid`.
     fn of(&self, fluid: u16, x: i32, y: i32, z: i32) -> i32 {
         let i = PaddedChunk::index(x, y, z);
-        let id = self.padded.voxels[i] & !FLUID_SURFACE_BIT;
+        let id = self.padded.voxels[i];
         if id == fluid {
-            let above = self.padded.voxels[i + PADDED_AREA] & !FLUID_SURFACE_BIT;
+            let above = self.padded.voxels[i + PADDED_AREA];
             if above == fluid || class_from_masks(self.padded, x, y + 1, z) == VoxelClass::Opaque {
                 return FULL;
             }
@@ -193,8 +192,8 @@ impl Heights<'_> {
 
 /// Finds the surface cells of `padded` whose top is not flat, takes their faces out of the
 /// greedy culling (so the greedy pass does not draw them; their neighbors still cull against
-/// them) and keeps them in `scratch.cells`. Needs the surface marks (`FLUID_SURFACE_BIT`); a
-/// chunk without marks has no sloped cells.
+/// them) and keeps them in `scratch.cells`. Needs the surface marks (`PaddedChunk::surface`,
+/// which gather sets when the table has a fluid); a table without fluids has no sloped cells.
 pub(crate) fn find_sloped(
     padded: &PaddedChunk,
     materials: &MaterialTable,
@@ -202,7 +201,7 @@ pub(crate) fn find_sloped(
     scratch: &mut FluidScratch,
 ) {
     scratch.cells.clear();
-    if padded.cull_mask == u16::MAX {
+    if !materials.has_fluid() {
         return;
     }
     for &(i, level) in &padded.fluid_levels {
@@ -223,19 +222,19 @@ pub(crate) fn find_sloped(
             continue;
         };
         for x in 0..CHUNK_SIZE {
-            // Inner voxels only (mask bit of padded z is z + 1), minus the surely flat ones.
+            // Inner surface cells only (mask bit of padded z is z + 1), minus the surely flat
+            // ones.
             let row = (x + 1) as usize;
-            let mut bits = (padded.transparent[mask_row(x, y)] & !flat[row]) >> 1;
+            let mut bits = (padded.surface[mask_row(x, y)] & !flat[row]) >> 1;
             bits &= u64::from(u32::MAX);
             while bits != 0 {
                 let z = bits.trailing_zeros() as i32;
                 bits &= bits - 1;
                 let i = PaddedChunk::index(x, y, z);
-                let id = padded.voxels[i];
-                if id & FLUID_SURFACE_BIT == 0 || scratch.levels[i] == WATERLOGGED {
+                if scratch.levels[i] == WATERLOGGED {
                     continue;
                 }
-                let fluid = id & !FLUID_SURFACE_BIT;
+                let fluid = padded.voxels[i];
                 let corners = heights.corners(fluid, [x, y, z]);
                 if corners == [FLAT; 4] {
                     continue;
@@ -257,9 +256,8 @@ pub(crate) fn find_sloped(
         if ![x, y, z].iter().all(|c| (0..CHUNK_SIZE).contains(c)) {
             continue;
         }
-        let id = padded.voxels[i as usize];
-        let fluid = id & !FLUID_SURFACE_BIT;
-        let corners = if id & FLUID_SURFACE_BIT != 0 {
+        let fluid = padded.voxels[i as usize];
+        let corners = if padded.is_surface(i as usize) {
             heights.corners(fluid, [x, y, z])
         } else {
             [16; 4]
@@ -300,13 +298,12 @@ fn flat_cells(
         let row = mask_row(x, y);
         let mut bits = padded.transparent[row];
         let mut surface = 0u64;
+        any_surface |= padded.surface[row] != 0;
         while bits != 0 {
             let bit = bits.trailing_zeros();
             bits &= bits - 1;
             let i = PaddedChunk::index(x, y, bit as i32 - 1);
-            let id = padded.voxels[i];
-            let m = id & !FLUID_SURFACE_BIT;
-            any_surface |= id & FLUID_SURFACE_BIT != 0;
+            let m = padded.voxels[i];
             if materials.model(m) != BlockModel::Fluid {
                 continue;
             }
@@ -315,7 +312,7 @@ fn flat_cells(
                 Some(f) if f != m => return any_layer(padded, y).then_some([0; PADDED]),
                 Some(_) => {}
             }
-            let above = padded.voxels[i + PADDED_AREA] & !FLUID_SURFACE_BIT;
+            let above = padded.voxels[i + PADDED_AREA];
             let full = above == m || padded.opaque[mask_row(x, y + 1)] >> bit & 1 != 0;
             let source = matches!(levels[i], 0 | 8..);
             if !full && source {
@@ -337,17 +334,7 @@ fn flat_cells(
 
 /// True if inner layer `y` has a fluid surface cell.
 fn any_layer(padded: &PaddedChunk, y: i32) -> bool {
-    (0..CHUNK_SIZE).any(|x| {
-        let mut bits = (padded.transparent[mask_row(x, y)] >> 1) & u64::from(u32::MAX);
-        while bits != 0 {
-            let z = bits.trailing_zeros() as i32;
-            bits &= bits - 1;
-            if padded.voxels[PaddedChunk::index(x, y, z)] & FLUID_SURFACE_BIT != 0 {
-                return true;
-            }
-        }
-        false
-    })
+    (0..CHUNK_SIZE).any(|x| padded.surface[mask_row(x, y)] != 0)
 }
 
 /// Appends the quads of the sloped cells to `out` with their buckets
@@ -395,7 +382,7 @@ pub(crate) fn emit_sloped(
 }
 
 /// Brute-force oracle of the corner heights (ADR 0021): every fluid surface cell of the inner
-/// 32^3 of a gathered chunk (marked with `FLUID_SURFACE_BIT`) and its 4 corner heights in
+/// 32^3 of a gathered chunk (marked in `PaddedChunk::surface`) and its 4 corner heights in
 /// sixteenths, from Minecraft's rule written out in floating point (heights in blocks, a source
 /// at 14/16, flowing level `l` at `(8 - l) / 8` of that; weights 10 at or above a source, 1
 /// below; a solid neighbor is left out). The mesher draws a cell with `SHAPE_FLUID_SLOPE` and
@@ -415,10 +402,10 @@ pub fn reference_fluid_heights(
     };
     // Height in blocks; `None` does not count.
     let height = |fluid: u16, x: i32, y: i32, z: i32| -> Option<f64> {
-        let id = padded.get(x, y, z) & !FLUID_SURFACE_BIT;
+        let id = padded.get(x, y, z);
         let class = |x, y, z| class_from_masks(padded, x, y, z);
         if id == fluid {
-            let above = padded.get(x, y + 1, z) & !FLUID_SURFACE_BIT;
+            let above = padded.get(x, y + 1, z);
             if above == fluid || class(x, y + 1, z) == VoxelClass::Opaque {
                 return Some(1.0);
             }
@@ -445,11 +432,10 @@ pub fn reference_fluid_heights(
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                let id = padded.get(x, y, z);
-                if padded.cull_mask == u16::MAX || id & FLUID_SURFACE_BIT == 0 {
+                if !padded.is_surface(PaddedChunk::index(x, y, z)) {
                     continue;
                 }
-                let fluid = id & !FLUID_SURFACE_BIT;
+                let fluid = padded.get(x, y, z);
                 let own = height(fluid, x, y, z).expect("a fluid cell");
                 let corners = std::array::from_fn(|k| {
                     let (dx, dz) = (

@@ -126,8 +126,9 @@ impl LodMaterials {
         for m in emissive {
             table.set_emissive(m, true);
         }
-        let see_through_ids = (0..n as u16)
-            .filter(|&m| see_through[usize::from(m)])
+        let see_through_ids = (0..n)
+            .filter(|&m| see_through[m])
+            .map(|m| m as u16)
             .collect();
         Self {
             classes,

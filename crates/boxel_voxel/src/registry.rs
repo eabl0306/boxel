@@ -8,6 +8,7 @@ use crate::rules::{NeighborRule, UseRule};
 use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
+use std::ops::Range;
 use std::sync::Arc;
 
 /// The state property of a fluid's level (Minecraft's `level`, `0..=15`): 0 is a source, 1 to 7
@@ -18,10 +19,9 @@ pub const FLUID_LEVEL: &str = "level";
 /// or `true`; ADR 0025): the states with `true` have [`StateFlags::WATERLOGGED`].
 pub const WATERLOGGED: &str = "waterlogged";
 
-/// Most states a registry holds: `2^15`. The mesher's material id is the state id, and its top
-/// bit (`boxel_mesh::FLUID_SURFACE_BIT`) marks fluid surface cells, so every state id must stay
-/// below it.
-pub const MAX_STATES: usize = 1 << 15;
+/// Most states a registry holds: `2^16`, every `u16` id. The mesher's material id is the state
+/// id; it marks fluid surface cells in a mask of their own, not in the id (ADR 0043).
+pub const MAX_STATES: usize = 1 << 16;
 
 /// Dense runtime block state id. `BlockState::AIR == BlockState(0)`. Never persisted raw
 /// (persistence will store names through an id map, M1).
@@ -552,6 +552,11 @@ struct BlockInfo {
 }
 
 impl BlockInfo {
+    /// The block's state ids, `first..first + count` (the last block may end at
+    /// [`MAX_STATES`], past `u16`).
+    fn range(&self) -> Range<usize> {
+        usize::from(self.first)..usize::from(self.first) + usize::from(self.count)
+    }
     fn values(&self, state: BlockState) -> StateValues<'_> {
         StateValues {
             properties: &self.properties,
@@ -719,7 +724,7 @@ impl BlockRegistryBuilder {
         states: impl Fn(&StateValues<'_>) -> bool,
     ) -> Result<(), RegistryError> {
         let info = &self.blocks[self.block_index(block)?];
-        let range = usize::from(info.first)..usize::from(info.first + info.count);
+        let range = info.range();
         let marks: Vec<bool> = range
             .clone()
             .map(|s| states(&info.values(BlockState(s as u16))))
@@ -755,7 +760,7 @@ impl BlockRegistryBuilder {
         support: impl Fn(&StateValues<'_>) -> Option<BlockCollision>,
     ) -> Result<(), RegistryError> {
         let info = &self.blocks[self.block_index(block)?];
-        let range = usize::from(info.first)..usize::from(info.first + info.count);
+        let range = info.range();
         let shapes: Vec<Option<BlockCollision>> = range
             .clone()
             .map(|s| support(&info.values(BlockState(s as u16))))
@@ -805,7 +810,7 @@ impl BlockRegistryBuilder {
             }
             _ => false,
         };
-        let states = usize::from(info.first)..usize::from(info.first + info.count);
+        let states = info.range();
         let fluid = self.states[states]
             .iter()
             .all(|def| def.model == BlockModel::Fluid);
@@ -1061,14 +1066,14 @@ impl BlockRegistryBuilder {
             }
             // An opaque, translucent or invisible full cube holds no water (a double slab),
             // whatever its property says; a cutout one does (leaves, ADR 0038).
-            for state in block.first..block.first + block.count {
-                let def = &states[usize::from(state)];
+            for state in block.range() {
+                let def = &states[state];
                 if def.model.is_solid_cube() && def.shape != RenderShape::Cutout {
                     continue;
                 }
-                let f = &mut flags[usize::from(state)];
+                let f = &mut flags[state];
                 f.insert(StateFlags::WATERLOGGABLE | StateFlags::KEEPS_FLUIDS_OUT);
-                if block.values(BlockState(state)).get(WATERLOGGED) == Some("true") {
+                if block.values(BlockState(state as u16)).get(WATERLOGGED) == Some("true") {
                     f.insert(StateFlags::WATERLOGGED);
                 }
             }
@@ -1215,7 +1220,7 @@ impl BlockRegistry {
     }
     /// Every block, in registration order.
     pub fn blocks(&self) -> impl ExactSizeIterator<Item = BlockId> + use<> {
-        (0..self.blocks.len() as u16).map(BlockId)
+        (0..self.blocks.len()).map(|b| BlockId(b as u16))
     }
     /// The block of a state (`None` if out of range).
     pub fn block(&self, s: BlockState) -> Option<BlockId> {
@@ -1251,8 +1256,8 @@ impl BlockRegistry {
         let range = self
             .blocks
             .get(usize::from(b.0))
-            .map_or(0..0, |b| b.first..b.first + b.count);
-        range.map(BlockState)
+            .map_or(0..0, BlockInfo::range);
+        range.map(|s| BlockState(s as u16))
     }
     /// The state properties of a block, sorted by name (none if out of range).
     pub fn properties(&self, b: BlockId) -> &[Property] {
@@ -1448,8 +1453,7 @@ impl BlockRegistry {
     pub fn textures(&self) -> &[TextureSpec] {
         &self.textures
     }
-    /// Mesher voxel value of a state: `0` for `RenderShape::None`, else `s.0` (the identity map;
-    /// below [`MAX_STATES`], so the mesher's top bit stays free).
+    /// Mesher voxel value of a state: `0` for `RenderShape::None`, else `s.0` (the identity map).
     pub fn material(&self, s: BlockState) -> u16 {
         if self.shape(s) == RenderShape::None {
             0

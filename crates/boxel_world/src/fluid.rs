@@ -93,7 +93,7 @@ impl Plugin for FluidPlugin {
                     react: None,
                     ..handler
                 };
-                for state in (0..registry.len() as u16).map(BlockState) {
+                for state in (0..registry.len()).map(|s| BlockState(s as u16)) {
                     if registry.is_waterlogged(state) {
                         ticks.register_state(&registry, state, held);
                     }

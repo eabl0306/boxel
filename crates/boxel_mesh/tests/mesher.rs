@@ -4,9 +4,9 @@ mod common;
 
 use boxel_light::PaddedLight;
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_SURFACE_BIT, FULL_SKY_ENTRY,
-    LightQuantization, MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshInput,
-    MeshOptions, Mesher, PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, layout,
+    AoPolicy, BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FULL_SKY_ENTRY, LightQuantization,
+    MAX_QUADS_PER_BUCKET, MAX_QUADS_PER_FACE_BUCKET, MaterialTable, MeshInput, MeshOptions, Mesher,
+    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass, layout,
 };
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, Face, LightValue, LocalPos,
@@ -971,7 +971,7 @@ fn water_surface_cells_drop_their_top() {
     let input = isolated(&center);
     let padded = gathered(&input, &table);
     for (x, z) in (1..5).flat_map(|x| (1..5).map(move |z| (x, z))) {
-        let marked = |y| padded.get(x, y, z) & FLUID_SURFACE_BIT != 0;
+        let marked = |y| padded.is_surface(PaddedChunk::index(x, y, z));
         assert!(!marked(1), "({x}, 1, {z}) has water above");
         assert_eq!(marked(2), (x, z) != (1, 1), "({x}, 2, {z})");
     }

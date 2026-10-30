@@ -1,7 +1,7 @@
 use super::*;
 use boxel_voxel::{
     BlockCollision, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockRegistryBuilder,
-    FaceTextures, LocalPos, MAX_CHUNK_COORD, Property, RenderShape, TextureId,
+    FaceTextures, LocalPos, MAX_CHUNK_COORD, MAX_STATES, Property, RenderShape, TextureId,
 };
 use proptest::prelude::*;
 
@@ -238,6 +238,52 @@ fn direct_storage_round_trips() {
     assert!(matches!(data.blocks(), Paletted::Direct(_)));
     let back = decode_chunk(&encode_chunk(&data, &ids).unwrap(), &ids).unwrap();
     assert_eq!(voxels(&back), voxels(&data));
+}
+
+/// A world saved before the registry grew past `2^15` states loads unchanged into one that holds
+/// every `u16` id (ADR 0043: the format stores names, never raw ids), and chunks with the
+/// highest ids round-trip in every storage.
+#[test]
+fn saves_load_into_a_registry_of_every_u16_state() {
+    let small = boxel_demo::blocks::registry();
+    let (saved_ids, _) = IdMap::resolve(Vec::new(), &small);
+    let saved = [chunk_with(&small, 3), chunk_with(&small, small.len())];
+    let bytes: Vec<Vec<u8>> = saved
+        .iter()
+        .map(|data| encode_chunk(data, &saved_ids).unwrap())
+        .collect();
+
+    let mut builder = boxel_demo::blocks::builder();
+    let filler = MAX_STATES - small.len() - 1;
+    builder
+        .add_block_with_states(
+            plain("test:filler"),
+            vec![Property::new("n", (0..filler).map(|v| v.to_string()))],
+            |_, _| {},
+        )
+        .unwrap();
+    let top = builder.add_block(plain("test:top")).unwrap();
+    assert_eq!(top, BlockState(u16::MAX));
+    let big = builder.build();
+    assert_eq!(big.len(), MAX_STATES);
+    let (ids, grew) = IdMap::resolve(saved_ids.names().to_vec(), &big);
+    assert!(grew, "the new states get names");
+    assert!(ids.unknown().is_empty());
+    for (data, bytes) in saved.iter().zip(&bytes) {
+        assert_eq!(voxels(&decode_chunk(bytes, &ids).unwrap()), voxels(data));
+    }
+    // The highest ids, around bit 15 and up to the last, packed and direct.
+    let high = |i: usize, n: usize| BlockState((MAX_STATES - 1 - i % n) as u16);
+    let around = |i: usize| BlockState((0x7FF0 + i % 32) as u16);
+    for states in [
+        (0..CHUNK_VOLUME).map(|i| high(i, 5)).collect::<Vec<_>>(),
+        (0..CHUNK_VOLUME).map(|i| high(i, 600)).collect(),
+        (0..CHUNK_VOLUME).map(around).collect(),
+    ] {
+        let data = ChunkData::from_dense(&states);
+        let back = decode_chunk(&encode_chunk(&data, &ids).unwrap(), &ids).unwrap();
+        assert_eq!(voxels(&back), states);
+    }
 }
 
 #[test]

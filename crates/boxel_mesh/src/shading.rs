@@ -336,12 +336,15 @@ impl LightPalette {
     }
 }
 
-/// What a merge key stands for: the material, the AO byte and the light palette index of a
-/// unit face. Two unit faces merge only if these are all equal.
+/// What a merge key stands for: the material, whether the face is of a fluid surface cell, the
+/// AO byte and the light palette index of a unit face. Two unit faces merge only if these are
+/// all equal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FaceKey {
     /// Material id.
     pub material: u16,
+    /// A face of a fluid surface cell (`PaddedChunk::surface`).
+    pub surface: bool,
     /// AO byte (corner `k` at bits `2k`).
     pub ao: u8,
     /// Light palette index.
@@ -349,8 +352,8 @@ pub struct FaceKey {
 }
 
 /// Dense `u32` ids of the [`FaceKey`]s of a chunk, in first-seen order. A face is looked up by
-/// its material, AO byte and corner lights in one probe; the palette is only asked for the
-/// index of corner lights the table has not seen with that material and AO.
+/// its material, surface flag, AO byte and corner lights in one probe; the palette is only asked
+/// for the index of corner lights the table has not seen with that material, flag and AO.
 #[derive(Clone, Debug)]
 pub struct KeyTable {
     map: StampMap,
@@ -380,20 +383,21 @@ impl KeyTable {
         self.keys.clear();
         self.last = None;
     }
-    /// The id of the face (`material`, `ao`, `corners`), added if new, with its corners added
-    /// to `palette` (the palette this table was filled with since both were cleared). `Err`
-    /// when the palette is full.
+    /// The id of the face (`material`, `surface`, `ao`, `corners`), added if new, with its
+    /// corners added to `palette` (the palette this table was filled with since both were
+    /// cleared). `Err` when the palette is full.
     #[inline]
     pub fn id(
         &mut self,
         material: u16,
+        surface: bool,
         ao: u8,
         corners: [LightValue; 4],
         palette: &mut LightPalette,
     ) -> Result<u32, PaletteFull> {
         let key = [
             pack_corners(corners),
-            u64::from(material) | u64::from(ao) << 16,
+            u64::from(material) | u64::from(ao) << 16 | u64::from(surface) << 24,
         ];
         if let Some((last, id)) = self.last
             && last == key
@@ -405,6 +409,7 @@ impl KeyTable {
             let light = palette.index(corners)?;
             keys.push(FaceKey {
                 material,
+                surface,
                 ao,
                 light,
             });
@@ -558,34 +563,40 @@ mod tests {
         let face = |i: u32| {
             (
                 i as u16,
+                i.is_multiple_of(3),
                 (i >> 16) as u8,
                 [LightValue((i % 4096) as u16); 4],
             )
         };
         for i in 0..100_000 {
-            let (material, ao, corners) = face(i);
-            assert_eq!(t.id(material, ao, corners, &mut p), Ok(i));
+            let (material, surface, ao, corners) = face(i);
+            assert_eq!(t.id(material, surface, ao, corners, &mut p), Ok(i));
         }
         assert_eq!(p.len(), 4096);
         for i in (0..100_000).step_by(7) {
-            let (material, ao, corners) = face(i);
-            assert_eq!(t.id(material, ao, corners, &mut p), Ok(i));
+            let (material, surface, ao, corners) = face(i);
+            assert_eq!(t.id(material, surface, ao, corners, &mut p), Ok(i));
             let key = t.key(i);
-            assert_eq!((key.material, key.ao), (material, ao));
+            assert_eq!((key.material, key.surface, key.ao), (material, surface, ao));
             assert_eq!(
                 palette_corners(p.entries()[usize::from(key.light)]),
                 corners
             );
         }
+        // The same face of the other kind of cell (surface or not) is another key, with the
+        // same light.
+        let (material, surface, ao, corners) = face(65_535);
+        assert_eq!(t.id(material, !surface, ao, corners, &mut p), Ok(100_000));
+        assert_eq!(t.key(100_000).light, t.key(65_535).light);
         // A new face whose corners are not in the full palette is refused.
         assert_eq!(
-            t.id(1, 0, [LightValue(0xFFFF); 4], &mut p),
+            t.id(1, false, 0, [LightValue(0xFFFF); 4], &mut p),
             Err(PaletteFull)
         );
         t.clear();
         p.clear();
-        let (material, ao, corners) = face(99_999);
-        assert_eq!(t.id(material, ao, corners, &mut p), Ok(0));
+        let (material, surface, ao, corners) = face(99_999);
+        assert_eq!(t.id(material, surface, ao, corners, &mut p), Ok(0));
         assert_eq!((t.len(), p.len()), (1, 1));
     }
 }

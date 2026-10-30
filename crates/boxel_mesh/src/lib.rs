@@ -33,7 +33,7 @@ pub use packed::{
     ChunkMesh, FULL_SKY_ENTRY, LightQuantization, MAX_PALETTE_ENTRIES, PackedQuad, PaletteEntry,
     layout, pack_model_box, palette_corners, palette_entry, unpack_model_box,
 };
-pub use padded::{FLUID_SURFACE_BIT, PADDED, PADDED_AREA, PADDED_VOLUME, PaddedChunk, VoxelClass};
+pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedChunk, VoxelClass};
 pub use shading::FaceShading;
 
 /// Number of buckets per chunk mesh (frozen layout).

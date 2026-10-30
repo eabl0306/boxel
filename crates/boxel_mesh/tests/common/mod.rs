@@ -3,8 +3,8 @@
 
 use boxel_light::{PADDED_VOLUME, PaddedLight};
 use boxel_mesh::{
-    AoPolicy, BUCKET_COUNT, ChunkMesh, FLUID_SURFACE_BIT, FaceShading, MAX_PALETTE_ENTRIES,
-    MaterialTable, PaddedChunk, VoxelClass, fluid_flow, layout, reference_face_shading,
+    AoPolicy, BUCKET_COUNT, ChunkMesh, FaceShading, MAX_PALETTE_ENTRIES, MaterialTable,
+    PaddedChunk, VoxelClass, fluid_flow, layout, reference_face_shading,
     reference_lit_emitter_shading, reference_visible_faces,
 };
 use boxel_voxel::{
@@ -261,10 +261,9 @@ pub fn verify_mesh(padded: &PaddedChunk, table: &MaterialTable, mesh: &ChunkMesh
                     p.iter().all(|&c| c < 32),
                     "{quad:?} leaves the chunk at {p:?}"
                 );
-                let id = padded.get(p[0] as i32, p[1] as i32, p[2] as i32);
-                let marked = padded.cull_mask != u16::MAX;
-                let surface = marked && id & FLUID_SURFACE_BIT != 0;
-                let material = if marked { id & !FLUID_SURFACE_BIT } else { id };
+                let (x, y, z) = (p[0] as i32, p[1] as i32, p[2] as i32);
+                let material = padded.get(x, y, z);
+                let surface = padded.is_surface(PaddedChunk::index(x, y, z));
                 let expected = match quad.fluid_heights() {
                     Some(heights) => table.sloped_bucket(material, face, heights),
                     None => table.bucket(material, face),
@@ -542,8 +541,13 @@ pub fn verify_shading(
             let mut want = *reference
                 .get(&(p, face))
                 .unwrap_or_else(|| panic!("{p:?} {face:?} is not a visible face"));
-            let id = padded.get(p[0] as i32, p[1] as i32, p[2] as i32);
-            let emission = table.lit_emission(id & !FLUID_SURFACE_BIT);
+            let (x, y, z) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            // The mesher never lights a fluid surface cell flat (ADR 0043).
+            let emission = if padded.is_surface(PaddedChunk::index(x, y, z)) {
+                LightValue::DARK
+            } else {
+                table.lit_emission(padded.get(x, y, z))
+            };
             if !emission.is_dark() {
                 let n = face.normal().to_array();
                 let front = std::array::from_fn(|a| p[a] as i32 + n[a]);

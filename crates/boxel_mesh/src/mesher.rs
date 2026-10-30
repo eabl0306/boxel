@@ -6,8 +6,8 @@ use crate::shading::{
     face_corner_lights, neighborhood8,
 };
 use crate::{
-    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, FLUID_SURFACE_BIT, PADDED, PADDED_AREA, PADDED_VOLUME,
-    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad,
+    PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
 };
 use boxel_light::PaddedLight;
 use boxel_voxel::{
@@ -307,10 +307,10 @@ impl MaterialTable {
             lit: vec![LightValue::DARK; n],
             has_lit: false,
             has_fluid: false,
-            fluid_source: (0..n as u16).collect(),
+            fluid_source: (0..n).map(|m| m as u16).collect(),
             fluid_level: vec![0; n],
             waterlogged: vec![false; n],
-            dry: (0..n as u16).collect(),
+            dry: (0..n).map(|m| m as u16).collect(),
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -431,6 +431,11 @@ impl MaterialTable {
             _ => (material, 0),
         }
     }
+    /// True if some material is a fluid (`BlockModel::Fluid`): gather marks the fluid surface
+    /// cells ([`PaddedChunk::surface`]).
+    pub(crate) fn has_fluid(&self) -> bool {
+        self.has_fluid
+    }
     /// Class of a material (out of range -> `Empty`).
     pub fn class(&self, material: u16) -> VoxelClass {
         self.class
@@ -476,22 +481,6 @@ impl MaterialTable {
     /// ([`crate::pack_model_box`]). At most [`MAX_MODEL_BOXES`] (the registry checks it).
     pub fn model_boxes(&self) -> &[ModelBox] {
         &self.box_models.boxes
-    }
-    /// True if gather marks fluid surface cells ([`FLUID_SURFACE_BIT`]): some material is a
-    /// fluid and every material id is below the bit (else fluids keep a full-height top).
-    fn marks_fluid_surfaces(&self) -> bool {
-        self.has_fluid && self.class.len() <= usize::from(FLUID_SURFACE_BIT)
-    }
-    /// The material of a merge key's voxel id and whether it is a fluid surface cell.
-    #[inline]
-    fn split_surface(&self, material: u16) -> (u16, bool) {
-        if !self.marks_fluid_surfaces() {
-            return (material, false);
-        }
-        (
-            material & !FLUID_SURFACE_BIT,
-            material & FLUID_SURFACE_BIT != 0,
-        )
     }
     /// Shape code of the cube faces of `material` facing `face` (`layout::SHAPE_CUBE` or
     /// `layout::SHAPE_TURNED`; out of range -> `SHAPE_CUBE`).
@@ -602,10 +591,10 @@ impl MaterialTable {
             model: vec![BlockModel::CUBE; n],
             codes: vec![[0; 6]; n],
             has_fluid: false,
-            fluid_source: (0..n as u16).collect(),
+            fluid_source: (0..n).map(|m| m as u16).collect(),
             fluid_level: vec![0; n],
             waterlogged: vec![false; n],
-            dry: (0..n as u16).collect(),
+            dry: (0..n).map(|m| m as u16).collect(),
             box_models: BoxModels {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
@@ -704,7 +693,8 @@ impl Mesher {
     /// bucket-contiguous with its light palette and hash.
     ///
     /// Face culling and greedy merging are binary greedy meshing (an in-repo fork, `greedy.rs`).
-    /// Two unit faces merge only if they have the same material, the same AO byte and the same 4
+    /// Two unit faces merge only if they have the same material, both or neither are of a fluid
+    /// surface cell ([`PaddedChunk::surface`]), and they have the same AO byte and the same 4
     /// corner lights ([`reference_face_shading`] defines both, per `options.ao`; the faces of a
     /// lit emitter are flat, [`reference_lit_emitter_shading`]). Each quad gets
     /// `MaterialTable::layer` of its material and face (and [`layout::FLAG_EMISSIVE`] if
@@ -786,7 +776,7 @@ fn gather_into(
     if materials.has_fluid {
         remap_fluid_levels(materials, out);
     }
-    if materials.marks_fluid_surfaces() {
+    if materials.has_fluid {
         mark_fluid_surfaces(materials, out);
     }
     gather_above(input, materials, out);
@@ -866,16 +856,16 @@ fn remap_fluid_levels(materials: &MaterialTable, out: &mut PaddedChunk) {
     }
 }
 
-/// Marks the fluid surface cells of the inner 32^3 with [`FLUID_SURFACE_BIT`]: the fluid voxels
+/// Marks the fluid surface cells of the inner 32^3 in [`PaddedChunk::surface`]: the fluid voxels
 /// whose voxel above is neither the same fluid nor opaque. Under an opaque block the fluid stays
 /// full height, so no gap shows under it (its top face is culled there).
 fn mark_fluid_surfaces(materials: &MaterialTable, out: &mut PaddedChunk) {
-    out.cull_mask = !FLUID_SURFACE_BIT;
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             // Inner voxels only (mask bit of padded z is z + 1).
             let mut bits = (out.transparent[mask_row(x, y)] >> 1) & u64::from(u32::MAX);
             let opaque_above = out.opaque[mask_row(x, y + 1)] >> 1;
+            let mut surface = 0u64;
             while bits != 0 {
                 let z = bits.trailing_zeros() as i32;
                 bits &= bits - 1;
@@ -884,11 +874,12 @@ fn mark_fluid_surfaces(materials: &MaterialTable, out: &mut PaddedChunk) {
                 if materials.model(m) != BlockModel::Fluid || opaque_above >> z & 1 != 0 {
                     continue;
                 }
-                let above = out.voxels[PaddedChunk::index(x, y + 1, z)] & !FLUID_SURFACE_BIT;
-                if above != m {
-                    out.voxels[i] = m | FLUID_SURFACE_BIT;
+                if out.voxels[PaddedChunk::index(x, y + 1, z)] != m {
+                    surface |= 1 << z;
                 }
             }
+            // Mask bit of padded z is z + 1.
+            out.surface[mask_row(x, y)] = surface << 1;
         }
     }
 }
@@ -1041,12 +1032,8 @@ fn mesh_into(
     out: &mut ChunkMesh,
 ) {
     out.clear();
-    s.greedy.cull(
-        &padded.voxels,
-        &padded.opaque,
-        &padded.transparent,
-        padded.cull_mask,
-    );
+    s.greedy
+        .cull(&padded.voxels, &padded.opaque, &padded.transparent);
     // Sloped fluid cells leave the greedy pass (ADR 0021).
     find_sloped(padded, materials, &mut s.greedy, &mut s.fluid);
     let elide = options.ao == AoPolicy::BakedLitOnly;
@@ -1076,19 +1063,30 @@ fn mesh_into(
         // Uniform light: one palette entry, the key is the material and maybe the AO.
         Err(v) => {
             s.greedy.clear();
+            // The fluid surface cells (ADR 0043): their faces merge apart from the rest of
+            // their fluid.
+            let marked = padded.has_surface();
             let ao = match options.ao {
                 AoPolicy::Off => false,
                 AoPolicy::Baked => true,
                 AoPolicy::BakedLitOnly => !v.is_dark(),
             };
             for face in 0..6 {
+                let keys = &mut s.keys;
                 if ao {
-                    let keys = &mut s.keys;
                     // Never fails: no palette here.
                     let _ = visit_face(face, &s.greedy, padded, |i, _, nb9| {
                         let ao = AO_TABLE[neighborhood8(nb9)];
-                        keys[i] = u32::from(padded.voxels[i]) << 8 | u32::from(ao);
+                        let surface = marked && padded.is_surface(i);
+                        keys[i] = u32::from(surface) << 24
+                            | u32::from(padded.voxels[i]) << 8
+                            | u32::from(ao);
                         Ok(())
+                    });
+                    s.greedy.merge_face(face, &s.keys);
+                } else if marked {
+                    visit_face_cells(face, &s.greedy, &padded.surface, |i, surface| {
+                        keys[i] = u32::from(surface) << 16 | u32::from(padded.voxels[i]);
                     });
                     s.greedy.merge_face(face, &s.keys);
                 } else {
@@ -1146,11 +1144,13 @@ fn mesh_into(
     match kind {
         KeyKind::Material => assemble(greedy, specials, materials, out, |k| FaceKey {
             material: k as u16,
+            surface: k >> 16 & 1 != 0,
             ao: AO_OPEN_BYTE,
             light: 0,
         }),
         KeyKind::MaterialAo => assemble(greedy, specials, materials, out, |k| FaceKey {
             material: (k >> 8) as u16,
+            surface: k >> 24 & 1 != 0,
             ao: k as u8,
             light: 0,
         }),
@@ -1176,12 +1176,16 @@ fn mesh_lit<const GLOW: bool>(
     level: LightQuantization,
 ) -> Result<(), PaletteFull> {
     let ao = options.ao;
+    // The fluid surface cells (ADR 0043): their faces merge apart from the rest of their fluid.
+    let marked = padded.has_surface();
     for face in 0..6 {
         let (keys, palette, table) = (&mut s.keys, &mut s.palette, &mut s.key_table);
         visit_face(face, &s.greedy, padded, |i, front, nb9| {
             let material = padded.voxels[i];
-            // A fluid surface id (`FLUID_SURFACE_BIT`) is past the table: never lit.
-            let emission = if GLOW {
+            let surface = marked && padded.is_surface(i);
+            // A fluid surface cell is never lit flat, as when it was marked by an id past the
+            // table (ADR 0043).
+            let emission = if GLOW && !surface {
                 materials.lit_emission(material)
             } else {
                 LightValue::DARK
@@ -1191,7 +1195,7 @@ fn mesh_lit<const GLOW: bool>(
             } else {
                 lit_shading(light, front, face, nb9, ao, elide, level)
             };
-            keys[i] = table.id(material, ao, corners, palette)?;
+            keys[i] = table.id(material, surface, ao, corners, palette)?;
             Ok(())
         })?;
         s.greedy.merge_face(face, &s.keys);
@@ -1554,9 +1558,7 @@ fn cube_face_hidden(
         VoxelClass::Opaque => true,
         VoxelClass::Transparent => {
             let i = PaddedChunk::index(nx, ny, nz);
-            let front = padded
-                .waterlogged_at(i)
-                .unwrap_or_else(|| materials.split_surface(padded.voxels[i]).0);
+            let front = padded.waterlogged_at(i).unwrap_or(padded.voxels[i]);
             materials.dry(front) == materials.dry(m)
         }
         VoxelClass::Empty | VoxelClass::Special => false,
@@ -1668,6 +1670,52 @@ fn visit_face(
     }
 }
 
+/// Calls `visit(voxel index, surface)` for every visible unit face of `face` (after
+/// `Greedy::cull`), `surface` its voxel's bit in the `surface` column masks
+/// ([`PaddedChunk::surface`]): [`visit_face`] without the voxel in front and its neighborhood.
+#[inline]
+fn visit_face_cells(face: usize, greedy: &Greedy, surface: &[u64], visit: impl FnMut(usize, bool)) {
+    let rows = greedy.face_rows(face);
+    if (2..4).contains(&face) {
+        visit_cells::<true>(rows, surface, false, visit);
+    } else {
+        visit_cells::<false>(rows, surface, face >= 4, visit);
+    }
+}
+
+/// [`visit_face_cells`]: `YX` for the ±X faces' rows (`y + x * 32`), `shifted` for the ±Z faces'
+/// bits (padded z, `z + 1`; the others' are `z`).
+#[inline]
+fn visit_cells<const YX: bool>(
+    rows: &[u64],
+    surface: &[u64],
+    shifted: bool,
+    mut visit: impl FnMut(usize, bool),
+) {
+    for (r, &bits) in rows.iter().enumerate() {
+        if bits == 0 {
+            continue;
+        }
+        // Unpadded x and y of the row (see `Greedy::face_rows`).
+        let (x, y) = if YX {
+            (r / 32, r % 32)
+        } else {
+            (r % 32, r / 32)
+        };
+        let row = (x + 1) + (y + 1) * PADDED;
+        // Padded z (the voxel index's low part and the surface mask's bit) is bit + 1, or the
+        // bit itself for ±Z.
+        let surface = surface[row] >> usize::from(!shifted);
+        let base = row * PADDED + usize::from(!shifted);
+        let mut bits = bits;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            visit(base + bit, surface >> bit & 1 != 0);
+        }
+    }
+}
+
 /// [`visit_face`] for face `F`.
 #[inline]
 fn visit_rows<const F: usize>(
@@ -1758,7 +1806,7 @@ fn assemble(
     let mut counts = [0u32; BUCKET_COUNT];
     for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
         for &quad in quads {
-            let (material, _) = materials.split_surface(decode((quad >> 32) as u32).material);
+            let material = decode((quad >> 32) as u32).material;
             counts[materials.bucket(material, face)] += 1;
         }
     }
@@ -1780,15 +1828,13 @@ fn assemble(
     out.quads.resize(total, PackedQuad::default());
     for (face, quads) in Face::ALL.into_iter().zip(&greedy.quads) {
         for &quad in quads {
-            let mut key = decode((quad >> 32) as u32);
-            let surface;
-            (key.material, surface) = materials.split_surface(key.material);
+            let key = decode((quad >> 32) as u32);
             let bucket = materials.bucket(key.material, face);
             let mut packed = to_packed(quad, face, materials.layer(key.material, face), key);
             if materials.emissive(key.material) {
                 packed.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
             }
-            let code = if surface && face != Face::NegY {
+            let code = if key.surface && face != Face::NegY {
                 layout::SHAPE_FLUID_SURFACE
             } else {
                 materials.cube_code(key.material, face)
@@ -1881,9 +1927,7 @@ pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face
                     let (nx, ny, nz) = (x + n.x, y + n.y, z + n.z);
                     let visible = match class(nx, ny, nz) {
                         VoxelClass::Empty | VoxelClass::Special => true,
-                        VoxelClass::Transparent => {
-                            (padded.get(nx, ny, nz) ^ material) & padded.cull_mask != 0
-                        }
+                        VoxelClass::Transparent => padded.get(nx, ny, nz) != material,
                         VoxelClass::Opaque => false,
                     };
                     if visible {
