@@ -122,6 +122,8 @@ completa, así no se ve un hueco debajo de un muelle.
   no cuesta más quads que antes (solo se separa la capa de arriba en los costados).
 - Solo se marca si todos los ids de material caben debajo del bit (hasta 32 768). Si no, el agua
   conserva el techo completo.
+- Actualizado el 2026-10-30 (ADR 0043): la marca salió del id a una máscara propia
+  (`PaddedChunk::surface`) y se marca con cualquier cantidad de estados. Ya no hay `cull_mask`.
 - Queda una ranura de 2/16 donde un agua de altura completa (bajo un bloque) toca de costado un
   agua de superficie. Es raro y se va con los líquidos que fluyen, que tendrán altura por esquina.
 - Revisado por el ADR 0021: el agua tiene `level` y corre. Cada celda de superficie tiene una

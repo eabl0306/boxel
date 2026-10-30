@@ -74,6 +74,8 @@ Además, los resource packs de Minecraft eligen el modelo de un bloque por su te
   el límite da `RegistryError::Full`. Minecraft vanilla tiene menos de 30 000 estados, así que un
   clon entra, aunque sin mucho margen. Si algún día no alcanza, la marca de superficie tiene que
   salir del material (por ejemplo a una máscara aparte en el gather).
+- Actualizado el 2026-10-30 (ADR 0043): así se hizo. La marca va en una máscara aparte y el
+  límite es 2^16 = 65 536, todo id `u16`.
 
 ### 5. Contenido migrado
 

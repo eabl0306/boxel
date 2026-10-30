@@ -2,7 +2,7 @@
 
 Documento técnico de referencia. Fecha: 2026-10-05. Estado: aprobado para el milestone M0
 (revisión final, después de tres revisiones adversariales del borrador v1).
-Las decisiones puntuales están en `docs/adr/` (0001 a 0042). Durante M0 hubo además una
+Las decisiones puntuales están en `docs/adr/` (0001 a 0043). Durante M0 hubo además una
 especificación para los agentes implementadores (en inglés, en `.scaffold/`), borrada al cerrar M0;
 este documento queda como referencia.
 
@@ -630,8 +630,9 @@ Propio, ~700 líneas, inspirado en `bevy_app` 0.20:
   persiste crudo (M1 agrega el IdMap, que guarda el texto del estado). Un bloque tiene
   propiedades con valores finitos, como en Minecraft (ADR 0019): cada combinación es un estado,
   con ids seguidos por bloque, y se escribe `boxel:stone_slab[type=top]` (`parse_state`,
-  `state_name`, `property`, `with`). Como mucho `MAX_STATES` = 2^15 estados, así el bit alto del
-  material del mesher queda libre. Tablas SoA por estado: nombre, capa de dibujo (`None`,
+  `state_name`, `property`, `with`). Como mucho `MAX_STATES` = 2^16 = 65 536 estados, todo id
+  `u16` (ADR 0043: la superficie de los fluidos se marca en una máscara aparte del mesher, no en
+  el id). Tablas SoA por estado: nombre, capa de dibujo (`None`,
   `Opaque`, `Cutout`, `Translucent`), modelo (`Cube { axis }`, `Slab`, `Cross`, ADR 0018;
   `Stairs`, `Fence`, `Torch`, `WallTorch`, ADR 0020, hechos de cajas en dieciseisavos),
   colisión (`None`, `Full` o cajas), forma de apoyo por estado (ADR 0037), flags, emisión RGB,
