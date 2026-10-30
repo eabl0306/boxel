@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use boxel_pack::{
-    BlockState as PackState, LayerRecipe, ResourceId, ResourcePack, Texture, Timeline, VariantList,
-    condition_matches, parse_variant_key,
+    BlockState as PackState, LayerRecipe, ResourceId, ResourcePack, Texture, TextureStep, Timeline,
+    VariantList, apply_steps, condition_matches, parse_variant_key,
 };
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, FLUID_LEVEL, Face, RenderShape, TextureSpec,
@@ -159,10 +159,12 @@ struct Part {
     tint: Option<[u8; 3]>,
 }
 
-/// A layer the pack fills: its parts and level 0 at tick 0.
+/// A layer the pack fills: its parts, how they are read ([`compose`]'s `quarter` and `steps`)
+/// and level 0 at tick 0.
 struct PackLayer {
     parts: Vec<Part>,
     quarter: bool,
+    steps: Vec<TextureStep>,
     texels: Vec<[u8; 4]>,
 }
 
@@ -188,6 +190,7 @@ fn pack_block_textures(
             Some(PackLayer {
                 parts,
                 quarter,
+                steps,
                 mut texels,
             }) => {
                 let cutout = finish_alpha(&mut texels, shape);
@@ -215,8 +218,12 @@ fn pack_block_textures(
                                     start_index(texture)
                                 }
                             };
+                            let read = Read {
+                                quarter,
+                                steps: &steps,
+                            };
                             let mut texels =
-                                compose(pack, &parts, size, quarter, &mut Vec::new(), &pick)
+                                compose(pack, &parts, size, read, &mut Vec::new(), &pick)
                                     .expect("the layer composed at tick 0");
                             finish_alpha(&mut texels, shape);
                             let mut bytes = Vec::with_capacity(layer_bytes(size));
@@ -371,7 +378,8 @@ fn pack_texture_size(pack: &ResourcePack, warnings: &mut Vec<String>) -> u32 {
     size
 }
 
-/// Shape of the first block drawing each layer (`None`: no block uses it).
+/// Shape of the first block drawing each layer on any of its six faces (`None`: no block uses
+/// it): a layer only a front face shows (a furnace's) gets its alpha mode too.
 fn layer_shapes(registry: &BlockRegistry) -> Vec<Option<RenderShape>> {
     let mut shapes = vec![None; registry.textures().len()];
     for state in 0..registry.len() {
@@ -380,7 +388,7 @@ fn layer_shapes(registry: &BlockRegistry) -> Vec<Option<RenderShape>> {
         if shape == RenderShape::None {
             continue;
         }
-        for face in [Face::PosY, Face::NegY, Face::PosX] {
+        for face in Face::ALL {
             let layer = registry.face_texture(state, face).0 as usize;
             if let Some(slot) = shapes.get_mut(layer)
                 && slot.is_none()
@@ -433,10 +441,11 @@ fn pack_layer(
             id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
             tint: None,
         }];
-        return match compose(pack, &parts, size, false, warnings, &tick0) {
+        return match compose(pack, &parts, size, Read::PLAIN, warnings, &tick0) {
             Ok(texels) => Some(PackLayer {
                 parts,
                 quarter: false,
+                steps: Vec::new(),
                 texels,
             }),
             Err(missing) => {
@@ -445,12 +454,17 @@ fn pack_layer(
             }
         };
     };
+    let read = Read {
+        quarter: recipe.quarter,
+        steps: &recipe.steps,
+    };
     if let Some(parts) = model_parts(pack, recipe, &recipe_values(registry, recipe)) {
-        match compose(pack, &parts, size, recipe.quarter, warnings, &tick0) {
+        match compose(pack, &parts, size, read, warnings, &tick0) {
             Ok(texels) => {
                 return Some(PackLayer {
                     parts,
                     quarter: recipe.quarter,
+                    steps: recipe.steps.clone(),
                     texels,
                 });
             }
@@ -468,10 +482,11 @@ fn pack_layer(
             tint: *tint,
         })
         .collect();
-    match compose(pack, &parts, size, recipe.quarter, warnings, &tick0) {
+    match compose(pack, &parts, size, read, warnings, &tick0) {
         Ok(texels) => Some(PackLayer {
             parts,
             quarter: recipe.quarter,
+            steps: recipe.steps.clone(),
             texels,
         }),
         Err(missing) => {
@@ -567,15 +582,33 @@ fn tick0(_: usize, texture: &Texture) -> u32 {
     start_index(texture)
 }
 
+/// How [`compose`] reads each part of a layer: a fluid's quarter flow sprite
+/// ([`LayerRecipe::quarter`]), then the recipe's transform steps ([`LayerRecipe::steps`]).
+#[derive(Clone, Copy)]
+struct Read<'a> {
+    quarter: bool,
+    steps: &'a [TextureStep],
+}
+
+impl Read<'_> {
+    /// Each part read as it is.
+    const PLAIN: Read<'static> = Read {
+        quarter: false,
+        steps: &[],
+    };
+}
+
 /// Composites `parts` bottom to top at `size`^2 (part `i` shows strip frame `pick(i, texture)`,
 /// nearest scaling, tint baked in, "over" blending in sRGB like Minecraft's overlay quads). The
 /// first part is required (`Err` names it when missing); a missing later part is a warning.
-/// `quarter`: a frame of twice `size` gives its top-left quarter ([`LayerRecipe::quarter`]).
+/// `read.quarter`: a frame of twice `size` gives its top-left quarter ([`LayerRecipe::quarter`]);
+/// `read.steps` then turn, mirror or crop each part at its own size, before it is scaled, so a
+/// crop keeps the pack's resolution (EW-XFORM, ADR 0044).
 fn compose(
     pack: &ResourcePack,
     parts: &[Part],
     size: u32,
-    quarter: bool,
+    read: Read<'_>,
     warnings: &mut Vec<String>,
     pick: &dyn Fn(usize, &Texture) -> u32,
 ) -> Result<Vec<[u8; 4]>, String> {
@@ -589,11 +622,14 @@ fn compose(
             continue;
         };
         let (mut width, mut height, mut frame) = frame_texels(texture, pick(i, texture));
-        if quarter && width == 2 * size && height == 2 * size {
+        if read.quarter && width == 2 * size && height == 2 * size {
             frame = (0..size * size)
                 .map(|i| frame[((i / size) * width + i % size) as usize])
                 .collect();
             (width, height) = (size, size);
+        }
+        if !read.steps.is_empty() {
+            (width, height, frame) = apply_steps(read.steps, width, height, &frame);
         }
         let mut texels = scale_nearest(width, height, &frame, size);
         if let Some(tint) = part.tint {
@@ -848,6 +884,7 @@ pub(crate) mod tests {
             tint: None,
             fallback: vec![("block/gravel".to_string(), Some([255, 0, 0]))],
             quarter: false,
+            steps: Vec::new(),
         };
         let source =
             TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![recipe]));
@@ -1005,11 +1042,7 @@ pub(crate) mod tests {
             collision: BlockCollision::None,
             emission,
             light_opacity: 1,
-            textures: FaceTextures {
-                top: still,
-                bottom: still,
-                side,
-            },
+            textures: FaceTextures::new(still, still, side),
         };
         b.add_block(fluid("goo", goo, goo_side, [0; 3]))
             .expect("goo");
@@ -1037,7 +1070,7 @@ pub(crate) mod tests {
                     def.emission = [0; 3];
                 }
                 if level >= 12 {
-                    def.textures.side = crust;
+                    def.textures.set_sides(crust);
                 }
             },
         )
@@ -1089,6 +1122,7 @@ pub(crate) mod tests {
             tint: None,
             fallback: vec![("block/stone".to_string(), None)],
             quarter: false,
+            steps: Vec::new(),
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", ""),
@@ -1160,6 +1194,7 @@ pub(crate) mod tests {
             tint: None,
             fallback: vec![(fallback.to_string(), None)],
             quarter: false,
+            steps: Vec::new(),
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", "mygame:ruby", "mygame:block/no_such_texture"),
@@ -1405,6 +1440,227 @@ pub(crate) mod tests {
             model_of("oak_log", &recipe_values(&registry, log_top)).as_deref(),
             Some("minecraft:block/log_y")
         );
+    }
+
+    /// A registry of a six-face cube with every face its own layer (EW-FACE6), a cutout cube
+    /// whose layer only its -Z face shows, and the transform test layers.
+    fn six_face_registry() -> BlockRegistry {
+        use boxel_voxel::{
+            BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FaceTextures, TextureImage,
+        };
+        let mut b = BlockRegistryBuilder::new();
+        let mut layer = |name: &str| {
+            b.add_texture(TextureSpec {
+                name: format!("game:{name}"),
+                image: TextureImage::solid(16, [90, 90, 90, 255]),
+            })
+            .expect("layer")
+        };
+        let faces = ["up", "down", "east", "west", "south", "north"].map(&mut layer);
+        let grille = layer("grille");
+        let plain = layer("plain");
+        let xform = [
+            "arrow",
+            "arrow_r90",
+            "arrow_r270",
+            "arrow_mx",
+            "arrow_my",
+            "arrow_crop",
+        ]
+        .map(&mut layer);
+        let cube = |name: &str, shape, textures| BlockDef {
+            name: format!("game:{name}"),
+            shape,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: if shape == RenderShape::Opaque { 15 } else { 0 },
+            textures,
+        };
+        b.add_block(cube(
+            "box",
+            RenderShape::Opaque,
+            FaceTextures::from_faces(faces),
+        ))
+        .expect("box");
+        b.add_block(cube(
+            "cage",
+            RenderShape::Cutout,
+            FaceTextures::all(plain).with(Face::NegZ, grille),
+        ))
+        .expect("cage");
+        b.add_block(cube(
+            "arrows",
+            RenderShape::Opaque,
+            FaceTextures::from_faces([xform[0], xform[1], xform[2], xform[3], xform[4], xform[5]]),
+        ))
+        .expect("arrows");
+        b.build()
+    }
+
+    /// Every face of a six-face cube reads its own layer, and the alpha mode of a layer comes
+    /// from the block that shows it on any face: the -Z only layers of the opaque cube lose their
+    /// alpha, the cutout cube's -Z only grille gets a binary one (before EW-FACE6 only the
+    /// +Y, -Y and +X faces counted, and both kept their half alpha).
+    #[test]
+    fn six_faces_read_their_own_layers_and_alpha_modes() {
+        let registry = six_face_registry();
+        let pack = TempPack::new("six_faces");
+        for (i, name) in ["up", "down", "east", "west", "south", "north"]
+            .into_iter()
+            .enumerate()
+        {
+            pack.png(name, 16, 16, |_, _| [i as u8 * 10, 0, 0, 100]);
+        }
+        pack.png("grille", 16, 16, |x, _| {
+            [200, 200, 200, if x < 8 { 100 } else { 180 }]
+        });
+        pack.png("plain", 16, 16, |_, _| [1, 2, 3, 255]);
+        let state = registry.default_state(registry.block_by_name("game:box").expect("box"));
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()));
+        let (data, _) = load_block_textures(&registry, &source).expect("pack");
+        for (i, face) in [
+            Face::PosY,
+            Face::NegY,
+            Face::PosX,
+            Face::NegX,
+            Face::PosZ,
+            Face::NegZ,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let layer = usize::from(registry.face_texture(state, face).0);
+            assert_eq!(
+                texel(&data, layer, 3, 3),
+                [i as u8 * 10, 0, 0, 255],
+                "{face:?}"
+            );
+        }
+        let grille = layer_of(&registry, "game:grille");
+        assert_eq!(texel(&data, grille, 0, 0), [200, 200, 200, 0]);
+        assert_eq!(texel(&data, grille, 15, 0), [200, 200, 200, 255]);
+    }
+
+    /// EW-XFORM: a recipe's steps turn, mirror and crop the pack texture into the layer, at the
+    /// pack's size before scaling, and the procedural fallback is left alone.
+    #[test]
+    fn recipe_steps_turn_mirror_and_crop_the_texture() {
+        let registry = six_face_registry();
+        let pack = TempPack::new("xform");
+        // Each texel names where it came from: red x * 16, green y * 16.
+        pack.png("arrow", 16, 16, |x, y| [x as u8 * 16, y as u8 * 16, 7, 255]);
+        let recipe = |layer: &str, steps: Vec<TextureStep>| LayerRecipe {
+            layer: format!("game:{layer}"),
+            block: String::new(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![("block/arrow".to_string(), None)],
+            quarter: false,
+            steps,
+        };
+        let recipes = vec![
+            recipe("arrow_r90", vec![TextureStep::Rotate(1)]),
+            recipe("arrow_r270", vec![TextureStep::Rotate(3)]),
+            recipe("arrow_mx", vec![TextureStep::MirrorX]),
+            recipe("arrow_my", vec![TextureStep::MirrorY]),
+            // The top-left quarter, stretched to the layer: each texel twice.
+            recipe(
+                "arrow_crop",
+                vec![TextureStep::Crop {
+                    rect: [0, 0, 8, 8],
+                    grid: 16,
+                }],
+            ),
+        ];
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(recipes));
+        let (data, report) = load_block_textures(&registry, &source).expect("pack");
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("arrow")),
+            "{:?}",
+            report.warnings
+        );
+        let at = |layer: &str, x: u32, y: u32| {
+            let t = texel(&data, layer_of(&registry, &format!("game:{layer}")), x, y);
+            (u32::from(t[0]) / 16, u32::from(t[1]) / 16)
+        };
+        for (x, y) in [(0, 0), (3, 1), (15, 0), (7, 12), (15, 15)] {
+            assert_eq!(at("arrow", x, y), (x, y));
+            // Clockwise: the output (x, y) is the input (y, 15 - x).
+            assert_eq!(at("arrow_r90", x, y), (y, 15 - x), "r90 {x} {y}");
+            assert_eq!(at("arrow_r270", x, y), (15 - y, x), "r270 {x} {y}");
+            assert_eq!(at("arrow_mx", x, y), (15 - x, y), "mx {x} {y}");
+            assert_eq!(at("arrow_my", x, y), (x, 15 - y), "my {x} {y}");
+            assert_eq!(at("arrow_crop", x, y), (x / 2, y / 2), "crop {x} {y}");
+        }
+        // Without the texture the layer keeps its procedural image, untransformed.
+        let empty = TempPack::new("xform_empty");
+        let source = TextureSource::Pack(PackSource::new(empty.0.clone()));
+        let (data, _) = load_block_textures(&registry, &source).expect("pack");
+        let r90 = layer_of(&registry, "game:arrow_r90");
+        assert_eq!(texel(&data, r90, 0, 15), [90, 90, 90, 255]);
+    }
+
+    /// The steps apply to every frame of an animated texture, and to a pack twice the size of
+    /// the array's edge before it is scaled (a crop keeps the pack's texels).
+    #[test]
+    fn recipe_steps_apply_to_animation_frames_and_big_textures() {
+        let registry = six_face_registry();
+        let pack = TempPack::new("xform_frames");
+        // Two 16 px frames: frame 0 has red x * 16, frame 1 red (15 - x) * 16.
+        pack.png("arrow", 16, 32, |x, y| {
+            let x = if y < 16 { x } else { 15 - x };
+            [x as u8 * 16, 0, 7, 255]
+        });
+        std::fs::write(
+            pack.0
+                .join("assets/minecraft/textures/block/arrow.png.mcmeta"),
+            r#"{"animation":{"frametime":1}}"#,
+        )
+        .expect("mcmeta");
+        // A 32 px texture among the 16 px ones: its left half cropped is 16 px, read 1:1.
+        pack.png("wide", 32, 32, |x, _| [x as u8 * 8, 0, 9, 255]);
+        let recipe = |layer: &str, texture: &str, steps: Vec<TextureStep>| LayerRecipe {
+            layer: format!("game:{layer}"),
+            block: String::new(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![(format!("block/{texture}"), None)],
+            quarter: false,
+            steps,
+        };
+        let recipes = vec![
+            recipe("arrow_mx", "arrow", vec![TextureStep::MirrorX]),
+            recipe(
+                "arrow_crop",
+                "wide",
+                vec![TextureStep::Crop {
+                    rect: [0, 0, 8, 16],
+                    grid: 16,
+                }],
+            ),
+        ];
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(recipes));
+        let (data, _) = load_block_textures(&registry, &source).expect("pack");
+        assert_eq!(data.size, 16);
+        let mx = layer_of(&registry, "game:arrow_mx");
+        assert_eq!(texel(&data, mx, 0, 0)[0], 15 * 16, "frame 0 mirrored");
+        let animation = data
+            .animations
+            .iter()
+            .find(|a| a.layer as usize == mx)
+            .expect("the mirrored layer animates");
+        // Frame 1, mirrored: red x * 16 again.
+        let frame = animation.frame(1);
+        assert_eq!((frame[0], frame[4 * 15]), (0, 15 * 16));
+        let crop = layer_of(&registry, "game:arrow_crop");
+        for x in [0, 1, 7, 15] {
+            assert_eq!(texel(&data, crop, x, 4)[0], x as u8 * 8, "texel {x}");
+        }
     }
 
     #[test]

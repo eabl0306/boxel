@@ -30,6 +30,7 @@ fn recipe(
             .map(|&(path, tint)| (path.to_string(), tint))
             .collect(),
         quarter: false,
+        steps: Vec::new(),
     }
 }
 
@@ -220,6 +221,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
         LayerRecipe {
             tint: Some(WATER_TINT),
             quarter: true,
+            steps: Vec::new(),
             ..recipe(
                 "boxel:water_flow",
                 "water",
@@ -229,6 +231,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
         },
         LayerRecipe {
             quarter: true,
+            steps: Vec::new(),
             ..recipe(
                 "boxel:lava_flow",
                 "lava",

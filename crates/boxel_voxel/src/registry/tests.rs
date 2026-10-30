@@ -248,3 +248,67 @@ fn the_name_rule_is_namespace_colon_path() {
         );
     }
 }
+
+/// EW-FACE6: six textures per state. The three-face constructor fills the four sides alike, the
+/// setters touch only their faces, and the registry checks and returns every face's layer.
+#[test]
+fn every_face_has_its_own_texture() {
+    let t = |i: u16| TextureId(i);
+    let three = FaceTextures::new(t(0), t(1), t(2));
+    assert_eq!(three.faces(), [t(0), t(1), t(2), t(2), t(2), t(2)]);
+    assert_eq!(FaceTextures::all(t(3)).faces(), [t(3); 6]);
+    let mut six = FaceTextures::from_faces([t(0), t(1), t(2), t(3), t(4), t(5)]);
+    for face in Face::ALL {
+        assert_eq!(six.get(face), t(face.index() as u16));
+    }
+    assert_eq!(six.with(Face::NegZ, t(9)).get(Face::NegZ), t(9));
+    six.set(Face::PosX, t(7));
+    assert_eq!(six.faces(), [t(0), t(1), t(7), t(3), t(4), t(5)]);
+    six.set_sides(t(8));
+    assert_eq!(six.faces(), [t(0), t(1), t(8), t(8), t(8), t(8)]);
+
+    let mut b = BlockRegistryBuilder::new();
+    let layers: Vec<TextureId> = (0..6)
+        .map(|i| {
+            b.add_texture(TextureSpec {
+                name: format!("test:face{i}"),
+                image: TextureImage::solid(16, [i, 0, 0, 255]),
+            })
+            .expect("layer")
+        })
+        .collect();
+    let faces: [TextureId; 6] = layers.try_into().expect("six");
+    let def = |name: &str, axis| BlockDef {
+        name: name.to_string(),
+        shape: RenderShape::Opaque,
+        model: BlockModel::Cube { axis },
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: OPAQUE_OPACITY,
+        textures: FaceTextures::from_faces(faces),
+    };
+    b.add_block(def("test:six", Axis::Y)).expect("six");
+    b.add_block(def("test:lying", Axis::X)).expect("lying");
+    // A layer past the registered ones on any face is refused, a front face's too.
+    let unknown = BlockDef {
+        textures: FaceTextures::from_faces(faces).with(Face::NegZ, t(6)),
+        ..def("test:unknown", Axis::Y)
+    };
+    assert_eq!(b.add_block(unknown), Err(RegistryError::UnknownTexture(6)));
+    let r = b.build();
+    let six = by(&r, "test:six");
+    for face in Face::ALL {
+        assert_eq!(r.face_texture(six, face), faces[face.index()], "{face:?}");
+    }
+    // A cube lying along X shows the +Y and -Y textures across its axis and the +X one around.
+    let lying = by(&r, "test:lying");
+    assert_eq!(r.face_texture(lying, Face::PosX), faces[Face::PosY.index()]);
+    assert_eq!(r.face_texture(lying, Face::NegX), faces[Face::NegY.index()]);
+    for face in [Face::PosY, Face::NegY, Face::PosZ, Face::NegZ] {
+        assert_eq!(
+            r.face_texture(lying, face),
+            faces[Face::PosX.index()],
+            "{face:?}"
+        );
+    }
+}

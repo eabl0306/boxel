@@ -300,6 +300,73 @@ fn quads_carry_the_texture_layer_of_their_face() {
     verify_mesh(&gathered(&isolated(&center), &table), &table, &mesh);
 }
 
+/// EW-FACE6: a cube and a slab with a texture of their own on every face (a furnace's front
+/// on -Z only). Merged quads keep the layer of their face; the slab's box faces too.
+#[test]
+fn six_face_cubes_and_boxes_show_one_layer_per_face() {
+    use boxel_voxel::{
+        BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FaceTextures, RenderShape,
+        SlabHalf, TextureImage, TextureSpec,
+    };
+    let mut b = BlockRegistryBuilder::new();
+    let mut faces = [boxel_voxel::TextureId(0); 6];
+    for (i, slot) in faces.iter_mut().enumerate() {
+        *slot = b
+            .add_texture(TextureSpec {
+                name: format!("test:face{i}"),
+                image: TextureImage::solid(16, [i as u8, 0, 0, 255]),
+            })
+            .expect("layer");
+    }
+    let def = |name: &str, model, faces: [boxel_voxel::TextureId; 6]| BlockDef {
+        name: name.to_string(),
+        shape: RenderShape::Opaque,
+        model,
+        collision: BlockCollision::Full,
+        emission: [0; 3],
+        light_opacity: 15,
+        textures: FaceTextures::from_faces(faces),
+    };
+    b.add_block(def("test:six", BlockModel::CUBE, faces))
+        .expect("six");
+    let mut turned = faces;
+    turned.rotate_left(1);
+    b.add_block(def("test:slab", BlockModel::Slab(SlabHalf::Bottom), turned))
+        .expect("slab");
+    let registry = b.build();
+    let table = MaterialTable::from_registry(&registry);
+    let six = registry.by_name("test:six").expect("six");
+    let slab = registry.by_name("test:slab").expect("slab");
+    // A row of three six-face cubes along X, and a slab apart.
+    let center = chunk_repr(
+        &dense_from(|x, y, z| match (x, y, z) {
+            (2..5, 3, 4) => six.0,
+            (20, 3, 4) => slab.0,
+            _ => 0,
+        }),
+        Repr::Direct,
+    );
+    let mesh = Mesher::new().mesh_chunk(&isolated(&center), &table, OPTIONS);
+    let mut seen = Vec::new();
+    for quad in &mesh.quads {
+        let (state, expected) = if quad.pos()[0] >= 20 {
+            (slab, turned)
+        } else {
+            (six, faces)
+        };
+        let layer = quad.layer();
+        assert_eq!(layer, expected[quad.face().index()].0, "{quad:?}");
+        assert_eq!(layer, registry.face_texture(state, quad.face()).0);
+        seen.push((state == six, quad.face(), layer));
+    }
+    // The cube row merges into one quad per face; every face of both shows.
+    assert_eq!(seen.iter().filter(|s| s.0).count(), 6, "{seen:?}");
+    for face in Face::ALL {
+        assert!(seen.iter().any(|s| s.0 && s.1 == face), "cube {face:?}");
+        assert!(seen.iter().any(|s| !s.0 && s.1 == face), "slab {face:?}");
+    }
+}
+
 #[test]
 fn emissive_blocks_flag_their_quads() {
     let (registry, table) = registry();

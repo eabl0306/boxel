@@ -111,9 +111,9 @@ pub enum SlabHalf {
 /// meshed one block at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockModel {
-    /// The full cube. `axis` orients it (logs): [`FaceTextures::top`] and
-    /// [`FaceTextures::bottom`] go on the faces across `axis` (+ and -), the side texture on the
-    /// other four, turned so that its vertical runs along `axis`.
+    /// The full cube. `axis` orients it (logs): the +Y and -Y textures ([`FaceTextures`]) go on
+    /// the faces across `axis` (+ and -), the +X texture on the other four, turned so that its
+    /// vertical runs along `axis`.
     Cube {
         /// Orientation; `Axis::Y` is the unturned cube.
         axis: Axis,
@@ -427,32 +427,57 @@ pub struct TextureSpec {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TextureId(pub u16);
 
-/// Texture per face group.
+/// The texture layer of each of the six faces of a block (EW-FACE6, ADR 0044). Most blocks
+/// need one texture ([`FaceTextures::all`]) or a top, a bottom and one side
+/// ([`FaceTextures::new`]); a furnace's front or a crafting table's sides set single faces
+/// ([`FaceTextures::with`]).
+///
+/// How a face shows its texture (`u` to the right of the image, `v` down; world axes, the cell
+/// from 0 to 1): on +Y and -Y, `u` runs along +X and `v` along +Z; on +X and -X, `u` runs along
+/// +Z and `v` down; on +Z and -Z, `u` runs along +X and `v` down. A Minecraft model differs on
+/// its north (-Z) and east (+X) faces, mirrored left to right, and on its down face, mirrored
+/// top to bottom: a texture that must read the same needs a mirrored layer there (a recipe step
+/// of `boxel_pack`, EW-XFORM).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FaceTextures {
-    /// +Y.
-    pub top: TextureId,
-    /// -Y.
-    pub bottom: TextureId,
-    /// ±X, ±Z.
-    pub side: TextureId,
-}
+pub struct FaceTextures([TextureId; 6]);
 
 impl FaceTextures {
     /// Same texture on every face.
     pub const fn all(t: TextureId) -> Self {
-        Self {
-            top: t,
-            bottom: t,
-            side: t,
-        }
+        Self([t; 6])
+    }
+    /// `top` on +Y, `bottom` on -Y and `side` on the four sides.
+    pub const fn new(top: TextureId, bottom: TextureId, side: TextureId) -> Self {
+        Self([top, bottom, side, side, side, side])
+    }
+    /// One texture per face, in [`Face::index`] order (+Y, -Y, +X, -X, +Z, -Z).
+    pub const fn from_faces(faces: [TextureId; 6]) -> Self {
+        Self(faces)
+    }
+    /// The textures in [`Face::index`] order.
+    pub const fn faces(self) -> [TextureId; 6] {
+        self.0
     }
     /// Texture for `face`.
     pub const fn get(self, face: Face) -> TextureId {
-        match face {
-            Face::PosY => self.top,
-            Face::NegY => self.bottom,
-            _ => self.side,
+        self.0[face.index()]
+    }
+    /// The same textures with `t` on `face`.
+    #[must_use]
+    pub const fn with(mut self, face: Face, t: TextureId) -> Self {
+        self.0[face.index()] = t;
+        self
+    }
+    /// Puts `t` on `face`.
+    pub const fn set(&mut self, face: Face, t: TextureId) {
+        self.0[face.index()] = t;
+    }
+    /// Puts `t` on the four side faces (±X, ±Z).
+    pub const fn set_sides(&mut self, t: TextureId) {
+        let mut i = 2;
+        while i < 6 {
+            self.0[i] = t;
+            i += 1;
         }
     }
 }
@@ -1017,7 +1042,7 @@ impl BlockRegistryBuilder {
             return Err(RegistryError::UnknownBoxModel(id.0));
         }
         if def.shape != RenderShape::None {
-            for t in [def.textures.top, def.textures.bottom, def.textures.side] {
+            for t in def.textures.faces() {
                 if t.0 as usize >= self.textures.len() {
                     return Err(RegistryError::UnknownTexture(t.0));
                 }

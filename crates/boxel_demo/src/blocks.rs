@@ -296,11 +296,7 @@ pub fn builder() -> BlockRegistryBuilder {
             "grass",
             opaque,
             true,
-            FaceTextures {
-                top: t.grass_top,
-                bottom: t.dirt,
-                side: t.grass_side,
-            },
+            FaceTextures::new(t.grass_top, t.dirt, t.grass_side),
         ),
         block("sand", opaque, true, all(t.sand)),
         block("gravel", opaque, true, all(t.gravel)),
@@ -310,11 +306,7 @@ pub fn builder() -> BlockRegistryBuilder {
         b.add_block(def).expect("demo block");
     }
     // The log lies along its `axis` (ADR 0018, 0019): the end texture on the faces across it.
-    let log_textures = FaceTextures {
-        top: t.log_top,
-        bottom: t.log_top,
-        side: t.log_side,
-    };
+    let log_textures = FaceTextures::new(t.log_top, t.log_top, t.log_side);
     b.add_block_with_states(
         block("log", opaque, true, log_textures),
         vec![Property::new("axis", ["x", "y", "z"]).with_default("y")],
@@ -330,11 +322,7 @@ pub fn builder() -> BlockRegistryBuilder {
         .expect("demo leaves");
     // A fluid's side faces show its flow texture (Minecraft draws a fluid's sides with its flow
     // sprite; ADR 0025), and the mesher gives it to the top of a cell that slopes.
-    let fluid_textures = |still, flow| FaceTextures {
-        top: still,
-        bottom: still,
-        side: flow,
-    };
+    let fluid_textures = |still, flow| FaceTextures::new(still, still, flow);
     // Water has Minecraft's `level` (ADR 0021): 0 is a source, 1 to 7 flowing water (lower as
     // the level grows) and 8 to 15 falling water. Every level draws, collides and lets light
     // through the same way: only the fluid ticks and the mesher's corner heights read it.

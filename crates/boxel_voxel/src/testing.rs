@@ -140,11 +140,7 @@ pub fn builder() -> BlockRegistryBuilder {
         model: BlockModel::Fluid,
         collision: BlockCollision::None,
         light_opacity: 1,
-        textures: FaceTextures {
-            top: still,
-            bottom: still,
-            side: flow,
-        },
+        textures: FaceTextures::new(still, still, flow),
         ..cube(name, shape, all(still))
     };
     let levels = || vec![Property::int(FLUID_LEVEL, 0..=15)];

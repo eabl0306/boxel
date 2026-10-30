@@ -70,5 +70,5 @@ pub use model::{
     resolve_model,
 };
 pub use pack::ResourcePack;
-pub use recipe::LayerRecipe;
+pub use recipe::{LayerRecipe, TextureStep, apply_steps};
 pub use texture::Texture;

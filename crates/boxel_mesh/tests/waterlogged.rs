@@ -331,11 +331,7 @@ fn held_registry() -> (BlockRegistry, MaterialTable) {
             solid,
         ),
     ];
-    let log_faces = FaceTextures {
-        top: solid,
-        bottom: solid,
-        side: leaves,
-    };
+    let log_faces = FaceTextures::new(solid, solid, leaves);
     let x_log = BlockModel::Cube { axis: Axis::X };
     let all = FaceTextures::all;
     let blocks = blocks.map(|(name, shape, model, collision, texture)| {

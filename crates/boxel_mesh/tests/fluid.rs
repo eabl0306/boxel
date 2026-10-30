@@ -481,11 +481,7 @@ fn full_registry() -> FullRegistry {
         model: BlockModel::Fluid,
         collision: BlockCollision::None,
         light_opacity: 1,
-        textures: FaceTextures {
-            top: still,
-            bottom: still,
-            side: flow,
-        },
+        textures: FaceTextures::new(still, still, flow),
         ..cube("test:deep", RenderShape::Translucent, still)
     };
     let source = b
