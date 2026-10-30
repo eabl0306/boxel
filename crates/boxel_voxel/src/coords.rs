@@ -434,6 +434,57 @@ impl Face {
             Face::NegZ => Face::PosZ,
         }
     }
+    /// The face turned `turns` quarter turns clockwise seen from above (east to south), as
+    /// `ModelBox::turned` turns a box.
+    pub const fn turned_y(self, turns: u8) -> Face {
+        let mut f = self;
+        let mut k = 0;
+        while k < turns % 4 {
+            f = match f {
+                Face::PosX => Face::PosZ,
+                Face::PosZ => Face::NegX,
+                Face::NegX => Face::NegZ,
+                Face::NegZ => Face::PosX,
+                end => end,
+            };
+            k += 1;
+        }
+        f
+    }
+    /// The face turned `turns` quarter turns around X, each taking the top to the north, as
+    /// `ModelBox::turned_x` turns a box.
+    pub const fn turned_x(self, turns: u8) -> Face {
+        let mut f = self;
+        let mut k = 0;
+        while k < turns % 4 {
+            f = match f {
+                Face::PosY => Face::NegZ,
+                Face::NegZ => Face::NegY,
+                Face::NegY => Face::PosZ,
+                Face::PosZ => Face::PosY,
+                side => side,
+            };
+            k += 1;
+        }
+        f
+    }
+    /// The face turned `turns` quarter turns around Z, each taking the top to the east, as
+    /// `ModelBox::turned_z` turns a box.
+    pub const fn turned_z(self, turns: u8) -> Face {
+        let mut f = self;
+        let mut k = 0;
+        while k < turns % 4 {
+            f = match f {
+                Face::PosY => Face::PosX,
+                Face::PosX => Face::NegY,
+                Face::NegY => Face::NegX,
+                Face::NegX => Face::PosY,
+                side => side,
+            };
+            k += 1;
+        }
+        f
+    }
     /// Canonical (normal axis, u axis, v axis), 0 = X, 1 = Y, 2 = Z (`PackedQuad` w runs along u,
     /// h along v): ±Y -> (1, 0, 2), ±X -> (0, 2, 1), ±Z -> (2, 0, 1).
     pub const fn axes(self) -> (usize, usize, usize) {

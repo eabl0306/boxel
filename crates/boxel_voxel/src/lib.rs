@@ -60,7 +60,7 @@ pub use lod::{CellPartial, LodClass, LodClasses};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
-    BlockState, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
+    BlockState, BoxFaceTexture, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
     MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
     TextureImage, TextureSpec, WATERLOGGED, validate_name,
 };

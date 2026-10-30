@@ -378,8 +378,9 @@ fn pack_texture_size(pack: &ResourcePack, warnings: &mut Vec<String>) -> u32 {
     size
 }
 
-/// Shape of the first block drawing each layer on any of its six faces (`None`: no block uses
-/// it): a layer only a front face shows (a furnace's) gets its alpha mode too.
+/// Shape of the first block drawing each layer on any of its six faces or its box faces
+/// (`None`: no block uses it): a layer only a front face shows (a furnace's), or only one box
+/// face (EW-BOXTEX), gets its alpha mode too.
 fn layer_shapes(registry: &BlockRegistry) -> Vec<Option<RenderShape>> {
     let mut shapes = vec![None; registry.textures().len()];
     for state in 0..registry.len() {
@@ -388,8 +389,8 @@ fn layer_shapes(registry: &BlockRegistry) -> Vec<Option<RenderShape>> {
         if shape == RenderShape::None {
             continue;
         }
-        for face in Face::ALL {
-            let layer = registry.face_texture(state, face).0 as usize;
+        for texture in registry.drawn_textures(state) {
+            let layer = texture.0 as usize;
             if let Some(slot) = shapes.get_mut(layer)
                 && slot.is_none()
             {
@@ -1540,6 +1541,41 @@ pub(crate) mod tests {
         let grille = layer_of(&registry, "game:grille");
         assert_eq!(texel(&data, grille, 0, 0), [200, 200, 200, 0]);
         assert_eq!(texel(&data, grille, 15, 0), [200, 200, 200, 255]);
+    }
+
+    /// EW-BOXTEX: a layer only a box face names takes its alpha mode from that block.
+    #[test]
+    fn a_layer_only_a_box_face_shows_gets_its_alpha_mode() {
+        use boxel_voxel::{
+            BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, BoxFaceTexture, BoxModel,
+            FaceTextures, ModelBox, TextureImage,
+        };
+        let mut b = BlockRegistryBuilder::new();
+        let mut layer = |name: &str| {
+            b.add_texture(TextureSpec {
+                name: format!("game:{name}"),
+                image: TextureImage::solid(16, [90, 90, 90, 255]),
+            })
+            .expect("layer")
+        };
+        let (plain, wick) = (layer("plain"), layer("wick"));
+        let post = ModelBox::new([7, 0, 7], [9, 6, 9]);
+        let model = BoxModel::from_boxes(vec![post])
+            .with_textures(vec![[BoxFaceTexture::layer(wick).at(0, 8); 6]]);
+        let model = b.add_box_model(model).expect("model");
+        b.add_block(BlockDef {
+            name: "game:post".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Boxes(model),
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(plain),
+        })
+        .expect("post");
+        let shapes = layer_shapes(&b.build());
+        assert_eq!(shapes[usize::from(wick.0)], Some(RenderShape::Cutout));
+        assert_eq!(shapes[usize::from(plain.0)], Some(RenderShape::Cutout));
     }
 
     /// EW-XFORM: a recipe's steps turn, mirror and crop the pack texture into the layer, at the

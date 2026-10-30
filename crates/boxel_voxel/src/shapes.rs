@@ -191,6 +191,65 @@ impl ModelBox {
         b
     }
 
+    /// The box turned `turns` quarter turns around the cell's center line along X, each taking
+    /// the top (+Y) to the north (-Z), as a Minecraft blockstate's `x` of 90 turns a model (the
+    /// texture offset turns with it).
+    #[must_use]
+    pub const fn turned_x(self, turns: u8) -> ModelBox {
+        let mut b = self;
+        let mut k = 0;
+        while k < turns % 4 {
+            // +Y to -Z and +Z to +Y: (y, z) -> (z, 16 - y).
+            let (min, max) = (b.bounds.min, b.bounds.max);
+            b.bounds =
+                CollisionBox::new([min[0], min[2], 16 - max[1]], [max[0], max[2], 16 - min[1]]);
+            let t = b.texture_offset;
+            b.texture_offset = [t[0], t[2], -t[1]];
+            k += 1;
+        }
+        b
+    }
+
+    /// The box turned `turns` quarter turns around the cell's center line along Z, each taking
+    /// the top (+Y) to the east (+X) (the texture offset turns with it).
+    #[must_use]
+    pub const fn turned_z(self, turns: u8) -> ModelBox {
+        let mut b = self;
+        let mut k = 0;
+        while k < turns % 4 {
+            // +Y to +X and +X to -Y: (x, y) -> (y, 16 - x).
+            let (min, max) = (b.bounds.min, b.bounds.max);
+            b.bounds =
+                CollisionBox::new([min[1], 16 - max[0], min[2]], [max[1], 16 - min[0], max[2]]);
+            let t = b.texture_offset;
+            b.texture_offset = [t[1], -t[0], t[2]];
+            k += 1;
+        }
+        b
+    }
+
+    /// The box with the texture offset that makes its `face` show the texture from texel
+    /// `uv = [u, v]` (sixteenths, `0..16`) at the face's top left corner (EW-BOXTEX, ADR 0045):
+    /// the corner at the face's lowest `u` and, on the sides, its highest `y` (lowest `z` on
+    /// ±Y), in the orientation `FaceTextures` documents. The other faces of the box read this
+    /// offset too, so a box whose faces want different crops takes one such box per face (one
+    /// model box table entry each, [`crate::BoxModel`]). Offsets come out in `0..16`: the
+    /// texture repeats every 16.
+    #[must_use]
+    pub const fn with_face_uv(self, face: Face, uv: [u8; 2]) -> ModelBox {
+        let (_, u, v) = face.axes();
+        let (min, max) = (self.bounds.min, self.bounds.max);
+        let mut b = self;
+        b.texture_offset[u] = (uv[0] as i32 - min[u] as i32).rem_euclid(16) as i8;
+        b.texture_offset[v] = if v == 1 {
+            // Sides: the texture's rows run down from the cell's top, row = 16 - (y + offset).
+            (16 - max[1] as i32 - uv[1] as i32).rem_euclid(16) as i8
+        } else {
+            (uv[1] as i32 - min[v] as i32).rem_euclid(16) as i8
+        };
+        b
+    }
+
     /// The box mirrored upside down (`y -> 16 - y`), for top stairs.
     #[must_use]
     pub const fn flipped(self) -> ModelBox {

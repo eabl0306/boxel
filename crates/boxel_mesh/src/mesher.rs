@@ -11,9 +11,9 @@ use crate::{
 };
 use boxel_light::PaddedLight;
 use boxel_voxel::{
-    BlockModel, BlockRegistry, BlockState, CHUNK_SIZE, CHUNK_VOLUME, ChunkData, FLUID_LEVEL, Face,
-    LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, Paletted, RenderShape,
-    neighbor_index,
+    BlockModel, BlockRegistry, BlockState, BoxFaceTexture, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
+    FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, Paletted,
+    RenderShape, neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -144,13 +144,19 @@ fn add_rect(cover: &mut Cover, rect: Rect) {
 #[derive(Clone, Copy, Debug)]
 struct BoxFace {
     face: Face,
-    /// Index of the box in [`BoxModels::boxes`].
+    /// Index of the box in [`BoxModels::boxes`] (the face's own entry when it crops its
+    /// texture, EW-BOXTEX).
     index: u16,
+    /// Its texture layer, [`BLOCK_LAYER`] for the block's layer of `face`.
+    layer: u16,
     /// Flush with the cell border (a neighbor can hide it).
     border: bool,
     /// Where it is on the face's plane.
     rect: Rect,
 }
+
+/// The [`BoxFace::layer`] of a face that shows the block's texture.
+const BLOCK_LAYER: u16 = u16::MAX;
 
 /// No solid top ([`BoxShape::top_floor`] of a model whose boxes leave part of its top layer
 /// open).
@@ -158,7 +164,8 @@ const NO_FLOOR: u8 = u8::MAX;
 
 /// The faces a model made of boxes draws: every box face that no other box of the model covers
 /// (the bottom of a stair's step on its slab, a fence bar's end on the post), and what its faces
-/// flush with the cell border cover, per face.
+/// flush with the cell border cover, per face. A hidden face ([`BoxFaceTexture::hidden`]) is
+/// not drawn and covers nothing.
 #[derive(Clone, Debug)]
 struct BoxShape {
     faces: Vec<BoxFace>,
@@ -173,20 +180,37 @@ struct BoxShape {
 }
 
 impl BoxShape {
-    /// The shape of `boxes`, `index` giving each box's table index.
-    fn new(boxes: &[ModelBox], mut index: impl FnMut(ModelBox) -> u16) -> Self {
+    /// The shape of `boxes`, whose faces show `textures` (none or one per box,
+    /// `BoxModel::textures`), `index` giving each table box's index.
+    fn new(
+        boxes: &[ModelBox],
+        textures: &[[BoxFaceTexture; 6]],
+        mut index: impl FnMut(ModelBox) -> u16,
+    ) -> Self {
+        let texture = |i: usize, face: Face| {
+            textures
+                .get(i)
+                .map_or(BoxFaceTexture::BLOCK, |t| t[face.index()])
+        };
         let mut faces = Vec::new();
         let mut covers = [[0u16; 16]; 6];
-        for &b in boxes {
+        for (i, &b) in boxes.iter().enumerate() {
             let (min, max) = (b.bounds.min, b.bounds.max);
             for face in Face::ALL {
                 let (n, u, v) = face.axes();
                 let positive = face.index().is_multiple_of(2);
                 let plane = if positive { max[n] } else { min[n] };
                 let rect = [min[u], max[u], min[v], max[v]];
+                let Some(table_box) = texture(i, face).table_box(b, face) else {
+                    continue;
+                };
                 // The other boxes whose opposite face lies on this plane, touching this box.
                 let mut inner: Cover = [0; 16];
-                for other in boxes.iter().filter(|o| **o != b) {
+                let others = boxes.iter().enumerate().filter(|(_, o)| **o != b);
+                for (j, other) in others {
+                    if texture(j, face.opposite()).hidden {
+                        continue;
+                    }
                     let (omin, omax) = (other.bounds.min, other.bounds.max);
                     let opposite = if positive { omin[n] } else { omax[n] };
                     if opposite == plane {
@@ -202,7 +226,8 @@ impl BoxShape {
                 }
                 faces.push(BoxFace {
                     face,
-                    index: index(b),
+                    index: index(table_box),
+                    layer: texture(i, face).texture.map_or(BLOCK_LAYER, |t| t.0),
                     border,
                     rect,
                 });
@@ -237,13 +262,19 @@ impl BoxShape {
 }
 
 impl BoxModels {
-    /// The shape of `model`, made of `model_boxes`, interning its boxes and itself.
-    fn intern(&mut self, model: BlockModel, model_boxes: &[ModelBox]) -> u16 {
+    /// The shape of `model`, made of `model_boxes` showing `textures`, interning its boxes and
+    /// itself.
+    fn intern(
+        &mut self,
+        model: BlockModel,
+        model_boxes: &[ModelBox],
+        textures: &[[BoxFaceTexture; 6]],
+    ) -> u16 {
         if let Some(&id) = self.shape_ids.get(&model) {
             return id;
         }
         let (boxes, ids) = (&mut self.boxes, &mut self.box_ids);
-        let shape = BoxShape::new(model_boxes, |b| {
+        let shape = BoxShape::new(model_boxes, textures, |b| {
             *ids.entry(b).or_insert_with(|| {
                 boxes.push(b);
                 (boxes.len() - 1) as u16
@@ -336,7 +367,12 @@ impl MaterialTable {
                 table.lit[m] = registry.emission(s);
                 table.has_lit |= !table.lit[m].is_dark();
             }
-            table.set_model(m as u16, registry.model(s), registry.model_boxes(s));
+            table.set_textured_model(
+                m as u16,
+                registry.model(s),
+                registry.model_boxes(s),
+                registry.box_textures(s),
+            );
             // Every level of a fluid meshes as its source (level 0).
             if registry.model(s) == BlockModel::Fluid
                 && let Some(level) = registry.values(s).index(FLUID_LEVEL)
@@ -456,6 +492,17 @@ impl MaterialTable {
     /// of the first one set. Tables built with [`MaterialTable::from_parts`] start with every
     /// material a cube.
     pub fn set_model(&mut self, material: u16, model: BlockModel, boxes: &[ModelBox]) {
+        self.set_textured_model(material, model, boxes, &[]);
+    }
+    /// [`MaterialTable::set_model`] with the texture of each box face (`BoxModel::textures`,
+    /// EW-BOXTEX: none or one per box).
+    pub fn set_textured_model(
+        &mut self,
+        material: u16,
+        model: BlockModel,
+        boxes: &[ModelBox],
+        textures: &[[BoxFaceTexture; 6]],
+    ) {
         let i = material as usize;
         if i >= self.class.len() {
             return;
@@ -470,7 +517,7 @@ impl MaterialTable {
         self.has_fluid |= model == BlockModel::Fluid;
         let made_of_boxes = self.shape[i] != RenderShape::None && !boxes.is_empty();
         self.box_models.shape_of[i] = if made_of_boxes {
-            self.box_models.intern(model, boxes)
+            self.box_models.intern(model, boxes, textures)
         } else {
             NO_SHAPE
         };
@@ -1454,19 +1501,18 @@ fn emit_specials(
 ) -> Result<(), PaletteFull> {
     out.clear();
     // `index`: the model box of a `SHAPE_BOX` quad (0 is `w = h = 1` for the others).
-    let mut push =
-        |m: u16, pos: [u32; 3], face: Face, layer_face: Face, code: u8, index, shading| {
-            let (ao, light): (u8, u16) = shading;
-            let mut quad = PackedQuad::new(pos, 1, 1, face, materials.layer(m, layer_face))
-                .with_ao_byte(ao)
-                .with_light_index(light)
-                .with_shape(code)
-                .with_box_index(index);
-            if materials.emissive(m) {
-                quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
-            }
-            out.push((materials.bucket(m, face) as u8, quad));
-        };
+    let mut push = |m: u16, pos: [u32; 3], face: Face, layer: u16, code: u8, index, shading| {
+        let (ao, light): (u8, u16) = shading;
+        let mut quad = PackedQuad::new(pos, 1, 1, face, layer)
+            .with_ao_byte(ao)
+            .with_light_index(light)
+            .with_shape(code)
+            .with_box_index(index);
+        if materials.emissive(m) {
+            quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
+        }
+        out.push((materials.bucket(m, face) as u8, quad));
+    };
     let models = &materials.box_models;
     // The quads of block `m` at inner `[x, y, z]`.
     let mut block = |m: u16, [x, y, z]: [i32; 3]| {
@@ -1488,13 +1534,19 @@ fn emit_specials(
                         shading
                     }
                 };
-                push(m, pos, face, face, layout::SHAPE_BOX, bf.index, shading);
+                let layer = if bf.layer == BLOCK_LAYER {
+                    materials.layer(m, face)
+                } else {
+                    bf.layer
+                };
+                push(m, pos, face, layer, layout::SHAPE_BOX, bf.index, shading);
             }
         } else if materials.model(m) == BlockModel::Cross {
             let i = PaddedChunk::index(x, y, z);
             for face in [Face::PosX, Face::PosZ] {
                 let shading = shade(m, i, face, None)?;
-                push(m, pos, face, Face::PosX, layout::SHAPE_CROSS, 0, shading);
+                let layer = materials.layer(m, Face::PosX);
+                push(m, pos, face, layer, layout::SHAPE_CROSS, 0, shading);
             }
         } else if materials.model(m).is_solid_cube() {
             // A waterlogged cube (`padded.special` holds none): the unit faces of the dry cube,
@@ -1508,7 +1560,7 @@ fn emit_specials(
                 let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
                 let shading = shade(m, front, face, Some(nb9))?;
                 let code = materials.cube_code(m, face);
-                push(m, pos, face, face, code, 0, shading);
+                push(m, pos, face, materials.layer(m, face), code, 0, shading);
             }
         }
         Ok(())
@@ -2083,7 +2135,7 @@ mod tests {
             .iter()
             .map(|&(min, max)| ModelBox::new(min, max))
             .collect();
-        BoxShape::new(&boxes, |_| 0)
+        BoxShape::new(&boxes, &[], |_| 0)
     }
 
     #[test]

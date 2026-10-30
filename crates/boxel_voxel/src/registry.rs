@@ -199,28 +199,177 @@ impl BlockModel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BoxModelId(pub u16);
 
-/// A model made of boxes ([`BlockModel::Boxes`]): the boxes it is drawn with and the boxes it is
+/// How one face of one box of a [`BoxModel`] shows its texture (EW-BOXTEX, ADR 0045). The
+/// default is the block's: the layer of its [`FaceTextures`] for that direction, the part under
+/// the box moved by the box's texture offset ([`ModelBox`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BoxFaceTexture {
+    /// The layer it shows; `None`: the block's for the face's direction.
+    pub texture: Option<TextureId>,
+    /// The texel (sixteenths, each `0..16`) its top left corner shows ([`ModelBox::with_face_uv`]):
+    /// a crop of the layer as big as the face. `None`: the part under the box, moved by its
+    /// texture offset. A crop of another size, turned or mirrored is a layer of its own (a recipe
+    /// step, EW-XFORM).
+    pub uv: Option<[u8; 2]>,
+    /// Not drawn (a face Minecraft's model leaves out). It hides nothing either.
+    pub hidden: bool,
+}
+
+impl BoxFaceTexture {
+    /// The block's texture, under the box.
+    pub const BLOCK: BoxFaceTexture = BoxFaceTexture {
+        texture: None,
+        uv: None,
+        hidden: false,
+    };
+    /// A face that is not drawn.
+    pub const HIDDEN: BoxFaceTexture = BoxFaceTexture {
+        texture: None,
+        uv: None,
+        hidden: true,
+    };
+
+    /// The layer `texture`, under the box.
+    pub const fn layer(texture: TextureId) -> Self {
+        Self {
+            texture: Some(texture),
+            uv: None,
+            hidden: false,
+        }
+    }
+
+    /// The same texture cropped from texel `[u, v]` (its [`BoxFaceTexture::uv`]).
+    #[must_use]
+    pub const fn at(mut self, u: u8, v: u8) -> Self {
+        self.uv = Some([u, v]);
+        self
+    }
+
+    /// The model box table entry this face of `b` reads (its own when it crops), `None` when
+    /// hidden.
+    pub const fn table_box(self, b: ModelBox, face: Face) -> Option<ModelBox> {
+        if self.hidden {
+            return None;
+        }
+        match self.uv {
+            Some(uv) => Some(b.with_face_uv(face, uv)),
+            None => Some(b),
+        }
+    }
+}
+
+/// A model made of boxes ([`BlockModel::Boxes`]): the boxes it is drawn with, the boxes it is
 /// picked by (its outline, often the boxes' bounds, sometimes bigger or simpler, as Minecraft's
-/// shapes: a fence is picked by a post and arms 4 wide, drawn with thin bars).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// shapes: a fence is picked by a post and arms 4 wide, drawn with thin bars), and how each box
+/// face shows its texture (EW-BOXTEX: empty, every face shows the block's).
+///
+/// The textures live here and not on [`ModelBox`], so the model box table (at most
+/// [`MAX_MODEL_BOXES`], shared by every model) keeps one entry per box. A face that crops its
+/// texture ([`BoxFaceTexture::uv`]) takes an entry of its own, unless another box already has
+/// the same one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BoxModel {
     /// The boxes it is drawn with (each [`ModelBox::is_valid`]; none draws nothing, as a wall
     /// without a post or sides).
     pub boxes: Vec<ModelBox>,
     /// The boxes it is picked by (each [`CollisionBox::is_valid`]: inside the cell).
     pub outline: Vec<CollisionBox>,
+    /// The faces of each box, in [`Face::index`] order: empty (every face the block's), or one
+    /// per box.
+    pub textures: Vec<[BoxFaceTexture; 6]>,
 }
 
 impl BoxModel {
     /// A model picked by the bounds of the boxes it is drawn with.
     pub fn from_boxes(boxes: Vec<ModelBox>) -> Self {
         let outline = boxes.iter().map(|b| b.bounds).collect();
-        Self { boxes, outline }
+        Self {
+            boxes,
+            outline,
+            textures: Vec::new(),
+        }
     }
 
-    /// Valid boxes and outline boxes.
+    /// The same model with `textures`, one per box ([`BoxModel::textures`]).
+    #[must_use]
+    pub fn with_textures(mut self, textures: Vec<[BoxFaceTexture; 6]>) -> Self {
+        self.textures = textures;
+        self
+    }
+
+    /// How `face` of box `i` shows its texture.
+    pub fn face_texture(&self, i: usize, face: Face) -> BoxFaceTexture {
+        self.textures
+            .get(i)
+            .map_or(BoxFaceTexture::BLOCK, |t| t[face.index()])
+    }
+
+    /// The model box table entries it draws with: each box's, and the crops of its faces.
+    pub fn table_boxes(&self) -> impl Iterator<Item = ModelBox> + '_ {
+        self.boxes.iter().enumerate().flat_map(move |(i, &b)| {
+            Face::ALL
+                .into_iter()
+                .filter_map(move |face| self.face_texture(i, face).table_box(b, face))
+        })
+    }
+
+    /// The model turned `turns` quarter turns clockwise seen from above ([`ModelBox::turned`]),
+    /// its outline too, each face's texture moved to the face it turns to (shown in that face's
+    /// orientation: a texture that must turn with the model takes a turned layer).
+    #[must_use]
+    pub fn turned(&self, turns: u8) -> BoxModel {
+        self.map(|b| b.turned(turns), |f| f.turned_y(turns))
+    }
+
+    /// The model turned around X, each quarter taking the top to the north
+    /// ([`ModelBox::turned_x`]), as [`BoxModel::turned`] does around Y.
+    #[must_use]
+    pub fn turned_x(&self, turns: u8) -> BoxModel {
+        self.map(|b| b.turned_x(turns), |f| f.turned_x(turns))
+    }
+
+    /// The model turned around Z, each quarter taking the top to the east
+    /// ([`ModelBox::turned_z`]), as [`BoxModel::turned`] does around Y.
+    #[must_use]
+    pub fn turned_z(&self, turns: u8) -> BoxModel {
+        self.map(|b| b.turned_z(turns), |f| f.turned_z(turns))
+    }
+
+    /// The model with every box and outline box moved by `turn`, the face textures by `face`.
+    fn map(&self, turn: impl Fn(ModelBox) -> ModelBox, face: impl Fn(Face) -> Face) -> BoxModel {
+        let outline = self.outline.iter().map(|&bounds| {
+            let b = ModelBox {
+                bounds,
+                texture_offset: [0; 3],
+            };
+            turn(b).bounds
+        });
+        let textures = self.textures.iter().map(|t| {
+            let mut turned = [BoxFaceTexture::BLOCK; 6];
+            for f in Face::ALL {
+                turned[face(f).index()] = t[f.index()];
+            }
+            turned
+        });
+        BoxModel {
+            boxes: self.boxes.iter().map(|&b| turn(b)).collect(),
+            outline: outline.collect(),
+            textures: textures.collect(),
+        }
+    }
+
+    /// Valid boxes and outline boxes, textures for no box or every box, crops inside the
+    /// texture.
     fn is_valid(&self) -> bool {
-        self.boxes.iter().all(|b| b.is_valid()) && self.outline.iter().all(|b| b.is_valid())
+        let crops_ok = self
+            .textures
+            .iter()
+            .flatten()
+            .all(|t| t.uv.is_none_or(|uv| uv[0] < 16 && uv[1] < 16));
+        self.boxes.iter().all(|b| b.is_valid())
+            && self.outline.iter().all(|b| b.is_valid())
+            && (self.textures.is_empty() || self.textures.len() == self.boxes.len())
+            && crops_ok
     }
 }
 
@@ -240,6 +389,16 @@ fn boxes_of(models: &[BoxModel], model: BlockModel) -> &[ModelBox] {
             .get(usize::from(id.0))
             .map_or(&[], |m| m.boxes.as_slice()),
         BlockModel::Cube { .. } | BlockModel::Cross | BlockModel::Fluid => &[],
+    }
+}
+
+/// The model box table entries `model` draws with ([`BoxModel::table_boxes`]; a slab's half).
+fn table_boxes_of(models: &[BoxModel], model: BlockModel) -> Vec<ModelBox> {
+    match model {
+        BlockModel::Boxes(id) => models
+            .get(usize::from(id.0))
+            .map_or_else(Vec::new, |m| m.table_boxes().collect()),
+        _ => boxes_of(models, model).to_vec(),
     }
 }
 
@@ -694,6 +853,11 @@ impl BlockRegistryBuilder {
         if !model.is_valid() {
             return Err(RegistryError::InvalidCollision("a box model".to_string()));
         }
+        for t in model.textures.iter().flatten().filter_map(|t| t.texture) {
+            if usize::from(t.0) >= self.textures.len() {
+                return Err(RegistryError::UnknownTexture(t.0));
+            }
+        }
         if let Some(&id) = self.box_model_ids.get(&model) {
             return Ok(id);
         }
@@ -1000,7 +1164,7 @@ impl BlockRegistryBuilder {
         }
         let mut new_boxes = std::collections::HashSet::new();
         for def in states.iter().filter(|d| d.shape != RenderShape::None) {
-            for &b in boxes_of(&self.box_models, def.model) {
+            for b in table_boxes_of(&self.box_models, def.model) {
                 if !self.model_boxes.contains(&b) {
                     new_boxes.insert(b);
                 }
@@ -1389,6 +1553,24 @@ impl BlockRegistry {
     /// mesher draws its own way (and out of range).
     pub fn model_boxes(&self, s: BlockState) -> &[ModelBox] {
         boxes_of(&self.box_models, self.model(s))
+    }
+    /// How the faces of each box `s` is drawn with show their texture ([`BoxModel::textures`]):
+    /// empty for every model but a [`BoxModel`] that sets them.
+    pub fn box_textures(&self, s: BlockState) -> &[[BoxFaceTexture; 6]] {
+        match self.model(s) {
+            BlockModel::Boxes(id) => self
+                .box_models
+                .get(usize::from(id.0))
+                .map_or(&[], |m| m.textures.as_slice()),
+            _ => &[],
+        }
+    }
+    /// Every texture layer `s` may draw: its face textures ([`BlockRegistry::face_texture`]) and
+    /// the layers its box faces name ([`BoxFaceTexture::texture`]). Repeats are possible.
+    pub fn drawn_textures(&self, s: BlockState) -> impl Iterator<Item = TextureId> + '_ {
+        let faces = Face::ALL.into_iter().map(move |f| self.face_texture(s, f));
+        let boxes = self.box_textures(s).iter().flatten();
+        faces.chain(boxes.filter(|t| !t.hidden).filter_map(|t| t.texture))
     }
     /// The boxes `s` is picked by (its outline): the full cell for cubes and fluids, the half
     /// cell for slabs, a smaller box around the stem for crosses, a [`BoxModel`]'s outline (out
