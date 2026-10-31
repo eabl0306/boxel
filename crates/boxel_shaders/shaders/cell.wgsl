@@ -17,6 +17,11 @@
 // its cell's light at the 4 corners and AO open. fs_cell_translucent (ADR 0055, its pipeline
 // blends and writes depth) shades the same way and gives the image's alpha times the opacity,
 // dropping texels of alpha under a tenth as Minecraft's translucent item shader does.
+//
+// Pattern quads (ADR 0056) have their own pipeline, vs_cell_pattern and fs_cell_pattern, with
+// the pattern texture array bound as group 0: a pattern fixed to the screen, as Minecraft's
+// rendertype_end_portal. data.x's layer is the first of three (base, layer image, tints) and
+// data.y's high byte (the opacity's) the number of layers over the base; the uv is not read.
 
 @group(0) @binding(0) var cell_textures: texture_2d_array<f32>;
 @group(0) @binding(1) var cell_sampler: sampler;
@@ -37,6 +42,12 @@ struct CellOut {
   @location(2) view_dist: f32,
 };
 
+// The corner `pos` of a quad of the chunk at `origin`, relative to the render origin.
+fn cell_rel(origin: vec3<i32>, pos: vec3<f32>) -> vec3<f32> {
+  // wrapping i32 subtraction first, as finish_vertex: exact at any world position
+  return vec3<f32>(origin - view.render_origin.xyz) + pos;
+}
+
 @vertex
 fn vs_cell(
   @location(0) origin: vec3<i32>,
@@ -44,10 +55,60 @@ fn vs_cell(
   @location(2) uv: vec2<f32>,
   @location(3) data: vec2<u32>,
 ) -> CellOut {
-  // wrapping i32 subtraction first, as finish_vertex: exact at any world position
-  let rel = vec3<f32>(origin - view.render_origin.xyz) + pos;
+  let rel = cell_rel(origin, pos);
   var o: CellOut;
   o.clip = view.view_proj * vec4(rel, 1.0);
+  o.uv = uv;
+  o.data = data;
+  o.view_dist = length(rel - view.camera_rel.xyz);
+  return o;
+}
+
+// The most layers a pattern quad draws over its base (boxel_shaders::gpu::cell).
+const PATTERN_LAYERS_MAX: u32 = 16u;
+
+// Layer k's turn (cos, sin): Minecraft's (k * k * 4321 + k * 9) * 2 degrees, taken modulo 360
+// exactly (whole degrees), so no tier takes the cosine of a large angle. A switch, not an array:
+// no shader keeps an array in a local variable (naga.rs).
+fn pattern_turn(k: u32) -> vec2<f32> {
+  switch k {
+    case 1u: { return vec2(0.939692621, 0.342020143); } // 20 degrees
+    case 2u: { return vec2(0.719339800, 0.694658370); } // 44 degrees
+    case 3u: { return vec2(0.309016994, 0.951056516); } // 72 degrees
+    case 4u: { return vec2(-0.241921896, 0.970295726); } // 104 degrees
+    case 5u: { return vec2(-0.766044443, 0.642787610); } // 140 degrees
+    case 6u: { return vec2(-1.0, 0.0); } // 180 degrees
+    case 7u: { return vec2(-0.719339800, -0.694658370); } // 224 degrees
+    case 8u: { return vec2(0.034899497, -0.999390827); } // 272 degrees
+    case 9u: { return vec2(0.809016994, -0.587785252); } // 324 degrees
+    case 10u: { return vec2(0.939692621, 0.342020143); } // 20 degrees
+    case 11u: { return vec2(0.173648178, 0.984807753); } // 80 degrees
+    case 12u: { return vec2(-0.809016994, 0.587785252); } // 144 degrees
+    case 13u: { return vec2(-0.848048096, -0.529919264); } // 212 degrees
+    case 14u: { return vec2(0.241921896, -0.970295726); } // 284 degrees
+    case 15u: { return vec2(1.0, 0.0); } // 0 degrees
+    default: { return vec2(0.173648178, 0.984807753); } // 16: 80 degrees
+  }
+}
+
+// A pattern quad is seen only from the side its face looks to (Minecraft culls the back of the
+// end portal's faces). The eye's side of an axis-aligned quad's plane is the same at its four
+// corners (their coordinate along the normal is the same float), so a quad seen from behind
+// puts all of them outside the clip volume and draws nothing.
+@vertex
+fn vs_cell_pattern(
+  @location(0) origin: vec3<i32>,
+  @location(1) pos: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(3) data: vec2<u32>,
+) -> CellOut {
+  let rel = cell_rel(origin, pos);
+  var o: CellOut;
+  o.clip = view.view_proj * vec4(rel, 1.0);
+  let normal = face_normal((data.x >> CELL_FACE_SHIFT) & 7u);
+  if (dot(normal, view.camera_rel.xyz - rel) <= 0.0) {
+    o.clip = vec4(2.0, 2.0, 0.5, 1.0);
+  }
   o.uv = uv;
   o.data = data;
   o.view_dist = length(rel - view.camera_rel.xyz);
@@ -59,6 +120,13 @@ fn cell_linear(c: vec3<f32>) -> vec3<f32> {
   let low = c / 12.92;
   let high = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
   return select(high, low, c <= vec3(0.04045));
+}
+
+// Linear to sRGB, per channel: the value Minecraft's shaders work with (it has no linear light).
+fn cell_display(c: vec3<f32>) -> vec3<f32> {
+  let low = c * 12.92;
+  let high = 1.055 * pow(c, vec3(1.0 / 2.4)) - vec3(0.055);
+  return select(high, low, c <= vec3(0.0031308));
 }
 
 // The quad's texel `albedo` shaded as a terrain fragment: tint, face, the cell's light, fog.
@@ -91,4 +159,41 @@ fn fs_cell_translucent(i: CellOut) -> @location(0) vec4<f32> {
   if (albedo.a < CELL_MIN_ALPHA) { discard; }
   let opacity = f32(i.data.y >> CELL_OPACITY_SHIFT) / 255.0;
   return vec4(cell_shade(albedo, i).rgb, albedo.a * opacity);
+}
+
+// Tint k of the pattern whose base is layer `base`: texel (k, 0) of its third layer, read as
+// linear (the multiplier itself; the content stores it sRGB-encoded).
+fn pattern_tint(base: u32, k: u32) -> vec3<f32> {
+  return textureLoad(cell_textures, vec2<i32>(i32(k), 0), i32(base + 2u), 0).rgb;
+}
+
+// Minecraft's rendertype_end_portal.fsh, in its display values: the base image over the whole
+// screen, tinted, plus `layers` layers of the layer image, layer k scaled by (4.5 - k / 4) * 2,
+// turned by pattern_turn(k), moved by (17 / k, (2 + k / 1.5) * 1.5 * phase), then halved
+// and moved by a quarter, each tinted by its tint; nearest texels of the top mip, the pattern
+// textures repeating. The screen point is Minecraft's texProj0 / w: (0, 0) at the bottom left.
+// The sum is clamped as Minecraft's 8-bit target does, then fogged as a terrain fragment.
+@fragment
+fn fs_cell_pattern(i: CellOut) -> @location(0) vec4<f32> {
+  let base = i.data.x & CELL_LAYER_MASK;
+  let layers = min(i.data.y >> CELL_OPACITY_SHIFT, PATTERN_LAYERS_MAX);
+  let screen = vec2(i.clip.x / view.viewport.x, 1.0 - i.clip.y / view.viewport.y);
+  let phase = view.light_params.z;
+  let sky = textureSampleLevel(cell_textures, cell_sampler, screen, base, 0.0).rgb;
+  var color = cell_display(sky) * pattern_tint(base, 0u);
+  for (var k = 1u; k <= layers; k = k + 1u) {
+    let f = f32(k);
+    let turn = pattern_turn(k);
+    let p = (4.5 - f / 4.0) * 2.0 * vec2(
+      turn.x * screen.x - turn.y * screen.y,
+      turn.y * screen.x + turn.x * screen.y,
+    );
+    let uv = 0.5 * (p + vec2(17.0 / f, (2.0 + f / 1.5) * (phase * 1.5))) + 0.25;
+    let stars = textureSampleLevel(cell_textures, cell_sampler, uv, base + 1u, 0.0).rgb;
+    color = color + cell_display(stars) * pattern_tint(base, k);
+  }
+  let tint = vec3<f32>((vec3(i.data.y) >> vec3(16u, 8u, 0u)) & vec3(255u)) / 255.0;
+  let lit = cell_linear(min(color * tint, vec3(1.0)));
+  let fog = clamp((i.view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
+  return vec4(mix(lit, view.fog_color.rgb, fog), 1.0);
 }

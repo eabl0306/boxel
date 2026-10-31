@@ -76,18 +76,18 @@ pub use pack_textures::{
 };
 pub use path::{CullCounts, cull_counts};
 pub use plugin::{
-    CellTextures, DebugDestroyDevice, GpuFailed, GpuReady, MovingCellQuads, PresentSettings,
-    Render, RenderInfo, RenderPlugin, RenderSettings, RenderSystems, RequestScreenshot, Resync,
-    ScreenshotSaved, SurfaceInfo,
+    CellTextures, DebugDestroyDevice, GpuFailed, GpuReady, MovingCellQuads, PatternTextures,
+    PresentSettings, Render, RenderInfo, RenderPlugin, RenderSettings, RenderSystems,
+    RequestScreenshot, Resync, ScreenshotSaved, SurfaceInfo,
 };
 #[doc(hidden)]
 pub use plugin::{DebugAllocProbe, frame_visibility, frame_visibility_with};
 #[doc(hidden)]
 pub use renderer::{AllocProbeReport, ResetState};
 pub use renderer::{
-    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, MemoryDemand, MemoryReserve, RenderStats,
-    RendererConfig, RendererError, ReserveMode, TEXTURE_TICKS_PER_SECOND, ViewParams,
-    VoxelRenderer, texture_tick,
+    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, MemoryDemand, MemoryReserve,
+    PATTERN_PERIOD_TICKS, RenderStats, RendererConfig, RendererError, ReserveMode,
+    TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, pattern_phase, texture_tick,
 };
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;

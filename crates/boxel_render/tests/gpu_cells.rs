@@ -31,6 +31,13 @@
 //! glass behind it seen, where a translucent quad there hides it; the same quads moving give the
 //! same pixels; and every tier draws the same pixels (0.1 %).
 //!
+//! A fourth scene draws pattern quads (`CellImage::Pattern`, ADR 0056) in front of the wall:
+//! one of solid images is the sum of its tinted layers in display values (Minecraft's end
+//! portal math) to 3 of 255; one of checkered images shows the same pixels from two depths
+//! (the pattern is fixed to the screen) and other pixels at another tick (it drifts); one whose
+//! face looks away is not drawn; the same quads moving give the same pixels; and every tier
+//! draws the same pixels (0.1 %).
+//!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cells/` (every image with
 //! `GPU_CELLS_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -47,9 +54,9 @@ use boxel_render::{
 use boxel_transform::Transform;
 use boxel_voxel::{
     Axis, BlockCollision, BlockData, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState,
-    BoxModel, CellBlend, CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face,
-    FaceTextures, LightValue, LocalPos, ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage,
-    TextureSpec, model_quads,
+    BoxModel, CellBlend, CellImage, CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue,
+    Face, FaceTextures, LightValue, LocalPos, ModelBox, ModelPlane, PlaneKind, RenderShape,
+    TextureImage, TextureSpec, model_quads,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1261,6 +1268,364 @@ fn translucent_cell_quads_blend_back_to_front_on_every_tier() {
                     &[
                         (&format!("{label}_{best}_translucent"), &b.near_first),
                         (&format!("{label}_{tier}_translucent"), &t.near_first),
+                    ],
+                );
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+// ---------------------------------------------------------------- pattern quads (ADR 0056)
+
+/// Edge of the pattern test images.
+const PATTERN_SIZE: u32 = 32;
+/// The solid pattern: its base, layer image and tints are layers 0, 1 and 2; 3 layers.
+const SOLID: (u16, u8) = (0, 3);
+/// The checkered pattern: layers 3, 4 and 5; 4 layers.
+const CHECKER: (u16, u8) = (3, 4);
+/// The solid pattern's base (gray), and its tints: the base's red, then green, blue and red.
+const SOLID_BASE: u8 = 64;
+const SOLID_TINTS: [[u8; 3]; 4] = [[255, 0, 0], [0, 128, 0], [0, 0, 128], [128, 0, 0]];
+
+/// The pattern textures: the solid pattern (a gray base, a white layer image, its tints) and the
+/// checkered one (two checkers of different cells, tints of 90 gray).
+fn pattern_textures() -> boxel_render::BlockTextureData {
+    let size = PATTERN_SIZE as usize;
+    let image = |texel: &dyn Fn(usize, usize) -> [u8; 4]| TextureImage {
+        size: PATTERN_SIZE,
+        texels: (0..size * size)
+            .map(|i| texel(i % size, i / size))
+            .collect::<Vec<_>>()
+            .into(),
+        binary_alpha: false,
+    };
+    let tints = |row: &dyn Fn(usize) -> [u8; 3]| {
+        image(&|x, y| {
+            let [r, g, b] = if y == 0 { row(x) } else { [0; 3] };
+            [r, g, b, 255]
+        })
+    };
+    let checker = |cell: usize, a: u8, b: u8| {
+        image(&|x, y| {
+            let c = if (x / cell + y / cell).is_multiple_of(2) {
+                a
+            } else {
+                b
+            };
+            [c, c, c, 255]
+        })
+    };
+    let spec = |name: &str, image| TextureSpec {
+        name: name.to_string(),
+        image,
+    };
+    boxel_render::generate_block_textures(&[
+        spec(
+            "test:solid_base",
+            TextureImage::solid(PATTERN_SIZE, [SOLID_BASE, SOLID_BASE, SOLID_BASE, 255]),
+        ),
+        spec(
+            "test:solid_layer",
+            TextureImage::solid(PATTERN_SIZE, [255; 4]),
+        ),
+        spec(
+            "test:solid_tints",
+            tints(&|x| SOLID_TINTS.get(x).copied().unwrap_or([0; 3])),
+        ),
+        spec("test:checker_base", checker(8, 255, 0)),
+        spec("test:checker_layer", checker(4, 255, 40)),
+        spec("test:checker_tints", tints(&|_| [90; 3])),
+    ])
+}
+
+/// A pattern quad across Z at `z`, from `min` to `max` (x, y), showing the pattern `(image,
+/// layers)`, its face looking to `face` (`NegZ`: toward the eye).
+fn pattern_quad(
+    min: [f32; 2],
+    max: [f32; 2],
+    z: f32,
+    (image, layers): (u16, u8),
+    face: Face,
+) -> CellQuad {
+    CellQuad {
+        corners: [
+            [min[0], min[1], z],
+            [max[0], min[1], z],
+            [min[0], max[1], z],
+            [max[0], max[1], z],
+        ],
+        uv: [[0.0; 2]; 4],
+        image,
+        source: CellImage::Pattern(layers),
+        face,
+        full_bright: false,
+        tint: [255; 3],
+        blend: CellBlend::Cutout,
+    }
+}
+
+/// The checkered quad, far (behind, bigger) or near (in front, smaller: inside the far one's
+/// screen rectangle).
+fn checker_quad(near: bool) -> CellQuad {
+    if near {
+        pattern_quad([14.0, 9.0], [17.0, 12.0], 17.0, CHECKER, Face::NegZ)
+    } else {
+        pattern_quad([13.0, 8.0], [19.0, 13.0], 18.5, CHECKER, Face::NegZ)
+    }
+}
+
+/// The pattern row in front of the wall: the solid quad, the checkered one (near or far) and a
+/// solid one looking away.
+fn pattern_quads(near: bool) -> Vec<(BlockPos, CellQuad)> {
+    let at = BlockPos::new(0, 0, 0);
+    vec![
+        (
+            at,
+            pattern_quad([8.0, 9.0], [11.0, 12.0], 18.0, SOLID, Face::NegZ),
+        ),
+        (at, checker_quad(near)),
+        (
+            at,
+            pattern_quad([20.0, 9.0], [23.0, 12.0], 18.0, SOLID, Face::PosZ),
+        ),
+    ]
+}
+
+/// The wall alone; the pattern row with the far checker, at tick 0 and at tick 6000; with the
+/// near checker; and the far row as moving quads.
+struct PatternImages {
+    bare: RgbaImage,
+    far: RgbaImage,
+    later: RgbaImage,
+    near: RgbaImage,
+    moving: RgbaImage,
+}
+
+fn render_patterns(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+) -> Result<PatternImages, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let materials = MaterialTable::from_registry(&scene.registry);
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        &RendererConfig::default(),
+        &boxel_render::generate_block_textures(scene.registry.textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    renderer.set_model_boxes(&queue, materials.model_boxes());
+    renderer.set_pattern_textures(&device, &queue, &Arc::new(pattern_textures()));
+    let view = view();
+    let draw = |renderer: &mut VoxelRenderer, quads: &[(BlockPos, CellQuad)], view: &ViewParams| {
+        let mesh = glass_mesh(scene, &materials, quads, false);
+        renderer
+            .upsert_chunk(1, I64Vec3::ZERO, Arc::new(mesh))
+            .map_err(|e| e.to_string())?;
+        render(&device, &queue, renderer, view)
+    };
+    let bare = draw(&mut renderer, &[], &view)?;
+    let far = draw(&mut renderer, &pattern_quads(false), &view)?;
+    let stats = renderer.stats().cells;
+    if (
+        stats.quads,
+        stats.patterns,
+        stats.drawn,
+        stats.pattern_layers,
+    ) != (3, 3, 3, 6)
+    {
+        return Err(format!("pattern cell stats {stats:?}"));
+    }
+    let later = draw(
+        &mut renderer,
+        &pattern_quads(false),
+        &ViewParams {
+            texture_tick: 6000,
+            ..view
+        },
+    )?;
+    let near = draw(&mut renderer, &pattern_quads(true), &view)?;
+    let _ = draw(&mut renderer, &[], &view)?;
+    let moving: Vec<_> = pattern_quads(false)
+        .into_iter()
+        .map(|(cell, quad)| (MovingCellQuad { cell, quad }, LightValue::FULL_SKY))
+        .collect();
+    let _ = renderer.set_moving_cell_quads(&device, &queue, moving);
+    let moving = render(&device, &queue, &mut renderer, &view)?;
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(PatternImages {
+        bare,
+        far,
+        later,
+        near,
+        moving,
+    })
+}
+
+/// The pixel rectangle (inclusive, shrunk by 2 pixels) of the quad `q` of cell (0, 0, 0).
+fn screen_rect(view: &ViewParams, q: &CellQuad) -> ((u32, u32), (u32, u32)) {
+    let points = q
+        .corners
+        .map(|[x, y, z]| project(view, DVec3::new(f64::from(x), f64::from(y), f64::from(z))));
+    let min_x = points.iter().map(|p| p.0).min().unwrap_or(0) + 2;
+    let max_x = points.iter().map(|p| p.0).max().unwrap_or(0) - 2;
+    let min_y = points.iter().map(|p| p.1).min().unwrap_or(0) + 2;
+    let max_y = points.iter().map(|p| p.1).max().unwrap_or(0) - 2;
+    ((min_x, min_y), (max_x, max_y))
+}
+
+fn check_patterns(report: &mut Report, what: &str, i: &PatternImages) {
+    let view = view();
+    let images = [
+        ("bare", &i.bare),
+        ("far", &i.far),
+        ("later", &i.later),
+        ("near", &i.near),
+        ("moving", &i.moving),
+    ];
+    // The solid quad: Minecraft's sum in display values, the base and three layers tinted.
+    let tint = |k: usize, c: usize| srgb_to_linear(SOLID_TINTS[k][c]);
+    let want: Vec<u8> = (0..3)
+        .map(|c| {
+            let display = f64::from(SOLID_BASE) / 255.0 * tint(0, c)
+                + (1..4).map(|k| tint(k, c)).sum::<f64>();
+            (display.min(1.0) * 255.0).round() as u8
+        })
+        .collect();
+    let solid = pixel(&i.far, project(&view, DVec3::new(9.5, 10.5, 18.0)));
+    if (0..3).any(|c| solid[c].abs_diff(want[c]) > 3) {
+        report.fail(
+            format!("{what}: the solid pattern is {solid:?}, want {want:?}"),
+            &images,
+        );
+    }
+    // Looking away: not drawn.
+    if drawn(
+        &i.bare,
+        &i.far,
+        project(&view, DVec3::new(21.5, 10.5, 18.0)),
+    ) {
+        report.fail(
+            format!("{what}: a pattern quad looking away is drawn"),
+            &images,
+        );
+    }
+    // Fixed to the screen: where the near checker covers the far one's place, the same pixels.
+    let ((x0, y0), (x1, y1)) = screen_rect(&view, &checker_quad(true));
+    let (mut differ, mut total, mut later) = (0, 0, 0);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (a, b) = (pixel(&i.far, (x, y)), pixel(&i.near, (x, y)));
+            total += 1;
+            if (0..3).any(|c| a[c].abs_diff(b[c]) > 1) {
+                differ += 1;
+            }
+            let l = pixel(&i.later, (x, y));
+            if (0..3).any(|c| a[c].abs_diff(l[c]) > 8) {
+                later += 1;
+            }
+        }
+    }
+    if total < 100 || differ * 1000 > total {
+        report.fail(
+            format!("{what}: near vs far checker: {differ} of {total} pixels differ"),
+            &images,
+        );
+    }
+    // Drifting: 6000 ticks later a quarter of the period has gone by.
+    if later * 10 < total {
+        report.fail(
+            format!("{what}: 6000 ticks later only {later} of {total} pixels changed"),
+            &images,
+        );
+    }
+    if !drawn(&i.bare, &i.far, (x0, y0)) {
+        report.fail(format!("{what}: the checker quad is not drawn"), &images);
+    }
+    let moving = i.far.compare(&i.moving, 1);
+    if moving.fraction() > 0.0 {
+        report.fail(
+            format!(
+                "{what}: moving vs baked pattern quads: {:.4} % of pixels differ",
+                moving.fraction() * 100.0
+            ),
+            &images,
+        );
+    }
+}
+
+/// Pattern quads (ADR 0056) show their tinted layers summed as Minecraft's end portal does,
+/// fixed to the screen and drifting with the ticks, only from the side their face looks to,
+/// moving as baked, the same on every tier.
+#[test]
+fn pattern_quads_show_a_screen_pattern_on_every_tier() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = scene();
+    let mut report = Report::new();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        let mut tiers = Vec::new();
+        for tier in allowed_tiers(&caps) {
+            match render_patterns(adapter, &caps, tier, &scene) {
+                Ok(images) => tiers.push((tier, images)),
+                Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
+            }
+        }
+        for (tier, i) in &tiers {
+            rendered += 1;
+            let what = format!("{label}_{tier}_pattern");
+            if std::env::var_os("GPU_CELLS_SAVE").is_some() {
+                report.save(&[
+                    (&format!("{what}_far"), &i.far),
+                    (&format!("{what}_later"), &i.later),
+                ]);
+            }
+            check_patterns(&mut report, &what, i);
+        }
+        let Some(((best, b), rest)) = tiers.split_first() else {
+            continue;
+        };
+        for (tier, t) in rest {
+            let diff = b.far.compare(&t.far, 2);
+            eprintln!(
+                "gpu_cells: {label}: pattern {tier} vs {best}: {:.4} % of pixels differ, max channel {}",
+                diff.fraction() * 100.0,
+                diff.max_channel_diff
+            );
+            if diff.fraction() > MAX_DIFF {
+                report.fail(
+                    format!(
+                        "{label}: pattern {tier} vs {best}: {:.4} % of pixels differ",
+                        diff.fraction() * 100.0
+                    ),
+                    &[
+                        (&format!("{label}_{best}_pattern"), &b.far),
+                        (&format!("{label}_{tier}_pattern"), &t.far),
                     ],
                 );
             }

@@ -122,7 +122,7 @@ struct View {
   fog_params: vec4<f32>,           // x = fog start, y = fog end (world units)
   counts: vec4<u32>,               // x = chunk slot count, y = pages with draw lists (L), z = opaque draws per page list (stride; the cutout lists hold stride / 6, after L opaque ones), w = 1: cave culling bits in use (High)
   sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
-  light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, zw = 0
+  light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, z = pattern drift phase in 0..1 (cell.wgsl, ADR 0056), w = 0
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
   viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = still flow textures (bit 0 water, bit 1 lava; ADR 0028)
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or

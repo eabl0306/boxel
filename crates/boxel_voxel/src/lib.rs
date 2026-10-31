@@ -54,7 +54,9 @@ mod chunk;
 mod masks;
 
 pub use block_data::{BlockData, DataValue, ItemStack};
-pub use cell_quads::{CellBlend, CellImage, CellQuad, CellQuadRule, CellQuadsFn, model_quads};
+pub use cell_quads::{
+    CellBlend, CellImage, CellQuad, CellQuadRule, CellQuadsFn, PATTERN_LAYERS_MAX, model_quads,
+};
 pub use chunk::{ChunkData, StateSet};
 pub use coords::{
     BlockPos, CHUNK_AREA, CHUNK_MASK, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkKey, ChunkPos,

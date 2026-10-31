@@ -152,6 +152,14 @@ impl Default for RenderSettings {
 #[derive(Resource, Clone, Debug, Default)]
 pub struct CellTextures(pub Option<Arc<BlockTextureData>>);
 
+/// The pattern textures (ADR 0056): the images the pattern quads show
+/// ([`boxel_voxel::CellImage::Pattern`], three layers a pattern), made as the block textures are
+/// ([`crate::generate_block_textures`]). The content sets it once its images are ready (and again
+/// with a new pack); `None` until then: no pattern quad is drawn. Each renderer, a rebuilt one
+/// too, takes the current value at its next frame.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PatternTextures(pub Option<Arc<BlockTextureData>>);
+
 /// The moving cell quads of this frame (ADR 0054): quads the content draws without baking them
 /// into a chunk mesh (a lid that opens, a bell that swings, a beam that turns). The render
 /// plugin lights each at its cell and draws them all, every frame, until the content changes
@@ -392,6 +400,7 @@ impl Plugin for RenderPlugin {
             .init_resource::<OverlayDraw>()
             .init_resource::<BlockOutline>()
             .init_resource::<CellTextures>()
+            .init_resource::<PatternTextures>()
             .init_resource::<MovingCellQuads>()
             .init_resource::<GpuState>()
             .init_resource::<InstanceState>()
@@ -775,6 +784,8 @@ pub(crate) struct ExtractedFrame {
     pub(crate) models: Vec<crate::model::ModelDraw>,
     /// A copy of [`CellTextures`].
     cell_textures: Option<Arc<BlockTextureData>>,
+    /// A copy of [`PatternTextures`].
+    pattern_textures: Option<Arc<BlockTextureData>>,
     /// [`MovingCellQuads`] with the light of each quad's cell.
     moving_cells: Vec<(crate::MovingCellQuad, LightValue)>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
@@ -1484,15 +1495,17 @@ pub(crate) fn extract(
     ),
     overlay: Res<OverlayDraw>,
     time: Option<Res<Time>>,
-    (outline, content, mut outline_cache, cell_textures): (
+    (outline, content, mut outline_cache, cell_textures, pattern_textures): (
         Option<Res<BlockOutline>>,
         Option<Res<WorldContent>>,
         Local<OutlineCache>,
         Option<Res<CellTextures>>,
+        Option<Res<PatternTextures>>,
     ),
 ) {
     let frame = &mut *frame;
     frame.cell_textures = cell_textures.and_then(|t| t.0.clone());
+    frame.pattern_textures = pattern_textures.and_then(|t| t.0.clone());
     frame.overlay.clear();
     frame.overlay.extend_from_slice(&overlay.rects);
     frame.outline = match (outline.as_deref(), chunks.as_deref(), content.as_deref()) {
@@ -1780,6 +1793,11 @@ fn prepare(
         ready
             .renderer
             .set_cell_textures(&ready.ctx.device, queue, textures);
+    }
+    if let Some(textures) = &frame.pattern_textures {
+        ready
+            .renderer
+            .set_pattern_textures(&ready.ctx.device, queue, textures);
     }
     let moving = std::mem::take(&mut frame.moving_cells);
     frame.moving_cells = ready

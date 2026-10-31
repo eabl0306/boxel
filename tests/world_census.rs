@@ -88,6 +88,7 @@ const APP_WIDE: &[&str] = &[
     "boxel_render::plugin::InstanceState",
     "boxel_render::plugin::LkgRes",
     "boxel_render::plugin::Losses",
+    "boxel_render::plugin::PatternTextures",
     "boxel_render::plugin::PresentSettings",
     "boxel_render::plugin::RenderInfo",
     "boxel_render::plugin::RenderSettings",

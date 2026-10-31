@@ -104,7 +104,8 @@ pub struct ViewParams {
     /// app's elapsed time wrapped at [`FLUID_TIME_PERIOD`].
     pub fluid_time: f32,
     /// Game ticks (20 a second) of the animated block textures (ADR 0028): each animated layer
-    /// shows the frame of its Minecraft animation at this tick. Not wrapped (the animations wrap
+    /// shows the frame of its Minecraft animation at this tick, and the pattern quads drift with
+    /// it ([`pattern_phase`], ADR 0056). Not wrapped (the animations wrap
     /// it at their own period, exactly). [`ViewParams::from_camera`] sets 0; the render plugin
     /// sets the app's elapsed time in ticks.
     pub texture_tick: u64,
@@ -116,6 +117,15 @@ pub const TEXTURE_TICKS_PER_SECOND: f64 = 20.0;
 /// The [`ViewParams::texture_tick`] of `seconds` of game time (whole ticks elapsed).
 pub fn texture_tick(seconds: f64) -> u64 {
     (seconds.max(0.0) * TEXTURE_TICKS_PER_SECOND) as u64
+}
+
+/// The pattern quads (ADR 0056) drift through one period in this many game ticks: Minecraft's
+/// `GameTime` (the game time modulo 24,000 over 24,000, 20 minutes).
+pub const PATTERN_PERIOD_TICKS: u64 = 24_000;
+
+/// The phase of the pattern quads' drift at `tick` ([`ViewParams::texture_tick`]), in `0..1`.
+pub fn pattern_phase(tick: u64) -> f32 {
+    (tick % PATTERN_PERIOD_TICKS) as f32 / PATTERN_PERIOD_TICKS as f32
 }
 
 /// The fluid animation repeats every this many seconds: the shaders' flow speeds (water half a
@@ -317,6 +327,8 @@ pub struct VoxelRenderer {
     moving_cells: bool,
     /// The cell textures given last ([`VoxelRenderer::set_cell_textures`]).
     cell_textures: Option<Arc<BlockTextureData>>,
+    /// The pattern textures given last ([`VoxelRenderer::set_pattern_textures`], ADR 0056).
+    pattern_textures: Option<Arc<BlockTextureData>>,
     /// The fog passes (ADR 0030), from the first [`VoxelRenderer::set_fog`] with input.
     fog: Option<FogPass>,
     /// The fog passes could not be created on this device: fog stays off.
@@ -828,6 +840,7 @@ impl VoxelRenderer {
             cells_failed: false,
             moving_cells: false,
             cell_textures: None,
+            pattern_textures: None,
             fog: None,
             fog_failed: false,
             materials_layout: layouts.materials,
@@ -1115,6 +1128,28 @@ impl VoxelRenderer {
         self.prepare_cells(device, queue);
     }
 
+    /// Sets the pattern textures (ADR 0056): the images the pattern quads show
+    /// ([`boxel_voxel::CellImage::Pattern`]), three layers a pattern (its base, its layer image
+    /// and its tints, at least 17 texels wide), all of one size, made as the block textures are
+    /// ([`crate::generate_block_textures`]; only the top mip is read). The same `Arc` again
+    /// changes nothing. Until the first call no pattern quad is drawn.
+    pub fn set_pattern_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &Arc<BlockTextureData>,
+    ) {
+        if self
+            .pattern_textures
+            .as_ref()
+            .is_some_and(|d| Arc::ptr_eq(d, data))
+        {
+            return;
+        }
+        self.pattern_textures = Some(Arc::clone(data));
+        self.prepare_cells(device, queue);
+    }
+
     /// Sets the moving cell quads (ADR 0054) of the next [`VoxelRenderer::render`] calls, each
     /// with its light: quads the content gives for a frame, not baked into a chunk mesh (a lid
     /// that opens, a beam that turns), drawn by the cell quad pass after the chunks' cell quads,
@@ -1147,6 +1182,7 @@ impl VoxelRenderer {
             || (self.cells.is_none()
                 && self.cell_store.is_empty()
                 && self.cell_textures.is_none()
+                && self.pattern_textures.is_none()
                 && !self.moving_cells)
         {
             return;
@@ -1178,6 +1214,12 @@ impl VoxelRenderer {
         {
             tracing::error!("cell textures: {e}; no cell quad is drawn");
             self.cell_textures = None;
+        }
+        if let (Some(pass), Some(data)) = (&mut self.cells, &self.pattern_textures)
+            && let Err(e) = pass.set_pattern_textures(device, queue, data)
+        {
+            tracing::error!("pattern textures: {e}; no pattern quad is drawn");
+            self.pattern_textures = None;
         }
     }
 
@@ -1610,7 +1652,8 @@ impl VoxelRenderer {
         // published), and the caller resyncs only after this frame.
         let reached_refused = self.refused.take_fresh(self.occlusion.set.as_deref());
         let culled = self.occlusion.set.is_some() && !reached_refused && !self.uploads.lost();
-        let (sky_light, light_params, light_curve) = view.light.uniform();
+        let (sky_light, mut light_params, light_curve) = view.light.uniform();
+        light_params[2] = pattern_phase(view.texture_tick);
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: cull_view.frustum.to_array(),

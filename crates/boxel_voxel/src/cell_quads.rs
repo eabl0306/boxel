@@ -26,7 +26,20 @@ pub enum CellImage {
     /// The block textures: the layers the terrain draws ([`crate::TextureId`]), so a block
     /// drawn small (in a frame, on a shelf) looks as it does in the world (ADR 0053).
     Block,
+    /// A pattern fixed to the screen (ADR 0056), from the pattern textures the content gives:
+    /// [`CellQuad::image`] is the first of three layers, the base image, the layer image and the
+    /// tints (row 0: texel 0 tints the base, texel `k` tints layer `k`). The quad shows the base
+    /// stretched over the screen and, over it, this many layers (at most
+    /// [`PATTERN_LAYERS_MAX`]) of the layer image, each scaled, turned and drifting by its own
+    /// amount, added up: Minecraft's end portal (15 layers) and end gateway (16). Drawn opaque at
+    /// full brightness, with fog; [`CellQuad::uv`], [`CellQuad::full_bright`] and
+    /// [`CellQuad::blend`] are not read, [`CellQuad::tint`] multiplies the sum. Seen only from
+    /// the side its [`CellQuad::face`] looks to, which must be across the quad (a cube face).
+    Pattern(u8),
 }
+
+/// The most layers a [`CellImage::Pattern`] draws over its base.
+pub const PATTERN_LAYERS_MAX: u8 = 16;
 
 /// How a [`CellQuad`] covers what is behind it (ADR 0055).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

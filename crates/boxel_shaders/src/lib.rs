@@ -233,6 +233,8 @@ impl ShaderModuleId {
                 ("vs_cell", Stage::Vertex),
                 ("fs_cell", Stage::Fragment),
                 ("fs_cell_translucent", Stage::Fragment),
+                ("vs_cell_pattern", Stage::Vertex),
+                ("fs_cell_pattern", Stage::Fragment),
             ],
         }
     }

@@ -32,6 +32,13 @@
 //! terrain's translucent quads, so water or glass in front of a translucent cell quad tints it,
 //! and the fog and clouds see a translucent one as opaque (they read the depth) and paint over a
 //! glow.
+//!
+//! Pattern quads ([`CellImage::Pattern`], ADR 0056: Minecraft's end portal and end gateway) show
+//! a pattern fixed to the screen from a third texture array, the pattern textures the content
+//! gives ([`crate::PatternTextures`]). They are kept in one more list per kind (the chunks' and
+//! the moving ones) and drawn opaque after the cutout quads by a fourth pipeline of the same
+//! shader (`vs_cell_pattern`, `fs_cell_pattern`), with the pattern array as group 0: one uniform
+//! and one texture/sampler pair, as every other pipeline here.
 
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
@@ -77,6 +84,11 @@ pub struct CellStats {
     /// Sorts of the translucent quads so far (one per frame whose eye, drawn chunks or quads
     /// changed).
     pub sorts: u64,
+    /// Pattern quads drawn this frame (ADR 0056), baked or moving (0 until the content gives
+    /// the pattern textures).
+    pub patterns: u32,
+    /// Layers of the pattern texture array (0 until the content gives it).
+    pub pattern_layers: u32,
 }
 
 /// A cell quad the content gives for one frame, not baked into a chunk mesh (ADR 0054): a part
@@ -164,8 +176,12 @@ pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6
         | if c.full_bright { cell::FULL_BRIGHT } else { 0 }
         | u32::from(q.light.0) << cell::LIGHT_SHIFT;
     let [r, g, b] = c.tint.map(u32::from);
-    let opacity = u32::from(c.blend.opacity());
-    let data = [data0, opacity << cell::OPACITY_SHIFT | r << 16 | g << 8 | b];
+    // A pattern quad keeps its layer count where a translucent one keeps its opacity.
+    let high = match c.source {
+        CellImage::Pattern(layers) => u32::from(layers).min(cell::PATTERN_LAYERS_MAX),
+        _ => u32::from(c.blend.opacity()),
+    };
+    let data = [data0, high << cell::OPACITY_SHIFT | r << 16 | g << 8 | b];
     TRIANGLES.map(|k| CellVertex {
         origin,
         pos: c.corners[k],
@@ -320,28 +336,39 @@ impl QuadList {
     /// Appends `q` (corners from `origin`, whose GPU origin is `gpu`), with its sort entry.
     fn push(&mut self, origin: I64Vec3, gpu: [i32; 3], q: &LitCellQuad) {
         self.vertices.extend(quad_vertices(gpu, q));
-        if q.quad.blend.is_translucent() {
+        if q.quad.blend.is_translucent() && !is_pattern(&q.quad) {
             self.sort.push(SortQuad::new(origin, &q.quad));
         }
     }
 }
 
+/// True for a quad of the pattern textures (ADR 0056): it goes to the pattern list whatever its
+/// blend.
+const fn is_pattern(q: &CellQuad) -> bool {
+    matches!(q.source, CellImage::Pattern(_))
+}
+
 /// The lists of one kind of quads (from the chunks, or moving): the cutout ones and the
-/// translucent ones (ADR 0055) per texture array, `[cell, block]` each.
+/// translucent ones (ADR 0055) per texture array, `[cell, block]` each, and the pattern ones
+/// (ADR 0056).
 #[derive(Default)]
 struct Lists {
     cutout: [QuadList; 2],
     translucent: [QuadList; 2],
+    pattern: QuadList,
 }
 
 impl Lists {
     fn clear(&mut self) {
-        for list in self.cutout.iter_mut().chain(&mut self.translucent) {
+        for list in self.all_mut() {
             list.clear();
         }
     }
 
     fn list(&mut self, q: &CellQuad) -> &mut QuadList {
+        if is_pattern(q) {
+            return &mut self.pattern;
+        }
         let lists = if q.blend.is_translucent() {
             &mut self.translucent
         } else {
@@ -351,13 +378,23 @@ impl Lists {
     }
 
     fn all(&self) -> impl Iterator<Item = &QuadList> {
-        self.cutout.iter().chain(&self.translucent)
+        self.cutout
+            .iter()
+            .chain(&self.translucent)
+            .chain([&self.pattern])
+    }
+
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut QuadList> {
+        self.cutout
+            .iter_mut()
+            .chain(&mut self.translucent)
+            .chain([&mut self.pattern])
     }
 
     /// Uploads every list's vertices; true if it wrote any.
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         let mut wrote = false;
-        for list in self.cutout.iter_mut().chain(&mut self.translucent) {
+        for list in self.all_mut() {
             wrote |= list.upload(device, queue);
         }
         wrote
@@ -438,10 +475,11 @@ impl Sorted {
     }
 }
 
-/// Index in [`CellPass::lists`] of the quads whose images are in `source`.
+/// Index in a kind's cutout and translucent lists of the quads whose images are in `source`
+/// (the pattern quads have a list of their own, `Lists::pattern`).
 const fn list_of(source: CellImage) -> usize {
     match source {
-        CellImage::Cell => 0,
+        CellImage::Cell | CellImage::Pattern(_) => 0,
         CellImage::Block => 1,
     }
 }
@@ -459,8 +497,7 @@ fn fill(lists: &mut Lists, store: &CellStore) {
         for q in &mesh.cell_quads {
             lists.list(&q.quad).push(*origin, gpu, q);
         }
-        let all = lists.cutout.iter_mut().chain(&mut lists.translucent);
-        for (list, start) in all.zip(starts) {
+        for (list, start) in lists.all_mut().zip(starts) {
             let end = list.vertices.len() as u32;
             if end > start {
                 list.ranges.push((*origin, start..end));
@@ -532,9 +569,13 @@ pub(crate) struct CellPass {
     /// same without writing it, for the glows.
     translucent: wgpu::RenderPipeline,
     glow: wgpu::RenderPipeline,
+    /// The pattern quads' pipeline (ADR 0056): `vs_cell_pattern` and `fs_cell_pattern`, opaque.
+    pattern: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     /// The cell textures and their bind group, with the data they were made from.
     textures: Option<(Arc<BlockTextureData>, wgpu::Texture, wgpu::BindGroup)>,
+    /// The pattern textures (ADR 0056) and their bind group, with the data they were made from.
+    patterns: Option<(Arc<BlockTextureData>, wgpu::Texture, wgpu::BindGroup)>,
     /// The block textures (the terrain's array, animated layers included) in this pipeline's
     /// layout.
     blocks: wgpu::BindGroup,
@@ -600,13 +641,16 @@ impl CellPass {
             attribute(wgpu::VertexFormat::Float32x2, o2, 2),
             attribute(wgpu::VertexFormat::Uint32x2, o3, 3),
         ];
-        let build = |label: &str, fragment: &str, blend: Option<wgpu::BlendState>, depth: bool| {
+        let build = |label: &str,
+                     (vertex, fragment): (&str, &str),
+                     blend: Option<wgpu::BlendState>,
+                     depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("vs_cell"),
+                    entry_point: Some(vertex),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<CellVertex>() as u64,
@@ -615,7 +659,7 @@ impl CellPass {
                     })],
                 },
                 // Both sides, as the terrain's cutout bucket (the sort drops the translucent
-                // quads that look away).
+                // quads that look away; `vs_cell_pattern` the pattern ones).
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
@@ -650,10 +694,13 @@ impl CellPass {
                 cache: None,
             })
         };
-        let pipeline = build("boxel cell", "fs_cell", None, true);
+        let pipeline = build("boxel cell", ("vs_cell", "fs_cell"), None, true);
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
-        let translucent = build("boxel cell translucent", "fs_cell_translucent", blend, true);
-        let glow = build("boxel cell glow", "fs_cell_translucent", blend, false);
+        let translucent_entries = ("vs_cell", "fs_cell_translucent");
+        let translucent = build("boxel cell translucent", translucent_entries, blend, true);
+        let glow = build("boxel cell glow", translucent_entries, blend, false);
+        let pattern_entries = ("vs_cell_pattern", "fs_cell_pattern");
+        let pattern = build("boxel cell pattern", pattern_entries, None, true);
         let blocks = texture_group(
             device,
             &layout,
@@ -664,8 +711,10 @@ impl CellPass {
             pipeline,
             translucent,
             glow,
+            pattern,
             layout,
             textures: None,
+            patterns: None,
             blocks,
             lists: Lists::default(),
             moving: Lists::default(),
@@ -719,6 +768,32 @@ impl CellPass {
         Ok(())
     }
 
+    /// Uses `data` as the pattern textures (ADR 0056; nothing to do if they are the ones in
+    /// use). A texture this device cannot hold is refused with the reason, and the pattern quads
+    /// are not drawn.
+    pub(crate) fn set_pattern_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &Arc<BlockTextureData>,
+    ) -> Result<(), String> {
+        if self
+            .patterns
+            .as_ref()
+            .is_some_and(|(d, ..)| Arc::ptr_eq(d, data))
+        {
+            return Ok(());
+        }
+        self.patterns = None;
+        self.stats.pattern_layers = 0;
+        let (texture, view, sampler) =
+            crate::renderer::block_textures(device, queue, data, &device.limits())?;
+        let group = texture_group(device, &self.layout, &view, &sampler);
+        self.stats.pattern_layers = data.layers;
+        self.patterns = Some((Arc::clone(data), texture, group));
+        Ok(())
+    }
+
     /// Uploads the vertices if the store changed, then picks this frame's draws: the chunks
     /// inside the GPU window (`chunks`) and the frustum of `view`; and sorts the translucent
     /// quads for its eye if it, the drawn chunks or the quads changed.
@@ -741,9 +816,14 @@ impl CellPass {
         let count = |l: &QuadList| l.vertices.len() as u32 / 6;
         let [cell, block] =
             [0, 1].map(|k| count(&self.lists.cutout[k]) + count(&self.lists.translucent[k]));
-        self.stats.quads = cell + block;
+        self.stats.quads = cell + block + count(&self.lists.pattern);
         self.stats.block_quads = block;
-        for list in &mut self.lists.cutout {
+        for list in self
+            .lists
+            .cutout
+            .iter_mut()
+            .chain([&mut self.lists.pattern])
+        {
             list.pick(chunks, view);
         }
         let mut changed = false;
@@ -752,12 +832,7 @@ impl CellPass {
             list.pick(chunks, view);
             changed |= before != list.draws;
         }
-        for list in self
-            .moving
-            .cutout
-            .iter_mut()
-            .chain(&mut self.moving.translucent)
-        {
+        for list in self.moving.all_mut() {
             list.pick_all();
         }
         let eye = (
@@ -782,8 +857,16 @@ impl CellPass {
         }
         self.stats.moving = self.moving_input.len() as u32;
         self.stats.translucent = self.sorted.order.len() as u32;
+        let patterns = [&self.lists.pattern, &self.moving.pattern];
+        self.stats.patterns = if self.patterns.is_some() {
+            patterns.iter().map(|l| l.drawn()).sum()
+        } else {
+            0
+        };
         let cutout = || self.lists.cutout.iter().chain(&self.moving.cutout);
-        self.stats.drawn = cutout().map(QuadList::drawn).sum::<u32>() + self.stats.translucent;
+        self.stats.drawn = cutout().map(QuadList::drawn).sum::<u32>()
+            + self.stats.translucent
+            + self.stats.patterns;
         let cells = if self.textures.is_some() {
             (self.lists.cutout[0].draws.len() + self.moving.cutout[0].draws.len()) as u32
                 + self.sorted.runs.iter().filter(|r| r.0 % 2 == 0).count() as u32
@@ -791,17 +874,25 @@ impl CellPass {
             0
         };
         let blocks = self.lists.cutout[1].draws.len() + self.moving.cutout[1].draws.len();
-        self.stats.draws =
-            cells + (blocks + self.sorted.runs.iter().filter(|r| r.0 % 2 == 1).count()) as u32;
+        let pattern_draws = if self.patterns.is_some() {
+            patterns.iter().map(|l| l.draws.len()).sum()
+        } else {
+            0
+        };
+        self.stats.draws = cells
+            + (blocks + pattern_draws + self.sorted.runs.iter().filter(|r| r.0 % 2 == 1).count())
+                as u32;
     }
 
     /// Draws this frame's cell quads into `pass` (group 1 already holds the View): the cutout
     /// ones of the cell textures (once the content gave them), then those of the block textures,
-    /// then the translucent ones back to front. Leaves group 0 bound to one of the arrays. False
-    /// if it drew nothing.
+    /// then the pattern ones (once the content gave their textures), then the translucent ones
+    /// back to front. Leaves group 0 bound to one of the arrays. False if it drew nothing.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
         let cutout = || self.lists.cutout.iter().chain(&self.moving.cutout);
-        if cutout().all(|l| l.draws.is_empty()) && self.sorted.runs.is_empty() {
+        let patterns = [&self.lists.pattern, &self.moving.pattern];
+        let any_pattern = self.patterns.is_some() && patterns.iter().any(|l| !l.draws.is_empty());
+        if cutout().all(|l| l.draws.is_empty()) && !any_pattern && self.sorted.runs.is_empty() {
             return false;
         }
         let mut drew = false;
@@ -813,6 +904,14 @@ impl CellPass {
             }
             drew |= self.lists.cutout[1].draw(pass, &self.blocks);
             drew |= self.moving.cutout[1].draw(pass, &self.blocks);
+        }
+        if let Some((_, _, group)) = &self.patterns
+            && any_pattern
+        {
+            pass.set_pipeline(&self.pattern);
+            for list in patterns {
+                drew |= list.draw(pass, group);
+            }
         }
         drew | self.draw_translucent(pass)
     }
@@ -1033,6 +1132,44 @@ mod tests {
         let q = SortQuad::new(I64Vec3::ZERO, &pane(0.0, Face::NegZ).quad);
         assert_eq!(q.distance(Vec3::new(3.0, 0.5, -4.0)), Some(4.0 + 16.0));
         assert_eq!(q.distance(Vec3::new(3.0, 0.5, 4.0)), None);
+    }
+
+    /// Pattern quads (ADR 0056) go to the pattern list whatever their blend, with their layer
+    /// count (at most 16) where a translucent quad keeps its opacity, and no sort entry.
+    #[test]
+    fn pattern_quads_have_a_list_of_their_own() {
+        let quad = mesh(1).cell_quads[0].quad;
+        let pattern = |layers, blend| MovingCellQuad {
+            cell: BlockPos::new(0, 0, 0),
+            quad: CellQuad {
+                source: CellImage::Pattern(layers),
+                ..quad
+            }
+            .with_blend(blend),
+        };
+        let quads: Vec<_> = [
+            pattern(15, CellBlend::Cutout),
+            pattern(200, CellBlend::Translucent(9)),
+        ]
+        .into_iter()
+        .map(|q| (q, LightValue::FULL_SKY))
+        .collect();
+        let mut lists = Lists::default();
+        fill_moving(&mut lists, &quads);
+        assert!(
+            lists
+                .cutout
+                .iter()
+                .chain(&lists.translucent)
+                .all(|l| l.vertices.is_empty())
+        );
+        let v = &lists.pattern.vertices;
+        assert_eq!(v.len(), 12);
+        assert!(lists.pattern.sort.is_empty());
+        assert_eq!(v[0].data[1] >> cell::OPACITY_SHIFT, 15);
+        assert_eq!(v[6].data[1] >> cell::OPACITY_SHIFT, 16);
+        assert_eq!(v[0].data[1] & 0xFF_FFFF, 0x01_02_03);
+        assert_eq!(v[0].data[0] & cell::LAYER_MASK, 5);
     }
 
     #[test]

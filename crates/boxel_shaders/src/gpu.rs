@@ -36,7 +36,9 @@ pub struct ViewUniform {
     /// rgb = sky light color times the daylight intensity (linear), a = ambient floor (no lit
     /// surface is darker than its albedo times this).
     pub sky_light: [f32; 4],
-    /// x = AO strength (`1 - x` is what the darkest corner keeps), y = block-light gain, zw = 0.
+    /// x = AO strength (`1 - x` is what the darkest corner keeps), y = block-light gain, z = the
+    /// phase of the pattern quads' drift (ADR 0056: game ticks modulo 24,000 over 24,000, in
+    /// `0..1`), w = 0.
     pub light_params: [f32; 4],
     /// Brightness of light levels `0..=15`: level `4k + j` at `[k][j]`, level 15 = 1. The
     /// shader interpolates it linearly between levels.
@@ -495,8 +497,10 @@ pub mod cell {
     /// Where the cell's `boxel_voxel::LightValue` sits in `CellVertex::data[0]` (16 bits).
     pub const LIGHT_SHIFT: u32 = 16;
     /// Where a translucent quad's opacity sits in `CellVertex::data[1]` (8 bits, 0 for a cutout
-    /// quad; ADR 0055).
+    /// quad; ADR 0055). A pattern quad (ADR 0056) keeps its layer count there.
     pub const OPACITY_SHIFT: u32 = 24;
+    /// The most layers a pattern quad draws over its base (ADR 0056).
+    pub const PATTERN_LAYERS_MAX: u32 = 16;
     /// Group of the cell texture array (binding 0) and its sampler (binding 1). The `View`
     /// uniform stays in [`super::bindings::GROUP_VIEW`].
     pub const GROUP_TEXTURES: u32 = 0;
