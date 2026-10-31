@@ -455,6 +455,23 @@ fn pack_layer(
             }
         };
     };
+    // The pack's own texture for the layer, as it is ([`LayerRecipe::own`]).
+    if let Some(own) = &recipe.own {
+        let parts = vec![Part {
+            id: ResourceId::parse(own),
+            tint: None,
+        }];
+        let mut quiet = Vec::new();
+        if let Ok(texels) = compose(pack, &parts, size, Read::PLAIN, &mut quiet, &tick0) {
+            warnings.extend(quiet);
+            return Some(PackLayer {
+                parts,
+                quarter: false,
+                steps: Vec::new(),
+                texels,
+            });
+        }
+    }
     let read = Read {
         quarter: recipe.quarter,
         steps: &recipe.steps,
@@ -886,6 +903,7 @@ pub(crate) mod tests {
             fallback: vec![("block/gravel".to_string(), Some([255, 0, 0]))],
             quarter: false,
             steps: Vec::new(),
+            own: None,
         };
         let source =
             TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![recipe]));
@@ -1124,6 +1142,7 @@ pub(crate) mod tests {
             fallback: vec![("block/stone".to_string(), None)],
             quarter: false,
             steps: Vec::new(),
+            own: None,
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", ""),
@@ -1196,6 +1215,7 @@ pub(crate) mod tests {
             fallback: vec![(fallback.to_string(), None)],
             quarter: false,
             steps: Vec::new(),
+            own: None,
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", "mygame:ruby", "mygame:block/no_such_texture"),
@@ -1596,6 +1616,7 @@ pub(crate) mod tests {
             fallback: vec![("block/arrow".to_string(), None)],
             quarter: false,
             steps,
+            own: None,
         };
         let recipes = vec![
             recipe("arrow_r90", vec![TextureStep::Rotate(1)]),
@@ -1639,6 +1660,48 @@ pub(crate) mod tests {
         assert_eq!(texel(&data, r90, 0, 15), [90, 90, 90, 255]);
     }
 
+    /// EW-BOXTEX: a pack's own texture for a layer wins, as it is; without it the recipe reads
+    /// as usual (its steps).
+    #[test]
+    fn a_packs_own_texture_wins_over_the_recipe() {
+        let registry = six_face_registry();
+        let recipe = LayerRecipe {
+            layer: "game:arrow_mx".to_string(),
+            block: String::new(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: vec![("block/arrow".to_string(), None)],
+            quarter: false,
+            steps: vec![TextureStep::MirrorX],
+            own: Some("block/arrow_right".to_string()),
+        };
+        let red = |data: &BlockTextureData, x: u32| {
+            u32::from(texel(data, layer_of(&registry, "game:arrow_mx"), x, 0)[0]) / 16
+        };
+        let load = |pack: &TempPack| {
+            let source = TextureSource::Pack(
+                PackSource::new(pack.0.clone()).with_recipes(vec![recipe.clone()]),
+            );
+            load_block_textures(&registry, &source).expect("pack").0
+        };
+        let plain = TempPack::new("own_none");
+        plain.png("arrow", 16, 16, |x, y| [x as u8 * 16, y as u8 * 16, 7, 255]);
+        assert_eq!(red(&load(&plain), 2), 13, "mirrored by the steps");
+        let own = TempPack::new("own_right");
+        own.png("arrow", 16, 16, |x, y| [x as u8 * 16, y as u8 * 16, 7, 255]);
+        own.png("arrow_right", 16, 16, |x, y| {
+            [x as u8 * 16, y as u8 * 16, 9, 255]
+        });
+        let data = load(&own);
+        assert_eq!(red(&data, 2), 2, "the pack's own, unmirrored");
+        assert_eq!(
+            texel(&data, layer_of(&registry, "game:arrow_mx"), 2, 0)[2],
+            9
+        );
+    }
+
     /// The steps apply to every frame of an animated texture, and to a pack twice the size of
     /// the array's edge before it is scaled (a crop keeps the pack's texels).
     #[test]
@@ -1668,6 +1731,7 @@ pub(crate) mod tests {
             fallback: vec![(format!("block/{texture}"), None)],
             quarter: false,
             steps,
+            own: None,
         };
         let recipes = vec![
             recipe("arrow_mx", "arrow", vec![TextureStep::MirrorX]),

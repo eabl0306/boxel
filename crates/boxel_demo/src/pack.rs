@@ -31,6 +31,7 @@ fn recipe(
             .collect(),
         quarter: false,
         steps: Vec::new(),
+        own: None,
     }
 }
 
@@ -222,6 +223,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
             tint: Some(WATER_TINT),
             quarter: true,
             steps: Vec::new(),
+            own: None,
             ..recipe(
                 "boxel:water_flow",
                 "water",
@@ -232,6 +234,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
         LayerRecipe {
             quarter: true,
             steps: Vec::new(),
+            own: None,
             ..recipe(
                 "boxel:lava_flow",
                 "lava",

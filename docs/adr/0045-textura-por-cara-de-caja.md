@@ -33,6 +33,10 @@ recorte (UV) que muestra. Tampoco había forma de no dibujar una cara.
   caja, el contenido usa una capa girada.
 - `pack_textures` elige el modo de alfa de una capa mirando también las caras de caja, y el
   registro expone `box_textures` y `drawn_textures`.
+- `LayerRecipe::own`: una textura que algunos packs traen propia para esa capa. Si el pack la
+  tiene, la capa es esa textura tal cual; si no, la receta se lee como siempre. Sirve para las
+  puertas con bisagra a la derecha: Minecraft espeja la textura de la puerta (los `steps` de la
+  receta) y Whimscape trae una dibujada aparte.
 
 ## Lo que no se hizo
 

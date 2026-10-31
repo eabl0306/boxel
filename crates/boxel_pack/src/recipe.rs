@@ -40,6 +40,11 @@ pub struct LayerRecipe {
     /// before the part is scaled to the layer's edge ([`apply_steps`]): a rotated glazed
     /// terracotta, a mirrored door. Empty for the texture as it is.
     pub steps: Vec<TextureStep>,
+    /// A texture some packs ship for this layer of their own (`block/oak_door_bottom_right`,
+    /// EW-BOXTEX, ADR 0045): when the pack has it, the layer is that texture as it is, and the
+    /// rest of the recipe is not read. A right-hinge door: Minecraft mirrors the door's
+    /// texture (the recipe's steps), Whimscape draws its own.
+    pub own: Option<String>,
 }
 
 /// One step of a layer's transform ([`LayerRecipe::steps`]). Images are rows from the top; a
