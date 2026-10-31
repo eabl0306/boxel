@@ -142,6 +142,34 @@ fn planes_with_their_own_rectangles_take_their_own_entries() {
 }
 
 #[test]
+fn a_turned_plane_carries_its_quarters_in_its_face_and_shares_its_entry() {
+    let mut table = table();
+    let tilted = ModelPlane::new(PlaneKind::Rising(Axis::X), [0, 16, 4], [32, 24, 28]);
+    table.set_model_parts(
+        1,
+        BlockModel::Boxes(BoxModelId(9)),
+        &[],
+        &[],
+        &[tilted.turned(3)],
+    );
+    let mut padded = PaddedChunk::new();
+    set_material(&mut padded, &table, [5, 5, 5], 1);
+    set_material(&mut padded, &table, [7, 5, 5], 3);
+    let m = mesh(&padded, &table);
+    let turned = plane_quads(&m, [5, 5, 5]);
+    let plain = plane_quads(&m, [7, 5, 5]);
+    assert_eq!(turned.len(), 1);
+    assert_eq!(turned[0].1.face(), Face::NegZ);
+    assert_eq!(turned[0].1.plane_quarter(), 3);
+    assert_eq!(plain[0].1.plane_quarter(), 0);
+    // The same box and rectangle: the post's plane had the same entry, a named layer aside.
+    assert_eq!(
+        entry(&table, turned[0].1).min,
+        entry(&table, plain[0].1).min
+    );
+}
+
+#[test]
 fn planes_cover_nothing() {
     let table = table();
     let mut padded = PaddedChunk::new();

@@ -61,13 +61,15 @@ pub mod layout {
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
     ///
-    /// With face `PosY` it is a plane quad (EW-PLANE, ADR 0046): one plane of a block model,
-    /// drawn the same way, on a mid-plane or diagonal of a box of its own. Its `w - 1` and
+    /// With another face it is a plane quad (EW-PLANE, ADR 0046): one plane of a block model,
+    /// drawn the same way, on a mid-plane or diagonal of a box of its own, turned about the
+    /// cell's vertical center line by the quarter turns its face says
+    /// ([`boxel_voxel::QUARTER_FACES`]: `PosY` 0, `NegY` 1, `NegX` 2, `NegZ` 3). Its `w - 1` and
     /// `h - 1` bits hold the index of its [`PlaneEntry`](boxel_voxel::PlaneEntry) in the model box table
     /// ([`GEO_BOX_SHIFT`]: the box, in thirty-seconds, and the texture rectangle), its AO byte
     /// its plane byte (no AO): the [`PlaneKind::code`](boxel_voxel::PlaneKind::code) in bits 0 to 3 ([`PLANE_KIND_MASK`]),
-    /// the spin in sixteenths of a turn in bits 4 to 7 ([`PLANE_SPIN_SHIFT`]). The other face
-    /// values are free.
+    /// the spin in sixteenths of a turn in bits 4 to 7 ([`PLANE_SPIN_SHIFT`]). The face values
+    /// 6 and 7 are free.
     pub const SHAPE_CROSS: u8 = 4;
     /// Mask of the plane kind in a plane quad's plane byte (its AO byte, [`SHAPE_CROSS`]).
     pub const PLANE_KIND_MASK: u32 = 15;
@@ -358,9 +360,23 @@ impl PackedQuad {
         }
         (self.mat >> layout::MAT_AO_SHIFT) as u8
     }
-    /// True for a plane quad (ADR 0046): a [`layout::SHAPE_CROSS`] quad of face `PosY`.
+    /// True for a plane quad (ADR 0046): a [`layout::SHAPE_CROSS`] quad of a face but `PosX`
+    /// and `PosZ` (the cross plant's).
     pub const fn is_plane(self) -> bool {
-        self.shape() == layout::SHAPE_CROSS && matches!(self.face(), Face::PosY)
+        self.shape() == layout::SHAPE_CROSS && !matches!(self.face(), Face::PosX | Face::PosZ)
+    }
+    /// The quarter turns of a plane quad about its cell's vertical center line (its face,
+    /// [`boxel_voxel::QUARTER_FACES`]; 0 for another quad).
+    pub const fn plane_quarter(self) -> u8 {
+        if !self.is_plane() {
+            return 0;
+        }
+        match self.face() {
+            Face::NegY => 1,
+            Face::NegX => 2,
+            Face::NegZ => 3,
+            _ => 0,
+        }
     }
     /// The kind and spin (sixteenths of a turn) of a plane quad ([`layout::SHAPE_CROSS`]), or
     /// `None` for another quad.

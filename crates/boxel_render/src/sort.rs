@@ -133,9 +133,16 @@ impl QuadBox {
         let surface = (layout::FLUID_SURFACE * SUB as f32) as i32;
         if quad.is_plane() {
             // A plane (ADR 0046) runs through its box: its box is the plane's box.
-            let b = boxes
+            let mut b = boxes
                 .get(usize::from(quad.box_index()))
                 .map_or(CollisionBox::FULL, |b| b.bounds());
+            for _ in 0..quad.plane_quarter() {
+                // Clockwise from above, as `ModelBox::turned`: (x, z) -> (16 - z, x).
+                b = CollisionBox::new(
+                    [16 - b.max[2], b.min[1], b.min[0]],
+                    [16 - b.min[2], b.max[1], b.max[0]],
+                );
+            }
             return Self {
                 min: [0, 1, 2].map(|a| p[a] + i32::from(b.min[a])),
                 max: [0, 1, 2].map(|a| p[a] + i32::from(b.max[a])),
@@ -901,6 +908,19 @@ mod tests {
             .with_ao_byte(plane.quad_byte());
         let b = QuadBox::of(quad_of, &planes);
         assert_eq!((b.min, b.max, b.plane), ([18, 16, 19], [30, 26, 29], None));
+        // A quarter turned plane (its face says so) turns its box: (x, z) -> (16 - z, x).
+        let mut turned = quad_of;
+        turned.geo = (turned.geo & !(7 << layout::GEO_FACE_SHIFT))
+            | (plane.turned(1).quad_face() as u32) << layout::GEO_FACE_SHIFT;
+        let b = QuadBox::of(turned, &planes);
+        assert_eq!((b.min, b.max), ([19, 16, 18], [29, 26, 30]));
+        // A quarter turned plane (its face says so) turns its box: (x, z) -> (16 - z, x).
+        let turned = quad_of.with_ao_byte(plane.quad_byte());
+        let mut turned = turned;
+        turned.geo = (turned.geo & !(7 << layout::GEO_FACE_SHIFT))
+            | (plane.turned(1).quad_face() as u32) << layout::GEO_FACE_SHIFT;
+        let b = QuadBox::of(turned, &planes);
+        assert_eq!((b.min, b.max), ([19, 16, 18], [29, 26, 30]));
         // a cross covers its cell and has no plane
         let cross =
             QuadBox::of_test(quad([1, 1, 1], 1, 1, Face::PosX).with_shape(layout::SHAPE_CROSS));

@@ -148,14 +148,16 @@ fn plane() -> impl Strategy<Value = ModelPlane> {
         [0u8..17, 0u8..17, 0u8..17, 0u8..17],
         0u8..4,
         0u8..16,
+        0u8..4,
     )
-        .prop_filter_map("a valid plane", |(kind, a, b, uv, turn, spin)| {
+        .prop_filter_map("a valid plane", |(kind, a, b, uv, turn, spin, quarter)| {
             let min = [0, 1, 2].map(|k| a[k].min(b[k]));
             let max = [0, 1, 2].map(|k| a[k].max(b[k]));
             let p = ModelPlane::new(kind, min, max)
                 .with_uv(uv)
                 .with_turn(turn)
-                .spun(spin);
+                .spun(spin)
+                .turned(quarter);
             p.is_valid().then_some(p)
         })
 }
@@ -194,6 +196,33 @@ proptest! {
         prop_assert!(same(&pairs(turn(p, 4).corners()), &pairs(p.corners())));
         prop_assert_eq!(turned.texture, p.texture);
     }
+}
+
+#[test]
+fn a_facing_turns_the_quad_and_keeps_the_entry() {
+    let plane =
+        ModelPlane::new(PlaneKind::Rising(Axis::X), [0, 4, 2], [32, 20, 30]).with_uv([2, 0, 14, 9]);
+    for k in 0..4u8 {
+        let turned = plane.turned(k);
+        assert_eq!(turned.entry(), plane.entry(), "{k}");
+        assert_eq!(
+            turned.quad_face(),
+            boxel_voxel::QUARTER_FACES[usize::from(k)]
+        );
+        // The same quad as the plane turned with its box.
+        assert!(
+            same(&pairs(turned.corners()), &pairs(turned.baked().corners())),
+            "{k}"
+        );
+        assert_eq!(turned.baked().quarter, 0);
+    }
+    // A quarter turn takes the plane's low west end to the north.
+    let c = plane.turned(1).corners();
+    assert!(
+        near(c[0].position, [1.0 - 2.0 / 32.0, 4.0 / 32.0, 0.0]),
+        "{:?}",
+        c[0]
+    );
 }
 
 #[test]

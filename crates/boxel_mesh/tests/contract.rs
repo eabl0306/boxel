@@ -10,8 +10,13 @@ fn packed_quad_roundtrip() {
     assert_eq!(q.face(), Face::NegX);
     assert_eq!(q.layer(), 4095);
     assert_eq!((q.ao_byte(), q.light_index(), q.flags()), (0xFF, 0, 0));
-    let lit = q.with_light_index(4095).with_ao([0, 1, 2, 3]).with_flags(9);
-    assert_eq!((lit.light_index(), lit.flags()), (4095, 9));
+    // Flags 13: emissive and the box shape (shape 4 on this face would be a plane quad, whose
+    // AO byte is its plane byte, ADR 0046).
+    let lit = q
+        .with_light_index(4095)
+        .with_ao([0, 1, 2, 3])
+        .with_flags(13);
+    assert_eq!((lit.light_index(), lit.flags()), (4095, 13));
     assert_eq!([0, 1, 2, 3].map(|k| lit.ao(k)), [0, 1, 2, 3]);
     assert_eq!(lit.ao_byte(), 0b11_10_01_00);
     // Geometry and layer are untouched by the other fields.

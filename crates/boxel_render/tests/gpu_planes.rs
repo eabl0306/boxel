@@ -2,8 +2,8 @@
 //! `BOXEL_REQUIRE_GPU=1`.
 //!
 //! A stone floor meshed by the real `Mesher` with a row of test blocks made of planes: a small
-//! cross, a tilted plane, a square plane spun 45 degrees and an opaque post with a flat plane
-//! over it. For every adapter (filtered by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier
+//! cross, a tilted plane, a square plane spun 45 degrees, an opaque post with a flat plane
+//! over it and the tilted plane turned a quarter (a facing). For every adapter (filtered by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier
 //! a local capability check allows (the one of `gpu_tiers.rs`), a `VoxelRenderer` draws the
 //! floor alone and with the row. Asserts:
 //!
@@ -170,6 +170,9 @@ fn row() -> Row {
         [0, 24, 0],
         [32, 24, 32],
     )];
+    // The tilted plane turned a quarter (a facing: its quad's face says so).
+    let turned =
+        vec![ModelPlane::new(PlaneKind::Rising(Axis::X), [0, 0, 0], [32, 16, 32]).turned(1)];
     let post = vec![ModelBox::new([7, 0, 7], [9, 12, 9])];
     let mut blocks = Vec::new();
     for (i, (name, shape, boxes, planes)) in [
@@ -177,6 +180,7 @@ fn row() -> Row {
         ("test:tilted", RenderShape::Cutout, Vec::new(), tilted),
         ("test:spun", RenderShape::Cutout, Vec::new(), spun),
         ("test:post", RenderShape::Opaque, post, flat),
+        ("test:turned", RenderShape::Cutout, Vec::new(), turned),
     ]
     .into_iter()
     .enumerate()
@@ -186,7 +190,7 @@ fn row() -> Row {
         let s = b
             .add_block(def(name, shape, BlockModel::Boxes(id)))
             .expect("block");
-        blocks.push(([13 + 2 * i as u32, 9, 16], s, planes));
+        blocks.push(([12 + 2 * i as u32, 9, 16], s, planes));
     }
     Row {
         registry: b.build(),

@@ -27,12 +27,16 @@ Los 8 códigos de forma del quad empaquetado ya estaban usados (el 3 es el muro 
   lado del bloque. Son las reglas de cara de caja del ADR 0045, con estirado.
 - Se dibuja por los dos lados, como la cruz: sin sombreado de cara, sin AO y con la luz de su
   celda. Siempre va al cubo cutout (o translucent), aunque el bloque sea opaco.
-- Formato: un plano es un quad `SHAPE_CROSS` de cara +Y. Las cruces de siempre usan las caras +X
-  y +Z y no cambian ni un bit. Los bits de `w - 1` y `h - 1` llevan el índice de su entrada en la
-  tabla de cajas; el byte de AO lleva el tipo de plano (4 bits) y el giro (4 bits).
+- Formato: un plano es un quad `SHAPE_CROSS` de cara +Y, -Y, -X o -Z. Las cruces de siempre usan
+  las caras +X y +Z y no cambian ni un bit. La cara dice cuántos cuartos de vuelta gira el plano
+  sobre el eje vertical de la celda (`quarter`, 0 a 3): la orientación del bloque. Los bits de
+  `w - 1` y `h - 1` llevan el índice de su entrada en la tabla de cajas; el byte de AO lleva el
+  tipo de plano (4 bits) y el giro en su plano (4 bits).
 - La entrada de la tabla (`PlaneEntry`) guarda la caja y el rectángulo de textura, en las mismas
-  dos palabras que una caja. El tipo y el giro van en el quad, así que los dos planos de una cruz
-  comparten entrada. Cuenta contra el tope de 1.024 como una caja.
+  dos palabras que una caja. El tipo, el giro y los cuartos de vuelta van en el quad, así que los
+  dos planos de una cruz y las cuatro orientaciones de un bloque comparten entrada. Cuenta contra
+  el tope de 1.024 como una caja. Sin los cuartos en el quad, el juego pasaba de 255 a 115
+  entradas de planos: es lo que lo deja dentro de su presupuesto de 900.
 - `ModelPlane::corners` calcula en CPU lo mismo que el shader. `BoxModel::turned`, `turned_x` y
   `turned_z` giran también los planos: buscan el tipo, el giro y el espejo cuyas esquinas son las
   giradas.

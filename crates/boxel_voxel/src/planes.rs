@@ -6,8 +6,10 @@
 //! geometry stays exact and shared in the model box table.
 //!
 //! A plane takes one entry of the model box table ([`PlaneEntry`]: its box and its texture
-//! rectangle); which plane of the box it is ([`PlaneKind`]) and its spin ride in its quad, so
-//! the two planes of a cross share one entry.
+//! rectangle); which plane of the box it is ([`PlaneKind`]), its spin and its quarter turns
+//! about the vertical ride in its quad, so the two planes of a cross and the four facings of a
+//! block share one entry.
+use crate::Face;
 use crate::registry::{Axis, TextureId};
 
 /// Thirty-seconds of a block: the unit of a plane's box ([`ModelPlane::min`] and `max`), twice
@@ -126,6 +128,10 @@ pub struct ModelPlane {
     /// its `v` (`0..16`). The box stays where it was: a turned quad may reach past it, but must
     /// stay in the cell. For an item in a frame (45 degrees a step); no block uses it yet.
     pub spin: u8,
+    /// Quarter turns clockwise seen from above, about the cell's vertical center line, after
+    /// all the rest (`0..4`): a block's facing. It rides in the quad, so the four facings of a
+    /// plane share its table entry ([`ModelPlane::turned`]).
+    pub quarter: u8,
     /// The layer it shows; `None`: the block's side (its `PosX` texture, as a cross plant).
     pub texture: Option<TextureId>,
 }
@@ -187,6 +193,7 @@ impl ModelPlane {
             uv: [0, 0, 16, 16],
             turn: 0,
             spin: 0,
+            quarter: 0,
             texture: None,
         }
     }
@@ -253,6 +260,12 @@ impl ModelPlane {
         self.kind.code() | self.spin << 4
     }
 
+    /// The face its quad carries, which says its [`ModelPlane::quarter`] turns: `PosY` 0,
+    /// `NegY` 1, `NegX` 2, `NegZ` 3 (a cross plant's quads take `PosX` and `PosZ`).
+    pub const fn quad_face(self) -> Face {
+        QUARTER_FACES[(self.quarter % 4) as usize]
+    }
+
     /// A valid plane: its box inside the cell, at least as high as low on every axis and
     /// higher on both axes it spans (all three for a diagonal), its texture rectangle inside
     /// the texture, a turn under 4 and a spin under 16.
@@ -262,7 +275,12 @@ impl ModelPlane {
             let across = matches!(self.kind, PlaneKind::Mid(axis) if axis_index(axis) == a);
             across || self.min[a] < self.max[a]
         });
-        inside && spans && self.uv.iter().all(|&t| t <= 16) && self.turn < 4 && self.spin < 16
+        inside
+            && spans
+            && self.uv.iter().all(|&t| t <= 16)
+            && self.turn < 4
+            && self.spin < 16
+            && self.quarter < 4
     }
 
     /// The plane's corner, `u` and `v` vectors (blocks), as `common.wgsl` builds them.
@@ -302,12 +320,16 @@ impl ModelPlane {
         let n = scale(n, 1.0 / len);
         std::array::from_fn(|k| {
             let (cu, cv) = ((k & 1) as f32, (k >> 1) as f32);
-            let position = if self.spin == 0 {
+            let mut position = if self.spin == 0 {
                 add(add(a, scale(u, cu)), scale(v, cv))
             } else {
                 let off = add(scale(u, cu - 0.5), scale(v, cv - 0.5));
                 add(center, add(scale(off, c), scale(cross(n, off), s)))
             };
+            for _ in 0..self.quarter % 4 {
+                let [x, y, z] = position;
+                position = [1.0 - z, y, x];
+            }
             // Down the texture from the top, but on Mid(Y), whose v runs along +Z as a top's.
             let down = if self.kind == PlaneKind::Mid(Axis::Y) {
                 cv
@@ -328,10 +350,23 @@ impl ModelPlane {
 
     /// The plane turned `turns` quarter turns clockwise seen from above, around the cell's
     /// vertical center line, as [`crate::ModelBox::turned`] turns a box: the same quad, its
-    /// texture as before on it.
+    /// texture as before on it. Only its [`ModelPlane::quarter`] changes.
     #[must_use]
-    pub fn turned(self, turns: u8) -> ModelPlane {
-        self.map(turns, |[x, y, z]| [1.0 - z, y, x])
+    pub const fn turned(mut self, turns: u8) -> ModelPlane {
+        self.quarter = (self.quarter + turns % 4) % 4;
+        self
+    }
+
+    /// The same quad with no [`ModelPlane::quarter`]: its box, kind and texture turned instead.
+    #[must_use]
+    pub fn baked(self) -> ModelPlane {
+        let turns = self.quarter;
+        let mut plane = self;
+        plane.quarter = 0;
+        for _ in 0..turns % 4 {
+            plane = plane.turn_once(&|[x, y, z]: [f32; 3]| [1.0 - z, y, x]);
+        }
+        plane
     }
 
     /// The plane turned around X, each quarter taking the top to the north, as
@@ -352,7 +387,7 @@ impl ModelPlane {
     /// turned point): the turned box, then the kind, spin, mirror and texture turn whose
     /// corners are the turned corners, showing the same texels.
     fn map(self, turns: u8, turn: impl Fn([f32; 3]) -> [f32; 3]) -> ModelPlane {
-        let mut plane = self;
+        let mut plane = if turns % 4 == 0 { self } else { self.baked() };
         for _ in 0..turns % 4 {
             plane = plane.turn_once(&turn);
         }
@@ -389,6 +424,7 @@ impl ModelPlane {
                             uv,
                             turn: t,
                             spin,
+                            quarter: 0,
                             texture: self.texture,
                         };
                         if candidate.is_valid() && same_corners(&candidate.corners(), &target) {
@@ -401,6 +437,9 @@ impl ModelPlane {
         unreachable!("a turned plane is a plane of its turned box: {self:?}")
     }
 }
+
+/// The face of a plane quad by its quarter turns ([`ModelPlane::quad_face`]).
+pub const QUARTER_FACES: [Face; 4] = [Face::PosY, Face::NegY, Face::NegX, Face::NegZ];
 
 /// True if `corners` are `target` (positions and texels), in any order.
 fn same_corners(corners: &[PlaneCorner; 4], target: &[([f32; 3], [f32; 2]); 4]) -> bool {

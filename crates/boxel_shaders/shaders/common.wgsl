@@ -6,8 +6,9 @@
 //        surface, model box face, sloped fluid cell; a box face keeps the index of its box in the
 //        View's box table in the (w-1, h-1) bits, a sloped fluid cell its 4 corner heights there
 //        and in the AO bits, and the bit after the heights for the water of a waterlogged block;
-//        a cross of face +Y is a plane (ADR 0046): its table entry in the (w-1, h-1) bits, its
-//        kind and spin in the AO bits)
+//        a cross of a face but +X and +Z is a plane (ADR 0046): its table entry in the (w-1,
+//        h-1) bits, its kind and spin in the AO bits, its quarter turns about the vertical in
+//        its face)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -52,8 +53,9 @@ const SHAPE_FLUID_CUBE: u32 = 2u;  // cube face of a fluid cell under its fluid 
 // side away from the normal, WALL_INSET into the cell (greedy).
 const SHAPE_WALL: u32 = 3u;
 const WALL_INSET: f32 = 0.001953125; // 1/512
-const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1), or a plane (face +Y)
-// A plane quad (ADR 0046): a SHAPE_CROSS quad of face +Y. Its AO byte is its plane byte: the kind
+const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1, faces +X, +Z), or a plane
+// A plane quad (ADR 0046): a SHAPE_CROSS quad of face +Y, -Y, -X or -Z (0 to 3 quarter turns
+// about the cell's vertical center line). Its AO byte is its plane byte: the kind
 // (boxel_voxel::PlaneKind::code, 3 per axis x, y, z: mid, rising, falling) in bits 0..3 and the
 // spin (sixteenths of a turn) in bits 4..7. Its (w-1, h-1) bits index its entry in the View's
 // box table: word 0 = min xyz (thirty-seconds, PLANE_COORD_BITS each), u0, v0 (PLANE_UV_BITS
@@ -283,7 +285,7 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     if ((geo & GEO_FLUID_INSET_BIT) != 0u && f != 0u) {
       o.local = o.local - n * FLUID_INSET;
     }
-  } else if (shape == SHAPE_CROSS && f == 0u) {
+  } else if (shape == SHAPE_CROSS && f != 2u && f != 4u) {
     // A plane (ADR 0046, boxel_voxel::ModelPlane::corners is its CPU twin): the box of its
     // table entry, then the kind's corner A and vectors U and V, corner k at A + U cu + V cv.
     let index = (geo >> GEO_W_SHIFT) & GEO_BOX_MASK;
@@ -324,7 +326,12 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     let off = pu * (cu - 0.5) + pv * (cv - 0.5);
     let normal = normalize(cross(pu, pv));
     let spun = a + pu * 0.5 + pv * 0.5 + off * cs.x + cross(normal, off) * cs.y;
-    o.local = p + select(straight, spun, spin != 0u);
+    var local = select(straight, spun, spin != 0u);
+    // Quarter turns about the cell's vertical center line, by the face (+Y 0, -Y 1, -X 2,
+    // -Z 3; boxel_voxel::QUARTER_FACES): clockwise from above, (x, z) -> (1 - z, x), exact.
+    let quarters = select(select(select(0u, 1u, f == 1u), 2u, f == 3u), 3u, f == 5u);
+    for (var k = 0u; k < quarters; k++) { local = vec3(1.0 - local.z, local.y, local.x); }
+    o.local = p + local;
     // The texture: (s, t) down from the top (along +Z on a mid plane across Y), turned a
     // quarter at a time, then read in the entry's rectangle (texels).
     var ts = vec2(cu, select(1.0 - cv, cv, kind == 3u));

@@ -165,6 +165,8 @@ struct PlaneFace {
     index: u16,
     /// [`ModelPlane::quad_byte`].
     byte: u8,
+    /// [`ModelPlane::quad_face`].
+    face: Face,
     /// Its texture layer, [`BLOCK_LAYER`] for the block's side.
     layer: u16,
 }
@@ -272,6 +274,7 @@ impl BoxShape {
             .map(|p| PlaneFace {
                 index: index(TableEntry::Plane(p.entry())),
                 byte: p.quad_byte(),
+                face: p.quad_face(),
                 layer: p.texture.map_or(BLOCK_LAYER, |t| t.0),
             })
             .collect();
@@ -1604,7 +1607,7 @@ fn emit_specials(
                     push(
                         m,
                         pos,
-                        Face::PosY,
+                        plane.face,
                         layer,
                         code,
                         plane.index,

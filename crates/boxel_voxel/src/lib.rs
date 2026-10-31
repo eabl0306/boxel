@@ -59,7 +59,9 @@ pub use fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MA
 pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
 pub use lod::{CellPartial, LodClass, LodClasses};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
-pub use planes::{ModelPlane, PLANE_UNIT, PlaneCorner, PlaneEntry, PlaneKind, TableEntry};
+pub use planes::{
+    ModelPlane, PLANE_UNIT, PlaneCorner, PlaneEntry, PlaneKind, QUARTER_FACES, TableEntry,
+};
 pub use registry::{
     Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
     BlockState, BoxFaceTexture, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
