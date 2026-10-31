@@ -36,6 +36,7 @@ fn the_demo_blocks_have_their_kinds() {
         Kind::Gate,
         Kind::WallPostOverride,
         Kind::WallTorch,
+        Kind::Pane,
     ];
     for (name, kind) in expected {
         let block = r.block_by_name(name).unwrap();

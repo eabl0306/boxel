@@ -938,3 +938,43 @@ fn cave_culling_counts_walls_and_gates_open() {
     assert_ne!(info.links & link_bit(Face::PosX, Face::NegX), 0);
     assert_eq!(info.links & link_bit(Face::PosY, Face::NegY), 0);
 }
+
+/// Walls join panes and bars (Minecraft's `IronBarsBlock` in `WallBlock::connectsTo`), whose
+/// sides are not sturdy: a cutout block of kind `Pane` connects, the same block without the
+/// kind does not.
+#[test]
+fn walls_join_blocks_of_kind_pane() {
+    use boxel_demo::rules::Kind;
+    use boxel_voxel::{BlockDef, BlockModel, FaceTextures, TextureId};
+    let mut b = boxel_demo::blocks::builder();
+    let pane = b
+        .add_block(BlockDef {
+            name: "test:pane".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Cross,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("test:pane");
+    let r = b.build();
+    let wall = s(&r, "boxel:cobblestone_wall");
+    let plain = Kinds::of_registry(&r);
+    let mut kinds = plain.clone();
+    kinds.add(r.block(pane).expect("a block"), Kind::Pane);
+    let mut n = [BlockState::AIR; 6];
+    n[Face::NegZ.index()] = pane;
+    for toward in Facing::ALL {
+        assert!(demo::wall_connects(&kinds, &r, pane, toward), "{toward:?}");
+        assert!(!demo::wall_connects(&plain, &r, pane, toward), "{toward:?}");
+    }
+    assert_eq!(
+        r.property(demo::wall_rule(&kinds, &r, wall, &n), "north"),
+        Some("low")
+    );
+    assert_eq!(
+        r.property(demo::wall_rule(&plain, &r, wall, &n), "north"),
+        Some("none")
+    );
+}

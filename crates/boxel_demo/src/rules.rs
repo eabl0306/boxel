@@ -5,7 +5,7 @@
 //! (`BlockRegistryBuilder::set_neighbor_rule`, `set_use_rule`); the world applies them.
 //!
 //! The rules find their partners by kind ([`Kinds`]: which blocks are stairs, fences, walls,
-//! gates, wall torches, and the standing torch a wall raises its post under) and by their state
+//! gates, wall torches, panes, and the standing torch a wall raises its post under) and by their state
 //! properties (`facing`, `half`, `up`, `open`, `in_wall`), the properties their shapes are built
 //! from.
 //!
@@ -40,6 +40,9 @@ pub enum Kind {
     WallPostOverride,
     /// A torch on a wall (`facing`, away from the wall).
     WallTorch,
+    /// A pane or bars (Minecraft's `IronBarsBlock`), which walls join though its sides are not
+    /// sturdy. The demo has none; content marks its own.
+    Pane,
 }
 
 impl Kind {
@@ -236,16 +239,16 @@ pub const fn gate_connects(gate: Facing, toward: Facing) -> bool {
 }
 
 /// True if a wall connects toward `toward` to `neighbor` (Minecraft's
-/// `WallBlock::connectsTo`): another wall, a fence gate that runs across `toward`
-/// ([`gate_connects`]), or a sturdy face toward the wall, except cutout blocks (leaves). Not a
-/// fence.
+/// `WallBlock::connectsTo`): another wall, a pane or bars ([`Kind::Pane`]), a fence gate that
+/// runs across `toward` ([`gate_connects`]), or a sturdy face toward the wall, except cutout
+/// blocks (leaves). Not a fence.
 pub fn wall_connects(
     kinds: &Kinds,
     registry: &BlockRegistry,
     neighbor: BlockState,
     toward: Facing,
 ) -> bool {
-    if kinds.is(registry, neighbor, Kind::Wall) {
+    if kinds.is(registry, neighbor, Kind::Wall) || kinds.is(registry, neighbor, Kind::Pane) {
         true
     } else if kinds.is(registry, neighbor, Kind::Gate) {
         gate_connects(facing_of(registry, neighbor), toward)
