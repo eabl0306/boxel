@@ -50,9 +50,10 @@ pub struct LayerRecipe {
     /// Pieces of textures composited bottom to top over a transparent layer (EW-BER, ADR 0049),
     /// each read through its own steps and then the recipe's `steps`: the faces of an entity
     /// texture (`entity/chest/normal`), cut out with [`TextureStep::Crop`] and set where a
-    /// block's box faces read them with [`TextureStep::Place`]. When not empty, the layer is
-    /// made of them and `block` and `fallback` are not read; the first piece's texture is
-    /// required, a missing later one is left out.
+    /// block's box faces read them with [`TextureStep::Place`]. Read when the pack has neither
+    /// the model's textures nor the fallback (a bed's block textures in one pack, its entity
+    /// texture in another), or the recipe names none; the first piece's texture is required, a
+    /// missing later one is left out.
     pub pieces: Vec<LayerPiece>,
 }
 

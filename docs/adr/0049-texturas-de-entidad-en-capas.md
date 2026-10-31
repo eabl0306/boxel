@@ -19,9 +19,10 @@ medida de la cara, no.
 
 - `LayerRecipe` tiene `pieces`: una lista de `LayerPiece` (una textura del pack y sus propios
   pasos). La capa es la suma de las piezas, de abajo arriba, sobre fondo transparente. Después de
-  los pasos de cada pieza se aplican los de la receta. Con piezas, la receta no lee el modelo ni
-  `fallback`. Si falta la textura de la primera pieza, la capa queda procedural con su aviso, como
-  siempre.
+  los pasos de cada pieza se aplican los de la receta. Las piezas se leen solo si el pack no tiene
+  ni las texturas del modelo ni las de `fallback` (o la receta no nombra ninguna): una cama usa las
+  texturas de bloque de Whimscape y la de entidad de BlockPixel. Si falta la textura de la primera
+  pieza, la capa queda procedural con su aviso, como siempre.
 - Una pieza puede nombrar `entity/...`: `pack_textures` lee esas texturas con `GuiPack`, una vez,
   solo las que nombra alguna receta. No se parten como tira animada, sea cual sea su forma (la de
   una calavera mide 64 x 32).

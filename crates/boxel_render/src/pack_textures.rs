@@ -555,30 +555,6 @@ fn pack_layer(
         quarter: recipe.quarter,
         steps: &recipe.steps,
     };
-    // Pieces of other textures, each through its own steps (ADR 0049).
-    if !recipe.pieces.is_empty() {
-        let parts: Vec<Part> = recipe
-            .pieces
-            .iter()
-            .map(|piece| Part {
-                id: ResourceId::parse(&piece.texture),
-                tint: None,
-                steps: piece.steps.clone(),
-            })
-            .collect();
-        return match compose(pack, &parts, size, read, warnings, &tick0) {
-            Ok(texels) => Some(PackLayer {
-                parts,
-                quarter: recipe.quarter,
-                steps: recipe.steps.clone(),
-                texels,
-            }),
-            Err(missing) => {
-                warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
-                None
-            }
-        };
-    }
     if let Some(parts) = model_parts(pack.pack, recipe, &recipe_values(registry, recipe)) {
         match compose(pack, &parts, size, read, warnings, &tick0) {
             Ok(texels) => {
@@ -600,18 +576,53 @@ fn pack_layer(
         .iter()
         .map(|(path, tint)| Part::new(ResourceId::parse(path), *tint))
         .collect();
-    match compose(pack, &parts, size, read, warnings, &tick0) {
-        Ok(texels) => Some(PackLayer {
-            parts,
-            quarter: recipe.quarter,
-            steps: recipe.steps.clone(),
-            texels,
-        }),
-        Err(missing) => {
-            warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
-            None
+    // With pieces, a missing fallback is no warning: the pieces are read next.
+    let mut quiet = Vec::new();
+    let fallback = if parts.is_empty() {
+        Err("(no texture parts)".to_string())
+    } else {
+        compose(pack, &parts, size, read, &mut quiet, &tick0)
+    };
+    let missing = match fallback {
+        Ok(texels) => {
+            warnings.extend(quiet);
+            return Some(PackLayer {
+                parts,
+                quarter: recipe.quarter,
+                steps: recipe.steps.clone(),
+                texels,
+            });
         }
-    }
+        Err(missing) if recipe.pieces.is_empty() => {
+            warnings.extend(quiet);
+            missing
+        }
+        // Pieces of other textures, each through its own steps (ADR 0049).
+        Err(_) => {
+            let parts: Vec<Part> = recipe
+                .pieces
+                .iter()
+                .map(|piece| Part {
+                    id: ResourceId::parse(&piece.texture),
+                    tint: None,
+                    steps: piece.steps.clone(),
+                })
+                .collect();
+            match compose(pack, &parts, size, read, warnings, &tick0) {
+                Ok(texels) => {
+                    return Some(PackLayer {
+                        parts,
+                        quarter: recipe.quarter,
+                        steps: recipe.steps.clone(),
+                        texels,
+                    });
+                }
+                Err(missing) => missing,
+            }
+        }
+    };
+    warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
+    None
 }
 
 /// The property values `recipe` asks the blockstate for: those of its state (when `registry`
@@ -1770,7 +1781,8 @@ pub(crate) mod tests {
 
     /// EW-BER (ADR 0049): a recipe's pieces cut rectangles out of an entity texture (64 x 32,
     /// as a skull's) and set them where a box face reads them, later pieces over earlier ones,
-    /// transparent elsewhere; a missing entity texture keeps the procedural layer.
+    /// transparent elsewhere; a fallback the pack has comes first; a missing entity texture
+    /// keeps the procedural layer.
     #[test]
     fn pieces_place_entity_texture_rectangles_into_a_layer() {
         use boxel_pack::LayerPiece;
@@ -1787,6 +1799,7 @@ pub(crate) mod tests {
             .expect("layer")
         };
         let (front, lost) = (layer("front"), layer("lost"));
+        let (owned, pieced) = (layer("owned"), layer("pieced"));
         b.add_block(BlockDef {
             name: "game:crate".to_string(),
             shape: RenderShape::Cutout,
@@ -1794,7 +1807,10 @@ pub(crate) mod tests {
             collision: BlockCollision::Full,
             emission: [0; 3],
             light_opacity: 0,
-            textures: FaceTextures::all(front).with(Face::NegZ, lost),
+            textures: FaceTextures::all(front)
+                .with(Face::NegZ, lost)
+                .with(Face::PosX, owned)
+                .with(Face::NegX, pieced),
         })
         .expect("crate");
         let registry = b.build();
@@ -1826,6 +1842,7 @@ pub(crate) mod tests {
                 },
             ],
         };
+        pack.png("plank", 16, 16, |_, _| [200, 8, 1, 255]);
         let recipe = |layer: &str, pieces: Vec<LayerPiece>| LayerRecipe {
             layer: format!("game:{layer}"),
             block: String::new(),
@@ -1833,7 +1850,11 @@ pub(crate) mod tests {
             variant: String::new(),
             face: boxel_pack::FaceName::North,
             tint: None,
-            fallback: Vec::new(),
+            fallback: match layer {
+                "owned" => vec![("block/plank".to_string(), None)],
+                "pieced" => vec![("block/no_plank".to_string(), None)],
+                _ => Vec::new(),
+            },
             quarter: false,
             steps: Vec::new(),
             own: None,
@@ -1853,6 +1874,15 @@ pub(crate) mod tests {
                 "lost",
                 vec![piece("entity/crate/missing", [0, 0, 8, 8], [0, 0, 16, 16])],
             ),
+            // The pack's fallback texture first; the pieces only where it lacks it.
+            recipe(
+                "owned",
+                vec![piece("entity/crate/test", [0, 0, 16, 16], [0, 0, 16, 16])],
+            ),
+            recipe(
+                "pieced",
+                vec![piece("entity/crate/test", [0, 0, 16, 16], [0, 0, 16, 16])],
+            ),
         ];
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(recipes));
         let (data, report) = load_block_textures(&registry, &source).expect("pack");
@@ -1870,6 +1900,9 @@ pub(crate) mod tests {
         assert_eq!(at(front, 0, 0).2, 0);
         assert_eq!(at(front, 15, 9).2, 0);
         assert_eq!(texel(&data, usize::from(lost.0), 3, 3), [90, 90, 90, 255]);
+        assert_eq!(texel(&data, usize::from(owned.0), 3, 3), [200, 8, 1, 255]);
+        // Texels 0..16 by 0..8 stretched over the layer: (4, 4) reads (4, 2).
+        assert_eq!(at(pieced, 4, 4), (4, 2, 255));
         assert!(
             report
                 .warnings
@@ -1878,11 +1911,13 @@ pub(crate) mod tests {
             "{:?}",
             report.warnings
         );
-        assert!(
-            !report.warnings.iter().any(|w| w.starts_with("game:front")),
-            "{:?}",
-            report.warnings
-        );
+        for quiet in ["game:front", "game:owned", "game:pieced"] {
+            assert!(
+                !report.warnings.iter().any(|w| w.starts_with(quiet)),
+                "{quiet}: {:?}",
+                report.warnings
+            );
+        }
     }
 
     /// EW-BOXTEX: a pack's own texture for a layer wins, as it is; without it the recipe reads
