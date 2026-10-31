@@ -54,3 +54,6 @@ medida de la cara, no.
 - Las recetas sin piezas se leen igual: mismas capas, mismas imágenes en los tres tiers.
 - Una capa de entidad cuesta lo mismo que cualquier otra capa (EW-LAYERS). Las mismas caras de
   cofre en las cuatro orientaciones comparten capa cuando se leen igual.
+- En el juego (lote B13: cofres, cofres de cobre, cofre de ender, cajas de shulker, cabezas y la
+  vasija, 42 bloques) cuesta 30 entradas de la tabla de cajas (861 a 891 de 900) y 353 capas (1.499
+  a 1.852 de 1.900). Las camas de BlockPixel dejan de ser procedurales sin capas nuevas.
