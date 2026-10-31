@@ -557,6 +557,7 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
                 boxes: shapes::fence_boxes(sides),
                 outline: shapes::fence_outline(sides),
                 textures: Vec::new(),
+                planes: Vec::new(),
             };
             box_model(b, model)
         })
@@ -602,6 +603,7 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
             boxes: vec![shapes::TORCH_BOX],
             outline: vec![shapes::TORCH_OUTLINE],
             textures: Vec::new(),
+            planes: Vec::new(),
         },
     );
     b.add_block(torch_def("torch", BlockModel::Boxes(torch)))
@@ -612,6 +614,7 @@ fn add_shapes(b: &mut BlockRegistryBuilder, t: &Layers) {
             boxes: vec![shapes::wall_torch_box(facing)],
             outline: vec![shapes::wall_torch_outline(facing)],
             textures: Vec::new(),
+            planes: Vec::new(),
         };
         box_model(b, model)
     });
@@ -671,6 +674,7 @@ fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
                 boxes: shapes::wall_boxes(post, sides),
                 outline: shapes::wall_outline(post, sides),
                 textures: Vec::new(),
+                planes: Vec::new(),
             };
             walls.insert((post, sides), box_model(b, model));
         }
@@ -714,6 +718,7 @@ fn add_walls_and_gates(b: &mut BlockRegistryBuilder, t: &Layers) {
                     boxes: shapes::fence_gate_boxes(facing, open, in_wall),
                     outline: vec![shapes::fence_gate_outline(facing, in_wall)],
                     textures: Vec::new(),
+                    planes: Vec::new(),
                 };
                 gates.insert((facing, open, in_wall), box_model(b, model));
             }

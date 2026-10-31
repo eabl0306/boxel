@@ -14,6 +14,7 @@ use boxel_demo::worldgen::{
 use boxel_mesh::{MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, Face, LocalPos, NEIGHBOR_OFFSETS,
+    TableEntry,
 };
 use boxel_worldgen::{FlatGenerator, WorldGenerator};
 use std::fmt::Write as _;
@@ -96,12 +97,15 @@ fn mesh_line(
 fn dump(r: &BlockRegistry) -> String {
     let mut d = String::new();
     let m = MaterialTable::from_registry(r);
-    for (i, b) in m.model_boxes().iter().enumerate() {
-        let _ = writeln!(
-            d,
-            "box {i} {:?}-{:?}@{:?}",
-            b.bounds.min, b.bounds.max, b.texture_offset
-        );
+    for (i, entry) in m.model_boxes().iter().enumerate() {
+        let _ = match entry {
+            TableEntry::Box(b) => writeln!(
+                d,
+                "box {i} {:?}-{:?}@{:?}",
+                b.bounds.min, b.bounds.max, b.texture_offset
+            ),
+            TableEntry::Plane(p) => writeln!(d, "plane {i} {p:?}"),
+        };
     }
     for i in 0..r.len() as u16 {
         let layers: Vec<u16> = Face::ALL.iter().map(|&f| m.layer(i, f)).collect();

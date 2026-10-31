@@ -315,6 +315,12 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("GEO_BOX_MASK", l::GEO_BOX_MASK),
         ("BOX_COORD_BITS", l::BOX_COORD_BITS),
         ("BOX_OFFSET_BITS", l::BOX_OFFSET_BITS),
+        ("PLANE_KIND_MASK", l::PLANE_KIND_MASK),
+        ("PLANE_SPIN_SHIFT", l::PLANE_SPIN_SHIFT),
+        ("PLANE_COORD_BITS", l::PLANE_COORD_BITS),
+        ("PLANE_UV_SHIFT", l::PLANE_UV_SHIFT),
+        ("PLANE_UV_BITS", l::PLANE_UV_BITS),
+        ("PLANE_TURN_SHIFT", l::PLANE_TURN_SHIFT),
     ] {
         assert_eq!(const_u32(&module, name), v, "{name}");
     }
@@ -322,6 +328,9 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
         ("FLUID_SURFACE", l::FLUID_SURFACE),
         ("FLUID_INSET", l::FLUID_INSET),
         ("WALL_INSET", l::WALL_INSET),
+        ("PLANE_COS1", boxel_voxel::planes::SPIN_COS[1]),
+        ("PLANE_COS2", boxel_voxel::planes::SPIN_COS[2]),
+        ("PLANE_COS3", boxel_voxel::planes::SPIN_COS[3]),
     ] {
         assert_eq!(const_f32(&module, name), v, "{name}");
     }

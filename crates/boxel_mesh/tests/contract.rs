@@ -133,7 +133,11 @@ fn model_boxes_pack_and_box_quads_keep_their_index() {
     use boxel_voxel::{Face, ModelBox};
     let registry = boxel_demo::blocks::registry();
     let table = MaterialTable::from_registry(&registry);
-    let mut boxes: Vec<ModelBox> = table.model_boxes().to_vec();
+    let mut boxes: Vec<ModelBox> = table
+        .model_boxes()
+        .iter()
+        .filter_map(|e| e.as_box())
+        .collect();
     assert!(boxes.len() > 20, "slabs, stairs, fences and torches");
     let mut extreme = ModelBox::new([0, 0, 0], [16, 16, 16]);
     extreme.texture_offset = [-32, 31, 0];

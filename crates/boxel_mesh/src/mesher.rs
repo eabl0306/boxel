@@ -12,8 +12,8 @@ use crate::{
 use boxel_light::PaddedLight;
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, BoxFaceTexture, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
-    FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, Paletted,
-    RenderShape, box_face_entries, neighbor_index,
+    FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, ModelPlane,
+    NEIGHBOR_OFFSETS, Paletted, RenderShape, TableEntry, box_face_entries, neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -100,17 +100,17 @@ pub struct MaterialTable {
 const NO_SHAPE: u16 = u16::MAX;
 
 /// The models made of boxes of a material table (slabs, stairs, fences, torches; ADR 0020):
-/// every distinct [`ModelBox`] gets an index (the box index of its `SHAPE_BOX` quads, the
-/// renderer's box table), every distinct model a [`BoxShape`].
+/// every distinct [`ModelBox`] and plane entry (ADR 0046) gets an index (the box index of its
+/// `SHAPE_BOX` and plane quads, the renderer's box table), every distinct model a [`BoxShape`].
 #[derive(Clone, Debug, Default)]
 struct BoxModels {
     /// [`BoxShape`] index of each material ([`NO_SHAPE`] for the others).
     shape_of: Vec<u16>,
     shapes: Vec<BoxShape>,
     shape_ids: HashMap<BlockModel, u16>,
-    /// Distinct boxes in first-use order: the box table.
-    boxes: Vec<ModelBox>,
-    box_ids: HashMap<ModelBox, u16>,
+    /// Distinct entries in first-use order: the box table.
+    boxes: Vec<TableEntry>,
+    box_ids: HashMap<TableEntry, u16>,
 }
 
 /// Sixteenths of a cell border face: bit `u` of row `v` (the face's axes, [`Face::axes`]).
@@ -158,6 +158,17 @@ struct BoxFace {
 /// The [`BoxFace::layer`] of a face that shows the block's texture.
 const BLOCK_LAYER: u16 = u16::MAX;
 
+/// One plane of a model (ADR 0046): its quad's table entry, plane byte and layer.
+#[derive(Clone, Copy, Debug)]
+struct PlaneFace {
+    /// Index of its entry in [`BoxModels::boxes`].
+    index: u16,
+    /// [`ModelPlane::quad_byte`].
+    byte: u8,
+    /// Its texture layer, [`BLOCK_LAYER`] for the block's side.
+    layer: u16,
+}
+
 /// No solid top ([`BoxShape::top_floor`] of a model whose boxes leave part of its top layer
 /// open).
 const NO_FLOOR: u8 = u8::MAX;
@@ -169,6 +180,8 @@ const NO_FLOOR: u8 = u8::MAX;
 #[derive(Clone, Debug)]
 struct BoxShape {
     faces: Vec<BoxFace>,
+    /// Its planes (ADR 0046), drawn after its faces. They cover nothing.
+    planes: Vec<PlaneFace>,
     covers: [Cover; 6],
     /// The faces (bit [`Face::index`]) its boxes cover whole on the cell border (Minecraft's
     /// sturdy faces: a slab's bottom, the back of stairs).
@@ -181,11 +194,12 @@ struct BoxShape {
 
 impl BoxShape {
     /// The shape of `boxes`, whose faces show `textures` (none or one per box,
-    /// `BoxModel::textures`), `index` giving each table box's index.
+    /// `BoxModel::textures`), and of `planes`, `index` giving each table entry's index.
     fn new(
         boxes: &[ModelBox],
         textures: &[[BoxFaceTexture; 6]],
-        mut index: impl FnMut(ModelBox) -> u16,
+        planes: &[ModelPlane],
+        mut index: impl FnMut(TableEntry) -> u16,
     ) -> Self {
         let texture = |i: usize, face: Face| {
             textures
@@ -227,7 +241,7 @@ impl BoxShape {
                 }
                 faces.push(BoxFace {
                     face,
-                    index: index(table_box),
+                    index: index(TableEntry::Box(table_box)),
                     layer: texture(i, face).texture.map_or(BLOCK_LAYER, |t| t.0),
                     border,
                     rect,
@@ -253,8 +267,17 @@ impl BoxShape {
             }
             top_floor = y;
         }
+        let planes = planes
+            .iter()
+            .map(|p| PlaneFace {
+                index: index(TableEntry::Plane(p.entry())),
+                byte: p.quad_byte(),
+                layer: p.texture.map_or(BLOCK_LAYER, |t| t.0),
+            })
+            .collect();
         Self {
             faces,
+            planes,
             covers,
             sturdy,
             top_floor,
@@ -263,19 +286,20 @@ impl BoxShape {
 }
 
 impl BoxModels {
-    /// The shape of `model`, made of `model_boxes` showing `textures`, interning its boxes and
-    /// itself.
+    /// The shape of `model`, made of `model_boxes` showing `textures` and of `planes`,
+    /// interning its table entries and itself.
     fn intern(
         &mut self,
         model: BlockModel,
         model_boxes: &[ModelBox],
         textures: &[[BoxFaceTexture; 6]],
+        planes: &[ModelPlane],
     ) -> u16 {
         if let Some(&id) = self.shape_ids.get(&model) {
             return id;
         }
         let (boxes, ids) = (&mut self.boxes, &mut self.box_ids);
-        let shape = BoxShape::new(model_boxes, textures, |b| {
+        let shape = BoxShape::new(model_boxes, textures, planes, |b| {
             *ids.entry(b).or_insert_with(|| {
                 boxes.push(b);
                 (boxes.len() - 1) as u16
@@ -283,7 +307,7 @@ impl BoxModels {
         });
         assert!(
             self.boxes.len() <= MAX_MODEL_BOXES,
-            "more than {MAX_MODEL_BOXES} model boxes (the registry refuses them)"
+            "more than {MAX_MODEL_BOXES} model box table entries (the registry refuses them)"
         );
         let id = self.shapes.len() as u16;
         self.shapes.push(shape);
@@ -368,11 +392,12 @@ impl MaterialTable {
                 table.lit[m] = registry.emission(s);
                 table.has_lit |= !table.lit[m].is_dark();
             }
-            table.set_textured_model(
+            table.set_model_parts(
                 m as u16,
                 registry.model(s),
                 registry.model_boxes(s),
                 registry.box_textures(s),
+                registry.model_planes(s),
             );
             // Every level of a fluid meshes as its source (level 0).
             if registry.model(s) == BlockModel::Fluid
@@ -504,6 +529,18 @@ impl MaterialTable {
         boxes: &[ModelBox],
         textures: &[[BoxFaceTexture; 6]],
     ) {
+        self.set_model_parts(material, model, boxes, textures, &[]);
+    }
+    /// [`MaterialTable::set_textured_model`] with the planes it draws too (`BoxModel::planes`,
+    /// ADR 0046).
+    pub fn set_model_parts(
+        &mut self,
+        material: u16,
+        model: BlockModel,
+        boxes: &[ModelBox],
+        textures: &[[BoxFaceTexture; 6]],
+        planes: &[ModelPlane],
+    ) {
         let i = material as usize;
         if i >= self.class.len() {
             return;
@@ -516,18 +553,20 @@ impl MaterialTable {
         };
         self.codes[i] = cube_codes(model);
         self.has_fluid |= model == BlockModel::Fluid;
-        let made_of_boxes = self.shape[i] != RenderShape::None && !boxes.is_empty();
+        let made_of_boxes =
+            self.shape[i] != RenderShape::None && !(boxes.is_empty() && planes.is_empty());
         self.box_models.shape_of[i] = if made_of_boxes {
-            self.box_models.intern(model, boxes, textures)
+            self.box_models.intern(model, boxes, textures, planes)
         } else {
             NO_SHAPE
         };
     }
-    /// The model box table: every distinct [`ModelBox`] of the materials made of boxes, in the
-    /// order first met (materials in id order). A `SHAPE_BOX` quad's
-    /// [`PackedQuad::box_index`] indexes it; the renderer uploads it packed
-    /// ([`crate::pack_model_box`]). At most [`MAX_MODEL_BOXES`] (the registry checks it).
-    pub fn model_boxes(&self) -> &[ModelBox] {
+    /// The model box table: every distinct [`ModelBox`] and plane entry (ADR 0046) of the
+    /// materials made of boxes, in the order first met (materials in id order). The
+    /// [`PackedQuad::box_index`] of a `SHAPE_BOX` or plane quad indexes it; the renderer uploads
+    /// it packed ([`crate::pack_table_entry`]). At most [`MAX_MODEL_BOXES`] (the registry checks
+    /// it).
+    pub fn model_boxes(&self) -> &[TableEntry] {
         &self.box_models.boxes
     }
     /// Shape code of the cube faces of `material` facing `face` (`layout::SHAPE_CUBE` or
@@ -1488,7 +1527,9 @@ fn emit_walls(
 /// that neighbor is opaque or the same block, wet or dry (two bottom slabs side by side, a
 /// stair's back against a full stair face, wet roots beside dry ones). Faces inside the cell
 /// are always drawn. Cubes never hide against a box model (the greedy pass sees it as empty),
-/// so a cube face behind a stair's back is drawn and hidden by depth. A cross gives two quads
+/// so a cube face behind a stair's back is drawn and hidden by depth. The model's planes (ADR
+/// 0046) follow its box faces, one plane quad each ([`PackedQuad::is_plane`]), lit as a cross
+/// and always in the cutout or translucent bucket. A cross gives two quads
 /// (faces `PosX` and `PosZ`, see [`layout::SHAPE_CROSS`]) with the texture of its side. The
 /// waterlogged blocks of the inner 32^3 ([`PaddedChunk::waterlogged`], ADR 0025) draw their
 /// boxes the same way, after the rest; a waterlogged cutout cube (ADR 0038) draws one unit quad
@@ -1512,7 +1553,13 @@ fn emit_specials(
         if materials.emissive(m) {
             quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
         }
-        out.push((materials.bucket(m, face) as u8, quad));
+        let mut bucket = materials.bucket(m, face);
+        if quad.is_plane() {
+            // Drawn from both sides: an opaque block's planes go to the cutout bucket, which
+            // culls no face (their opaque texels pass the alpha test).
+            bucket = bucket.max(CUTOUT_BUCKET);
+        }
+        out.push((bucket as u8, quad));
     };
     let models = &materials.box_models;
     // The quads of block `m` at inner `[x, y, z]`.
@@ -1541,6 +1588,29 @@ fn emit_specials(
                     bf.layer
                 };
                 push(m, pos, face, layer, layout::SHAPE_BOX, bf.index, shading);
+            }
+            if !shape.planes.is_empty() {
+                // Lit as a cross: from the block's own cell, without AO (the AO byte holds the
+                // plane byte).
+                let i = PaddedChunk::index(x, y, z);
+                let (_, light) = shade(m, i, Face::PosY, None)?;
+                for plane in &shape.planes {
+                    let layer = if plane.layer == BLOCK_LAYER {
+                        materials.layer(m, Face::PosX)
+                    } else {
+                        plane.layer
+                    };
+                    let code = layout::SHAPE_CROSS;
+                    push(
+                        m,
+                        pos,
+                        Face::PosY,
+                        layer,
+                        code,
+                        plane.index,
+                        (plane.byte, light),
+                    );
+                }
             }
         } else if materials.model(m) == BlockModel::Cross {
             let i = PaddedChunk::index(x, y, z);
@@ -2136,7 +2206,7 @@ mod tests {
             .iter()
             .map(|&(min, max)| ModelBox::new(min, max))
             .collect();
-        BoxShape::new(&boxes, &[], |_| 0)
+        BoxShape::new(&boxes, &[], &[], |_| 0)
     }
 
     #[test]

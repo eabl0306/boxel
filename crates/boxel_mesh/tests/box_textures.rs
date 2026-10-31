@@ -7,7 +7,9 @@ mod common;
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, ChunkMesh, MaterialTable, MeshOptions, Mesher, PaddedChunk, layout,
 };
-use boxel_voxel::{BlockModel, BoxFaceTexture, BoxModelId, Face, ModelBox, RenderShape, TextureId};
+use boxel_voxel::{
+    BlockModel, BoxFaceTexture, BoxModelId, Face, ModelBox, RenderShape, TableEntry, TextureId,
+};
 use common::set_material;
 
 /// The block's layer of (material, face) is `material * 6 + face`; the box layers start at 100.
@@ -55,7 +57,9 @@ fn box_quads(mesh: &ChunkMesh, table: &MaterialTable, p: [u32; 3]) -> Vec<(Face,
         .flat_map(|b| mesh.bucket(b).iter())
         .filter(|q| q.shape() == layout::SHAPE_BOX && q.pos() == p)
         .map(|q| {
-            let b = table.model_boxes()[usize::from(q.box_index())];
+            let TableEntry::Box(b) = table.model_boxes()[usize::from(q.box_index())] else {
+                panic!("a box face indexes a plane: {q:?}");
+            };
             (q.face(), q.layer(), b)
         })
         .collect();

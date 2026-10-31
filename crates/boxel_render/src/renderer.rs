@@ -23,11 +23,11 @@ use crate::upload::{GpuSink, UploadKinds, Uploads};
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::Tier;
 use boxel_math::{Frustum, I64Vec3, Mat4, Quat, UVec2, Vec3, wrap_to_i32};
-use boxel_mesh::{ChunkMesh, pack_model_box};
+use boxel_mesh::{ChunkMesh, pack_table_entry};
 use boxel_shaders::gpu::{
     VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
 };
-use boxel_voxel::{CHUNK_SHIFT, ChunkPos, ModelBox};
+use boxel_voxel::{CHUNK_SHIFT, ChunkPos, TableEntry};
 use boxel_world::VisibleSet;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1160,13 +1160,14 @@ impl VoxelRenderer {
         }
     }
 
-    /// Sets the model box table the `SHAPE_BOX` quads of the meshes index (ADR 0020):
+    /// Sets the model box table the `SHAPE_BOX` and plane quads of the meshes index (ADR 0020,
+    /// ADR 0046):
     /// `boxel_mesh::MaterialTable::model_boxes` of the material table the meshes come from. It
     /// goes into the view uniform (after the per-frame part), written here once, and to the
-    /// translucent sorter. Until it is set the table is empty: box faces collapse to nothing
-    /// (and sort as cube faces). Boxes past [`VIEW_BOX_CAPACITY`] are dropped with an error
+    /// translucent sorter. Until it is set the table is empty: box faces and planes collapse to
+    /// nothing (and sort as cube faces). Boxes past [`VIEW_BOX_CAPACITY`] are dropped with an error
     /// log (the registry never makes that many).
-    pub fn set_model_boxes(&mut self, queue: &wgpu::Queue, boxes: &[ModelBox]) {
+    pub fn set_model_boxes(&mut self, queue: &wgpu::Queue, boxes: &[TableEntry]) {
         let boxes = if boxes.len() > VIEW_BOX_CAPACITY {
             tracing::error!(
                 "{} model boxes, the view uniform holds {VIEW_BOX_CAPACITY}",
@@ -1178,7 +1179,7 @@ impl VoxelRenderer {
         };
         let mut words = vec![[0u32; 2]; VIEW_BOX_CAPACITY];
         for (slot, &b) in words.iter_mut().zip(boxes) {
-            *slot = pack_model_box(b);
+            *slot = pack_table_entry(b);
         }
         queue.write_buffer(
             &self.view_buffer,

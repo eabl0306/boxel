@@ -339,7 +339,7 @@ fn scenes(registry: &BlockRegistry) -> Vec<Scene> {
                 let keep = |q: PackedQuad| {
                     q.shape() == layout::SHAPE_BOX
                         && q.face() == Face::PosY
-                        && boxes[usize::from(q.box_index())].bounds.max[1] == 16
+                        && boxes[usize::from(q.box_index())].bounds().max[1] == 16
                 };
                 (*o, only(m, &keep))
             })

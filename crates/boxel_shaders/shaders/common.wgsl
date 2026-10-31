@@ -5,7 +5,9 @@
 //        shape code, ADR 0018, 0020, 0021 and 0025: cube, turned cube, fluid cube, cross, fluid
 //        surface, model box face, sloped fluid cell; a box face keeps the index of its box in the
 //        View's box table in the (w-1, h-1) bits, a sloped fluid cell its 4 corner heights there
-//        and in the AO bits, and the bit after the heights for the water of a waterlogged block)
+//        and in the AO bits, and the bit after the heights for the water of a waterlogged block;
+//        a cross of face +Y is a plane (ADR 0046): its table entry in the (w-1, h-1) bits, its
+//        kind and spin in the AO bits)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -50,7 +52,23 @@ const SHAPE_FLUID_CUBE: u32 = 2u;  // cube face of a fluid cell under its fluid 
 // side away from the normal, WALL_INSET into the cell (greedy).
 const SHAPE_WALL: u32 = 3u;
 const WALL_INSET: f32 = 0.001953125; // 1/512
-const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1)
+const SHAPE_CROSS: u32 = 4u;       // plant quad through the cell's diagonal (w = h = 1), or a plane (face +Y)
+// A plane quad (ADR 0046): a SHAPE_CROSS quad of face +Y. Its AO byte is its plane byte: the kind
+// (boxel_voxel::PlaneKind::code, 3 per axis x, y, z: mid, rising, falling) in bits 0..3 and the
+// spin (sixteenths of a turn) in bits 4..7. Its (w-1, h-1) bits index its entry in the View's
+// box table: word 0 = min xyz (thirty-seconds, PLANE_COORD_BITS each), u0, v0 (PLANE_UV_BITS
+// each, from PLANE_UV_SHIFT) and the texture's quarter turns (PLANE_TURN_SHIFT); word 1 = max
+// xyz, u1, v1.
+const PLANE_KIND_MASK: u32 = 15u;
+const PLANE_SPIN_SHIFT: u32 = 4u;
+const PLANE_COORD_BITS: u32 = 6u;
+const PLANE_UV_SHIFT: u32 = 18u;
+const PLANE_UV_BITS: u32 = 5u;
+const PLANE_TURN_SHIFT: u32 = 28u;
+// cos(k * 22.5 degrees), k = 1..3 (boxel_voxel's SPIN_COS)
+const PLANE_COS1: f32 = 0.9238795;
+const PLANE_COS2: f32 = 0.70710677;
+const PLANE_COS3: f32 = 0.38268343;
 const SHAPE_FLUID_SURFACE: u32 = 5u; // fluid surface cell: its top drops to FLUID_SURFACE (greedy)
 const SHAPE_FLUID_SLOPE: u32 = 7u; // fluid cell with a height per top corner (w = h = 1, no AO)
 const FLUID_SURFACE: f32 = 0.875;
@@ -265,6 +283,60 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     if ((geo & GEO_FLUID_INSET_BIT) != 0u && f != 0u) {
       o.local = o.local - n * FLUID_INSET;
     }
+  } else if (shape == SHAPE_CROSS && f == 0u) {
+    // A plane (ADR 0046, boxel_voxel::ModelPlane::corners is its CPU twin): the box of its
+    // table entry, then the kind's corner A and vectors U and V, corner k at A + U cu + V cv.
+    let index = (geo >> GEO_W_SHIFT) & GEO_BOX_MASK;
+    let pair = view.boxes[index >> 1u];
+    let odd = (index & 1u) == 1u;
+    let w0 = select(pair.x, pair.z, odd);
+    let w1 = select(pair.y, pair.w, odd);
+    let shifts = vec3(0u, PLANE_COORD_BITS, 2u * PLANE_COORD_BITS);
+    let lo = vec3<f32>((vec3(w0) >> shifts) & vec3(63u)) / 32.0;
+    let hi = vec3<f32>((vec3(w1) >> shifts) & vec3(63u)) / 32.0;
+    let d = hi - lo;
+    let mid = (lo + hi) * 0.5;
+    let byte = (mat >> MAT_AO_SHIFT) & 0xFFu;
+    let kind = byte & PLANE_KIND_MASK;
+    var a = lo;
+    var pu = vec3(d.x, 0.0, 0.0);
+    var pv = vec3(0.0, d.y, 0.0);
+    switch kind {
+      case 0u: { a = vec3(mid.x, lo.y, lo.z); pu = vec3(0.0, 0.0, d.z); }  // mid, across X
+      case 1u: { pv = vec3(0.0, d.y, d.z); }                                // rising, along X
+      case 2u: { a = vec3(lo.x, lo.y, hi.z); pv = vec3(0.0, d.y, -d.z); }   // falling, along X
+      case 3u: { a = vec3(lo.x, mid.y, lo.z); pv = vec3(0.0, 0.0, d.z); }  // mid, across Y
+      case 4u: { pu = vec3(d.x, 0.0, d.z); }                                // rising, along Y
+      case 5u: { a = vec3(hi.x, lo.y, lo.z); pu = vec3(-d.x, 0.0, d.z); }   // falling, along Y
+      case 6u: { a = vec3(lo.x, lo.y, mid.z); }                             // mid, across Z
+      case 7u: { pu = vec3(0.0, 0.0, d.z); pv = vec3(d.x, d.y, 0.0); }      // rising, along Z
+      default: { a = vec3(hi.x, lo.y, lo.z); pu = vec3(0.0, 0.0, d.z); pv = vec3(-d.x, d.y, 0.0); }
+    }
+    let straight = a + pu * cu + pv * cv;
+    // Spin: the corner turned about the quad's center in its plane, from U toward V, by
+    // `spin` sixteenths of a turn (exact at quarter turns).
+    let spin = byte >> PLANE_SPIN_SHIFT;
+    let r = spin & 3u;
+    let c0 = select(select(select(1.0, PLANE_COS1, r == 1u), PLANE_COS2, r == 2u), PLANE_COS3, r == 3u);
+    let s0 = select(select(select(0.0, PLANE_COS3, r == 1u), PLANE_COS2, r == 2u), PLANE_COS1, r == 3u);
+    let q = spin >> 2u;
+    let cs = select(select(select(vec2(c0, s0), vec2(-s0, c0), q == 1u), vec2(-c0, -s0), q == 2u), vec2(s0, -c0), q == 3u);
+    let off = pu * (cu - 0.5) + pv * (cv - 0.5);
+    let normal = normalize(cross(pu, pv));
+    let spun = a + pu * 0.5 + pv * 0.5 + off * cs.x + cross(normal, off) * cs.y;
+    o.local = p + select(straight, spun, spin != 0u);
+    // The texture: (s, t) down from the top (along +Z on a mid plane across Y), turned a
+    // quarter at a time, then read in the entry's rectangle (texels).
+    var ts = vec2(cu, select(1.0 - cv, cv, kind == 3u));
+    let turns = (w0 >> PLANE_TURN_SHIFT) & 3u;
+    for (var k = 0u; k < turns; k++) { ts = vec2(ts.y, 1.0 - ts.x); }
+    let uv0 = vec2<f32>(vec2((w0 >> PLANE_UV_SHIFT) & 31u, (w0 >> (PLANE_UV_SHIFT + PLANE_UV_BITS)) & 31u));
+    let uv1 = vec2<f32>(vec2((w1 >> PLANE_UV_SHIFT) & 31u, (w1 >> (PLANE_UV_SHIFT + PLANE_UV_BITS)) & 31u));
+    o.uv = (uv0 + (uv1 - uv0) * ts) / 16.0;
+    // Drawn from both sides at full face brightness, without AO and never grown, as a cross.
+    o.face = 0u;
+    o.ao = 0xFFu;
+    o.grow = vec2(0.0);
   } else if (shape == SHAPE_CROSS) {
     // Face 2 (+X) runs from (0, 0) to (1, 1) in (x, z), face 4 (+Z) from (1, 0) to (0, 1); full
     // height. Drawn from both sides at full face brightness (face 0's shade, as Minecraft draws

@@ -53,7 +53,7 @@ use crate::path::CHUNK_EDGE;
 use crate::renderer::ViewParams;
 use boxel_math::{Aabb, DVec3, I64Vec3, Vec3};
 use boxel_mesh::{ChunkMesh, PackedQuad, TRANSLUCENT_BUCKET, layout};
-use boxel_voxel::{CollisionBox, Face, ModelBox};
+use boxel_voxel::{CollisionBox, Face, TableEntry};
 use boxel_world::jobs::{InlineExecutor, JobExecutor, TaskPoolExecutor};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -114,7 +114,8 @@ pub(crate) struct QuadBox {
     /// Max corner.
     pub max: [i32; 3],
     /// The quad's plane (`None` for a cross plant quad, which runs along a diagonal: its box is
-    /// its cell, and for the sloped top of a fluid cell: its box spans its corner heights).
+    /// its cell, for a plane quad: its box is the plane's, and for the sloped top of a fluid
+    /// cell: its box spans its corner heights).
     pub plane: Option<Plane>,
 }
 
@@ -122,7 +123,7 @@ impl QuadBox {
     /// The geometry `common.wgsl` (`decode_quad`) builds for `quad`, without the sub-pixel edge
     /// growth. `boxes` is the model box table a `SHAPE_BOX` quad indexes (a box index outside
     /// it counts as the cube face).
-    pub fn of(quad: PackedQuad, boxes: &[ModelBox]) -> Self {
+    pub fn of(quad: PackedQuad, boxes: &[TableEntry]) -> Self {
         let face = quad.face();
         let (n, u, v) = face.axes();
         let p = quad.pos().map(|c| c as i32 * SUB);
@@ -130,11 +131,22 @@ impl QuadBox {
         let mut min = p;
         let mut max = p;
         let surface = (layout::FLUID_SURFACE * SUB as f32) as i32;
+        if quad.is_plane() {
+            // A plane (ADR 0046) runs through its box: its box is the plane's box.
+            let b = boxes
+                .get(usize::from(quad.box_index()))
+                .map_or(CollisionBox::FULL, |b| b.bounds());
+            return Self {
+                min: [0, 1, 2].map(|a| p[a] + i32::from(b.min[a])),
+                max: [0, 1, 2].map(|a| p[a] + i32::from(b.max[a])),
+                plane: None,
+            };
+        }
         if quad.shape() == layout::SHAPE_BOX {
             // One box face (ADR 0020): the box spans its own sixteenths of the cell.
             let b = boxes
                 .get(usize::from(quad.box_index()))
-                .map_or(CollisionBox::FULL, |b| b.bounds);
+                .map_or(CollisionBox::FULL, |b| b.bounds());
             for a in [u, v] {
                 min[a] = p[a] + i32::from(b.min[a]);
                 max[a] = p[a] + i32::from(b.max[a]);
@@ -377,7 +389,7 @@ fn block_cell(eye: [f64; 3]) -> Validity {
 /// the cell where it stays right. See the module docs.
 pub(crate) fn sort_order(
     quads: &[PackedQuad],
-    model_boxes: &[ModelBox],
+    model_boxes: &[TableEntry],
     eye: DVec3,
 ) -> (Vec<u32>, Validity) {
     let eye = (eye * f64::from(SUB)).to_array();
@@ -460,7 +472,7 @@ fn topo_order(boxes: &[QuadBox], keys: &[u64], eye: [f64; 3]) -> Vec<u32> {
 /// cell where the order stays right; `boxes` is the model box table.
 pub(crate) fn sort_bucket(
     mesh: &ChunkMesh,
-    boxes: &[ModelBox],
+    boxes: &[TableEntry],
     eye: DVec3,
 ) -> (Vec<PackedQuad>, Validity) {
     let quads = mesh.bucket(TRANSLUCENT_BUCKET);
@@ -518,7 +530,7 @@ struct SortTask {
     id: u64,
     ticket: u64,
     mesh: Arc<ChunkMesh>,
-    boxes: Arc<[ModelBox]>,
+    boxes: Arc<[TableEntry]>,
     eye: DVec3,
 }
 
@@ -548,7 +560,7 @@ pub(crate) struct TranslucentSorter {
     dirty: bool,
     stats: SortStats,
     /// The model box table the quads index (`SHAPE_BOX` quads).
-    boxes: Arc<[ModelBox]>,
+    boxes: Arc<[TableEntry]>,
 }
 
 impl TranslucentSorter {
@@ -571,7 +583,7 @@ impl TranslucentSorter {
     }
 
     /// The model box table changed: every chunk sorts again with it.
-    pub fn set_boxes(&mut self, boxes: Arc<[ModelBox]>) {
+    pub fn set_boxes(&mut self, boxes: Arc<[TableEntry]>) {
         self.boxes = boxes;
         for state in self.chunks.values_mut() {
             state.valid = None;
@@ -804,7 +816,9 @@ mod tests {
     use boxel_camera::{Camera, CameraView};
     use boxel_mesh::{BUCKET_COUNT, MaterialTable, MeshInput, MeshOptions, Mesher};
     use boxel_transform::Transform;
-    use boxel_voxel::{BlockState, ChunkData, Face, LocalPos, ModelBox};
+    use boxel_voxel::{
+        Axis, BlockState, ChunkData, Face, LocalPos, ModelBox, ModelPlane, PlaneKind, TableEntry,
+    };
 
     fn quad(pos: [u32; 3], w: u32, h: u32, face: Face) -> PackedQuad {
         PackedQuad::new(pos, w, h, face, 0)
@@ -850,7 +864,8 @@ mod tests {
             ModelBox::new([0, 0, 0], [16, 8, 16]),
             ModelBox::new([0, 8, 0], [16, 16, 16]),
             ModelBox::new([7, 0, 7], [9, 10, 9]),
-        ];
+        ]
+        .map(TableEntry::Box);
         let boxed = |f, index| {
             QuadBox::of(
                 quad([0, 3, 0], 1, 1, f)
@@ -877,6 +892,15 @@ mod tests {
         assert_eq!(stick.plane.map(|p| (p.axis, p.positive)), Some((0, false)));
         // an index outside the table counts as the cube face
         assert_eq!(boxed(Face::PosY, 9).plane.map(|p| p.at), Some(64));
+        // a plane (ADR 0046) covers its box, rounded out to sixteenths, and has no plane
+        let plane = ModelPlane::new(PlaneKind::Falling(Axis::Y), [5, 0, 6], [27, 20, 26]);
+        let planes = [TableEntry::Plane(plane.entry())];
+        let quad_of = quad([1, 1, 1], 1, 1, Face::PosY)
+            .with_shape(layout::SHAPE_CROSS)
+            .with_box_index(0)
+            .with_ao_byte(plane.quad_byte());
+        let b = QuadBox::of(quad_of, &planes);
+        assert_eq!((b.min, b.max, b.plane), ([18, 16, 19], [30, 26, 29], None));
         // a cross covers its cell and has no plane
         let cross =
             QuadBox::of_test(quad([1, 1, 1], 1, 1, Face::PosX).with_shape(layout::SHAPE_CROSS));

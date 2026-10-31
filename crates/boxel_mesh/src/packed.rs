@@ -1,5 +1,5 @@
 use crate::BUCKET_COUNT;
-use boxel_voxel::{Face, LightValue, ModelBox};
+use boxel_voxel::{Face, LightValue, ModelBox, PlaneEntry, PlaneKind, TableEntry};
 use bytemuck::{Pod, Zeroable};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
@@ -60,7 +60,29 @@ pub mod layout {
     /// A cross plant quad through the cell's diagonal, full height: face `PosX` is the one from
     /// `(0, 0)` to `(1, 1)` in (x, z), face `PosZ` the one from `(1, 0)` to `(0, 1)`. Drawn from
     /// both sides (cutout pipeline), without face shading, its light is the block's own cell.
+    ///
+    /// With face `PosY` it is a plane quad (EW-PLANE, ADR 0046): one plane of a block model,
+    /// drawn the same way, on a mid-plane or diagonal of a box of its own. Its `w - 1` and
+    /// `h - 1` bits hold the index of its [`PlaneEntry`](boxel_voxel::PlaneEntry) in the model box table
+    /// ([`GEO_BOX_SHIFT`]: the box, in thirty-seconds, and the texture rectangle), its AO byte
+    /// its plane byte (no AO): the [`PlaneKind::code`](boxel_voxel::PlaneKind::code) in bits 0 to 3 ([`PLANE_KIND_MASK`]),
+    /// the spin in sixteenths of a turn in bits 4 to 7 ([`PLANE_SPIN_SHIFT`]). The other face
+    /// values are free.
     pub const SHAPE_CROSS: u8 = 4;
+    /// Mask of the plane kind in a plane quad's plane byte (its AO byte, [`SHAPE_CROSS`]).
+    pub const PLANE_KIND_MASK: u32 = 15;
+    /// Shift of the spin (sixteenths of a turn, 4 bits) in a plane quad's plane byte.
+    pub const PLANE_SPIN_SHIFT: u32 = 4;
+    /// Bits of each box coordinate of a packed plane entry ([`pack_plane_entry`](crate::pack_plane_entry)):
+    /// thirty-seconds, `0..=32`. Word 0 holds the low corner (x, y, z), word 1 the high one.
+    pub const PLANE_COORD_BITS: u32 = 6;
+    /// Shift, in each word of a packed plane entry, of its two texture rectangle values (5
+    /// bits each: `u0` then `v0` in word 0, `u1` then `v1` in word 1).
+    pub const PLANE_UV_SHIFT: u32 = 18;
+    /// Bits of each texture rectangle value of a packed plane entry (texels, `0..=16`).
+    pub const PLANE_UV_BITS: u32 = 5;
+    /// Shift of the texture's quarter turns (2 bits) in word 0 of a packed plane entry.
+    pub const PLANE_TURN_SHIFT: u32 = 28;
     /// A face of a fluid's surface cell (`BlockModel::Fluid`): the cell's top drops to
     /// [`FLUID_SURFACE`] of a block. The +Y face lies there and the side faces span `y` in
     /// `0..FLUID_SURFACE`; the -Y face is the cube's. Greedy quads (any `w`; side faces have
@@ -328,12 +350,29 @@ impl PackedQuad {
         (self.ao_byte() >> (2 * k as u32)) & 3
     }
     /// The packed AO byte (corner `k` at bits `2k..2k+2`; open, `0xFF`, for a
-    /// [`layout::SHAPE_FLUID_SLOPE`] quad, whose AO bits hold corner heights).
+    /// [`layout::SHAPE_FLUID_SLOPE`] quad, whose AO bits hold corner heights, and for a plane
+    /// quad, whose AO bits hold its plane byte).
     pub const fn ao_byte(self) -> u8 {
-        if self.shape() == layout::SHAPE_FLUID_SLOPE {
+        if self.shape() == layout::SHAPE_FLUID_SLOPE || self.is_plane() {
             return 0xFF;
         }
         (self.mat >> layout::MAT_AO_SHIFT) as u8
+    }
+    /// True for a plane quad (ADR 0046): a [`layout::SHAPE_CROSS`] quad of face `PosY`.
+    pub const fn is_plane(self) -> bool {
+        self.shape() == layout::SHAPE_CROSS && matches!(self.face(), Face::PosY)
+    }
+    /// The kind and spin (sixteenths of a turn) of a plane quad ([`layout::SHAPE_CROSS`]), or
+    /// `None` for another quad.
+    pub const fn plane(self) -> Option<(PlaneKind, u8)> {
+        if !self.is_plane() {
+            return None;
+        }
+        let byte = (self.mat >> layout::MAT_AO_SHIFT) & 0xFF;
+        match PlaneKind::from_code((byte & layout::PLANE_KIND_MASK) as u8) {
+            Some(kind) => Some((kind, (byte >> layout::PLANE_SPIN_SHIFT) as u8)),
+            None => None,
+        }
     }
     /// Light palette index.
     pub const fn light_index(self) -> u16 {
@@ -370,6 +409,55 @@ pub fn pack_model_box(b: ModelBox) -> [u32; 2] {
         word1 |= ((i32::from(t) + BOX_OFFSET_BIAS) as u32) << (BOX_OFFSET_BITS * k as u32);
     }
     [word0, word1]
+}
+
+/// A plane's table entry as the shaders read it ([`layout::SHAPE_CROSS`]): word 0 holds the low
+/// corner (thirty-seconds, [`layout::PLANE_COORD_BITS`] each), `u0` and `v0`
+/// ([`layout::PLANE_UV_SHIFT`]) and the texture's quarter turns ([`layout::PLANE_TURN_SHIFT`]),
+/// word 1 the high corner, `u1` and `v1`. Debug-asserts a valid entry.
+pub fn pack_plane_entry(p: PlaneEntry) -> [u32; 2] {
+    use layout::*;
+    debug_assert!(
+        p.min.iter().chain(&p.max).all(|&c| c <= 32) && p.uv.iter().all(|&t| t <= 16) && p.turn < 4,
+        "{p:?}"
+    );
+    let corner = |c: [u8; 3]| {
+        (0..3).fold(0, |w, k| {
+            w | u32::from(c[k]) << (PLANE_COORD_BITS * k as u32)
+        })
+    };
+    let uv = |a: u8, b: u8| (u32::from(a) | u32::from(b) << PLANE_UV_BITS) << PLANE_UV_SHIFT;
+    [
+        corner(p.min) | uv(p.uv[0], p.uv[1]) | u32::from(p.turn & 3) << PLANE_TURN_SHIFT,
+        corner(p.max) | uv(p.uv[2], p.uv[3]),
+    ]
+}
+
+/// The plane entry of a packed one ([`pack_plane_entry`]).
+pub fn unpack_plane_entry(words: [u32; 2]) -> PlaneEntry {
+    use layout::*;
+    let corner = |w: u32| [0, 1, 2].map(|k| ((w >> (PLANE_COORD_BITS * k)) & 63) as u8);
+    let uv = |w: u32, k: u32| ((w >> (PLANE_UV_SHIFT + PLANE_UV_BITS * k)) & 31) as u8;
+    PlaneEntry {
+        min: corner(words[0]),
+        max: corner(words[1]),
+        uv: [
+            uv(words[0], 0),
+            uv(words[0], 1),
+            uv(words[1], 0),
+            uv(words[1], 1),
+        ],
+        turn: ((words[0] >> PLANE_TURN_SHIFT) & 3) as u8,
+    }
+}
+
+/// A model box table entry as the shaders read it: [`pack_model_box`] or [`pack_plane_entry`]
+/// (the quads that index it know which).
+pub fn pack_table_entry(entry: TableEntry) -> [u32; 2] {
+    match entry {
+        TableEntry::Box(b) => pack_model_box(b),
+        TableEntry::Plane(p) => pack_plane_entry(p),
+    }
 }
 
 /// The model box of a packed one ([`pack_model_box`]).

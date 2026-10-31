@@ -4,6 +4,7 @@
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
 use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
+use crate::planes::{ModelPlane, TableEntry};
 use crate::rules::{NeighborRule, UseRule};
 use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
@@ -310,6 +311,10 @@ pub struct BoxModel {
     /// The faces of each box, in [`Face::index`] order: empty (every face the block's), or one
     /// per box.
     pub textures: Vec<[BoxFaceTexture; 6]>,
+    /// Its planes (EW-PLANE, ADR 0046): quads on a mid-plane or diagonal of a box of their own,
+    /// drawn from both sides (a chain's crossed planes, a potted plant). They cover nothing and
+    /// are picked by the outline only.
+    pub planes: Vec<ModelPlane>,
 }
 
 impl BoxModel {
@@ -320,7 +325,15 @@ impl BoxModel {
             boxes,
             outline,
             textures: Vec::new(),
+            planes: Vec::new(),
         }
+    }
+
+    /// The same model with `planes` too ([`BoxModel::planes`]).
+    #[must_use]
+    pub fn with_planes(mut self, planes: Vec<ModelPlane>) -> Self {
+        self.planes = planes;
+        self
     }
 
     /// The same model with `textures`, one per box ([`BoxModel::textures`]).
@@ -346,30 +359,55 @@ impl BoxModel {
         })
     }
 
+    /// Every model box table entry it draws with: those of its boxes ([`BoxModel::table_boxes`])
+    /// and of its planes ([`ModelPlane::entry`]).
+    pub fn table_entries(&self) -> impl Iterator<Item = TableEntry> + '_ {
+        let planes = self.planes.iter().map(|p| TableEntry::Plane(p.entry()));
+        self.table_boxes().map(TableEntry::Box).chain(planes)
+    }
+
     /// The model turned `turns` quarter turns clockwise seen from above ([`ModelBox::turned`]),
     /// its outline too, each face's texture moved to the face it turns to (shown in that face's
     /// orientation: a texture that must turn with the model takes a turned layer).
     #[must_use]
     pub fn turned(&self, turns: u8) -> BoxModel {
-        self.map(|b| b.turned(turns), |f| f.turned_y(turns))
+        self.map(
+            |b| b.turned(turns),
+            |f| f.turned_y(turns),
+            |p| p.turned(turns),
+        )
     }
 
     /// The model turned around X, each quarter taking the top to the north
     /// ([`ModelBox::turned_x`]), as [`BoxModel::turned`] does around Y.
     #[must_use]
     pub fn turned_x(&self, turns: u8) -> BoxModel {
-        self.map(|b| b.turned_x(turns), |f| f.turned_x(turns))
+        self.map(
+            |b| b.turned_x(turns),
+            |f| f.turned_x(turns),
+            |p| p.turned_x(turns),
+        )
     }
 
     /// The model turned around Z, each quarter taking the top to the east
     /// ([`ModelBox::turned_z`]), as [`BoxModel::turned`] does around Y.
     #[must_use]
     pub fn turned_z(&self, turns: u8) -> BoxModel {
-        self.map(|b| b.turned_z(turns), |f| f.turned_z(turns))
+        self.map(
+            |b| b.turned_z(turns),
+            |f| f.turned_z(turns),
+            |p| p.turned_z(turns),
+        )
     }
 
-    /// The model with every box and outline box moved by `turn`, the face textures by `face`.
-    fn map(&self, turn: impl Fn(ModelBox) -> ModelBox, face: impl Fn(Face) -> Face) -> BoxModel {
+    /// The model with every box and outline box moved by `turn`, the face textures by `face`,
+    /// the planes by `plane`.
+    fn map(
+        &self,
+        turn: impl Fn(ModelBox) -> ModelBox,
+        face: impl Fn(Face) -> Face,
+        plane: impl Fn(ModelPlane) -> ModelPlane,
+    ) -> BoxModel {
         let outline = self.outline.iter().map(|&bounds| {
             let b = ModelBox {
                 bounds,
@@ -388,6 +426,7 @@ impl BoxModel {
             boxes: self.boxes.iter().map(|&b| turn(b)).collect(),
             outline: outline.collect(),
             textures: textures.collect(),
+            planes: self.planes.iter().map(|&p| plane(p)).collect(),
         }
     }
 
@@ -400,6 +439,7 @@ impl BoxModel {
             .flatten()
             .all(|t| t.uv.is_none_or(|uv| uv[0] < 16 && uv[1] < 16));
         self.boxes.iter().all(|b| b.is_valid())
+            && self.planes.iter().all(ModelPlane::is_valid)
             && self.outline.iter().all(|b| b.is_valid())
             && (self.textures.is_empty() || self.textures.len() == self.boxes.len())
             && crops_ok
@@ -425,13 +465,26 @@ fn boxes_of(models: &[BoxModel], model: BlockModel) -> &[ModelBox] {
     }
 }
 
-/// The model box table entries `model` draws with ([`BoxModel::table_boxes`]; a slab's half).
-fn table_boxes_of(models: &[BoxModel], model: BlockModel) -> Vec<ModelBox> {
+/// The model box table entries `model` draws with ([`BoxModel::table_entries`]; a slab's half).
+fn table_entries_of(models: &[BoxModel], model: BlockModel) -> Vec<TableEntry> {
     match model {
         BlockModel::Boxes(id) => models
             .get(usize::from(id.0))
-            .map_or_else(Vec::new, |m| m.table_boxes().collect()),
-        _ => boxes_of(models, model).to_vec(),
+            .map_or_else(Vec::new, |m| m.table_entries().collect()),
+        _ => boxes_of(models, model)
+            .iter()
+            .map(|&b| TableEntry::Box(b))
+            .collect(),
+    }
+}
+
+/// The planes `model` draws ([`BoxModel::planes`]; none but for a box model).
+fn planes_of(models: &[BoxModel], model: BlockModel) -> &[ModelPlane] {
+    match model {
+        BlockModel::Boxes(id) => models
+            .get(usize::from(id.0))
+            .map_or(&[], |m| m.planes.as_slice()),
+        _ => &[],
     }
 }
 
@@ -790,8 +843,9 @@ pub struct BlockRegistryBuilder {
     /// One per state, in state order.
     states: Vec<BlockDef>,
     blocks: Vec<BlockInfo>,
-    /// The distinct [`ModelBox`]es of the states so far (at most [`MAX_MODEL_BOXES`]).
-    model_boxes: std::collections::HashSet<ModelBox>,
+    /// The distinct model box table entries of the states so far (at most
+    /// [`MAX_MODEL_BOXES`]): boxes and planes.
+    model_boxes: std::collections::HashSet<TableEntry>,
     /// The neighbor rule of each block (by [`BlockId`]; missing at the end: none).
     neighbor_rules: Vec<Option<NeighborRule>>,
     /// The use rule of each block (by [`BlockId`]; missing at the end: none).
@@ -886,7 +940,8 @@ impl BlockRegistryBuilder {
         if !model.is_valid() {
             return Err(RegistryError::InvalidCollision("a box model".to_string()));
         }
-        for t in model.textures.iter().flatten().filter_map(|t| t.texture) {
+        let faces = model.textures.iter().flatten().filter_map(|t| t.texture);
+        for t in faces.chain(model.planes.iter().filter_map(|p| p.texture)) {
             if usize::from(t.0) >= self.textures.len() {
                 return Err(RegistryError::UnknownTexture(t.0));
             }
@@ -1197,7 +1252,7 @@ impl BlockRegistryBuilder {
         }
         let mut new_boxes = std::collections::HashSet::new();
         for def in states.iter().filter(|d| d.shape != RenderShape::None) {
-            for b in table_boxes_of(&self.box_models, def.model) {
+            for b in table_entries_of(&self.box_models, def.model) {
                 if !self.model_boxes.contains(&b) {
                     new_boxes.insert(b);
                 }
@@ -1598,12 +1653,20 @@ impl BlockRegistry {
             _ => &[],
         }
     }
+    /// The planes `s` draws ([`BoxModel::planes`]): empty for every model but a [`BoxModel`]
+    /// that has them.
+    pub fn model_planes(&self, s: BlockState) -> &[ModelPlane] {
+        planes_of(&self.box_models, self.model(s))
+    }
     /// Every texture layer `s` may draw: its face textures ([`BlockRegistry::face_texture`]) and
-    /// the layers its box faces name ([`BoxFaceTexture::texture`]). Repeats are possible.
+    /// the layers its box faces and planes name ([`BoxFaceTexture::texture`],
+    /// [`ModelPlane::texture`]). Repeats are possible.
     pub fn drawn_textures(&self, s: BlockState) -> impl Iterator<Item = TextureId> + '_ {
         let faces = Face::ALL.into_iter().map(move |f| self.face_texture(s, f));
         let boxes = self.box_textures(s).iter().flatten();
-        faces.chain(boxes.filter(|t| !t.hidden).filter_map(|t| t.texture))
+        let boxes = boxes.filter(|t| !t.hidden).filter_map(|t| t.texture);
+        let planes = self.model_planes(s).iter().filter_map(|p| p.texture);
+        faces.chain(boxes).chain(planes)
     }
     /// The boxes `s` is picked by (its outline): the full cell for cubes and fluids, the half
     /// cell for slabs, a smaller box around the stem for crosses, a [`BoxModel`]'s outline (out
