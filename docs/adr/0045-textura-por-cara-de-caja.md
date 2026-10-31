@@ -19,8 +19,9 @@ recorte (UV) que muestra. Tampoco había forma de no dibujar una cara.
   (`hidden`: no se dibuja y no tapa nada).
 - Las texturas van en el `BoxModel`, no en `ModelBox`. La tabla de cajas (1.024 entradas, en el
   uniform de los tres tiers) sigue compartida por todos los modelos. Un recorte es otra entrada:
-  la misma caja con otro desplazamiento de textura (`ModelBox::with_face_uv`). El registro las
-  cuenta contra el tope.
+  la misma caja con otro desplazamiento de textura (`ModelBox::with_face_uv`). Cada cara lee
+  solo dos de los tres desplazamientos, así que las caras de una caja que coinciden comparten
+  entrada (`box_face_entries`). El registro las cuenta contra el tope.
 - Cada quad ya llevaba su capa, así que no cambian el formato empaquetado ni los shaders. El
   mesher guarda la capa de cada cara al armar la forma del modelo; en el camino caliente solo
   suma una comparación por cara.

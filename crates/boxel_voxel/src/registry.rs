@@ -244,18 +244,51 @@ impl BoxFaceTexture {
         self.uv = Some([u, v]);
         self
     }
+}
 
-    /// The model box table entry this face of `b` reads (its own when it crops), `None` when
-    /// hidden.
-    pub const fn table_box(self, b: ModelBox, face: Face) -> Option<ModelBox> {
-        if self.hidden {
-            return None;
+/// The model box table entry each face of the box `b` reads when its faces show `faces`
+/// (`None`: hidden). A face reads two of the box's three texture offsets (the axes of its
+/// plane): a face that shows the part under the box needs `b`'s own on them, a face that crops
+/// ([`BoxFaceTexture::uv`]) the ones of [`ModelBox::with_face_uv`]. Faces whose needs agree
+/// share one entry (in [`Face::index`] order, the first entry that fits), so a box takes as
+/// few entries of the shared table as its crops allow; an offset no face needs stays `b`'s.
+pub fn box_face_entries(b: ModelBox, faces: &[BoxFaceTexture; 6]) -> [Option<ModelBox>; 6] {
+    // Per entry: its offsets and which of them a face needs.
+    let mut entries: Vec<([i8; 3], [bool; 3])> = Vec::new();
+    let mut out = [None; 6];
+    for face in Face::ALL {
+        let t = faces[face.index()];
+        if t.hidden {
+            continue;
         }
-        match self.uv {
-            Some(uv) => Some(b.with_face_uv(face, uv)),
-            None => Some(b),
+        let (_, u, v) = face.axes();
+        let wanted = match t.uv {
+            Some(uv) => b.with_face_uv(face, uv).texture_offset,
+            None => b.texture_offset,
+        };
+        let fits = |(offset, set): &([i8; 3], [bool; 3])| {
+            [u, v].iter().all(|&a| !set[a] || offset[a] == wanted[a])
+        };
+        let k = match entries.iter().position(fits) {
+            Some(k) => k,
+            None => {
+                entries.push((b.texture_offset, [false; 3]));
+                entries.len() - 1
+            }
+        };
+        let (offset, set) = &mut entries[k];
+        for a in [u, v] {
+            offset[a] = wanted[a];
+            set[a] = true;
         }
+        out[face.index()] = Some(k);
     }
+    out.map(|k| {
+        k.map(|k| ModelBox {
+            texture_offset: entries[k].0,
+            ..b
+        })
+    })
 }
 
 /// A model made of boxes ([`BlockModel::Boxes`]): the boxes it is drawn with, the boxes it is
@@ -304,12 +337,12 @@ impl BoxModel {
             .map_or(BoxFaceTexture::BLOCK, |t| t[face.index()])
     }
 
-    /// The model box table entries it draws with: each box's, and the crops of its faces.
+    /// The model box table entries it draws with: those of each box's faces
+    /// ([`box_face_entries`]).
     pub fn table_boxes(&self) -> impl Iterator<Item = ModelBox> + '_ {
         self.boxes.iter().enumerate().flat_map(move |(i, &b)| {
-            Face::ALL
-                .into_iter()
-                .filter_map(move |face| self.face_texture(i, face).table_box(b, face))
+            let faces = Face::ALL.map(|f| self.face_texture(i, f));
+            box_face_entries(b, &faces).into_iter().flatten()
         })
     }
 

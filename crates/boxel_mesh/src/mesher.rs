@@ -13,7 +13,7 @@ use boxel_light::PaddedLight;
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, BoxFaceTexture, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
     FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, NEIGHBOR_OFFSETS, Paletted,
-    RenderShape, neighbor_index,
+    RenderShape, box_face_entries, neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -196,12 +196,13 @@ impl BoxShape {
         let mut covers = [[0u16; 16]; 6];
         for (i, &b) in boxes.iter().enumerate() {
             let (min, max) = (b.bounds.min, b.bounds.max);
+            let entries = box_face_entries(b, &Face::ALL.map(|f| texture(i, f)));
             for face in Face::ALL {
                 let (n, u, v) = face.axes();
                 let positive = face.index().is_multiple_of(2);
                 let plane = if positive { max[n] } else { min[n] };
                 let rect = [min[u], max[u], min[v], max[v]];
-                let Some(table_box) = texture(i, face).table_box(b, face) else {
+                let Some(table_box) = entries[face.index()] else {
                     continue;
                 };
                 // The other boxes whose opposite face lies on this plane, touching this box.

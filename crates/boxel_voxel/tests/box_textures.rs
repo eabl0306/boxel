@@ -55,11 +55,11 @@ fn box_textures_are_per_model_and_counted_in_the_box_table() {
     // The face textures and the box layer, in that order.
     let drawn: Vec<TextureId> = r.drawn_textures(s).collect();
     assert_eq!(drawn, [vec![TextureId(1); 6], vec![wax; 5]].concat());
-    // ±X and ±Z crop with two entries; the hidden bottom takes none (the plain post has the
-    // plain box).
+    // The ±Z sides share their top's entry (the same x offset, y free there), the ±X sides take
+    // another (their z offset differs from the top's); the hidden bottom takes none.
     let model = r.box_model(waxed).expect("model");
     let entries: std::collections::HashSet<ModelBox> = model.table_boxes().collect();
-    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert_eq!(entries.len(), 2, "{entries:?}");
     assert!(!entries.contains(&post));
 }
 
@@ -83,6 +83,26 @@ fn box_models_with_bad_textures_are_refused() {
         b.add_box_model(BoxModel::from_boxes(vec![post]).with_textures(vec![outside]))
             .is_err()
     );
+}
+
+#[test]
+fn faces_share_table_entries_where_their_offsets_agree() {
+    use boxel_voxel::box_face_entries;
+    let b = ModelBox::new([0, 0, 0], [16, 16, 16]);
+    // Every face the block's: the box itself, once.
+    let plain = box_face_entries(b, &[BoxFaceTexture::BLOCK; 6]);
+    assert!(plain.iter().all(|e| *e == Some(b)));
+    // A crop on one side and a hidden face: the other faces keep the box.
+    let mut faces = [BoxFaceTexture::BLOCK; 6];
+    faces[Face::PosZ.index()] = BoxFaceTexture::BLOCK.at(4, 0);
+    faces[Face::NegY.index()] = BoxFaceTexture::HIDDEN;
+    let entries = box_face_entries(b, &faces);
+    assert_eq!(entries[Face::NegY.index()], None);
+    assert_eq!(entries[Face::PosY.index()], Some(b));
+    let crop = entries[Face::PosZ.index()].expect("drawn");
+    assert_eq!(crop.texture_offset[0], 4);
+    // -Z needs x 0 (the box's), so it cannot share +Z's entry.
+    assert_eq!(entries[Face::NegZ.index()], Some(b));
 }
 
 #[test]

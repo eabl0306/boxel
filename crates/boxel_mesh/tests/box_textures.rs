@@ -95,10 +95,11 @@ fn box_faces_show_their_own_layers_and_crops() {
 #[test]
 fn crops_take_their_own_table_entries_and_share_them() {
     let table = table();
-    // The post's ±X sides read one entry and its ±Z sides another (their u runs along z and x),
-    // its top a third, its bottom the plain box; the two full boxes share theirs.
+    // The post's top and its ±Z sides share an entry (the same x offset), its bottom reads the
+    // plain box and its ±X sides a third (their z offset differs from the top's); the two full
+    // boxes share theirs.
     let boxes = table.model_boxes();
-    assert_eq!(boxes.len(), 5, "{boxes:?}");
+    assert_eq!(boxes.len(), 4, "{boxes:?}");
 }
 
 #[test]
