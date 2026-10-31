@@ -53,6 +53,7 @@ mod ui;
 mod arena;
 #[doc(hidden)]
 pub mod bench;
+mod cells;
 mod chunk_table;
 mod memory;
 mod path;
@@ -60,6 +61,7 @@ mod sort;
 mod targets;
 mod upload;
 
+pub use cells::CellStats;
 pub use distance_fog::{DistanceFog, DistanceFogError};
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use memory::{
@@ -73,12 +75,13 @@ pub use pack_textures::{
     load_block_textures,
 };
 pub use path::{CullCounts, cull_counts};
+pub use plugin::{
+    CellTextures, DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo,
+    RenderPlugin, RenderSettings, RenderSystems, RequestScreenshot, Resync, ScreenshotSaved,
+    SurfaceInfo,
+};
 #[doc(hidden)]
 pub use plugin::{DebugAllocProbe, frame_visibility, frame_visibility_with};
-pub use plugin::{
-    DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo, RenderPlugin,
-    RenderSettings, RenderSystems, RequestScreenshot, Resync, ScreenshotSaved, SurfaceInfo,
-};
 #[doc(hidden)]
 pub use renderer::{AllocProbeReport, ResetState};
 pub use renderer::{

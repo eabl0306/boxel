@@ -1386,3 +1386,110 @@ fn lod_seams_are_drawn_where_a_seam_can_show() {
     }
     assert_eq!(bucket_quads(5, [10, 20], 0, 0, true), 0, "never below zero");
 }
+
+/// The cell quad pipeline (ADR 0050) runs on every tier, the Low one on GL included: one uniform
+/// block (the View) and one texture/sampler pair (the cell texture array), no storage buffer or
+/// immediates; the vertex is the four attributes `CellVertex` gives, the data reaches the
+/// fragment flat, and the shader's bit layout is `boxel_shaders::gpu::cell`'s.
+#[test]
+fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
+    use boxel_shaders::gpu::cell;
+    let id = ShaderModuleId::Cell;
+    let (module, info) = load(id);
+    assert!(!id.uses_immediates());
+    assert_eq!(id.min_gl(), (3, 3));
+    let mut seen = Vec::new();
+    for (i, ep) in module.entry_points.iter().enumerate() {
+        let ep_info = info.get_entry_point(i);
+        let (mut uniforms, mut textures, mut samplers) = (0, 0, 0);
+        for (handle, g) in module.global_variables.iter() {
+            if ep_info[handle].is_empty() {
+                continue;
+            }
+            match g.space {
+                naga::AddressSpace::Uniform => {
+                    uniforms += 1;
+                    assert_eq!(g.binding.as_ref().map(|b| b.group), Some(1));
+                }
+                naga::AddressSpace::Immediate => panic!("{}: immediates", ep.name),
+                naga::AddressSpace::Storage { .. } => panic!("{}: storage buffer", ep.name),
+                naga::AddressSpace::Handle => {
+                    let binding = match module.types[g.ty].inner {
+                        naga::TypeInner::Image { arrayed, .. } => {
+                            assert!(arrayed, "a texture array");
+                            textures += 1;
+                            0
+                        }
+                        naga::TypeInner::Sampler { .. } => {
+                            samplers += 1;
+                            1
+                        }
+                        _ => continue,
+                    };
+                    assert_eq!(
+                        g.binding,
+                        Some(naga::ResourceBinding {
+                            group: cell::GROUP_TEXTURES,
+                            binding
+                        })
+                    );
+                }
+                _ => {}
+            }
+        }
+        seen.push((ep.name.as_str(), (uniforms, textures, samplers)));
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, [("fs_cell", (1, 1, 1)), ("vs_cell", (1, 0, 0))]);
+    let vs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "vs_cell")
+        .expect("vs_cell");
+    let attributes: Vec<_> = vs
+        .function
+        .arguments
+        .iter()
+        .filter_map(|arg| match arg.binding {
+            Some(naga::Binding::Location { location, .. }) => {
+                Some((location, module.types[arg.ty].inner.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let vector = |size, scalar| naga::TypeInner::Vector { size, scalar };
+    assert_eq!(
+        attributes,
+        [
+            (0, vector(naga::VectorSize::Tri, naga::Scalar::I32)),
+            (1, vector(naga::VectorSize::Tri, naga::Scalar::F32)),
+            (2, vector(naga::VectorSize::Bi, naga::Scalar::F32)),
+            (3, vector(naga::VectorSize::Bi, naga::Scalar::U32)),
+        ]
+    );
+    let fs = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "fs_cell")
+        .expect("fs_cell");
+    let naga::TypeInner::Struct { members, .. } = &module.types[fs.function.arguments[0].ty].inner
+    else {
+        panic!("fs_cell takes the vertex output struct");
+    };
+    let flat: Vec<u32> = members
+        .iter()
+        .filter_map(|m| match m.binding {
+            Some(naga::Binding::Location {
+                location,
+                interpolation: Some(naga::Interpolation::Flat),
+                ..
+            }) => Some(location),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flat, [1]);
+    assert_eq!(const_u32(&module, "CELL_LAYER_MASK"), cell::LAYER_MASK);
+    assert_eq!(const_u32(&module, "CELL_FACE_SHIFT"), cell::FACE_SHIFT);
+    assert_eq!(const_u32(&module, "CELL_BRIGHT_BIT"), cell::FULL_BRIGHT);
+    assert_eq!(const_u32(&module, "CELL_LIGHT_SHIFT"), cell::LIGHT_SHIFT);
+}

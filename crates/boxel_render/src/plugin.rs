@@ -144,6 +144,14 @@ impl Default for RenderSettings {
     }
 }
 
+/// The cell textures (ADR 0050): the images the cell quads of the chunk meshes show
+/// ([`boxel_voxel::CellQuad::image`] is a layer), made as the block textures are
+/// ([`crate::generate_block_textures`]). The content sets it once its images are ready (and
+/// again with a new pack); `None` until then: no cell quad is drawn. Each renderer, a rebuilt
+/// one too, takes the current value at its next frame.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct CellTextures(pub Option<Arc<BlockTextureData>>);
+
 /// Presentation setting (vsync), read by the renderer every frame. A change reconfigures the
 /// surface on the same device in the next `Render` (`RenderSystems::Setup`): no new device, no
 /// renderer rebuild, no chunk re-upload. Inserted by [`RenderPlugin`] with `init_resource`
@@ -374,6 +382,7 @@ impl Plugin for RenderPlugin {
             .init_resource::<SurfaceInfo>()
             .init_resource::<OverlayDraw>()
             .init_resource::<BlockOutline>()
+            .init_resource::<CellTextures>()
             .init_resource::<GpuState>()
             .init_resource::<InstanceState>()
             .init_resource::<LkgRes>()
@@ -721,6 +730,8 @@ pub(crate) struct ExtractedFrame {
     outline: Option<Outline>,
     /// The entity model instances of this frame (`crate::model::extract_models`).
     pub(crate) models: Vec<crate::model::ModelDraw>,
+    /// A copy of [`CellTextures`].
+    cell_textures: Option<Arc<BlockTextureData>>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
     visibility: Option<Arc<VisibleSet>>,
     /// This frame's fog (`crate::fog::FogPlugin`'s extract), `None` without the plugin.
@@ -1428,13 +1439,15 @@ pub(crate) fn extract(
     ),
     overlay: Res<OverlayDraw>,
     time: Option<Res<Time>>,
-    (outline, content, mut outline_cache): (
+    (outline, content, mut outline_cache, cell_textures): (
         Option<Res<BlockOutline>>,
         Option<Res<WorldContent>>,
         Local<OutlineCache>,
+        Option<Res<CellTextures>>,
     ),
 ) {
     let frame = &mut *frame;
+    frame.cell_textures = cell_textures.and_then(|t| t.0.clone());
     frame.overlay.clear();
     frame.overlay.extend_from_slice(&overlay.rects);
     frame.outline = match (outline.as_deref(), chunks.as_deref(), content.as_deref()) {
@@ -1718,6 +1731,11 @@ fn prepare(
         warnings.record(e);
     }
     ready.renderer.set_outline(frame.outline.take());
+    if let Some(textures) = &frame.cell_textures {
+        ready
+            .renderer
+            .set_cell_textures(&ready.ctx.device, queue, textures);
+    }
     let camera = frame.camera.map_or(Quat::IDENTITY, |(_, t)| t.rotation);
     let models = std::mem::take(&mut frame.models);
     frame.models = ready.renderer.set_models(&ready.ctx.device, models, camera);

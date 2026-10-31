@@ -1,5 +1,5 @@
 use crate::BUCKET_COUNT;
-use boxel_voxel::{Face, LightValue, ModelBox, PlaneEntry, PlaneKind, TableEntry};
+use boxel_voxel::{CellQuad, Face, LightValue, ModelBox, PlaneEntry, PlaneKind, TableEntry};
 use bytemuck::{Pod, Zeroable};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
@@ -528,6 +528,16 @@ impl LightQuantization {
     }
 }
 
+/// A quad a cell draws from its data (ADR 0050), placed in its chunk: its corners are in
+/// blocks from the chunk's min corner. Lit by its cell's light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LitCellQuad {
+    /// The quad, its corners in the chunk.
+    pub quad: CellQuad,
+    /// The light of its cell (open sky in a mesh without light).
+    pub light: LightValue,
+}
+
 /// A chunk's mesh: quads stored bucket-contiguous (bucket 0 first), per-bucket counts, the light
 /// palette the quads index and a hash of all of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -541,6 +551,11 @@ pub struct ChunkMesh {
     pub palette: Vec<PaletteEntry>,
     /// How the palette was quantized.
     pub light_quantization: LightQuantization,
+    /// The quads its cells draw from their data (ADR 0050), in local index order of the cells.
+    /// They are not in [`ChunkMesh::quads`]: the renderer draws them with the cell textures. A
+    /// block that draws cell quads draws block quads of its own too, so a mesh with cell quads
+    /// is never [`ChunkMesh::is_empty`].
+    pub cell_quads: Vec<LitCellQuad>,
     /// [`ChunkMesh::compute_hash`] of the content (the mesher sets it; equal meshes have equal
     /// hashes, so a remesh that changed nothing can be skipped).
     pub hash: u64,
@@ -610,14 +625,20 @@ impl ChunkMesh {
         self.bucket_counts = [0; BUCKET_COUNT];
         self.palette.clear();
         self.light_quantization = LightQuantization::Exact;
+        self.cell_quads.clear();
         self.hash = 0;
     }
-    /// foldhash with a fixed seed over the quads, the bucket counts and the palette.
+    /// foldhash with a fixed seed over the quads, the bucket counts, the palette and the cell
+    /// quads (only when there are some: a mesh without them hashes as before ADR 0050).
     pub fn compute_hash(&self) -> u64 {
+        use std::hash::Hash as _;
         let mut h = foldhash::fast::FixedState::with_seed(Self::HASH_SEED).build_hasher();
         h.write(bytemuck::cast_slice(&self.quads));
         h.write(bytemuck::cast_slice(&self.bucket_counts));
         h.write(bytemuck::cast_slice(&self.palette));
+        if !self.cell_quads.is_empty() {
+            self.cell_quads.hash(&mut h);
+        }
         h.finish()
     }
 }

@@ -47,6 +47,9 @@ pub const UI_WGSL: &str = include_str!("../shaders/ui.wgsl");
 /// `model.wgsl`: entity models posed on the CPU, one skin read with `textureLoad` (`vs_model`,
 /// `fs_model_opaque`, `fs_model_cutout`, ADR 0040).
 pub const MODEL_WGSL: &str = include_str!("../shaders/model.wgsl");
+/// `cell.wgsl`: the quads cells draw from their data, baked in the chunk meshes, one texture
+/// array of the content's images (`vs_cell`, `fs_cell`, ADR 0050).
+pub const CELL_WGSL: &str = include_str!("../shaders/cell.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +95,8 @@ pub enum ShaderModuleId {
     Ui,
     /// common + model: entity models (all tiers, only once a model instance is drawn).
     Model,
+    /// common + cell: cell quads (all tiers, only once a chunk mesh has some, ADR 0050).
+    Cell,
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
@@ -104,10 +109,11 @@ static LOD_PULL: LazyLock<String> =
     LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_COMMON_WGSL}\n{LOD_PULL_WGSL}"));
 static LOD_CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_CULL_WGSL}"));
 static MODEL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{MODEL_WGSL}"));
+static CELL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CELL_WGSL}"));
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 13] = [
+    pub const ALL: [ShaderModuleId; 14] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -121,6 +127,7 @@ impl ShaderModuleId {
         ShaderModuleId::LodHiz,
         ShaderModuleId::Ui,
         ShaderModuleId::Model,
+        ShaderModuleId::Cell,
     ];
 
     /// Debug label.
@@ -139,6 +146,7 @@ impl ShaderModuleId {
             ShaderModuleId::LodHiz => "boxel lod_hiz",
             ShaderModuleId::Ui => "boxel ui",
             ShaderModuleId::Model => "boxel model",
+            ShaderModuleId::Cell => "boxel cell",
         }
     }
 
@@ -158,6 +166,7 @@ impl ShaderModuleId {
             ShaderModuleId::LodHiz => LOD_HIZ_WGSL,
             ShaderModuleId::Ui => UI_WGSL,
             ShaderModuleId::Model => MODEL.as_str(),
+            ShaderModuleId::Cell => CELL.as_str(),
         }
     }
 
@@ -220,6 +229,7 @@ impl ShaderModuleId {
                 ("fs_model_opaque", Stage::Fragment),
                 ("fs_model_cutout", Stage::Fragment),
             ],
+            ShaderModuleId::Cell => &[("vs_cell", Stage::Vertex), ("fs_cell", Stage::Fragment)],
         }
     }
 
@@ -244,7 +254,8 @@ impl ShaderModuleId {
             | ShaderModuleId::Fog
             | ShaderModuleId::Lod
             | ShaderModuleId::Ui
-            | ShaderModuleId::Model => (3, 3),
+            | ShaderModuleId::Model
+            | ShaderModuleId::Cell => (3, 3),
         }
     }
 }

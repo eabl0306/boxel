@@ -6,17 +6,19 @@ use crate::shading::{
     face_corner_lights, neighborhood8,
 };
 use crate::{
-    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, PADDED, PADDED_AREA, PADDED_VOLUME, PackedQuad,
-    PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
+    BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, LitCellQuad, PADDED, PADDED_AREA, PADDED_VOLUME,
+    PackedQuad, PaddedChunk, TRANSLUCENT_BUCKET, VoxelClass,
 };
 use boxel_light::PaddedLight;
 use boxel_voxel::{
-    BlockModel, BlockRegistry, BlockState, BoxFaceTexture, CHUNK_SIZE, CHUNK_VOLUME, ChunkData,
-    FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox, ModelPlane,
-    NEIGHBOR_OFFSETS, Paletted, RenderShape, TableEntry, box_face_entries, neighbor_index,
+    BlockModel, BlockRegistry, BlockState, BoxFaceTexture, CHUNK_SIZE, CHUNK_VOLUME, CellQuad,
+    CellQuadsFn, ChunkData, FLUID_LEVEL, Face, LightValue, LocalPos, MAX_MODEL_BOXES, ModelBox,
+    ModelPlane, NEIGHBOR_OFFSETS, Paletted, RenderShape, TableEntry, box_face_entries,
+    neighbor_index,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Which faces get ambient occlusion (ADR 0015). AO is part of the greedy-merge key, so every
 /// AO value baked splits merges: it costs quads.
@@ -94,6 +96,21 @@ pub struct MaterialTable {
     dry: Vec<u16>,
     /// The models made of boxes (ADR 0020), see [`BoxModels`].
     box_models: BoxModels,
+    /// What the cells of each state draw from their data (ADR 0050), see [`CellQuadFns`].
+    cell_quads: CellQuadFns,
+}
+
+/// Per state, the function its cells with data draw their cell quads with (ADR 0050,
+/// [`boxel_voxel::CellQuadRule::bind`]); empty when no state has one, so the mesher skips the
+/// step without looking at any cell.
+#[derive(Clone, Default)]
+struct CellQuadFns(Vec<Option<Arc<CellQuadsFn>>>);
+
+impl std::fmt::Debug for CellQuadFns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.iter().filter(|r| r.is_some()).count();
+        write!(f, "CellQuadFns({n} states)")
+    }
 }
 
 /// No box shape (`MaterialTable` materials that are not made of boxes).
@@ -374,6 +391,7 @@ impl MaterialTable {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
             },
+            cell_quads: CellQuadFns::default(),
         };
         // The source of the fluid the waterlogged blocks hold.
         let water = registry
@@ -416,7 +434,32 @@ impl MaterialTable {
                 table.set_waterlogged(m as u16, water, registry.material(dry));
             }
         }
+        // The cell quads of the states whose block has a rule, by state (the cells' data is
+        // looked up by the state the chunk holds).
+        for i in 0..n {
+            let s = BlockState(i as u16);
+            let Some(rule) = registry.block(s).and_then(|b| registry.cell_quad_rule(b)) else {
+                continue;
+            };
+            if let Some(f) = rule.bind(registry, s) {
+                table.set_cell_quads(s, f);
+            }
+        }
         table
+    }
+    /// Sets the function the cells of state `s` with data draw their cell quads with (ADR 0050;
+    /// [`MaterialTable::from_registry`] binds every block's [`boxel_voxel::CellQuadRule`]).
+    pub fn set_cell_quads(&mut self, s: BlockState, f: Arc<CellQuadsFn>) {
+        let fns = &mut self.cell_quads.0;
+        let i = usize::from(s.0);
+        if fns.len() <= i {
+            fns.resize(i + 1, None);
+        }
+        fns[i] = Some(f);
+    }
+    /// True if some state draws cell quads from its data.
+    pub fn has_cell_quads(&self) -> bool {
+        !self.cell_quads.0.is_empty()
     }
     /// Declares `material` (a block made of boxes or a cutout cube) as waterlogged, holding a
     /// source of fluid `water` (ADR 0025), `dry` being the same block without it: gather puts
@@ -689,6 +732,7 @@ impl MaterialTable {
                 shape_of: vec![NO_SHAPE; n],
                 ..BoxModels::default()
             },
+            cell_quads: CellQuadFns::default(),
             shape,
             layers,
         }
@@ -730,6 +774,8 @@ struct Scratch {
     key_table: KeyTable,
     /// Fluid surface cells with their own corner heights (ADR 0021).
     fluid: FluidScratch,
+    /// One cell's cell quads, as its function writes them (ADR 0050).
+    cells: Vec<CellQuad>,
     /// A uniform light spread over every padded voxel, for a chunk with a lit emitter (made on
     /// first use, kept).
     expanded: Option<Box<[u16; PADDED_VOLUME]>>,
@@ -760,6 +806,7 @@ impl Mesher {
                 palette: LightPalette::new(),
                 key_table: KeyTable::new(),
                 fluid: FluidScratch::new(),
+                cells: Vec::new(),
                 expanded: None,
             },
             padded: PaddedChunk::new(),
@@ -803,8 +850,10 @@ impl Mesher {
         mesh_into(&mut self.scratch, padded, light, materials, options, out);
     }
 
-    /// `gather` + `mesh`. Fast paths: center uniform air -> empty mesh; center uniform opaque with
-    /// all 6 face neighbors uniform opaque -> empty mesh.
+    /// `gather` + `mesh`, then the cell quads of the center's cells with data (ADR 0050,
+    /// [`ChunkMesh::cell_quads`]; only `mesh_chunk` draws them, `mesh` has no data to read).
+    /// Fast paths: center uniform air -> empty mesh; center uniform opaque with all 6 face
+    /// neighbors uniform opaque -> empty mesh (neither has a cell with data).
     pub fn mesh_chunk(
         &mut self,
         input: &MeshInput<'_>,
@@ -825,7 +874,41 @@ impl Mesher {
             options,
             &mut out,
         );
+        if materials.has_cell_quads() && input.center.has_block_data() {
+            emit_cell_quads(input, materials, &mut self.scratch.cells, &mut out);
+        }
         out
+    }
+}
+
+/// The cell quads of `input.center`'s cells with data whose state has a function
+/// ([`MaterialTable::set_cell_quads`]), in local index order, moved into the chunk and lit by
+/// the cell's light; then the mesh's hash again. `scratch` is the function's output buffer.
+fn emit_cell_quads(
+    input: &MeshInput<'_>,
+    materials: &MaterialTable,
+    scratch: &mut Vec<CellQuad>,
+    out: &mut ChunkMesh,
+) {
+    let fns = &materials.cell_quads.0;
+    for (p, data) in input.center.block_data_cells() {
+        let state = input.center.get(p);
+        let Some(Some(f)) = fns.get(usize::from(state.0)) else {
+            continue;
+        };
+        scratch.clear();
+        f(data, scratch);
+        let [x, y, z] = [p.x(), p.y(), p.z()].map(|c| c as i32);
+        let light = input.light.map_or(LightValue::FULL_SKY, |l| l.get(x, y, z));
+        let at = [x, y, z].map(|c| c as f32);
+        out.cell_quads
+            .extend(scratch.drain(..).map(|q| LitCellQuad {
+                quad: q.moved(at),
+                light,
+            }));
+    }
+    if !out.cell_quads.is_empty() {
+        out.hash = out.compute_hash();
     }
 }
 

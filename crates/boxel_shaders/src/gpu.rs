@@ -465,6 +465,47 @@ const _: () =
 const _: () =
     assert!(std::mem::offset_of!(ModelVertex, data) as u64 == model::ATTRIBUTE_OFFSETS[3]);
 
+/// One vertex of a cell quad (`cell.wgsl`, ADR 0050): 40 bytes in one vertex-step buffer,
+/// attributes `Sint32x3`, `Float32x3`, `Float32x2` and `Uint32x2` at locations 0 to 3
+/// ([`cell::ATTRIBUTE_OFFSETS`]). The CPU writes them once per chunk mesh: the shader subtracts
+/// the render origin from the chunk's, as the terrain does, so a camera move uploads nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct CellVertex {
+    /// The chunk's world voxel min corner, low 32 bits (wrapping, as `ChunkGpu::origin`).
+    pub origin: [i32; 3],
+    /// The corner in its chunk, blocks.
+    pub pos: [f32; 3],
+    /// The point of the image it shows, a fraction of it.
+    pub uv: [f32; 2],
+    /// `[0]`: the image layer, the face ([`cell::FACE_SHIFT`]), the full bright bit
+    /// ([`cell::FULL_BRIGHT`]) and the cell's light ([`cell::LIGHT_SHIFT`]); `[1]`: the tint,
+    /// sRGB `0xRRGGBB`.
+    pub data: [u32; 2],
+}
+
+/// Constants of the cell quad pipeline (`cell.wgsl`, ADR 0050).
+pub mod cell {
+    /// Mask of the image layer in `CellVertex::data[0]`.
+    pub const LAYER_MASK: u32 = 0xFFF;
+    /// Where the face sits in `CellVertex::data[0]` (3 bits).
+    pub const FACE_SHIFT: u32 = 12;
+    /// The full bright bit of `CellVertex::data[0]`.
+    pub const FULL_BRIGHT: u32 = 0x8000;
+    /// Where the cell's `boxel_voxel::LightValue` sits in `CellVertex::data[0]` (16 bits).
+    pub const LIGHT_SHIFT: u32 = 16;
+    /// Group of the cell texture array (binding 0) and its sampler (binding 1). The `View`
+    /// uniform stays in [`super::bindings::GROUP_VIEW`].
+    pub const GROUP_TEXTURES: u32 = 0;
+    /// Byte offsets of the four attributes of [`super::CellVertex`].
+    pub const ATTRIBUTE_OFFSETS: [u64; 4] = [0, 12, 24, 32];
+}
+
+const _: () = assert!(size_of::<CellVertex>() == 40);
+const _: () = assert!(std::mem::offset_of!(CellVertex, pos) as u64 == cell::ATTRIBUTE_OFFSETS[1]);
+const _: () = assert!(std::mem::offset_of!(CellVertex, uv) as u64 == cell::ATTRIBUTE_OFFSETS[2]);
+const _: () = assert!(std::mem::offset_of!(CellVertex, data) as u64 == cell::ATTRIBUTE_OFFSETS[3]);
+
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]

@@ -82,6 +82,7 @@ const APP_WIDE: &[&str] = &[
     "boxel_render::fog::FogSettings",
     "boxel_render::fog::plugin::FogClock",
     "boxel_render::overlay::OverlayDraw",
+    "boxel_render::plugin::CellTextures",
     "boxel_render::plugin::ExtractedFrame",
     "boxel_render::plugin::GpuState",
     "boxel_render::plugin::InstanceState",

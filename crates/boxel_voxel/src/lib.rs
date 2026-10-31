@@ -24,7 +24,8 @@
 //! - [`lod`]: far level of detail (ADR 0031): the [`LodClass`] of every state and the cell rule
 //!   that turns a cube of blocks into one coarse cell ([`CellPartial`]).
 //! - [`block_data`]: data a block cell carries next to its state ([`BlockData`], ADR 0048: an
-//!   inventory, typed fields, the game's bytes), kept in its [`ChunkData`].
+//!   inventory, typed fields, the game's bytes), kept in its [`ChunkData`]; [`cell_quads`]: the
+//!   quads a block's cells draw from that data ([`CellQuadRule`], ADR 0050: an item in a frame).
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
 //!   emitters; built and cached only when the storage cannot serve them as is), and
@@ -34,6 +35,7 @@
 //!   tests; the engine itself holds no content (#48).
 
 pub mod block_data;
+pub mod cell_quads;
 pub mod coords;
 pub mod faces;
 pub mod fluid;
@@ -52,6 +54,7 @@ mod chunk;
 mod masks;
 
 pub use block_data::{BlockData, DataValue, ItemStack};
+pub use cell_quads::{CellQuad, CellQuadRule, CellQuadsFn};
 pub use chunk::{ChunkData, StateSet};
 pub use coords::{
     BlockPos, CHUNK_AREA, CHUNK_MASK, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkKey, ChunkPos,

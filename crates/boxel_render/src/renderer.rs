@@ -1,4 +1,5 @@
 use crate::arena::QUAD_BYTES;
+use crate::cells::{CellPass, CellStats, CellStore};
 use crate::chunk_table::ChunkTable;
 use crate::distance_fog::DistanceFog;
 use crate::fog::{FogInput, FogPass};
@@ -223,6 +224,8 @@ pub struct RenderStats {
     pub chunk_memory: ChunkMemoryStats,
     /// Entity models (ADR 0040; all 0 before the first instance).
     pub models: ModelStats,
+    /// Cell quads (ADR 0050; all 0 before the first chunk with some).
+    pub cells: CellStats,
 }
 
 /// Renderer errors.
@@ -304,6 +307,14 @@ pub struct VoxelRenderer {
     models: Option<ModelPass>,
     /// The model pipelines could not be created on this device: no model is drawn.
     models_failed: bool,
+    /// The chunks with cell quads (ADR 0050).
+    cell_store: CellStore,
+    /// The cell quad pass, from the first chunk with cell quads or the first cell textures.
+    cells: Option<CellPass>,
+    /// The cell quad pipeline could not be created on this device: no cell quad is drawn.
+    cells_failed: bool,
+    /// The cell textures given last ([`VoxelRenderer::set_cell_textures`]).
+    cell_textures: Option<Arc<BlockTextureData>>,
     /// The fog passes (ADR 0030), from the first [`VoxelRenderer::set_fog`] with input.
     fog: Option<FogPass>,
     /// The fog passes could not be created on this device: fog stays off.
@@ -810,6 +821,10 @@ impl VoxelRenderer {
             outline,
             models: None,
             models_failed: false,
+            cell_store: CellStore::default(),
+            cells: None,
+            cells_failed: false,
+            cell_textures: None,
             fog: None,
             fog_failed: false,
             materials_layout: layouts.materials,
@@ -1074,6 +1089,62 @@ impl VoxelRenderer {
         self.outline.set(outline);
     }
 
+    /// Sets the cell textures (ADR 0050): the images the cell quads of the chunk meshes show,
+    /// one layer each ([`boxel_voxel::CellQuad::image`]), with their mips, made as the block
+    /// textures are ([`crate::generate_block_textures`]). The same `Arc` again changes nothing.
+    /// Until the first call no cell quad is drawn; the pipeline is made with the first textures
+    /// or the first chunk with cell quads (inside error scopes: if it fails, an error is logged
+    /// and no cell quad is drawn on this renderer).
+    pub fn set_cell_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &Arc<BlockTextureData>,
+    ) {
+        if self
+            .cell_textures
+            .as_ref()
+            .is_some_and(|d| Arc::ptr_eq(d, data))
+        {
+            return;
+        }
+        self.cell_textures = Some(Arc::clone(data));
+        self.prepare_cells(device, queue);
+    }
+
+    /// Builds the cell quad pass once it is needed and gives it the cell textures.
+    fn prepare_cells(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.cells_failed
+            || (self.cells.is_none() && self.cell_store.is_empty() && self.cell_textures.is_none())
+        {
+            return;
+        }
+        if self.cells.is_none() {
+            let mut pass = None;
+            let built = boxel_gfx::run_in_error_scopes(device, || {
+                pass = Some(CellPass::new(device, &self.view_layout));
+                Ok(())
+            });
+            match (built, pass) {
+                (Ok(()), Some(pass)) => self.cells = Some(pass),
+                (result, _) => {
+                    tracing::error!(
+                        "cell quad pipeline: {}; no cell quad is drawn",
+                        result.err().unwrap_or_default()
+                    );
+                    self.cells_failed = true;
+                    return;
+                }
+            }
+        }
+        if let (Some(pass), Some(data)) = (&mut self.cells, &self.cell_textures)
+            && let Err(e) = pass.set_textures(device, queue, data)
+        {
+            tracing::error!("cell textures: {e}; no cell quad is drawn");
+            self.cell_textures = None;
+        }
+    }
+
     /// Sets the entity model instances of the next [`VoxelRenderer::render`] calls (ADR 0040)
     /// and the camera's rotation (the view layer follows it); gives back the previous list,
     /// emptied, to fill again without allocating. [`crate::model::ModelInstance`] does this from
@@ -1248,6 +1319,7 @@ impl VoxelRenderer {
             self.remove_chunk(id);
             return Ok(());
         }
+        self.cell_store.upsert(id, origin, &mesh);
         debug_assert!(
             mesh.palette.is_empty()
                 || mesh
@@ -1302,6 +1374,7 @@ impl VoxelRenderer {
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
     pub fn remove_chunk(&mut self, id: u64) -> bool {
         self.refused.shown(id);
+        self.cell_store.remove(id);
         let Some(quads) = self.chunks.get(id).map(|(_, r)| r.alloc.alloc.size) else {
             return false;
         };
@@ -1320,6 +1393,7 @@ impl VoxelRenderer {
     pub fn clear_chunks(&mut self) {
         self.refused.clear();
         self.chunks.clear();
+        self.cell_store.clear();
         self.memory.reset();
         self.uploads.clear();
         self.sorter.clear();
@@ -1545,6 +1619,13 @@ impl VoxelRenderer {
             let _span = frame_span!("render.models");
             models.prepare(device, queue, view);
         }
+        if !self.cell_store.is_empty() || self.cells.is_some() {
+            let _span = frame_span!("render.cells");
+            self.prepare_cells(device, queue);
+            if let Some(cells) = &mut self.cells {
+                cells.prepare(device, queue, &mut self.cell_store, &self.chunks, cull_view);
+            }
+        }
         if let Some(lod) = &mut self.lod {
             let _span = frame_span!("render.lod");
             // Underground the cave culling search often reaches no chunk on the border of its
@@ -1575,6 +1656,7 @@ impl VoxelRenderer {
                 lod.draw(&mut pass);
             }
             draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
+            draw_cells(self.cells.as_ref(), &self.materials, &mut pass);
             self.outline.draw(&mut pass);
             // The far water (one layer, a depth prepass then its color) before the near water,
             // which blends over it where it is in front.
@@ -1594,6 +1676,8 @@ impl VoxelRenderer {
             // The entity models with the solid terrain, before the outline (an edge behind a
             // model stays hidden) and the water (which tints a model behind it).
             draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
+            // The cell quads (ADR 0050) with them, for the same reasons.
+            draw_cells(self.cells.as_ref(), &self.materials, &mut pass);
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
             // The far water before the near water, as above.
@@ -1673,6 +1757,7 @@ impl VoxelRenderer {
                 .as_ref()
                 .map(ModelPass::stats)
                 .unwrap_or_default(),
+            cells: self.cells.as_ref().map(CellPass::stats).unwrap_or_default(),
             ..self.lod_stats(self.stats)
         }
     }
@@ -1893,6 +1978,21 @@ fn draw_world_models(
     }
 }
 
+/// This frame's cell quads (ADR 0050) into the main pass, then group 0 back to the block
+/// textures (`materials`) for the draws after them.
+fn draw_cells(
+    cells: Option<&CellPass>,
+    materials: &wgpu::BindGroup,
+    pass: &mut wgpu::RenderPass<'_>,
+) {
+    if let Some(cells) = cells {
+        let _span = frame_span!("render.cells");
+        if cells.draw(pass) {
+            pass.set_bind_group(bindings::GROUP_MATERIALS, materials, &[]);
+        }
+    }
+}
+
 pub(crate) fn far_plane_at(frustum: &mut Frustum, eye: Vec3, distance: f32) {
     let plane = frustum.planes[5];
     let forward = -plane.truncate();
@@ -1936,8 +2036,9 @@ pub struct AllocProbeReport {
 }
 
 /// Block texture array (layer-major upload, full mip chain), its `D2Array` view and the block
-/// sampler (`Repeat`, mag `Nearest`, min and mip `Linear`).
-fn block_textures(
+/// sampler (`Repeat`, mag `Nearest`, min and mip `Linear`). The cell textures are made the same
+/// way (ADR 0050).
+pub(crate) fn block_textures(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     textures: &BlockTextureData,

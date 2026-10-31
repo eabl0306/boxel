@@ -3,6 +3,7 @@
 //! assigned in registration order and contiguous per block. Every per-state datum (model,
 //! collision, textures, light) lives in flat arrays indexed by the state id. Frozen before the
 //! world loads and shared as `Arc<BlockRegistry>`.
+use crate::cell_quads::CellQuadRule;
 use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 use crate::planes::{ModelPlane, TableEntry};
 use crate::rules::{NeighborRule, PlaceRule, UseRule};
@@ -858,6 +859,8 @@ pub struct BlockRegistryBuilder {
     place_rules: Vec<Option<PlaceRule>>,
     /// The blocks whose mesh reads their cells' data (by [`BlockId`]; missing at the end: not).
     meshes_data: Vec<bool>,
+    /// The cell quad rule of each block (by [`BlockId`]; missing at the end: none).
+    cell_quad_rules: Vec<Option<CellQuadRule>>,
     /// The box models, by [`BoxModelId`], and the id of each.
     box_models: Vec<BoxModel>,
     box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
@@ -950,13 +953,28 @@ impl BlockRegistryBuilder {
 
     /// Declares that the mesh of every state of `block` reads its cell's data
     /// ([`StateFlags::MESHES_DATA`], ADR 0048): the world remeshes a chunk when such a cell's
-    /// data changes. The engine's mesher draws no data yet; this is the seam for one that does.
+    /// data changes. The mesher draws what the block's [`CellQuadRule`] says
+    /// ([`BlockRegistryBuilder::set_cell_quads`], which sets this too).
     pub fn set_meshes_data(&mut self, block: BlockId) -> Result<(), RegistryError> {
         let i = self.block_index(block)?;
         if self.meshes_data.len() <= i {
             self.meshes_data.resize(i + 1, false);
         }
         self.meshes_data[i] = true;
+        Ok(())
+    }
+
+    /// Sets the [`CellQuadRule`] of `block` (replaces an earlier one): what its cells draw from
+    /// their data (ADR 0050). Marks the block as meshing its data
+    /// ([`BlockRegistryBuilder::set_meshes_data`]), so a change of a cell's data remeshes it.
+    pub fn set_cell_quads(
+        &mut self,
+        block: BlockId,
+        rule: CellQuadRule,
+    ) -> Result<(), RegistryError> {
+        self.set_meshes_data(block)?;
+        let i = self.block_index(block)?;
+        set_slot(&mut self.cell_quad_rules, i, rule);
         Ok(())
     }
 
@@ -1388,6 +1406,7 @@ impl BlockRegistryBuilder {
             neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
             use_rules: per_block(self.use_rules, self.blocks.len()),
             place_rules: per_block(self.place_rules, self.blocks.len()),
+            cell_quad_rules: per_block(self.cell_quad_rules, self.blocks.len()),
             state_block,
             shapes: states.iter().map(|b| b.shape).collect(),
             models: states.iter().map(|b| b.model).collect(),
@@ -1498,6 +1517,8 @@ pub struct BlockRegistry {
     use_rules: Vec<Option<UseRule>>,
     /// The placement rule of each block (by [`BlockId`]).
     place_rules: Vec<Option<PlaceRule>>,
+    /// The cell quad rule of each block (by [`BlockId`], ADR 0050).
+    cell_quad_rules: Vec<Option<CellQuadRule>>,
 }
 
 impl BlockRegistry {
@@ -1557,6 +1578,10 @@ impl BlockRegistry {
     /// The [`PlaceRule`] of a block, if it has one ([`BlockRegistryBuilder::set_place_rule`]).
     pub fn place_rule(&self, b: BlockId) -> Option<&PlaceRule> {
         self.place_rules.get(usize::from(b.0))?.as_ref()
+    }
+    /// The [`CellQuadRule`] of a block, if it has one ([`BlockRegistryBuilder::set_cell_quads`]).
+    pub fn cell_quad_rule(&self, b: BlockId) -> Option<&CellQuadRule> {
+        self.cell_quad_rules.get(usize::from(b.0))?.as_ref()
     }
     /// The default state of a block (air if out of range).
     pub fn default_state(&self, b: BlockId) -> BlockState {

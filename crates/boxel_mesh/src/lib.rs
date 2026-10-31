@@ -30,9 +30,9 @@ pub use mesher::{
     reference_visible_faces,
 };
 pub use packed::{
-    ChunkMesh, FULL_SKY_ENTRY, LightQuantization, MAX_PALETTE_ENTRIES, PackedQuad, PaletteEntry,
-    layout, pack_model_box, pack_plane_entry, pack_table_entry, palette_corners, palette_entry,
-    unpack_model_box, unpack_plane_entry,
+    ChunkMesh, FULL_SKY_ENTRY, LightQuantization, LitCellQuad, MAX_PALETTE_ENTRIES, PackedQuad,
+    PaletteEntry, layout, pack_model_box, pack_plane_entry, pack_table_entry, palette_corners,
+    palette_entry, unpack_model_box, unpack_plane_entry,
 };
 pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedChunk, VoxelClass};
 pub use shading::FaceShading;
