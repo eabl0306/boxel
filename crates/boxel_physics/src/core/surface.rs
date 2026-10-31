@@ -16,6 +16,8 @@
 //!   climbs, and a body falling against a [`Surface::slide`] side slides down.
 //! - The sweep: a block with a [`Surface::hold`] collides only for bodies above it ([`Tread`]).
 //! - A landing on a block with [`Surface::bounce`] bounces with that restitution.
+//! - Pushed (ADR 0057): each cell with a [`Surface::push`] the box overlapped at the end of the
+//!   previous step moves its vertical speed toward the push's limit (a bubble column).
 
 use super::shape::LocalBox;
 use super::source::{CollisionShape, CollisionTable, Probe, VoxelSource};
@@ -49,6 +51,8 @@ pub struct Surface {
     pub slide: Option<f64>,
     /// The block's collision holds only some bodies (`None`: every body, as registered).
     pub hold: Option<Hold>,
+    /// A vertical push on bodies whose box overlaps the cell (ADR 0057: a bubble column).
+    pub push: Option<Push>,
 }
 
 impl Surface {
@@ -62,6 +66,7 @@ impl Surface {
         climb: None,
         slide: None,
         hold: None,
+        push: None,
     };
 
     /// The same surface with every value finite and in range: NaN and infinities count as the
@@ -86,6 +91,10 @@ impl Surface {
             }),
             slide: self.slide.map(rate),
             hold: self.hold,
+            push: self.push.map(|p| Push {
+                inside: p.inside.sanitized(),
+                top: p.top.sanitized(),
+            }),
         }
     }
 
@@ -94,9 +103,9 @@ impl Surface {
         self.friction != 0.0 || self.drag != 0.0 || self.jump != 1.0 || self.bounce.is_some()
     }
 
-    /// It acts on bodies in the block's cell (inside drag, climbing or sliding).
+    /// It acts on bodies in the block's cell (inside drag, climbing, sliding or a push).
     pub fn acts_inside(&self) -> bool {
-        self.inside.is_some() || self.climb.is_some() || self.slide.is_some()
+        self.inside.is_some() || self.climb.is_some() || self.slide.is_some() || self.push.is_some()
     }
 }
 
@@ -148,6 +157,67 @@ impl Default for Climb {
         }
     }
 }
+
+/// A vertical push on bodies whose box overlaps a block's cell (ADR 0057: Minecraft's bubble
+/// column): each step, every such cell moves a body's vertical speed by its [`Lift`]. A cell
+/// whose cell above has no collision, holds no fluid and does not push (the column's top, under
+/// air) pushes with `top`, the others with `inside` (Minecraft's `onAboveBubbleColumn` and
+/// `onInsideBubbleColumn`; there the cell above a column cell holds water). A flying character
+/// is not pushed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Push {
+    /// The push of a cell with something above it (a fluid, a block).
+    pub inside: Lift,
+    /// The push of a cell under an empty cell.
+    pub top: Lift,
+}
+
+/// One cell's push on a body's vertical speed `v` in a step of `dt` seconds:
+/// `min(limit, v + accel * dt)` for a push up (`accel` at least 0), `max(limit, v + accel * dt)`
+/// for a push down, as Minecraft's `min(0.7, v + 0.06)` per tick: a body faster than the limit
+/// is brought back to it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lift {
+    /// Vertical acceleration, blocks per second squared (negative: down).
+    pub accel: f64,
+    /// The vertical speed the push stops at, blocks per second (signed: up or down).
+    pub limit: f64,
+}
+
+impl Lift {
+    /// No push.
+    pub const NONE: Self = Self {
+        accel: 0.0,
+        limit: 0.0,
+    };
+
+    /// The same lift with NaN and infinities as 0.
+    pub fn sanitized(self) -> Self {
+        let or0 = |v: f64| if v.is_finite() { v } else { 0.0 };
+        Self {
+            accel: or0(self.accel),
+            limit: or0(self.limit),
+        }
+    }
+
+    /// The vertical speed `v` after this lift acts for `dt` seconds.
+    #[inline]
+    pub fn apply(self, v: f64, dt: f64) -> f64 {
+        if self.accel == 0.0 {
+            return v;
+        }
+        let pushed = v + self.accel * dt;
+        if self.accel > 0.0 {
+            pushed.min(self.limit)
+        } else {
+            pushed.max(self.limit)
+        }
+    }
+}
+
+/// The most different lifts [`Inside::pushes`] keeps for one body (a body in two kinds of
+/// column, or at a column's top, uses two); more are left out.
+pub const MAX_PUSHES: usize = 4;
 
 /// Which bodies a block's collision holds: only bodies above the block's collision at the start
 /// of a move (their bottom at most [`HOLD_TOLERANCE`] under its top), that do not descend
@@ -210,7 +280,7 @@ impl Tread {
 }
 
 /// What the cells around a body do to it in its next step ([`sense_inside`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inside {
     /// The climb of the cell its feet are in.
     pub climb: Option<Climb>,
@@ -218,6 +288,59 @@ pub struct Inside {
     pub drag: Option<Drag>,
     /// The fastest slide of a side it is against (off the ground, below the block's top).
     pub slide: Option<f64>,
+    /// The lifts of the push cells its box overlaps, each with how many cells push with it, in
+    /// the order first met (cells by y, then x, then z, from the bottom): applied in that order,
+    /// once per cell.
+    pub pushes: [(Lift, u16); MAX_PUSHES],
+}
+
+impl Inside {
+    /// True if a cell pushes the body.
+    pub fn pushed(&self) -> bool {
+        self.pushes[0].1 != 0
+    }
+
+    /// True if a cell pushes the body down.
+    pub fn pulled(&self) -> bool {
+        self.pushes
+            .iter()
+            .any(|&(lift, n)| n != 0 && lift.accel < 0.0)
+    }
+
+    /// The vertical speed `v` after every push cell acts for `dt` seconds.
+    pub fn push(&self, mut v: f64, dt: f64) -> f64 {
+        for &(lift, n) in &self.pushes {
+            for _ in 0..n {
+                v = lift.apply(v, dt);
+            }
+        }
+        v
+    }
+
+    /// Counts one more cell pushing with `lift`.
+    fn add_push(&mut self, lift: Lift) {
+        for entry in &mut self.pushes {
+            if entry.1 == 0 {
+                *entry = (lift, 1);
+                return;
+            }
+            if entry.0 == lift {
+                entry.1 = entry.1.saturating_add(1);
+                return;
+            }
+        }
+    }
+}
+
+impl Default for Inside {
+    fn default() -> Self {
+        Self {
+            climb: None,
+            drag: None,
+            slide: None,
+            pushes: [(Lift::NONE, 0); MAX_PUSHES],
+        }
+    }
 }
 
 /// The surfaces in the cells the box `shape` at `pos` overlaps by more than `eps` (its strict
@@ -225,8 +348,10 @@ pub struct Inside {
 /// [`Surface::climb`] of the cell holding `pos` (the feet of a standing collider) when `climber`
 /// gives the body's [`crate::Treads`] (`None`: it does not climb), and the fastest
 /// [`Surface::slide`] whose block's collision the box is beside (off the ground, its bottom
-/// under the collision's top, and not overlapping it on X or on Z). Cells not loaded count as
-/// plain. Exact far from the origin: every cell is in the frame of `pos.block`.
+/// under the collision's top, and not overlapping it on X or on Z), and the [`Surface::push`]
+/// lift of every cell it overlaps (the `top` one under a cell without collision, fluid or push,
+/// which is looked at only for those cells; a cell above not loaded counts as full). Cells not loaded
+/// count as plain. Exact far from the origin: every cell is in the frame of `pos.block`.
 pub fn sense_inside<S: VoxelSource + ?Sized>(
     src: &mut S,
     table: &CollisionTable,
@@ -284,6 +409,14 @@ pub fn sense_inside<S: VoxelSource + ?Sized>(
                     && beside(table.shape(state), [x, y, z], bx, eps)
                 {
                     out.slide = Some(speed);
+                }
+                if let Some(push) = surface.push {
+                    let open = state_at(src, x, y + 1, z).is_some_and(|above| {
+                        matches!(table.shape(above), CollisionShape::Empty)
+                            && !table.is_wet(above)
+                            && table.surface(above).push.is_none()
+                    });
+                    out.add_push(if open { push.top } else { push.inside });
                 }
             }
         }

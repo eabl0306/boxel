@@ -185,8 +185,10 @@ fn fluid_depth(
 /// a jump was pressed (the jump latch is used up: no jump off the bottom). On the ground with
 /// the fluid at most [`FLUID_JUMP_THRESHOLD`] above its feet (a waterlogged slab or stair) it
 /// does not swim up: the jump latch stays for the controller, which jumps as on land
-/// (Minecraft's `jumpFromGround` there). A flyer counts as dry for all of that (it keeps the
-/// jump latch), though [`Swimmer::in_fluid`] still tells.
+/// (Minecraft's `jumpFromGround` there). A body a cell pulled down in the last step
+/// (`SurfaceContacts::pulled`, ADR 0057: a bubble column over magma) does not swim up and its
+/// jump is used up. A flyer counts as dry for all of that (it keeps the jump latch), though
+/// [`Swimmer::in_fluid`] still tells.
 pub fn swim_bodies(
     content: Res<PhysicsContent>,
     map: Res<ChunkMap>,
@@ -263,6 +265,14 @@ pub fn swim_bodies(
         }
         let jump = intent.as_ref().is_some_and(|i| i.jump);
         let held = up.is_some_and(|u| u.up);
+        // Pulled down by a cell (ADR 0057: a bubble column over magma): no swimming up, and a
+        // jump is used up (Minecraft's column wins over its swimming).
+        if contacts.is_some_and(|c| c.surface.pulled()) {
+            if jump && let Some(mut intent) = intent {
+                intent.jump = false;
+            }
+            continue;
+        }
         // Shallow fluid under a body on the ground: the jump key jumps (Minecraft's
         // `LivingEntity::aiStep`). Only looked at when a key is down.
         if (jump || held)

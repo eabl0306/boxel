@@ -835,6 +835,12 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             v.y = climb.up;
         }
     });
+    // Pushed (ADR 0057): each push cell moves the vertical speed toward its limit; a flyer is
+    // not pushed.
+    let pushed = inside.pushed() && !flying;
+    if pushed {
+        v.y = inside.push(v.y, params.dt);
+    }
     // Sliding down a side: falling against it, off the ground.
     let slid = inside
         .slide
@@ -1004,7 +1010,9 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
                 .surface
                 .with(SurfaceContacts::CLIMBING, climbed.is_some())
                 .with(SurfaceContacts::STUCK, inside.drag.is_some())
-                .with(SurfaceContacts::SLIDING, slid.is_some());
+                .with(SurfaceContacts::SLIDING, slid.is_some())
+                .with(SurfaceContacts::PUSHED, pushed)
+                .with(SurfaceContacts::PULLED, pushed && inside.pulled());
             if let Some(controller) = controller.as_mut() {
                 touched.ran_into = ran_into(
                     &out.sweep,

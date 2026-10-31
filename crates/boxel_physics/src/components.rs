@@ -377,7 +377,9 @@ impl SurfaceContacts {
     pub(crate) const CLIMBING: u8 = 1 << 1;
     pub(crate) const STUCK: u8 = 1 << 2;
     pub(crate) const SLIDING: u8 = 1 << 3;
-    pub(crate) const ALL: u8 = (1 << 4) - 1;
+    pub(crate) const PUSHED: u8 = 1 << 4;
+    pub(crate) const PULLED: u8 = 1 << 5;
+    pub(crate) const ALL: u8 = (1 << 6) - 1;
 
     /// The same with `bit` set to `on`.
     pub(crate) const fn with(self, bit: u8, on: bool) -> Self {
@@ -403,6 +405,19 @@ impl SurfaceContacts {
     /// The body slid down a side ([`crate::Surface::slide`]).
     pub const fn sliding(self) -> bool {
         self.0 & Self::SLIDING != 0
+    }
+
+    /// A cell's [`crate::Surface::push`] moved the body (ADR 0057: in a bubble column, whose
+    /// push ends a fall as Minecraft's `resetFallDistance`).
+    pub const fn pushed(self) -> bool {
+        self.0 & Self::PUSHED != 0
+    }
+
+    /// A push down acted on the body ([`crate::Lift::accel`] below 0: a bubble column over
+    /// magma). A swimmer pulled down does not swim up ([`crate::SwimPlugin`]), as Minecraft's
+    /// column wins over its swimming.
+    pub const fn pulled(self) -> bool {
+        self.0 & Self::PULLED != 0
     }
 }
 

@@ -80,12 +80,12 @@ pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 pub use crate::core::move_box_stepping_unpruned;
 pub use crate::core::{
     BlockBounds, BodyImpact, BodySettings, BodyStep, Climb, CollisionLayers, CollisionShape,
-    CollisionTable, Contact, Drag, EDGE_MARGIN, Grid, GridSlot, HOLD_TOLERANCE, Hold, Inside,
-    LocalBox, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe, RayResult, SLIDE_ACROSS, SLIDE_CUT_FROM,
-    SLIDE_FROM, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp, Surface, SweepConfig, SweepOut,
-    TestWorld, Tread, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order, guard_edge,
-    integrate_velocity, move_body, move_box, move_box_stepping, move_box_treading, predict,
-    raycast_voxels, sense_inside, shape_contact, step_body,
+    CollisionTable, Contact, Drag, EDGE_MARGIN, Grid, GridSlot, HOLD_TOLERANCE, Hold, Inside, Lift,
+    LocalBox, MAX_PUSHES, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe, Push, RayResult,
+    SLIDE_ACROSS, SLIDE_CUT_FROM, SLIDE_FROM, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp,
+    Surface, SweepConfig, SweepOut, TestWorld, Tread, Unloaded, VoxelFilter, VoxelHit, VoxelSource,
+    axis_order, guard_edge, integrate_velocity, move_body, move_box, move_box_stepping,
+    move_box_treading, predict, raycast_voxels, sense_inside, shape_contact, step_body,
 };
 pub use boxel_voxel::WorldPos;
 pub use persist::{BODY_CODEC, BODY_CODEC_VERSION, BodyCodec};

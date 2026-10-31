@@ -44,8 +44,8 @@ pub use ray::{MAX_RAY_DISTANCE, RayResult, VoxelFilter, VoxelHit, raycast_voxels
 pub use shape::{LocalBox, Shape, ShapeHit};
 pub use source::{CollisionShape, CollisionTable, Probe, TestWorld, VoxelSource};
 pub use surface::{
-    Climb, Drag, HOLD_TOLERANCE, Hold, Inside, SLIDE_ACROSS, SLIDE_CUT_FROM, SLIDE_FROM, Surface,
-    Tread, sense_inside,
+    Climb, Drag, HOLD_TOLERANCE, Hold, Inside, Lift, MAX_PUSHES, Push, SLIDE_ACROSS,
+    SLIDE_CUT_FROM, SLIDE_FROM, Surface, Tread, sense_inside,
 };
 #[doc(hidden)]
 pub use sweep::move_box_stepping_unpruned;

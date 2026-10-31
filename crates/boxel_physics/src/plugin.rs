@@ -20,7 +20,7 @@ use boxel_app::{
 };
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::SingleThreadedExecutor;
-use boxel_voxel::{BlockId, BlockRegistry};
+use boxel_voxel::{BlockId, BlockRegistry, BlockState};
 use boxel_world::{BlockChanged, ChunkDataEvent, WorldContent};
 use std::sync::Arc;
 
@@ -36,8 +36,10 @@ pub struct PhysicsContent {
 /// ground that slows walkers, cells that hold bodies back, cells characters climb, sides bodies
 /// slide down, blocks that hold only bodies above them. The game inserts it (any time: the
 /// next fixed step reads a change) and [`PhysicsPlugin`] puts the surfaces in
-/// [`PhysicsContent::collision`] for every state of each block. A block not named here is
-/// plain. Removing the resource leaves the surfaces as they were: insert an empty one instead.
+/// [`PhysicsContent::collision`] for every state of each block. A name with properties
+/// (`game:bubble_column[drag=true]`, ADR 0057) sets the states with those values only, over the
+/// block's own surface; names set later win. A block not named here is plain. Removing the
+/// resource leaves the surfaces as they were: insert an empty one instead.
 ///
 /// ```ignore
 /// let mut surfaces = BlockSurfaces::default();
@@ -50,7 +52,8 @@ pub struct BlockSurfaces {
 }
 
 impl BlockSurfaces {
-    /// Gives the block named `block` (`"game:ice"`) its surface, replacing one set before.
+    /// Gives the block named `block` (`"game:ice"`) its surface, replacing one set before; with
+    /// properties (`"game:bubble_column[drag=true]"`), the states with those values.
     pub fn set(&mut self, block: impl Into<String>, surface: Surface) -> &mut Self {
         let block = block.into();
         match self.blocks.iter_mut().find(|(name, _)| *name == block) {
@@ -76,28 +79,78 @@ impl BlockSurfaces {
     }
 
     /// Puts the surfaces in `table`, built from `registry` ([`CollisionTable::set_surfaces`]),
-    /// and returns the names `registry` does not have (they are left out).
+    /// and returns the names `registry` does not have (they are left out), properties included
+    /// (an unknown property or value).
     pub fn apply(&self, registry: &BlockRegistry, table: &mut CollisionTable) -> Vec<String> {
         let mut unknown = Vec::new();
         let mut by_block: Vec<Option<Surface>> = Vec::new();
+        let mut by_state: Vec<(Vec<BlockState>, Surface)> = Vec::new();
         for (name, surface) in &self.blocks {
-            let Some(BlockId(id)) = registry.block_by_name(name) else {
+            let (block_name, pairs) = match name.split_once('[') {
+                Some((block, rest)) => (block, rest.strip_suffix(']')),
+                None => (name.as_str(), None),
+            };
+            let Some(block) = registry.block_by_name(block_name) else {
                 unknown.push(name.clone());
                 continue;
             };
-            let id = usize::from(id);
+            if let Some(pairs) = pairs {
+                match states_with(registry, block, pairs) {
+                    Some(states) => by_state.push((states, *surface)),
+                    None => unknown.push(name.clone()),
+                }
+                continue;
+            }
+            if name.contains(']') {
+                unknown.push(name.clone());
+                continue;
+            }
+            let id = usize::from(block.0);
             if by_block.len() <= id {
                 by_block.resize(id + 1, None);
             }
             by_block[id] = Some(*surface);
         }
         table.set_surfaces(|state| {
-            registry
-                .block(state)
-                .and_then(|BlockId(id)| by_block.get(usize::from(id)).copied().flatten())
+            let of_state = by_state
+                .iter()
+                .rev()
+                .find(|(states, _)| states.contains(&state))
+                .map(|(_, s)| *s);
+            of_state.or_else(|| {
+                registry
+                    .block(state)
+                    .and_then(|BlockId(id)| by_block.get(usize::from(id)).copied().flatten())
+            })
         });
         unknown
     }
+}
+
+/// The states of `block` whose properties have the values `pairs` names (`"a=x,b=y"`); `None`
+/// if it names a property the block lacks, a value it lacks, or nothing.
+fn states_with(registry: &BlockRegistry, block: BlockId, pairs: &str) -> Option<Vec<BlockState>> {
+    let pairs: Vec<(&str, &str)> = pairs
+        .split(',')
+        .map(|pair| pair.split_once('='))
+        .collect::<Option<_>>()?;
+    let properties = registry.properties(block);
+    for (property, value) in &pairs {
+        let known = properties.iter().find(|p| p.name() == *property)?;
+        if !known.values().iter().any(|v| v == value) {
+            return None;
+        }
+    }
+    Some(
+        registry
+            .states(block)
+            .filter(|&state| {
+                pairs
+                    .iter()
+                    .all(|(p, v)| registry.property(state, p) == Some(*v))
+            })
+            .collect(),
+    )
 }
 
 /// [`PhysicsSystems::Prepare`], first: a new or changed [`BlockSurfaces`] goes into the
