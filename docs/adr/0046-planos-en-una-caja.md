@@ -35,8 +35,8 @@ Los 8 códigos de forma del quad empaquetado ya estaban usados (el 3 es el muro 
 - La entrada de la tabla (`PlaneEntry`) guarda la caja y el rectángulo de textura, en las mismas
   dos palabras que una caja. El tipo, el giro y los cuartos de vuelta van en el quad, así que los
   dos planos de una cruz y las cuatro orientaciones de un bloque comparten entrada. Cuenta contra
-  el tope de 1.024 como una caja. Sin los cuartos en el quad, el juego pasaba de 255 a 115
-  entradas de planos: es lo que lo deja dentro de su presupuesto de 900.
+  el tope de 1.024 como una caja. Con los cuartos en el quad, los planos del juego bajan de 255
+  a 143 entradas, y el juego queda en 820 de su presupuesto de 900.
 - `ModelPlane::corners` calcula en CPU lo mismo que el shader. `BoxModel::turned`, `turned_x` y
   `turned_z` giran también los planos: buscan el tipo, el giro y el espejo cuyas esquinas son las
   giradas.
