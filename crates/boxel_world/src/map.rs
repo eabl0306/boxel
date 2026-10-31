@@ -4,8 +4,8 @@ use boxel_ecs::prelude::*;
 use boxel_light::ChunkLight;
 use boxel_mesh::ChunkMesh;
 use boxel_voxel::{
-    ALL_LINKS, BlockPos, BlockState, ChunkData, ChunkFaceInfo, ChunkKey, ChunkPos, DimensionId,
-    LightValue,
+    ALL_LINKS, BlockData, BlockPos, BlockState, ChunkData, ChunkFaceInfo, ChunkKey, ChunkPos,
+    DimensionId, LightValue,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -479,6 +479,16 @@ impl ChunkMap {
             DataState::Ready(d) => Some(d.get(local)),
             DataState::Missing => Some(BlockState::AIR),
             DataState::Queued | DataState::Generating => None,
+        }
+    }
+    /// The data of the block at a world position ([`BlockData`], ADR 0048): `None` if the cell
+    /// has none or its chunk is not `Ready`. A system that also writes data reads what the
+    /// frame queued first ([`EditQueue::pending_data`](crate::EditQueue::pending_data)).
+    pub fn block_data_at(&self, p: BlockPos) -> Option<&BlockData> {
+        let (chunk, local) = p.split();
+        match &self.slots.get(self.id_at(chunk)?)?.data {
+            DataState::Ready(d) => d.block_data(local),
+            _ => None,
         }
     }
     /// Light at a world position, as of the chunk's last mesh or light job (see

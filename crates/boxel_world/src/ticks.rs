@@ -444,6 +444,13 @@ fn map_block<'a>(map: &'a ChunkMap, cache: &ChunkCache<'a>, pos: BlockPos) -> Op
 }
 
 impl<'a> TickContext<'a> {
+    /// The data of the block at `pos` ([`boxel_voxel::BlockData`], ADR 0048), as the map holds
+    /// it before this frame's edits. Read only: a handler writes blocks; data is written by
+    /// systems, through the [`EditQueue`].
+    pub fn block_data(&self, pos: BlockPos) -> Option<&'a boxel_voxel::BlockData> {
+        self.map.block_data_at(pos)
+    }
+
     /// The block at `pos` (`None` where the chunk is not loaded: outside the handler's reach).
     pub fn get(&self, pos: BlockPos) -> Option<BlockState> {
         if !self.overlay.is_empty()

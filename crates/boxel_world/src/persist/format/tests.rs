@@ -447,16 +447,20 @@ fn damaged_envelopes_are_refused() {
     for len in 0..good.len() {
         assert!(decode_chunk(&good[..len], &ids).is_err(), "length {len}");
     }
-    // Another record version is not read as this one.
+    // Another record version is not read as this one (and a chunk record without data read
+    // as one with data is damaged: its data is missing).
     let mut newer = good.clone();
-    newer[4] = CHUNK_VERSION + 1;
+    newer[4] = CHUNK_DATA_VERSION + 1;
     assert_eq!(
         decode_chunk(&newer, &ids).unwrap_err(),
         FormatError::Version {
-            found: CHUNK_VERSION + 1,
-            supported: CHUNK_VERSION
+            found: CHUNK_DATA_VERSION + 1,
+            supported: CHUNK_DATA_VERSION
         }
     );
+    let mut with_data = good.clone();
+    with_data[4] = CHUNK_DATA_VERSION;
+    assert!(decode_chunk(&with_data, &ids).is_err());
     // A stored id past the id map is damage too.
     let (small, _) = IdMap::resolve(
         vec!["boxel:air".to_string()],
@@ -662,4 +666,141 @@ fn a_worldgen_name_table_holds_each_dimension_once_and_fits_its_numbers() {
         decode_worldgen(&worldgen_with_names(&twice)),
         Err(FormatError::Damaged("a dimension named twice in the table"))
     );
+}
+
+/// Block data with every kind of value, far apart in the chunk (ADR 0048).
+fn chunk_with_data(registry: &BlockRegistry) -> ChunkData {
+    let stone = registry.by_name("boxel:stone").unwrap();
+    let mut data = chunk_with(registry, 5);
+    let cells = [
+        LocalPos::new(0, 0, 0),
+        LocalPos::new(31, 31, 31),
+        LocalPos::new(4, 17, 9),
+    ];
+    for p in cells {
+        data.set(p, stone);
+    }
+    let items: Vec<Option<ItemStack>> = vec![
+        Some(ItemStack::new("game:coal", 63)),
+        None,
+        Some(ItemStack {
+            item: "game:golden_pickaxe".into(),
+            count: 1,
+            damage: 31,
+        }),
+    ];
+    data.set_block_data(
+        cells[0],
+        Some(
+            BlockData::new()
+                .with("items", DataValue::Items(items.into()))
+                .with("lit", DataValue::Int(1600))
+                .with("cook", DataValue::Int(-7)),
+        ),
+    );
+    data.set_block_data(
+        cells[1],
+        Some(
+            BlockData::new()
+                .with("name", DataValue::Text("ñandú".into()))
+                .with("game", DataValue::Bytes(vec![0, 255, 7].into()))
+                .with("min", DataValue::Int(i64::MIN))
+                .with("max", DataValue::Int(i64::MAX)),
+        ),
+    );
+    data.set_block_data(cells[2], Some(BlockData::new()));
+    data
+}
+
+#[test]
+fn block_data_round_trips_and_chunks_without_it_keep_their_bytes() {
+    let registry = boxel_demo::blocks::registry();
+    let (ids, _) = IdMap::resolve(Vec::new(), &registry);
+    let data = chunk_with_data(&registry);
+    let bytes = encode_chunk(&data, &ids).unwrap();
+    assert_eq!(bytes[4], CHUNK_DATA_VERSION);
+    let back = decode_chunk(&bytes, &ids).unwrap();
+    assert_eq!(voxels(&back), voxels(&data));
+    assert_eq!(back.block_data_len(), 3);
+    let cells: Vec<_> = back.block_data_cells().collect();
+    let want: Vec<_> = data.block_data_cells().collect();
+    assert_eq!(cells, want);
+    // Without data: the old layout, byte for byte (the chunk of an old save reads the same).
+    let mut plain = data.clone();
+    for (p, _) in want.iter().map(|(p, d)| (*p, *d)).collect::<Vec<_>>() {
+        plain.set_block_data(p, None);
+    }
+    let bytes = encode_chunk(&plain, &ids).unwrap();
+    assert_eq!(bytes[4], CHUNK_VERSION);
+    let mut blocks = plain.blocks().clone();
+    blocks.compact();
+    let mut payload = Vec::new();
+    put_storage(&mut payload, &blocks, |s| ids.stored(s).map(u64::from)).unwrap();
+    assert_eq!(bytes, seal(CHUNK_MAGIC, CHUNK_VERSION, &payload));
+    assert!(!decode_chunk(&bytes, &ids).unwrap().has_block_data());
+}
+
+#[test]
+fn any_damage_to_block_data_is_an_error() {
+    let registry = boxel_demo::blocks::registry();
+    let (ids, _) = IdMap::resolve(Vec::new(), &registry);
+    let good = encode_chunk(&chunk_with_data(&registry), &ids).unwrap();
+    for i in 0..good.len() {
+        let mut bad = good.clone();
+        bad[i] ^= 0x10;
+        assert!(decode_chunk(&bad, &ids).is_err(), "byte {i}");
+    }
+    for len in 0..good.len() {
+        assert!(decode_chunk(&good[..len], &ids).is_err(), "length {len}");
+    }
+}
+
+/// Cells and fields out of order, a stack of none and an unknown tag are refused even with a
+/// good checksum.
+#[test]
+fn block_data_out_of_order_is_refused() {
+    let registry = boxel_demo::blocks::registry();
+    let (ids, _) = IdMap::resolve(Vec::new(), &registry);
+    let storage = |payload: &mut Vec<u8>| {
+        put_storage(payload, &Paletted::Uniform(BlockState(1)), |s| {
+            ids.stored(s).map(u64::from)
+        })
+        .unwrap();
+    };
+    let record = |data: &[u8]| {
+        let mut payload = Vec::new();
+        storage(&mut payload);
+        payload.extend_from_slice(data);
+        decode_chunk(&seal(CHUNK_MAGIC, CHUNK_DATA_VERSION, &payload), &ids)
+    };
+    // One cell at 5 with no field: fine.
+    assert!(record(&[1, 5, 0]).is_ok());
+    // Two cells, the second before the first.
+    assert!(record(&[2, 5, 0, 4, 0]).is_err());
+    // An index past the chunk (32768 as a varint).
+    assert!(record(&[1, 0x80, 0x80, 0x02, 0]).is_err());
+    // Two fields, "b" then "a".
+    assert!(record(&[1, 5, 2, 1, b'b', 0, 0, 1, b'a', 0, 0]).is_err());
+    // A stack of none.
+    assert!(record(&[1, 5, 1, 1, b'i', 3, 1, 1, 1, b'x', 0, 0]).is_err());
+    // An unknown value tag.
+    assert!(record(&[1, 5, 1, 1, b'a', 9, 0]).is_err());
+}
+
+proptest! {
+    /// Any bytes after a good storage, sealed with a good checksum, read or are an error.
+    #[test]
+    fn sealed_block_data_is_an_error_not_a_panic(
+        tail in proptest::collection::vec(any::<u8>(), 0..120)
+    ) {
+        let registry = boxel_demo::blocks::registry();
+        let (ids, _) = IdMap::resolve(Vec::new(), &registry);
+        let mut payload = Vec::new();
+        put_storage(&mut payload, &Paletted::Uniform(BlockState(1)), |s| {
+            ids.stored(s).map(u64::from)
+        })
+        .unwrap();
+        payload.extend_from_slice(&tail);
+        let _ = decode_chunk(&seal(CHUNK_MAGIC, CHUNK_DATA_VERSION, &payload), &ids);
+    }
 }

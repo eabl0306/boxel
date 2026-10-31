@@ -6,8 +6,9 @@
   descarga de ADR 0015 sección 7 (una edición que movió un techo ya no se pierde) y "Fuera de
   esta parte" de ADR 0021 (los ticks programados se guardan).
 - Revisado por: ADR 0039 (una clave de metadatos más del motor, `boxel:worldgen`, hecha en
-  WG-SAVE, #121) y ADR 0042 (una caché de lo generado en un archivo aparte, `cache.redb`: el
-  mundo sigue guardando solo lo editado)
+  WG-SAVE, #121), ADR 0042 (una caché de lo generado en un archivo aparte, `cache.redb`: el
+  mundo sigue guardando solo lo editado) y ADR 0048 (los datos por celda van en el registro del
+  chunk, versión 2; un chunk sin datos se escribe como antes)
 
 ## Contexto
 

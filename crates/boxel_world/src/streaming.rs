@@ -30,8 +30,8 @@ use crate::sky::{
     ColumnId, SkyMap, SkyRule, SkyState, WalkJob, layer_below, may_block, padded_chunks,
 };
 use crate::{
-    BlockChanged, BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataState,
-    Interest, MeshState, WorldContent, WorldSettings, WorldStats,
+    BlockChanged, BlockEdit, CachedLight, ChunkId, ChunkMap, ChunkMeshEvent, ChunkSlot, DataEdit,
+    DataState, Interest, MeshState, WorldContent, WorldSettings, WorldStats,
 };
 use boxel_app::IdleWork;
 use boxel_ecs::prelude::*;
@@ -1784,10 +1784,37 @@ impl WorldJobs {
     /// Returns what changed (the `BlockChanged` messages), from the same per-voxel record the
     /// light uses: per position, the state before its first edit and after its last, in the
     /// order positions were first edited, without the positions that end as they were.
+    #[cfg(test)]
     pub(crate) fn apply_edits(
         &mut self,
         cx: &mut Ctx<'_>,
         edits: Vec<BlockEdit>,
+    ) -> Vec<BlockChanged> {
+        self.apply_edits_with_data(cx, edits, BTreeMap::new())
+    }
+
+    /// [`WorldJobs::apply_edits`] with the batch's data edits (ADR 0048): a voxel whose block
+    /// changes to another block loses its data unless `data` has an edit for it; then `data`
+    /// is applied ([`WorldJobs::apply_data_edits`]).
+    pub(crate) fn apply_edits_with_data(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        edits: Vec<BlockEdit>,
+        data: BTreeMap<BlockPos, DataEdit>,
+    ) -> Vec<BlockChanged> {
+        let changed = self.apply_block_edits(cx, edits, &data);
+        if !data.is_empty() {
+            self.apply_data_edits(cx, data);
+        }
+        changed
+    }
+
+    /// The block part of [`WorldJobs::apply_edits_with_data`].
+    fn apply_block_edits(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        edits: Vec<BlockEdit>,
+        data_edits: &BTreeMap<BlockPos, DataEdit>,
     ) -> Vec<BlockChanged> {
         let mut by_chunk: BTreeMap<ChunkPos, Vec<(usize, LocalPos, BlockState)>> = BTreeMap::new();
         for (order, edit) in edits.into_iter().enumerate() {
@@ -1873,8 +1900,19 @@ impl WorldJobs {
         let mut refaced = BTreeSet::new();
         let mut border = BTreeSet::new();
         for &(id, local, old, state) in &changes {
+            let pos = cx.map.slots[id].pos;
             if let Some(data) = cx.map.ready_data_mut(id) {
-                Arc::make_mut(data).set(local, state);
+                let data = Arc::make_mut(data);
+                data.set(local, state);
+                // Another block drops the cell's data, unless the batch says what it is; air
+                // holds none.
+                if data.has_block_data()
+                    && registry.block(old) != registry.block(state)
+                    && (state.is_air()
+                        || !data_edits.contains_key(&BlockPos::from_parts(pos, local)))
+                {
+                    data.set_block_data(local, None);
+                }
             }
             if let Some(p) = &mut self.persist {
                 let slot = &mut cx.map.slots[id];
@@ -1885,7 +1923,6 @@ impl WorldJobs {
             }
             if registry.occludes(old) != registry.occludes(state) {
                 refaced.insert(id);
-                let pos = cx.map.slots[id].pos;
                 let l = [local.x(), local.y(), local.z()];
                 for face in Face::ALL {
                     let n = face.normal();
@@ -3388,5 +3425,6 @@ fn is_enclosed_opaque<'a>(
             .all(|&i| near.get(map, pos, i).is_some_and(|d| opaque(d)))
 }
 
+mod block_data;
 #[cfg(test)]
 mod tests;

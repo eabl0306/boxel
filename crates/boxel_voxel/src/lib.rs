@@ -23,6 +23,8 @@
 //!   itself is derived data, computed by `boxel_light`; chunks do not store it.
 //! - [`lod`]: far level of detail (ADR 0031): the [`LodClass`] of every state and the cell rule
 //!   that turns a cube of blocks into one coarse cell ([`CellPartial`]).
+//! - [`block_data`]: data a block cell carries next to its state ([`BlockData`], ADR 0048: an
+//!   inventory, typed fields, the game's bytes), kept in its [`ChunkData`].
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
 //!   emitters; built and cached only when the storage cannot serve them as is), and
@@ -31,6 +33,7 @@
 //! - `testing` (with the `testing` feature): a minimal block set with `test:` names for engine
 //!   tests; the engine itself holds no content (#48).
 
+pub mod block_data;
 pub mod coords;
 pub mod faces;
 pub mod fluid;
@@ -48,6 +51,7 @@ pub mod testing;
 mod chunk;
 mod masks;
 
+pub use block_data::{BlockData, DataValue, ItemStack};
 pub use chunk::{ChunkData, StateSet};
 pub use coords::{
     BlockPos, CHUNK_AREA, CHUNK_MASK, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkKey, ChunkPos,

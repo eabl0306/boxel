@@ -20,10 +20,12 @@
 //! (fluids): it only sees one edit batch and adds edits to it.
 //!
 //! [`BlockUses`] is the other engine hook of ADR 0027: what using a block does (a gate opens),
-//! for the game to ask before it places a block.
+//! for the game to ask before it places a block, and (ADR 0048) the cells a use changes (both
+//! halves of a bed) and the cells placing a block fills ([`BlockUses::place`]).
 use crate::BlockEdit;
 use boxel_ecs::prelude::Resource;
-use boxel_voxel::rules::{NeighborRule, UseRule};
+use boxel_math::{DVec3, IVec3};
+use boxel_voxel::rules::{CellChange, NeighborRule, PlaceRule, Placing, Use, UseRule};
 use boxel_voxel::{BlockId, BlockPos, BlockRegistry, BlockState, Face, Facing};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -184,21 +186,47 @@ fn fast_map<K, V>(capacity: usize) -> FastMap<K, V> {
 
 /// What using each block of a registry does (ADR 0027, indexed by [`BlockId`]): the
 /// [`UseRule`] of the blocks a player can use (a fence gate opens and closes). The game asks it
-/// before placing a block on a right click ([`BlockUses::use_block`]) and queues the state it
-/// gives as an edit.
+/// before placing a block on a right click ([`BlockUses::use_block`], or
+/// [`BlockUses::use_cells`] for the rules that change several cells) and queues the edits it
+/// gives. It also keeps the blocks' [`PlaceRule`]s ([`BlockUses::place`], ADR 0048).
 #[derive(Resource, Clone, Debug, Default)]
 pub struct BlockUses {
     by_block: Vec<Option<UseRule>>,
+    places: Vec<Option<PlaceRule>>,
+}
+
+/// A click that places a block, for [`BlockUses::place`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaceClick {
+    /// The cell the block goes into.
+    pub at: BlockPos,
+    /// The state the held item places.
+    pub held: BlockState,
+    /// The clicked block.
+    pub clicked: BlockPos,
+    /// The clicked block's state.
+    pub clicked_state: BlockState,
+    /// The clicked face.
+    pub face: Face,
+    /// Where the click hit inside the clicked cell, `0..=1` on each axis.
+    pub hit: DVec3,
+    /// The player's view direction.
+    pub look: DVec3,
 }
 
 impl BlockUses {
-    /// The use rules the blocks of `registry` registered ([`BlockRegistry::use_rule`]).
+    /// The use and placement rules the blocks of `registry` registered
+    /// ([`BlockRegistry::use_rule`], [`BlockRegistry::place_rule`]).
     pub fn from_registry(registry: &BlockRegistry) -> Self {
         let by_block = registry
             .blocks()
             .map(|b| registry.use_rule(b).cloned())
             .collect();
-        Self { by_block }
+        let places = registry
+            .blocks()
+            .map(|b| registry.place_rule(b).cloned())
+            .collect();
+        Self { by_block, places }
     }
 
     /// Sets (or with `None` removes) the use rule of `block`.
@@ -210,14 +238,30 @@ impl BlockUses {
         self.by_block[i] = rule;
     }
 
+    /// Sets (or with `None` removes) the placement rule of `block`.
+    pub fn set_place(&mut self, block: BlockId, rule: Option<PlaceRule>) {
+        let i = usize::from(block.0);
+        if self.places.len() <= i {
+            self.places.resize(i + 1, None);
+        }
+        self.places[i] = rule;
+    }
+
     /// The use rule of the block of `state`, if it has one.
     pub fn rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<&UseRule> {
         let block = registry.block(state)?;
         self.by_block.get(usize::from(block.0))?.as_ref()
     }
 
+    /// The placement rule of the block of `state`, if it has one.
+    pub fn place_rule(&self, registry: &BlockRegistry, state: BlockState) -> Option<&PlaceRule> {
+        let block = registry.block(state)?;
+        self.places.get(usize::from(block.0))?.as_ref()
+    }
+
     /// The state `state` takes when used by someone looking toward `look` (horizontally), or
-    /// `None` when it is not used that way (the click places a block instead).
+    /// `None` when it is not used that way (the click places a block instead). A rule of
+    /// several cells answers as [`UseRule::apply`] says; ask [`BlockUses::use_cells`] for all.
     pub fn use_block(
         &self,
         registry: &BlockRegistry,
@@ -226,6 +270,83 @@ impl BlockUses {
     ) -> Option<BlockState> {
         self.rule(registry, state)?.apply(registry, state, look)
     }
+
+    /// The edits using the block `state` at `pos` makes, looking toward `look`, or `None` when
+    /// it is not used that way. `read` gives the world's cells (`None`: not loaded). Every use
+    /// rule answers here: one of one cell edits `pos`, one of several cells the cells it
+    /// names, in one batch.
+    pub fn use_cells(
+        &self,
+        registry: &BlockRegistry,
+        pos: BlockPos,
+        state: BlockState,
+        look: Facing,
+        read: impl Fn(BlockPos) -> Option<BlockState>,
+    ) -> Option<Vec<BlockEdit>> {
+        let rule = self.rule(registry, state)?;
+        let at = |offset: IVec3| read(offset_pos(pos, offset));
+        let used = Use {
+            state,
+            look,
+            read: &at,
+        };
+        let cells = rule.apply_cells(registry, &used)?;
+        Some(edits_at(pos, cells))
+    }
+
+    /// The edits placing `click.held` at `click.at` makes, when its block has a
+    /// [`PlaceRule`]: `None` when it has none (the game places it its own way), `Some(None)`
+    /// when the rule says it cannot go there, else the cells it fills (`click.at` first).
+    pub fn place(
+        &self,
+        registry: &BlockRegistry,
+        click: &PlaceClick,
+        read: impl Fn(BlockPos) -> Option<BlockState>,
+    ) -> Option<Option<Vec<BlockEdit>>> {
+        let rule = self.place_rule(registry, click.held)?;
+        let at = |offset: IVec3| read(offset_pos(click.at, offset));
+        let d = [
+            click.clicked.x.wrapping_sub(click.at.x),
+            click.clicked.y.wrapping_sub(click.at.y),
+            click.clicked.z.wrapping_sub(click.at.z),
+        ]
+        .map(|v| v.clamp(-1, 1) as i32);
+        let placing = Placing {
+            held: click.held,
+            clicked: click.clicked_state,
+            face: click.face,
+            clicked_offset: IVec3::from_array(d),
+            hit: click.hit,
+            look: click.look,
+            read: &at,
+        };
+        Some(rule.apply(registry, &placing).map(|cells| {
+            let mut edits = edits_at(click.at, cells);
+            // The placed cell first.
+            edits.sort_by_key(|e| e.pos != click.at);
+            edits
+        }))
+    }
+}
+
+/// `pos` moved by `offset` (saturating at the ends of `i64`).
+fn offset_pos(pos: BlockPos, offset: IVec3) -> BlockPos {
+    BlockPos::new(
+        pos.x.saturating_add(i64::from(offset.x)),
+        pos.y.saturating_add(i64::from(offset.y)),
+        pos.z.saturating_add(i64::from(offset.z)),
+    )
+}
+
+/// The cells of a rule as edits from `pos`.
+fn edits_at(pos: BlockPos, cells: Vec<CellChange>) -> Vec<BlockEdit> {
+    cells
+        .into_iter()
+        .map(|c| BlockEdit {
+            pos: offset_pos(pos, c.offset),
+            state: c.state,
+        })
+        .collect()
 }
 
 /// The face neighbor of `p` (saturating at the ends of `i64`).
@@ -624,6 +745,164 @@ mod tests {
             assert_eq!(blocks[&at(1, 0)], wall_torch, "{base:?}");
             assert_eq!(blocks[&at(4, 1)], BlockState::AIR, "{base:?}");
             assert_eq!(blocks[&at(5, 0)], BlockState::AIR, "{base:?}");
+        }
+    }
+
+    /// A two-cell block (ADR 0048): `test:bed` with `part` and `facing`, its head one block
+    /// toward its facing. Its use flips `occupied` on both halves; its placement puts the foot
+    /// in the cell and the head ahead of the look, when that cell is free.
+    fn bed_registry() -> (BlockRegistry, BlockState) {
+        use boxel_voxel::rules::{CellChange, PlaceRule, UseRule};
+        use boxel_voxel::{Property, testing};
+        let mut b = testing::builder();
+        let def = boxel_voxel::BlockDef {
+            name: "test:bed".into(),
+            shape: boxel_voxel::RenderShape::Cutout,
+            model: boxel_voxel::BlockModel::CUBE,
+            collision: boxel_voxel::BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: boxel_voxel::FaceTextures::all(boxel_voxel::TextureId(1)),
+        };
+        let bed = b
+            .add_block_with_states(
+                def,
+                vec![
+                    Property::new("facing", ["north", "south", "west", "east"]),
+                    Property::new("part", ["foot", "head"]),
+                    Property::boolean("occupied"),
+                ],
+                |_, _| {},
+            )
+            .unwrap();
+        let block = b.block_by_name("test:bed").unwrap();
+        let toward_other = |r: &BlockRegistry, s: BlockState| {
+            let f = Facing::from_name(r.property(s, "facing")?)?;
+            let n = f.face().normal();
+            Some(if r.property(s, "part")? == "foot" {
+                n
+            } else {
+                -n
+            })
+        };
+        b.set_use_rule(
+            block,
+            UseRule::cells(move |r, used| {
+                let flip = |s: BlockState| {
+                    let occupied = r.property(s, "occupied")? == "true";
+                    r.with(s, "occupied", if occupied { "false" } else { "true" })
+                };
+                let mut cells = vec![CellChange::here(flip(used.state)?)];
+                let d = toward_other(r, used.state)?;
+                if let Some(other) = used.at(d).filter(|&o| r.block(o) == r.block(used.state)) {
+                    cells.push(CellChange::new(d, flip(other)?));
+                }
+                Some(cells)
+            }),
+        )
+        .unwrap();
+        b.set_place_rule(
+            block,
+            PlaceRule::new(|r, placing| {
+                let facing = placing.look_facing();
+                let ahead = facing.face().normal();
+                if placing.at(ahead) != Some(BlockState::AIR) {
+                    return None;
+                }
+                let foot = r.with(placing.held, "facing", facing.name())?;
+                let head = r.with(foot, "part", "head")?;
+                Some(vec![CellChange::new(ahead, head), CellChange::here(foot)])
+            }),
+        )
+        .unwrap();
+        (b.build(), bed)
+    }
+
+    #[test]
+    fn a_use_and_a_placement_edit_both_cells_far_from_the_origin() {
+        let (registry, bed) = bed_registry();
+        let uses = BlockUses::from_registry(&registry);
+        let s = |name: &str| registry.parse_state(name).unwrap();
+        for base in [
+            BlockPos::new(0, 0, 0),
+            BlockPos::new(i64::from(i32::MAX), -64, i64::from(i32::MIN)),
+            BlockPos::new(1 << 40, 1 << 40, -(1 << 40)),
+        ] {
+            let east = |p: BlockPos, d: i64| BlockPos::new(p.x + d, p.y, p.z);
+            // Placed looking east on a free cell: the foot here, the head east of it.
+            let click = PlaceClick {
+                at: base,
+                held: bed,
+                clicked: BlockPos::new(base.x, base.y - 1, base.z),
+                clicked_state: BlockState(1),
+                face: Face::PosY,
+                hit: DVec3::new(0.5, 1.0, 0.5),
+                look: DVec3::new(1.0, -0.3, 0.1),
+            };
+            let free = |_: BlockPos| Some(BlockState::AIR);
+            let placed = uses.place(&registry, &click, free).expect("a rule");
+            let foot = s("test:bed[facing=east,occupied=false,part=foot]");
+            let head = s("test:bed[facing=east,occupied=false,part=head]");
+            assert_eq!(
+                placed,
+                Some(vec![
+                    BlockEdit {
+                        pos: base,
+                        state: foot
+                    },
+                    BlockEdit {
+                        pos: east(base, 1),
+                        state: head
+                    },
+                ])
+            );
+            // Not where the head's cell is taken or not loaded.
+            let blocked = |p: BlockPos| (p == base).then_some(BlockState::AIR);
+            assert_eq!(uses.place(&registry, &click, blocked), Some(None));
+            // A block without a rule places the game's way.
+            let plain = PlaceClick {
+                held: BlockState(1),
+                ..click
+            };
+            assert_eq!(uses.place(&registry, &plain, free), None);
+            // Used from either half, both change.
+            let world = |p: BlockPos| {
+                if p == base {
+                    Some(foot)
+                } else if p == east(base, 1) {
+                    Some(head)
+                } else {
+                    Some(BlockState::AIR)
+                }
+            };
+            let both = vec![
+                BlockEdit {
+                    pos: east(base, 1),
+                    state: s("test:bed[facing=east,occupied=true,part=head]"),
+                },
+                BlockEdit {
+                    pos: base,
+                    state: s("test:bed[facing=east,occupied=true,part=foot]"),
+                },
+            ];
+            let used = uses
+                .use_cells(&registry, east(base, 1), head, Facing::North, world)
+                .unwrap();
+            assert_eq!(used, both);
+            let used = uses
+                .use_cells(&registry, base, foot, Facing::North, world)
+                .unwrap();
+            assert_eq!(used, [both[1], both[0]]);
+            // Asked as a rule of one cell, it changes the used half only.
+            assert_eq!(
+                uses.use_block(&registry, foot, Facing::North),
+                Some(both[1].state)
+            );
+            // A rule of one cell answers use_cells with its cell.
+            assert_eq!(
+                uses.use_cells(&registry, base, BlockState(1), Facing::North, world),
+                None
+            );
         }
     }
 }

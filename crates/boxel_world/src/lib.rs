@@ -12,6 +12,8 @@
 //!    [`WorldSettings::interest_budget`], nearest first; refresh the stale job priorities a batch
 //!    at a time.
 //! 2. `Edits`: apply [`EditQueue`] (copy-on-write, version bump) and remesh, as one edit batch,
+//!    then the batch's block data edits ([`DataEdit`], ADR 0048: data lives in the chunk, is
+//!    saved and streamed with it, and is dropped when its cell's block changes to another one),
 //!    with the neighbor updates of [`NeighborRules`] (stairs, fences, torches, walls, gates)
 //!    added to it: the center and every neighbor whose padded region holds a changed voxel
 //!    (edges and corners included, for AO), every chunk the light change can reach (up to 8 per
@@ -98,10 +100,12 @@ pub use daylight::{
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};
-pub use neighbor_rules::{BlockUses, MAX_RULE_UPDATES, NeighborRules, RULE_UPDATES_PER_CELL};
+pub use neighbor_rules::{
+    BlockUses, MAX_RULE_UPDATES, NeighborRules, PlaceClick, RULE_UPDATES_PER_CELL,
+};
 pub use plugin::{
     BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
-    EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,
+    DataEdit, EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,
 };
 pub use sky::{ColumnId, SkyMap};
 pub use ticks::{

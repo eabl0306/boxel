@@ -166,6 +166,9 @@ fn a_closed_worlds_leftovers_never_reach_the_next_one() {
     app.world_mut()
         .resource_mut::<EditQueue>()
         .set_block(near, stone);
+    app.world_mut()
+        .resource_mut::<EditQueue>()
+        .set_data(near, Some(boxel_voxel::BlockData::new()));
     app.world_mut().spawn(Saved::new());
     app.world_mut().write_message(ChunkMeshResync);
     app.world_mut().write_message(LodResync);

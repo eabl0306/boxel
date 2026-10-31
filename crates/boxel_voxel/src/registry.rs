@@ -5,7 +5,7 @@
 //! world loads and shared as `Arc<BlockRegistry>`.
 use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 use crate::planes::{ModelPlane, TableEntry};
-use crate::rules::{NeighborRule, UseRule};
+use crate::rules::{NeighborRule, PlaceRule, UseRule};
 use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
@@ -621,6 +621,10 @@ bitflags::bitflags! {
         /// waterloggable one still takes a new source of the waterlog fluid. Unlike
         /// [`StateFlags::BLOCKS_MOTION`], it is no floor for a new source (#110).
         const KEEPS_FLUIDS_OUT = 1 << 7;
+        /// Its mesh reads the cell's data ([`crate::BlockData`], ADR 0048: an item frame's
+        /// item): a change of that data remeshes the chunk like a block edit. Set per block
+        /// with [`BlockRegistryBuilder::set_meshes_data`].
+        const MESHES_DATA = 1 << 8;
     }
 }
 
@@ -850,6 +854,10 @@ pub struct BlockRegistryBuilder {
     neighbor_rules: Vec<Option<NeighborRule>>,
     /// The use rule of each block (by [`BlockId`]; missing at the end: none).
     use_rules: Vec<Option<UseRule>>,
+    /// The placement rule of each block (by [`BlockId`]; missing at the end: none).
+    place_rules: Vec<Option<PlaceRule>>,
+    /// The blocks whose mesh reads their cells' data (by [`BlockId`]; missing at the end: not).
+    meshes_data: Vec<bool>,
     /// The box models, by [`BoxModelId`], and the id of each.
     box_models: Vec<BoxModel>,
     box_model_ids: std::collections::HashMap<BoxModel, BoxModelId>,
@@ -930,6 +938,25 @@ impl BlockRegistryBuilder {
     pub fn set_use_rule(&mut self, block: BlockId, rule: UseRule) -> Result<(), RegistryError> {
         let i = self.block_index(block)?;
         set_slot(&mut self.use_rules, i, rule);
+        Ok(())
+    }
+
+    /// Sets the [`PlaceRule`] of `block` (replaces an earlier one): the cells placing it fills.
+    pub fn set_place_rule(&mut self, block: BlockId, rule: PlaceRule) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        set_slot(&mut self.place_rules, i, rule);
+        Ok(())
+    }
+
+    /// Declares that the mesh of every state of `block` reads its cell's data
+    /// ([`StateFlags::MESHES_DATA`], ADR 0048): the world remeshes a chunk when such a cell's
+    /// data changes. The engine's mesher draws no data yet; this is the seam for one that does.
+    pub fn set_meshes_data(&mut self, block: BlockId) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        if self.meshes_data.len() <= i {
+            self.meshes_data.resize(i + 1, false);
+        }
+        self.meshes_data[i] = true;
         Ok(())
     }
 
@@ -1328,6 +1355,8 @@ impl BlockRegistryBuilder {
                 f.set(StateFlags::BLOCKS_MOTION, solid || declared);
                 let keeps = self.keeps_fluids_out.get(usize::from(block)).copied();
                 f.set(StateFlags::KEEPS_FLUIDS_OUT, keeps.unwrap_or(false));
+                let meshes = self.meshes_data.get(usize::from(block)).copied();
+                f.set(StateFlags::MESHES_DATA, meshes.unwrap_or(false));
                 f.set(
                     StateFlags::OCCLUDES,
                     b.shape == RenderShape::Opaque && b.model.is_solid_cube(),
@@ -1358,6 +1387,7 @@ impl BlockRegistryBuilder {
         BlockRegistry {
             neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
             use_rules: per_block(self.use_rules, self.blocks.len()),
+            place_rules: per_block(self.place_rules, self.blocks.len()),
             state_block,
             shapes: states.iter().map(|b| b.shape).collect(),
             models: states.iter().map(|b| b.model).collect(),
@@ -1466,6 +1496,8 @@ pub struct BlockRegistry {
     neighbor_rules: Vec<Option<NeighborRule>>,
     /// The use rule of each block (by [`BlockId`]).
     use_rules: Vec<Option<UseRule>>,
+    /// The placement rule of each block (by [`BlockId`]).
+    place_rules: Vec<Option<PlaceRule>>,
 }
 
 impl BlockRegistry {
@@ -1521,6 +1553,10 @@ impl BlockRegistry {
     /// The [`UseRule`] of a block, if it has one ([`BlockRegistryBuilder::set_use_rule`]).
     pub fn use_rule(&self, b: BlockId) -> Option<&UseRule> {
         self.use_rules.get(usize::from(b.0))?.as_ref()
+    }
+    /// The [`PlaceRule`] of a block, if it has one ([`BlockRegistryBuilder::set_place_rule`]).
+    pub fn place_rule(&self, b: BlockId) -> Option<&PlaceRule> {
+        self.place_rules.get(usize::from(b.0))?.as_ref()
     }
     /// The default state of a block (air if out of range).
     pub fn default_state(&self, b: BlockId) -> BlockState {
@@ -1696,6 +1732,10 @@ impl BlockRegistry {
     /// [`StateFlags::OCCLUDES`]).
     pub fn occludes(&self, s: BlockState) -> bool {
         self.flags(s).contains(StateFlags::OCCLUDES)
+    }
+    /// True if the mesh of `s` reads its cell's data ([`StateFlags::MESHES_DATA`], ADR 0048).
+    pub fn meshes_data(&self, s: BlockState) -> bool {
+        self.flags(s).contains(StateFlags::MESHES_DATA)
     }
     /// True if `s` stops movement ([`StateFlags::BLOCKS_MOTION`]): it collides, or its block was
     /// declared to ([`BlockRegistryBuilder::set_blocks_motion`]: a fence gate, open or closed).

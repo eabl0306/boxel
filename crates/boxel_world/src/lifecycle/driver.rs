@@ -366,6 +366,7 @@ pub(crate) fn open_engine_state(
         feedback.chunks.clear();
     }
     edits.edits.clear();
+    edits.data.clear();
 }
 
 /// Closes the open world now (an exclusive caller, as [`open_world`]): [`WorldSave`] (unless

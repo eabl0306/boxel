@@ -12,7 +12,8 @@
 //!   bumps the blob's version; [`FORMAT_VERSION`] changes only when the old files cannot be read
 //!   any more.
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, DimensionId, Paletted,
+    BlockData, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, DataValue,
+    DimensionId, ItemStack, LocalPos, Paletted,
 };
 use boxel_worldgen::lod::LOD_PADDED_VOLUME as LOD_CELLS;
 use boxel_worldgen::preset::{DimensionRecord, MAX_DIMENSIONS, SpecLine, WorldgenRecord};
@@ -42,8 +43,12 @@ pub(crate) const CACHE_CHUNK_MAGIC: [u8; 4] = *b"BXGC";
 pub(crate) const CACHE_NODE_MAGIC: [u8; 4] = *b"BXGN";
 /// Magic of a generation cache record of a far LOD column's band (ADR 0042).
 pub(crate) const CACHE_BAND_MAGIC: [u8; 4] = *b"BXGB";
-/// Version of the chunk record layout.
+/// Version of the chunk record layout of a chunk without block data: its storage only.
 pub(crate) const CHUNK_VERSION: u8 = 1;
+/// Version of the chunk record layout of a chunk with block data (ADR 0048): its storage, then
+/// the cells' data. A chunk without data is still written as [`CHUNK_VERSION`], so its record
+/// is the same bytes as before and older builds read it.
+pub(crate) const CHUNK_DATA_VERSION: u8 = 2;
 /// Version of the metadata blob layouts.
 pub(crate) const META_VERSION: u8 = 1;
 /// Version of the entity record layout (the codecs' own bytes have their own versions).
@@ -68,11 +73,13 @@ const MAX_CHUNK_PAYLOAD: usize = 1 + 5 * CHUNK_VOLUME;
 /// at most 255 bytes out): a longer length in a damaged header is refused before allocating.
 const LZ4_MAX_RATIO: usize = 255;
 
-/// Largest payload of a blob with `magic`: a chunk record's size is bounded by its layout; a
+/// Largest payload of a blob with `magic` and `version`: a chunk record's size is bounded by its
+/// layout (with block data, by the header's `u32` length alone: an inventory has no bound); a
 /// metadata blob (a long pending tick list) or an entity record by the header's `u32` length
 /// alone. The reader takes whatever the writer can seal.
-fn max_payload(magic: [u8; 4]) -> usize {
+fn max_payload(magic: [u8; 4], version: u8) -> usize {
     match magic {
+        CHUNK_MAGIC if version >= CHUNK_DATA_VERSION => u32::MAX as usize,
         CHUNK_MAGIC => MAX_CHUNK_PAYLOAD,
         // A chunk's storage and its version (a varint of a `u32`).
         CACHE_CHUNK_MAGIC => MAX_CHUNK_PAYLOAD + 5,
@@ -178,7 +185,7 @@ pub(crate) fn seal(magic: [u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
         None => (0, payload),
     };
     debug_assert!(
-        payload.len() <= max_payload(magic),
+        payload.len() <= max_payload(magic, version),
         "the reader would refuse it"
     );
     let len = u32::try_from(payload.len()).expect("payloads are far below 4 GiB");
@@ -212,7 +219,7 @@ pub(crate) fn open(magic: [u8; 4], version: u8, bytes: &[u8]) -> Result<Vec<u8>,
     sum.copy_from_slice(&bytes[10..18]);
     let body = &bytes[HEADER_LEN..];
     let compressed = flags & FLAG_LZ4 != 0;
-    if len > max_payload(magic)
+    if len > max_payload(magic, version)
         || (compressed && len > body.len().saturating_mul(LZ4_MAX_RATIO))
         || flags & !FLAG_LZ4 != 0
     {
@@ -478,22 +485,150 @@ pub(crate) fn decode_names(bytes: &[u8]) -> Result<Vec<String>, FormatError> {
 
 // ---- Chunk records -------------------------------------------------------------------------
 
-/// The record of a chunk's blocks: its storage, compacted, with stored ids.
+/// The record of a chunk's blocks: its storage, compacted, with stored ids, and its cells' data
+/// when it has some (a record of version 2; without data, version 1 as before ADR 0048).
 pub fn encode_chunk(data: &ChunkData, ids: &IdMap) -> Result<Vec<u8>, FormatError> {
     let mut blocks = data.blocks().clone();
     blocks.compact();
     let mut payload = Vec::new();
     put_storage(&mut payload, &blocks, |s| ids.stored(s).map(u64::from))?;
-    Ok(seal(CHUNK_MAGIC, CHUNK_VERSION, &payload))
+    if !data.has_block_data() {
+        return Ok(seal(CHUNK_MAGIC, CHUNK_VERSION, &payload));
+    }
+    put_block_data(&mut payload, data);
+    Ok(seal(CHUNK_MAGIC, CHUNK_DATA_VERSION, &payload))
 }
 
-/// The blocks of a chunk record, with runtime states.
+/// The blocks of a chunk record, with runtime states, and its cells' data. Reads both layouts.
 pub fn decode_chunk(bytes: &[u8], ids: &IdMap) -> Result<ChunkData, FormatError> {
-    let payload = open(CHUNK_MAGIC, CHUNK_VERSION, bytes)?;
+    let version = match bytes.get(4) {
+        Some(&CHUNK_VERSION) => CHUNK_VERSION,
+        _ => CHUNK_DATA_VERSION,
+    };
+    let payload = open(CHUNK_MAGIC, version, bytes)?;
     let mut r = Reader::new(&payload);
     let blocks = read_storage(&mut r, |id| ids.runtime(id))?;
+    let mut data = ChunkData::from_paletted(blocks);
+    if version == CHUNK_DATA_VERSION {
+        read_block_data(&mut r, &mut data)?;
+    }
     r.finish()?;
-    Ok(ChunkData::from_paletted(blocks))
+    Ok(data)
+}
+
+/// Tags of a block data field's value.
+const VALUE_INT: u8 = 0;
+const VALUE_TEXT: u8 = 1;
+const VALUE_BYTES: u8 = 2;
+const VALUE_ITEMS: u8 = 3;
+
+/// Appends the cells' data of `data`: their count, then each cell's local index (ascending)
+/// and fields (their count, then each name, ascending, a value tag and the value). A number is
+/// a zigzag varint; a text or bytes their length and bytes; an inventory its slot count and per
+/// slot 0 (empty) or 1, the item's name, the count and the damage.
+fn put_block_data(out: &mut Vec<u8>, data: &ChunkData) {
+    put_varint(out, data.block_data_len() as u64);
+    for (p, cell) in data.block_data_cells() {
+        put_varint(out, p.index() as u64);
+        put_varint(out, cell.fields().len() as u64);
+        for (name, value) in cell.fields() {
+            put_str(out, name);
+            match value {
+                DataValue::Int(v) => {
+                    out.push(VALUE_INT);
+                    put_varint(out, ((v << 1) ^ (v >> 63)) as u64);
+                }
+                DataValue::Text(t) => {
+                    out.push(VALUE_TEXT);
+                    put_str(out, t);
+                }
+                DataValue::Bytes(b) => {
+                    out.push(VALUE_BYTES);
+                    put_varint(out, b.len() as u64);
+                    out.extend_from_slice(b);
+                }
+                DataValue::Items(items) => {
+                    out.push(VALUE_ITEMS);
+                    put_varint(out, items.len() as u64);
+                    for slot in items.iter() {
+                        match slot {
+                            None => out.push(0),
+                            Some(stack) => {
+                                out.push(1);
+                                put_str(out, &stack.item);
+                                put_varint(out, u64::from(stack.count));
+                                put_varint(out, u64::from(stack.damage));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The inverse of [`put_block_data`], into `data`. Refuses cells or names out of order, an
+/// index past the chunk, a stack of none and an unknown tag.
+fn read_block_data(r: &mut Reader<'_>, data: &mut ChunkData) -> Result<(), FormatError> {
+    let cells = r.count(CHUNK_VOLUME)?;
+    let mut last = None;
+    for _ in 0..cells {
+        let index = r.count(CHUNK_VOLUME - 1)?;
+        if last.is_some_and(|l| l >= index) {
+            return Err(FormatError::Damaged("block data cells out of order"));
+        }
+        last = Some(index);
+        let fields = r.count(r.bytes.len())?;
+        let mut cell = BlockData::new();
+        let mut last_name: Option<String> = None;
+        for _ in 0..fields {
+            let name = r.str(r.bytes.len())?.to_string();
+            if last_name.as_ref().is_some_and(|l| *l >= name) {
+                return Err(FormatError::Damaged("block data fields out of order"));
+            }
+            let value = match r.u8()? {
+                VALUE_INT => {
+                    let z = r.varint()?;
+                    DataValue::Int(((z >> 1) as i64) ^ -((z & 1) as i64))
+                }
+                VALUE_TEXT => DataValue::Text(r.str(r.bytes.len())?.into()),
+                VALUE_BYTES => {
+                    let n = r.count(r.bytes.len())?;
+                    DataValue::Bytes(r.take(n)?.into())
+                }
+                VALUE_ITEMS => {
+                    let n = r.count(r.bytes.len())?;
+                    let mut items = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        items.push(match r.u8()? {
+                            0 => None,
+                            1 => {
+                                let item: std::sync::Arc<str> = r.str(r.bytes.len())?.into();
+                                let count = u32::try_from(r.varint()?)
+                                    .ok()
+                                    .filter(|&c| c > 0)
+                                    .ok_or(FormatError::Damaged("a stack of none"))?;
+                                let damage = u32::try_from(r.varint()?)
+                                    .map_err(|_| FormatError::Damaged("damage out of range"))?;
+                                Some(ItemStack {
+                                    item,
+                                    count,
+                                    damage,
+                                })
+                            }
+                            _ => return Err(FormatError::Damaged("bad item slot")),
+                        });
+                    }
+                    DataValue::Items(items.into())
+                }
+                _ => return Err(FormatError::Damaged("unknown block data value")),
+            };
+            cell.set(&name, value);
+            last_name = Some(name);
+        }
+        data.set_block_data(LocalPos::from_index(index), Some(cell));
+    }
+    Ok(())
 }
 
 /// Appends block storage `blocks` as it is (no compaction), each state as the id `id_of` gives

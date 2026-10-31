@@ -1,6 +1,7 @@
+use crate::block_data::CellData;
 use crate::{
-    BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables, LocalPos,
-    Occupancy, OwnedLightMasks, Paletted,
+    BlockData, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables,
+    LocalPos, Occupancy, OwnedLightMasks, Paletted,
 };
 use std::num::NonZeroU64;
 use std::sync::OnceLock;
@@ -14,6 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// shared by every reader of the snapshot, dropped by every change of the blocks (and not
 /// carried by `clone`). It also caches the answer of [`ChunkData::may_contain`] for one
 /// [`StateSet`], dropped the same way.
+///
+/// Some cells carry data next to their state ([`BlockData`], ADR 0048: a furnace's slots). It
+/// lives here so it is saved, loaded and streamed with the blocks; a chunk without any holds one
+/// empty pointer. Changing it does not bump `version` (it is not the blocks): the world remeshes
+/// the chunk when a block's mesh reads its data ([`BlockRegistry::meshes_data`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkData {
     /// Block states (private so that every change goes through a method that resets the
@@ -25,6 +31,8 @@ pub struct ChunkData {
     masks: MaskCache,
     /// The last answer of [`ChunkData::may_contain`] and the set it was for.
     contains: ContainsCache,
+    /// The data of the cells that have some.
+    cells: CellData,
 }
 
 /// A set of block states that a chunk can be asked about ([`ChunkData::may_contain`]: "may you
@@ -172,6 +180,7 @@ impl ChunkData {
             version: 0,
             masks: MaskCache::default(),
             contains: ContainsCache::default(),
+            cells: CellData::default(),
         }
     }
     /// The block storage.
@@ -385,10 +394,37 @@ impl ChunkData {
         }
         occupancy
     }
-    /// Heap bytes used: the block storage plus the cached light masks, if built (excludes
-    /// `size_of::<ChunkData>()` itself).
+    /// The data of the cell `p`, if it has some ([`BlockData`], ADR 0048).
+    #[inline]
+    pub fn block_data(&self, p: LocalPos) -> Option<&BlockData> {
+        self.cells.get(p.index() as u16)
+    }
+    /// Sets (or with `None` removes) the data of the cell `p`, returning what it had. The
+    /// blocks, `version` and the caches stay as they are. The world keeps data only on cells
+    /// whose block stays the same (`boxel_world` applies it with the edits); this method does
+    /// not check.
+    pub fn set_block_data(&mut self, p: LocalPos, data: Option<BlockData>) -> Option<BlockData> {
+        self.cells.set(p.index() as u16, data)
+    }
+    /// Every cell with data, in local index order (y, then x, then z).
+    pub fn block_data_cells(&self) -> impl Iterator<Item = (LocalPos, &BlockData)> {
+        self.cells
+            .iter()
+            .map(|(i, d)| (LocalPos::from_index(usize::from(i)), d))
+    }
+    /// How many cells have data.
+    pub fn block_data_len(&self) -> usize {
+        self.cells.len()
+    }
+    /// True if some cell has data.
+    #[inline]
+    pub fn has_block_data(&self) -> bool {
+        self.cells.len() > 0
+    }
+    /// Heap bytes used: the block storage, the cached light masks, if built, and the cells'
+    /// data (excludes `size_of::<ChunkData>()` itself).
     pub fn heap_bytes(&self) -> usize {
         let masks = self.masks.0.get().map_or(0, |m| m.heap_bytes());
-        self.blocks.heap_bytes() + masks
+        self.blocks.heap_bytes() + masks + self.cells.heap_bytes()
     }
 }

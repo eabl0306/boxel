@@ -26,10 +26,11 @@ use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable};
 use boxel_tasks::{AsyncComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockPos, BlockRegistry, BlockRegistryBuilder, BlockState, ChunkKey, ChunkPos, DimensionId,
-    LightTables,
+    BlockData, BlockPos, BlockRegistry, BlockRegistryBuilder, BlockState, ChunkKey, ChunkPos,
+    DimensionId, LightTables,
 };
 use boxel_worldgen::{FlatGenerator, WorldGenerator};
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -367,11 +368,28 @@ pub struct BlockEdit {
     pub state: BlockState,
 }
 
+/// What an edit does to a cell's data ([`BlockData`], ADR 0048).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DataEdit {
+    /// The cell's data becomes this (`None`: it has none).
+    Set(Option<BlockData>),
+    /// The cell keeps its data even if the batch changes its block to another one (a copper
+    /// chest that oxidizes keeps its items).
+    Keep,
+}
+
 /// Pending edits, applied in `WorldSystems::Edits` (edits to non-Ready chunks are dropped with a
 /// debug log in M0).
+///
+/// Block data goes with the blocks (ADR 0048). A batch applies its block edits first, then its
+/// data edits, so a block placed with its data in one frame gets it. A cell whose block changes
+/// to another block (not just another state of it) loses its data, unless the batch has a data
+/// edit for that cell. Data is kept only on cells that are not air. The last data edit of a
+/// cell in a batch wins.
 #[derive(Resource, Debug, Default)]
 pub struct EditQueue {
     pub(crate) edits: Vec<BlockEdit>,
+    pub(crate) data: BTreeMap<BlockPos, DataEdit>,
 }
 
 impl EditQueue {
@@ -379,13 +397,27 @@ impl EditQueue {
     pub fn set_block(&mut self, pos: BlockPos, state: BlockState) {
         self.edits.push(BlockEdit { pos, state });
     }
-    /// Queued edits.
+    /// Queues a change of the data of the cell `pos` (`None` removes it).
+    pub fn set_data(&mut self, pos: BlockPos, data: Option<BlockData>) {
+        self.data.insert(pos, DataEdit::Set(data));
+    }
+    /// Keeps the data of `pos` through a change of its block in this batch.
+    pub fn keep_data(&mut self, pos: BlockPos) {
+        self.data.entry(pos).or_insert(DataEdit::Keep);
+    }
+    /// The data edit queued for `pos`, if any: what the cell's data will be after the next
+    /// `Edits` (read it before the world's, [`ChunkMap::block_data_at`], so two systems of a
+    /// frame do not write over each other).
+    pub fn pending_data(&self, pos: BlockPos) -> Option<&DataEdit> {
+        self.data.get(&pos)
+    }
+    /// Queued block edits.
     pub fn len(&self) -> usize {
         self.edits.len()
     }
-    /// Nothing queued.
+    /// Nothing queued, blocks nor data.
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
+        self.edits.is_empty() && self.data.is_empty()
     }
 }
 
@@ -751,11 +783,12 @@ fn apply_edits(
         return;
     }
     let mut edits = std::mem::take(&mut queue.edits);
+    let data = std::mem::take(&mut queue.data);
     // Stairs, fences and torches next to the edits follow them in the same batch (ADR 0020).
     rules.expand(&content.registry, |p| map.block_at(p), &mut edits);
     let mut events = Vec::new();
     let mut cx = Ctx::new(&mut map, &mut sky, &content, &mut events);
-    let changes = jobs.apply_edits(&mut cx, edits);
+    let changes = jobs.apply_edits_with_data(&mut cx, edits, data);
     writer.write_batch(events);
     changed.write_batch(changes);
 }

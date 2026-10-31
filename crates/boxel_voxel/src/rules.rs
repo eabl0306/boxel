@@ -1,7 +1,9 @@
 //! The engine side of the rules of blocks (ADR 0020, ADR 0027): a block may register a
-//! [`NeighborRule`] (the state it takes given its 6 face neighbors) and a [`UseRule`] (the state
-//! it takes when a player uses it) in its registry ([`BlockRegistryBuilder::set_neighbor_rule`],
-//! [`BlockRegistryBuilder::set_use_rule`]). `boxel_world` applies the neighbor rules to the
+//! [`NeighborRule`] (the state it takes given its 6 face neighbors), a [`UseRule`] (the state
+//! it takes when a player uses it, or the cells a use changes: both halves of a bed, ADR 0048)
+//! and a [`PlaceRule`] (the cells placing it fills, from the click and the look) in its
+//! registry ([`BlockRegistryBuilder::set_neighbor_rule`],
+//! [`BlockRegistryBuilder::set_use_rule`], [`BlockRegistryBuilder::set_place_rule`]). `boxel_world` applies the neighbor rules to the
 //! blocks around every edit (`NeighborRules`), and again around every block a rule changed, and
 //! asks the use rules on a player's click (`BlockUses`). The rules themselves are content: the
 //! game writes them, as closures over what they need, and they can be tested without a world.
@@ -14,8 +16,10 @@
 //!
 //! [`BlockRegistryBuilder::set_neighbor_rule`]: crate::BlockRegistryBuilder::set_neighbor_rule
 //! [`BlockRegistryBuilder::set_use_rule`]: crate::BlockRegistryBuilder::set_use_rule
+//! [`BlockRegistryBuilder::set_place_rule`]: crate::BlockRegistryBuilder::set_place_rule
 use crate::shapes::Facing;
 use crate::{BlockCollision, BlockRegistry, BlockState, Face};
+use glam::{DVec3, IVec3};
 use std::sync::Arc;
 
 /// The signature of a neighbor rule: the registry, the state and its 6 face neighbors (indexed
@@ -24,6 +28,123 @@ type NeighborFn = dyn Fn(&BlockRegistry, BlockState, &[BlockState; 6]) -> BlockS
 
 /// The signature of a use rule: the registry, the state and where the user looks.
 type UseFn = dyn Fn(&BlockRegistry, BlockState, Facing) -> Option<BlockState> + Send + Sync;
+
+/// The signature of a use rule of several cells: the registry and the use.
+type UseCellsFn = dyn Fn(&BlockRegistry, &Use<'_>) -> Option<Vec<CellChange>> + Send + Sync;
+
+/// The signature of a placement rule: the registry and the placement.
+type PlaceFn = dyn Fn(&BlockRegistry, &Placing<'_>) -> Option<Vec<CellChange>> + Send + Sync;
+
+/// A cell a rule changes: where, from the cell the rule is about, and the state it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellChange {
+    /// From the used or placed cell, in blocks.
+    pub offset: IVec3,
+    /// The state the cell takes.
+    pub state: BlockState,
+}
+
+impl CellChange {
+    /// `state` at `offset`.
+    pub const fn new(offset: IVec3, state: BlockState) -> Self {
+        Self { offset, state }
+    }
+
+    /// `state` in the cell the rule is about.
+    pub const fn here(state: BlockState) -> Self {
+        Self::new(IVec3::ZERO, state)
+    }
+}
+
+/// What a rule may read of the world: the state of a cell by its offset from the cell the rule
+/// is about (`None`: not loaded).
+pub type CellReader<'a> = &'a dyn Fn(IVec3) -> Option<BlockState>;
+
+/// A use of a block, for a [`UseRule::cells`] rule.
+pub struct Use<'a> {
+    /// The used block's state.
+    pub state: BlockState,
+    /// Where the user looks, horizontally.
+    pub look: Facing,
+    /// Reads the cells around the used one.
+    pub read: CellReader<'a>,
+}
+
+impl Use<'_> {
+    /// The state at `offset` from the used cell (`None`: not loaded).
+    pub fn at(&self, offset: IVec3) -> Option<BlockState> {
+        (self.read)(offset)
+    }
+}
+
+/// A placement of a block, for a [`PlaceRule`]: what the player holds, what was clicked and
+/// how, and where the player looks. The game picks the cell (the one in front of the clicked
+/// face, or the clicked one when it is replaced); the rule picks the states.
+pub struct Placing<'a> {
+    /// The state the held item places (its block's default, or what the game's placement
+    /// already chose).
+    pub held: BlockState,
+    /// The state of the clicked block.
+    pub clicked: BlockState,
+    /// The clicked face.
+    pub face: Face,
+    /// The clicked cell from the placed one (the face's opposite normal, or zero when the
+    /// clicked cell is the one replaced).
+    pub clicked_offset: IVec3,
+    /// Where the click hit inside the clicked cell, `0..=1` on each axis.
+    pub hit: DVec3,
+    /// The player's view direction (unit length).
+    pub look: DVec3,
+    /// Reads the cells around the placed one.
+    pub read: CellReader<'a>,
+}
+
+impl Placing<'_> {
+    /// The state at `offset` from the placed cell (`None`: not loaded).
+    pub fn at(&self, offset: IVec3) -> Option<BlockState> {
+        (self.read)(offset)
+    }
+
+    /// The horizontal direction the player looks to most.
+    pub fn look_facing(&self) -> Facing {
+        Facing::of_look(self.look.x, self.look.z)
+    }
+}
+
+/// How a block places: from a [`Placing`], the cells it fills (the placed cell at offset zero
+/// and any other, the head of a bed), or `None` when it cannot go there. Registered per block
+/// like [`UseRule`] ([`BlockRegistryBuilder::set_place_rule`]); the world keeps them
+/// (`boxel_world::BlockUses::place`) and the game asks. A block without one places as the game
+/// decides.
+///
+/// [`BlockRegistryBuilder::set_place_rule`]: crate::BlockRegistryBuilder::set_place_rule
+#[derive(Clone)]
+pub struct PlaceRule(Arc<PlaceFn>);
+
+impl PlaceRule {
+    /// The rule `rule`.
+    pub fn new(
+        rule: impl Fn(&BlockRegistry, &Placing<'_>) -> Option<Vec<CellChange>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(rule))
+    }
+
+    /// The cells `placing` fills, if the block can go there.
+    #[inline]
+    pub fn apply(
+        &self,
+        registry: &BlockRegistry,
+        placing: &Placing<'_>,
+    ) -> Option<Vec<CellChange>> {
+        (self.0)(registry, placing)
+    }
+}
+
+impl std::fmt::Debug for PlaceRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PlaceRule(..)")
+    }
+}
 
 /// A neighbor rule: the state `state` should have given its 6 face neighbors (indexed by
 /// [`Face::index`]). Returning `state` changes nothing; returning air removes the block. A
@@ -65,18 +186,38 @@ impl std::fmt::Debug for NeighborRule {
 /// someone looking toward `look` (horizontally), or `None` if the block is not used that way
 /// (then the click places a block, as before). Registered per block like [`NeighborRule`]; the
 /// world keeps them (`boxel_world::BlockUses`) and the game asks it.
+///
+/// A rule made with [`UseRule::cells`] reads the cells around and changes several of them in
+/// one batch (both halves of a bed or a door, ADR 0048): a block's own neighbor rule runs on
+/// every edited cell, so a two-cell block whose halves follow each other must change both.
 #[derive(Clone)]
-pub struct UseRule(Arc<UseFn>);
+pub struct UseRule(UseKind);
+
+#[derive(Clone)]
+enum UseKind {
+    One(Arc<UseFn>),
+    Cells(Arc<UseCellsFn>),
+}
 
 impl UseRule {
     /// The rule `rule`.
     pub fn new(
         rule: impl Fn(&BlockRegistry, BlockState, Facing) -> Option<BlockState> + Send + Sync + 'static,
     ) -> Self {
-        Self(Arc::new(rule))
+        Self(UseKind::One(Arc::new(rule)))
     }
 
-    /// The state `state` takes when used by someone looking toward `look`, if it is used.
+    /// A rule of several cells: from the [`Use`], the cells it changes (the used one at
+    /// offset zero), or `None` when the block is not used that way.
+    pub fn cells(
+        rule: impl Fn(&BlockRegistry, &Use<'_>) -> Option<Vec<CellChange>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(UseKind::Cells(Arc::new(rule)))
+    }
+
+    /// The state `state` takes when used by someone looking toward `look`, if it is used. A
+    /// rule of several cells is asked with no cell around loaded, and answers with the change
+    /// it makes to the used cell.
     #[inline]
     pub fn apply(
         &self,
@@ -84,7 +225,32 @@ impl UseRule {
         state: BlockState,
         look: Facing,
     ) -> Option<BlockState> {
-        (self.0)(registry, state, look)
+        match &self.0 {
+            UseKind::One(rule) => rule(registry, state, look),
+            UseKind::Cells(_) => {
+                let read = |_: IVec3| None;
+                let used = Use {
+                    state,
+                    look,
+                    read: &read,
+                };
+                self.apply_cells(registry, &used)?
+                    .into_iter()
+                    .find(|c| c.offset == IVec3::ZERO)
+                    .map(|c| c.state)
+            }
+        }
+    }
+
+    /// The cells `used` changes, if the block is used that way: a rule of one cell changes the
+    /// used one.
+    pub fn apply_cells(&self, registry: &BlockRegistry, used: &Use<'_>) -> Option<Vec<CellChange>> {
+        match &self.0 {
+            UseKind::One(rule) => {
+                rule(registry, used.state, used.look).map(|s| vec![CellChange::here(s)])
+            }
+            UseKind::Cells(rule) => rule(registry, used),
+        }
     }
 }
 
@@ -185,6 +351,50 @@ pub fn broken(registry: &BlockRegistry, state: BlockState) -> BlockState {
 mod tests {
     use super::*;
     use crate::testing;
+
+    /// A rule of several cells reads around and answers both ways; a rule of one cell answers
+    /// the cells question with its cell; a placement rule sees the click.
+    #[test]
+    fn cell_rules_read_around_and_answer_both_ways() {
+        let r = testing::registry();
+        let (a, b) = (BlockState(1), BlockState(2));
+        let pair = UseRule::cells(|_, used| {
+            let up = IVec3::Y;
+            let mut cells = vec![CellChange::here(BlockState(2))];
+            if used.at(up) == Some(used.state) {
+                cells.push(CellChange::new(up, BlockState(2)));
+            }
+            Some(cells)
+        });
+        let world = |o: IVec3| (o == IVec3::Y).then_some(a);
+        let used = Use {
+            state: a,
+            look: Facing::North,
+            read: &world,
+        };
+        let cells = pair.apply_cells(&r, &used).unwrap();
+        assert_eq!(cells, [CellChange::here(b), CellChange::new(IVec3::Y, b)]);
+        assert_eq!(pair.apply(&r, a, Facing::North), Some(b), "the used cell");
+        let one = UseRule::new(|_, s, _| Some(BlockState(s.0 + 1)));
+        assert_eq!(one.apply_cells(&r, &used), Some(vec![CellChange::here(b)]));
+        let place = PlaceRule::new(|_, p| {
+            let side = p.face == Face::PosX && p.hit.y > 0.5;
+            side.then(|| vec![CellChange::here(p.held)])
+        });
+        let mut placing = Placing {
+            held: a,
+            clicked: b,
+            face: Face::PosX,
+            clicked_offset: IVec3::NEG_X,
+            hit: DVec3::new(1.0, 0.75, 0.5),
+            look: DVec3::new(-1.0, 0.0, 0.2),
+            read: &world,
+        };
+        assert_eq!(place.apply(&r, &placing), Some(vec![CellChange::here(a)]));
+        assert_eq!(placing.look_facing(), Facing::West);
+        placing.hit.y = 0.25;
+        assert_eq!(place.apply(&r, &placing), None);
+    }
 
     /// No block of the `test:` set sets a support shape, so every state (and one out of range)
     /// holds other blocks with its collision: [`is_sturdy`] and [`supports_center`] read what
