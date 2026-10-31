@@ -387,7 +387,11 @@ impl ModelPlane {
     /// turned point): the turned box, then the kind, spin, mirror and texture turn whose
     /// corners are the turned corners, showing the same texels.
     fn map(self, turns: u8, turn: impl Fn([f32; 3]) -> [f32; 3]) -> ModelPlane {
-        let mut plane = if turns % 4 == 0 { self } else { self.baked() };
+        let mut plane = if turns.is_multiple_of(4) {
+            self
+        } else {
+            self.baked()
+        };
         for _ in 0..turns % 4 {
             plane = plane.turn_once(&turn);
         }
