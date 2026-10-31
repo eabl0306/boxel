@@ -150,10 +150,13 @@ impl QuadBox {
             };
         }
         if quad.shape() == layout::SHAPE_BOX {
-            // One box face (ADR 0020): the box spans its own sixteenths of the cell.
-            let b = boxes
-                .get(usize::from(quad.box_index()))
-                .map_or(CollisionBox::FULL, |b| b.bounds());
+            // One box face (ADR 0020): the box spans its own sixteenths of the cell, its entry
+            // turned by the quad's quarter turns (ADR 0052).
+            let b = match boxes.get(usize::from(quad.box_index())) {
+                Some(TableEntry::Box(b)) => b.turned(quad.box_turn()).bounds,
+                Some(entry) => entry.bounds(),
+                None => CollisionBox::FULL,
+            };
             for a in [u, v] {
                 min[a] = p[a] + i32::from(b.min[a]);
                 max[a] = p[a] + i32::from(b.max[a]);

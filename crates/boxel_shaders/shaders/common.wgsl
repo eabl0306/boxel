@@ -8,7 +8,8 @@
 //        and in the AO bits, and the bit after the heights for the water of a waterlogged block;
 //        a cross of a face but +X and +Z is a plane (ADR 0046): its table entry in the (w-1,
 //        h-1) bits, its kind and spin in the AO bits, its quarter turns about the vertical in
-//        its face)
+//        its face; a box face keeps its box's quarter turns in flag bit 0 and the top layer
+//        bit, or, full bright, its face and turns in the AO bits and face value 6, ADR 0052)
 //   mat: layer:12 | ao:8 (2 bits per corner, 3 = unoccluded) | light:12 (index into the chunk's
 //        light palette)
 // face: 0=+Y 1=-Y 2=+X 3=-X 4=+Z 5=-Z  (u,v axes: ±Y -> (X,Z), ±X -> (Z,Y), ±Z -> (X,Y))
@@ -87,6 +88,15 @@ const WATER_FLOW_SPEED: f32 = 0.5;
 const LAVA_FLOW_SPEED: f32 = 0.25;
 const SHAPE_BOX: u32 = 6u;         // a face of one model box (slabs, stairs, fences, torches; w = h = 1)
 const GEO_BOX_MASK: u32 = 1023u;   // the box index of a SHAPE_BOX quad, at GEO_W_SHIFT
+// A box face's box is its table entry turned clockwise from above by its quarter turns (ADR
+// 0052): the low bit is flag bit 0 (BOX_TURN_FLAG, not FLAG_EMISSIVE), the high one mat bit 11
+// (MAT_BOX_TURN_BIT: its layer has 11 bits, BOX_LAYER_MASK). A full bright box face has face
+// value BOX_BRIGHT_FACE: its face is in AO bits 0..2 and its turns in bits 3..4 (it has no AO).
+const BOX_TURN_FLAG: u32 = 1u;
+const MAT_BOX_TURN_BIT: u32 = 11u;
+const BOX_LAYER_MASK: u32 = 0x7FFu;
+const BOX_BRIGHT_FACE: u32 = 6u;
+const BOX_BRIGHT_TURN_SHIFT: u32 = 3u;
 const BOX_COORD_BITS: u32 = 5u;    // packed box word 0: min xyz, max xyz in sixteenths
 const BOX_OFFSET_BITS: u32 = 6u;   // packed box word 1: texture offset xyz, biased by BOX_OFFSET_BIAS
 const BOX_OFFSET_BIAS: i32 = 32;
@@ -185,7 +195,10 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   let p = vec3<f32>(f32(geo & GEO_POS_MASK), f32((geo >> GEO_Y_SHIFT) & GEO_POS_MASK), f32((geo >> GEO_Z_SHIFT) & GEO_POS_MASK));
   let w = select(f32(((geo >> GEO_W_SHIFT) & GEO_POS_MASK) + 1u), 1.0, sloped);
   let h = select(f32(((geo >> GEO_H_SHIFT) & GEO_POS_MASK) + 1u), 1.0, sloped);
-  let f = (geo >> GEO_FACE_SHIFT) & 7u;
+  let boxed = shape == SHAPE_BOX;
+  let raw_face = (geo >> GEO_FACE_SHIFT) & 7u;
+  let bright_box = boxed && raw_face == BOX_BRIGHT_FACE;
+  let f = select(raw_face, (mat >> MAT_AO_SHIFT) & 7u, bright_box);
   let n = face_normal(f);
   let u = face_u(f);
   let v = face_v(f);
@@ -219,10 +232,24 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     let odd = (index & 1u) == 1u;
     let w0 = select(pair.x, pair.z, odd);
     let w1 = select(pair.y, pair.w, odd);
-    let lo = vec3<f32>((vec3(w0) >> vec3(0u, BOX_COORD_BITS, 2u * BOX_COORD_BITS)) & vec3(31u)) / 16.0;
-    let hi = vec3<f32>((vec3(w0) >> vec3(3u * BOX_COORD_BITS, 4u * BOX_COORD_BITS, 5u * BOX_COORD_BITS)) & vec3(31u)) / 16.0;
+    var lo_i = (vec3(w0) >> vec3(0u, BOX_COORD_BITS, 2u * BOX_COORD_BITS)) & vec3(31u);
+    var hi_i = (vec3(w0) >> vec3(3u * BOX_COORD_BITS, 4u * BOX_COORD_BITS, 5u * BOX_COORD_BITS)) & vec3(31u);
     let raw = (vec3(w1) >> vec3(0u, BOX_OFFSET_BITS, 2u * BOX_OFFSET_BITS)) & vec3(63u);
-    let shift = vec3<f32>(vec3<i32>(raw) - vec3(BOX_OFFSET_BIAS)) / 16.0;
+    var shift_i = vec3<i32>(raw) - vec3(BOX_OFFSET_BIAS);
+    // The entry turned a quarter at a time, clockwise from above, as boxel_voxel's
+    // ModelBox::turned: (x, z) -> (16 - z, x), the texture offset (-z, y, x). Integers, so the
+    // box is exactly the turned copy it stands for.
+    let turns = select(((geo >> GEO_FLAGS_SHIFT) & BOX_TURN_FLAG) | (((mat >> MAT_BOX_TURN_BIT) & 1u) << 1u),
+                       (mat >> (MAT_AO_SHIFT + BOX_BRIGHT_TURN_SHIFT)) & 3u, bright_box);
+    for (var k = 0u; k < turns; k++) {
+      let l = lo_i;
+      lo_i = vec3(16u - hi_i.z, l.y, l.x);
+      hi_i = vec3(16u - l.z, hi_i.y, hi_i.x);
+      shift_i = vec3(-shift_i.z, shift_i.y, shift_i.x);
+    }
+    let lo = vec3<f32>(lo_i) / 16.0;
+    let hi = vec3<f32>(hi_i) / 16.0;
+    let shift = vec3<f32>(shift_i) / 16.0;
     let an = abs(n);
     let su = select(dot(lo, u), dot(hi, u), (c & 1u) == 1u);
     let sv = select(dot(lo, v), dot(hi, v), (c >> 1u) == 1u);
@@ -232,6 +259,10 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     let tv = sv + dot(shift, v);
     o.uv = select(vec2(tu, tv), vec2(tu, 1.0 - tv), f >= 2u);
     o.st = vec2(su, sv);
+    // 11 bits of layer; full bright only by its face value (flag bit 0 is a turn bit), no AO.
+    o.layer = mat & BOX_LAYER_MASK;
+    o.flags = (o.flags & ~FLAG_EMISSIVE) | select(0u, FLAG_EMISSIVE, bright_box);
+    o.ao = select(o.ao, 0xFFu, bright_box);
   } else if (shape == SHAPE_FLUID_SURFACE) {
     // Fluid surface (water): the cell's top drops to FLUID_SURFACE. Side faces span y in
     // [0, FLUID_SURFACE] (h = 1: a surface cell has no surface cell of its fluid above or below)

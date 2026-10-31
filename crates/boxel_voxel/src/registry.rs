@@ -7,7 +7,7 @@ use crate::cell_quads::CellQuadRule;
 use crate::fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
 use crate::planes::{ModelPlane, TableEntry};
 use crate::rules::{NeighborRule, PlaceRule, UseRule};
-use crate::shapes::{MAX_MODEL_BOXES, ModelBox};
+use crate::shapes::{MAX_BOX_FACE_LAYERS, MAX_MODEL_BOXES, ModelBox};
 use crate::state::{Property, StateName, StateParseError, StateValues, split_state};
 use crate::{Face, LightValue, OPAQUE_OPACITY};
 use std::ops::Range;
@@ -352,11 +352,15 @@ impl BoxModel {
     }
 
     /// The model box table entries it draws with: those of each box's faces
-    /// ([`box_face_entries`]).
+    /// ([`box_face_entries`]), each as the entry it shares with its quarter turns
+    /// ([`ModelBox::canonical`], ADR 0052: the face quad says the turns).
     pub fn table_boxes(&self) -> impl Iterator<Item = ModelBox> + '_ {
         self.boxes.iter().enumerate().flat_map(move |(i, &b)| {
             let faces = Face::ALL.map(|f| self.face_texture(i, f));
-            box_face_entries(b, &faces).into_iter().flatten()
+            box_face_entries(b, &faces)
+                .into_iter()
+                .flatten()
+                .map(|b| b.canonical().0)
         })
     }
 
@@ -466,7 +470,8 @@ fn boxes_of(models: &[BoxModel], model: BlockModel) -> &[ModelBox] {
     }
 }
 
-/// The model box table entries `model` draws with ([`BoxModel::table_entries`]; a slab's half).
+/// The model box table entries `model` draws with ([`BoxModel::table_entries`]; a slab's half,
+/// as the entry of its turns).
 fn table_entries_of(models: &[BoxModel], model: BlockModel) -> Vec<TableEntry> {
     match model {
         BlockModel::Boxes(id) => models
@@ -474,7 +479,7 @@ fn table_entries_of(models: &[BoxModel], model: BlockModel) -> Vec<TableEntry> {
             .map_or_else(Vec::new, |m| m.table_entries().collect()),
         _ => boxes_of(models, model)
             .iter()
-            .map(|&b| TableEntry::Box(b))
+            .map(|&b| TableEntry::Box(b.canonical().0))
             .collect(),
     }
 }
@@ -768,7 +773,8 @@ pub enum RegistryError {
     #[error("invalid name {0}")]
     InvalidName(String),
     /// More than 4096 textures, [`MAX_STATES`] states, `u16::MAX` box models,
-    /// [`MAX_MODEL_BOXES`] distinct model boxes or [`MAX_FLUIDS`] fluids.
+    /// [`MAX_MODEL_BOXES`] distinct model boxes or [`MAX_FLUIDS`] fluids, or a box face that
+    /// shows a layer past [`MAX_BOX_FACE_LAYERS`].
     #[error("registry full: {0}")]
     Full(&'static str),
     /// A property of the block with an invalid name or value, no values, a default that is not
@@ -986,10 +992,19 @@ impl BlockRegistryBuilder {
             return Err(RegistryError::InvalidCollision("a box model".to_string()));
         }
         let faces = model.textures.iter().flatten().filter_map(|t| t.texture);
-        for t in faces.chain(model.planes.iter().filter_map(|p| p.texture)) {
+        for t in faces
+            .clone()
+            .chain(model.planes.iter().filter_map(|p| p.texture))
+        {
             if usize::from(t.0) >= self.textures.len() {
                 return Err(RegistryError::UnknownTexture(t.0));
             }
+        }
+        if faces
+            .clone()
+            .any(|t| usize::from(t.0) >= MAX_BOX_FACE_LAYERS)
+        {
+            return Err(RegistryError::Full("box face layers"));
         }
         if let Some(&id) = self.box_model_ids.get(&model) {
             return Ok(id);
@@ -1343,6 +1358,17 @@ impl BlockRegistryBuilder {
                 if t.0 as usize >= self.textures.len() {
                     return Err(RegistryError::UnknownTexture(t.0));
                 }
+            }
+            // A box face quad holds 11 bits of layer (ADR 0052).
+            let boxes = matches!(def.model, BlockModel::Slab(_) | BlockModel::Boxes(_));
+            if boxes
+                && def
+                    .textures
+                    .faces()
+                    .iter()
+                    .any(|t| usize::from(t.0) >= MAX_BOX_FACE_LAYERS)
+            {
+                return Err(RegistryError::Full("box face layers"));
             }
         }
         Ok(())

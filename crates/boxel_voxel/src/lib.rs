@@ -75,7 +75,7 @@ pub use registry::{
     MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
     TextureImage, TextureSpec, WATERLOGGED, box_face_entries, validate_name,
 };
-pub use shapes::{Facing, MAX_MODEL_BOXES, ModelBox};
+pub use shapes::{Facing, MAX_BOX_FACE_LAYERS, MAX_MODEL_BOXES, ModelBox};
 pub use state::{Property, StateName, StateParseError, StateValues};
 pub use storage::{Occupancy, Paletted};
 

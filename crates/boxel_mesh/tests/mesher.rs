@@ -590,6 +590,17 @@ fn a_lit_emitter_is_drawn_flat_at_its_own_light() {
         assert_eq!(glowing.bucket_counts, like.bucket_counts, "{ember}");
         assert_eq!(glowing.quads.len(), like.quads.len(), "{ember}");
         for (a, b) in like.quads.iter().zip(&glowing.quads) {
+            if own(b) && special == Some(layout::SHAPE_BOX) {
+                // A full bright box face says so by its face value and keeps its face and turns
+                // in its AO byte (ADR 0052): the same face of the same box.
+                assert!(b.is_emissive() && !a.is_emissive(), "{ember}: {a:?} {b:?}");
+                let fields = |q: &PackedQuad| {
+                    let at = (q.pos(), q.face(), q.layer(), q.light_index());
+                    (at, q.shape(), q.box_index(), q.box_turn())
+                };
+                assert_eq!(fields(a), fields(b), "{ember}");
+                continue;
+            }
             assert_eq!(a.mat, b.mat, "{ember}");
             let expected = if own(b) { flag } else { 0 };
             assert_eq!(a.geo ^ b.geo, expected, "{ember}: {a:?} {b:?}");

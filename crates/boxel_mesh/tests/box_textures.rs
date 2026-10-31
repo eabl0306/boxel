@@ -6,10 +6,9 @@ mod common;
 
 use boxel_mesh::{
     AoPolicy, BUCKET_COUNT, ChunkMesh, MaterialTable, MeshOptions, Mesher, PaddedChunk, layout,
+    quad_model_box,
 };
-use boxel_voxel::{
-    BlockModel, BoxFaceTexture, BoxModelId, Face, ModelBox, RenderShape, TableEntry, TextureId,
-};
+use boxel_voxel::{BlockModel, BoxFaceTexture, BoxModelId, Face, ModelBox, RenderShape, TextureId};
 use common::set_material;
 
 /// The block's layer of (material, face) is `material * 6 + face`; the box layers start at 100.
@@ -57,7 +56,8 @@ fn box_quads(mesh: &ChunkMesh, table: &MaterialTable, p: [u32; 3]) -> Vec<(Face,
         .flat_map(|b| mesh.bucket(b).iter())
         .filter(|q| q.shape() == layout::SHAPE_BOX && q.pos() == p)
         .map(|q| {
-            let TableEntry::Box(b) = table.model_boxes()[usize::from(q.box_index())] else {
+            // The entry turned by the quad's turns (ADR 0052).
+            let Some(b) = quad_model_box(*q, table.model_boxes()) else {
                 panic!("a box face indexes a plane: {q:?}");
             };
             (q.face(), q.layer(), b)
@@ -136,4 +136,48 @@ fn hidden_faces_are_not_drawn_and_hide_nothing() {
         .map(|q| q.0)
         .collect();
     assert!(!plain.contains(&Face::PosX), "{plain:?}");
+}
+
+/// ADR 0052: the four facings of a model share its table entries, and each facing's quads draw
+/// its own turned boxes (the entry turned by the quad's turns), full bright or not.
+#[test]
+fn turned_models_share_their_table_entries() {
+    let step = [
+        ModelBox::new([0, 0, 0], [16, 8, 16]),
+        ModelBox {
+            texture_offset: [3, 0, -5],
+            ..ModelBox::new([8, 8, 0], [16, 16, 16])
+        },
+        ModelBox::new([1, 8, 2], [4, 12, 7]),
+    ];
+    let shapes = vec![RenderShape::Cutout; 9];
+    let layers = (0..9u16)
+        .map(|m| Face::ALL.map(|f| m * BLOCK_LAYERS + f.index() as u16))
+        .collect();
+    let mut t = MaterialTable::from_parts(shapes, layers);
+    for m in 1..9u16 {
+        let turns = (m - 1) % 4;
+        let boxes = step.map(|b| b.turned(turns as u8));
+        t.set_model(m, BlockModel::Boxes(BoxModelId(m)), &boxes);
+        t.set_emissive(m, m >= 5);
+    }
+    assert_eq!(t.model_boxes().len(), step.len(), "{:?}", t.model_boxes());
+    for m in 1..9u16 {
+        let turns = ((m - 1) % 4) as u8;
+        let mut padded = PaddedChunk::new();
+        set_material(&mut padded, &t, [5, 5, 5], m);
+        let mesh = mesh(&padded, &t);
+        let quads = box_quads(&mesh, &t, [5, 5, 5]);
+        assert!(!quads.is_empty());
+        for (face, _, b) in &quads {
+            assert!(
+                step.iter().any(|s| s.turned(turns) == *b),
+                "material {m}: {face:?} draws {b:?}"
+            );
+        }
+        let all = (0..BUCKET_COUNT).flat_map(|b| mesh.bucket(b).iter());
+        for q in all.filter(|q| q.shape() == layout::SHAPE_BOX) {
+            assert_eq!(q.is_emissive(), m >= 5, "{q:?}");
+        }
+    }
 }

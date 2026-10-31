@@ -161,9 +161,11 @@ fn add_rect(cover: &mut Cover, rect: Rect) {
 #[derive(Clone, Copy, Debug)]
 struct BoxFace {
     face: Face,
-    /// Index of the box in [`BoxModels::boxes`] (the face's own entry when it crops its
-    /// texture, EW-BOXTEX).
+    /// Index of the box's entry in [`BoxModels::boxes`] (the face's own entry when it crops its
+    /// texture, EW-BOXTEX), which the box shares with its quarter turns (ADR 0052).
     index: u16,
+    /// The quarter turns from that entry to the box ([`ModelBox::canonical`]).
+    turn: u8,
     /// Its texture layer, [`BLOCK_LAYER`] for the block's layer of `face`.
     layer: u16,
     /// Flush with the cell border (a neighbor can hide it).
@@ -258,9 +260,11 @@ impl BoxShape {
                 if border {
                     add_rect(&mut covers[face.index()], rect);
                 }
+                let (entry, turn) = table_box.canonical();
                 faces.push(BoxFace {
                     face,
-                    index: index(TableEntry::Box(table_box)),
+                    index: index(TableEntry::Box(entry)),
+                    turn,
                     layer: texture(i, face).texture.map_or(BLOCK_LAYER, |t| t.0),
                     border,
                     rect,
@@ -1628,8 +1632,8 @@ fn emit_specials(
     mut shade: impl FnMut(u16, usize, Face, Option<u32>) -> Result<(u8, u16), PaletteFull>,
 ) -> Result<(), PaletteFull> {
     out.clear();
-    // `index`: the model box of a `SHAPE_BOX` quad (0 is `w = h = 1` for the others).
-    let mut push = |m: u16, pos: [u32; 3], face: Face, layer: u16, code: u8, index, shading| {
+    // `index`: the table entry of a plane quad (0 is `w = h = 1` for the others).
+    let quad = |m: u16, pos: [u32; 3], face: Face, layer: u16, code: u8, index, shading| {
         let (ao, light): (u8, u16) = shading;
         let mut quad = PackedQuad::new(pos, 1, 1, face, layer)
             .with_ao_byte(ao)
@@ -1639,6 +1643,9 @@ fn emit_specials(
         if materials.emissive(m) {
             quad.geo |= layout::FLAG_EMISSIVE << layout::GEO_FLAGS_SHIFT;
         }
+        quad
+    };
+    let mut push = |m: u16, face: Face, quad: PackedQuad| {
         let mut bucket = materials.bucket(m, face);
         if quad.is_plane() {
             // Drawn from both sides: an opaque block's planes go to the cutout bucket, which
@@ -1673,7 +1680,14 @@ fn emit_specials(
                 } else {
                     bf.layer
                 };
-                push(m, pos, face, layer, layout::SHAPE_BOX, bf.index, shading);
+                // Its entry, its turns and the full bright flag in the box face's own way
+                // (ADR 0052).
+                let (ao, light) = shading;
+                let bright = materials.emissive(m);
+                let (index, turn) = (bf.index, bf.turn);
+                let q =
+                    PackedQuad::model_box_face(pos, face, layer, index, turn, bright, ao, light);
+                push(m, face, q);
             }
             if !shape.planes.is_empty() {
                 // Lit as a cross: from the block's own cell, without AO (the AO byte holds the
@@ -1687,15 +1701,9 @@ fn emit_specials(
                         plane.layer
                     };
                     let code = layout::SHAPE_CROSS;
-                    push(
-                        m,
-                        pos,
-                        plane.face,
-                        layer,
-                        code,
-                        plane.index,
-                        (plane.byte, light),
-                    );
+                    let shading = (plane.byte, light);
+                    let q = quad(m, pos, plane.face, layer, code, plane.index, shading);
+                    push(m, plane.face, q);
                 }
             }
         } else if materials.model(m) == BlockModel::Cross {
@@ -1703,7 +1711,11 @@ fn emit_specials(
             for face in [Face::PosX, Face::PosZ] {
                 let shading = shade(m, i, face, None)?;
                 let layer = materials.layer(m, Face::PosX);
-                push(m, pos, face, layer, layout::SHAPE_CROSS, 0, shading);
+                push(
+                    m,
+                    face,
+                    quad(m, pos, face, layer, layout::SHAPE_CROSS, 0, shading),
+                );
             }
         } else if materials.model(m).is_solid_cube() {
             // A waterlogged cube (`padded.special` holds none): the unit faces of the dry cube,
@@ -1717,7 +1729,8 @@ fn emit_specials(
                 let nb9 = front_nb9(face, &padded.opaque, x as usize, y as usize, z as usize);
                 let shading = shade(m, front, face, Some(nb9))?;
                 let code = materials.cube_code(m, face);
-                push(m, pos, face, materials.layer(m, face), code, 0, shading);
+                let layer = materials.layer(m, face);
+                push(m, face, quad(m, pos, face, layer, code, 0, shading));
             }
         }
         Ok(())

@@ -3,7 +3,10 @@
 //! mesh of a showcase chunk with every state of the registry on a grid, and the meshes of two
 //! chunks each (surface and underground) of the flat, terrain, forest and overworld (with its
 //! caves) worlds. Frozen before the content moved out of the engine: the literal never changes,
-//! only the setup lines below may.
+//! only the setup lines below may. One exception, ADR 0052: box faces carry their box's quarter
+//! turns, so the turns of a box share one table entry. Every quad count, bucket count, palette
+//! and material line stayed; the box table (160 entries to 56) and the showcase's mesh hash
+//! changed, and the pixels did not (`gpu_box_turns`).
 
 #[path = "../../boxel_voxel/tests/golden/mod.rs"]
 mod golden;
@@ -169,5 +172,5 @@ fn dump(r: &BlockRegistry) -> String {
 
 #[test]
 fn the_meshes_of_the_content_are_frozen() {
-    golden::check("mesh", &dump(&registry()), 0x5b12_bf92_b5fd_cace);
+    golden::check("mesh", &dump(&registry()), 0xc921_2b29_d02c_6e2d);
 }

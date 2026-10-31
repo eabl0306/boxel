@@ -15,7 +15,6 @@ use boxel_mesh::{
 };
 use boxel_voxel::{
     Axis, BlockModel, BoxModelId, Face, Facing, LightValue, ModelBox, RenderShape, SlabHalf,
-    TableEntry,
 };
 use common::{Fill, LIGHT_FILLS, random_light, random_padded, set_material};
 use std::collections::BTreeSet;
@@ -284,8 +283,8 @@ fn split_mesh(
                     }
                 }
                 layout::SHAPE_BOX => {
-                    let TableEntry::Box(b) = table.model_boxes()[usize::from(quad.box_index())]
-                    else {
+                    // The entry turned by the quad's turns (ADR 0052).
+                    let Some(b) = boxel_mesh::quad_model_box(quad, table.model_boxes()) else {
                         panic!("a box face indexes a plane: {quad:?}");
                     };
                     specials.push((

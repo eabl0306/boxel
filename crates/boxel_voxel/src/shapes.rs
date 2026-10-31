@@ -8,8 +8,14 @@
 use crate::{CollisionBox, Face, SlabHalf};
 
 /// Most distinct [`ModelBox`]es a registry may use, over all its states: the box index of a
-/// mesher quad has 10 bits, and the renderer keeps the whole table in its view uniform.
+/// mesher quad has 10 bits, and the renderer keeps the whole table in its view uniform. The
+/// quarter turns of a box share its entry ([`ModelBox::canonical`], ADR 0052).
 pub const MAX_MODEL_BOXES: usize = 1 << 10;
+
+/// Texture layers a box face can show (`0..MAX_BOX_FACE_LAYERS`): the box face quad keeps the
+/// top bit of its 12-bit layer for its box's quarter turns (ADR 0052). The registry refuses a
+/// box model or a block made of boxes that shows a layer past it.
+pub const MAX_BOX_FACE_LAYERS: usize = 1 << 11;
 
 /// A horizontal direction (Minecraft's `facing` of stairs and wall torches): north is -Z, south
 /// +Z, west -X and east +X.
@@ -248,6 +254,22 @@ impl ModelBox {
             (uv[1] as i32 - min[v] as i32).rem_euclid(16) as i8
         };
         b
+    }
+
+    /// The box of the model box table entry this box shares with its quarter turns around the
+    /// vertical (ADR 0052), and the turns that take that box to this one: `(entry, turns)` with
+    /// `entry.turned(turns) == self`. The entry is the smallest valid one of the four turns of
+    /// the box (by min, max, then texture offset), so every turn of a box gives the same entry;
+    /// `turns` is the fewest that fit (a box its turns leave as it is gives 0).
+    pub fn canonical(self) -> (ModelBox, u8) {
+        let key =
+            |(b, turns): &(ModelBox, u8)| (b.bounds.min, b.bounds.max, b.texture_offset, *turns);
+        // `self.turned(j)` turned `4 - j` more is `self` again.
+        (0..4)
+            .map(|j| (self.turned(j), (4 - j) % 4))
+            .filter(|(b, _)| b.is_valid())
+            .min_by_key(key)
+            .unwrap_or((self, 0))
     }
 
     /// The box mirrored upside down (`y -> 16 - y`), for top stairs.

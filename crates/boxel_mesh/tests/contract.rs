@@ -10,13 +10,12 @@ fn packed_quad_roundtrip() {
     assert_eq!(q.face(), Face::NegX);
     assert_eq!(q.layer(), 4095);
     assert_eq!((q.ao_byte(), q.light_index(), q.flags()), (0xFF, 0, 0));
-    // Flags 13: emissive and the box shape (shape 4 on this face would be a plane quad, whose
-    // AO byte is its plane byte, ADR 0046).
-    let lit = q
-        .with_light_index(4095)
-        .with_ao([0, 1, 2, 3])
-        .with_flags(13);
-    assert_eq!((lit.light_index(), lit.flags()), (4095, 13));
+    // Flags 5: emissive and the fluid cube shape (shape 4 on this face would be a plane quad,
+    // whose AO byte is its plane byte, ADR 0046; a box face, shape 6, reads flag bit 0 and the
+    // layer's top bit as its turns, ADR 0052).
+    let lit = q.with_light_index(4095).with_ao([0, 1, 2, 3]).with_flags(5);
+    assert_eq!((lit.light_index(), lit.flags()), (4095, 5));
+    assert!(lit.is_emissive());
     assert_eq!([0, 1, 2, 3].map(|k| lit.ao(k)), [0, 1, 2, 3]);
     assert_eq!(lit.ao_byte(), 0b11_10_01_00);
     // Geometry and layer are untouched by the other fields.
@@ -27,6 +26,52 @@ fn packed_quad_roundtrip() {
     assert_eq!(lit.layer(), 4095);
     assert_eq!(lit.with_light_index(7).with_flags(0).light_index(), 7);
     assert_eq!(size_of::<PackedQuad>(), 8);
+}
+
+/// A box face quad (ADR 0052) keeps every field through every turn, full bright or not: the
+/// turns in flag bit 0 and the layer's top bit, or, full bright, the face and turns in the AO
+/// byte under face value 6.
+#[test]
+fn box_face_quads_keep_their_turns() {
+    use layout::*;
+    for face in Face::ALL {
+        for turns in 0..4 {
+            for bright in [false, true] {
+                for (layer, index, ao, light) in [(0, 0, 0, 0), (2047, 1023, 0xA5, 4095)] {
+                    let q = PackedQuad::model_box_face(
+                        [31, 7, 0],
+                        face,
+                        layer,
+                        index,
+                        turns,
+                        bright,
+                        ao,
+                        light,
+                    );
+                    let what = format!("{face:?} {turns} {bright} {layer}");
+                    assert_eq!(q.shape(), SHAPE_BOX, "{what}");
+                    assert_eq!(q.pos(), [31, 7, 0], "{what}");
+                    assert_eq!(
+                        (q.face(), q.layer(), q.box_index()),
+                        (face, layer, index),
+                        "{what}"
+                    );
+                    assert_eq!((q.box_turn(), q.is_emissive()), (turns, bright), "{what}");
+                    assert_eq!(q.light_index(), light, "{what}");
+                    assert_eq!(q.ao_byte(), if bright { 0xFF } else { ao }, "{what}");
+                    let raw_face = (q.geo >> GEO_FACE_SHIFT) & 7;
+                    assert_eq!(raw_face == BOX_BRIGHT_FACE, bright, "{what}");
+                    assert!(!q.is_plane(), "{what}");
+                }
+            }
+        }
+    }
+    // The other shapes keep the emissive flag and 12 bits of layer.
+    let cube = PackedQuad::new([0; 3], 1, 1, Face::PosY, 4095).with_flags(1);
+    assert_eq!(
+        (cube.layer(), cube.is_emissive(), cube.box_turn()),
+        (4095, true, 0)
+    );
 }
 
 #[test]

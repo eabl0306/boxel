@@ -10,6 +10,9 @@ use std::ops::Range;
 /// [`FLAG_EMISSIVE`](crate::layout::FLAG_EMISSIVE); bits 1 to 3: the quad's shape code,
 /// [`GEO_SHAPE_SHIFT`](crate::layout::GEO_SHAPE_SHIFT), ADR 0018)
 /// `mat`: `layer:12 | ao:8 (2 bits per corner, 3 = open) | light:12 (palette index)`
+///
+/// Some shapes give fields other meanings: a box face ([`SHAPE_BOX`](crate::layout::SHAPE_BOX))
+/// keeps its quarter turns in flag bit 0 and the top bit of the layer (ADR 0052).
 pub mod layout {
     /// Mask of one 5-bit position/extent field.
     pub const GEO_POS_MASK: u32 = 31;
@@ -115,16 +118,38 @@ pub mod layout {
     /// 1/512 of a block (Minecraft's is 0.001).
     pub const FLUID_INSET: f32 = 1.0 / 512.0;
     /// A face of one box of a block model made of boxes (slabs, stairs, fences, torches; ADR
-    /// 0020): the quad's `w - 1` and `h - 1` bits hold the box's index in the model box table
-    /// (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from its view
-    /// uniform. The face lies on the box's side toward the quad's face, spans the box along u
-    /// and v, and shades like that part of the cube face. (Code 3, a slab half in ADR 0018, is
-    /// the edge wall's now: slabs are boxes.)
+    /// 0020): the quad's `w - 1` and `h - 1` bits hold the index of its box's entry in the model
+    /// box table (`MaterialTable::model_boxes`, [`GEO_BOX_SHIFT`]), which the shader reads from
+    /// its view uniform. The face lies on the box's side toward the quad's face, spans the box
+    /// along u and v, and shades like that part of the cube face. (Code 3, a slab half in ADR
+    /// 0018, is the edge wall's now: slabs are boxes.)
+    ///
+    /// The box is the entry turned clockwise seen from above by the quad's quarter turns (ADR
+    /// 0052, [`PackedQuad::box_turn`](crate::PackedQuad::box_turn), as `ModelBox::turned`), so
+    /// the four turns of a box share one entry. The turns take two bits no box face uses
+    /// otherwise: the low one is flag bit 0 ([`BOX_TURN_FLAG`], [`FLAG_EMISSIVE`] on other
+    /// quads), the high one the top bit of the layer ([`MAT_BOX_TURN_BIT`]: a box face's layer
+    /// has 11 bits, [`BOX_LAYER_MASK`]). A full bright box face, which has no AO, says so with
+    /// face value [`BOX_BRIGHT_FACE`] and keeps its face in AO bits 0 to 2 and its turns in bits
+    /// 3 and 4 ([`BOX_BRIGHT_TURN_SHIFT`]).
     pub const SHAPE_BOX: u8 = 6;
     /// Shift of the model box index of a [`SHAPE_BOX`] quad (the `w - 1` and `h - 1` fields).
     pub const GEO_BOX_SHIFT: u32 = GEO_W_SHIFT;
     /// Mask of the model box index (after the shift): 10 bits.
     pub const GEO_BOX_MASK: u32 = 1023;
+    /// The flag bit (of the 4 at [`GEO_FLAGS_SHIFT`]) that holds the low bit of a [`SHAPE_BOX`]
+    /// quad's quarter turns (ADR 0052): bit 0, [`FLAG_EMISSIVE`] on the other shapes.
+    pub const BOX_TURN_FLAG: u32 = FLAG_EMISSIVE;
+    /// Bit of `mat` that holds the high bit of a [`SHAPE_BOX`] quad's quarter turns: the top bit
+    /// of the layer field.
+    pub const MAT_BOX_TURN_BIT: u32 = 11;
+    /// Mask of a [`SHAPE_BOX`] quad's layer: 11 bits (`boxel_voxel::MAX_BOX_FACE_LAYERS`).
+    pub const BOX_LAYER_MASK: u32 = 0x7FF;
+    /// The face value of a full bright [`SHAPE_BOX`] quad (no AO, no light): its face is in AO
+    /// bits 0 to 2 and its quarter turns in bits 3 and 4.
+    pub const BOX_BRIGHT_FACE: u32 = 6;
+    /// Shift, in the AO byte of a full bright [`SHAPE_BOX`] quad, of its quarter turns.
+    pub const BOX_BRIGHT_TURN_SHIFT: u32 = 3;
     /// Bits of the first word of a packed model box ([`pack_model_box`](crate::pack_model_box)):
     /// min x, y, z then max x, y, z, 5 bits each (sixteenths, `0..=16`).
     pub const BOX_COORD_BITS: u32 = 5;
@@ -303,16 +328,75 @@ impl PackedQuad {
         quad.mat = (quad.mat & !(0xFF << MAT_AO_SHIFT)) | (h[2] | h[3] << 4) << MAT_AO_SHIFT;
         quad
     }
-    /// Face (invalid bit patterns map to `NegZ`).
+    /// Face (invalid bit patterns map to `NegZ`; a full bright box face's is in its AO byte,
+    /// [`layout::BOX_BRIGHT_FACE`]).
     pub const fn face(self) -> Face {
-        match Face::from_index(((self.geo >> layout::GEO_FACE_SHIFT) & 7) as u8) {
+        let index = if self.is_bright_box() {
+            (self.mat >> layout::MAT_AO_SHIFT) & 7
+        } else {
+            (self.geo >> layout::GEO_FACE_SHIFT) & 7
+        };
+        match Face::from_index(index as u8) {
             Some(f) => f,
             None => Face::NegZ,
         }
     }
-    /// The 4 flag bits.
+    /// The 4 flag bits as stored (bit 0 of a [`layout::SHAPE_BOX`] quad is the low bit of its
+    /// quarter turns, not [`layout::FLAG_EMISSIVE`]: see [`PackedQuad::is_emissive`]).
     pub const fn flags(self) -> u8 {
         ((self.geo >> layout::GEO_FLAGS_SHIFT) & 15) as u8
+    }
+    /// True for a full bright [`layout::SHAPE_BOX`] quad (face value
+    /// [`layout::BOX_BRIGHT_FACE`]).
+    const fn is_bright_box(self) -> bool {
+        self.shape() == layout::SHAPE_BOX
+            && (self.geo >> layout::GEO_FACE_SHIFT) & 7 == layout::BOX_BRIGHT_FACE
+    }
+    /// A [`layout::SHAPE_BOX`] quad (ADR 0020, 0052): the face `face` of the box of table entry
+    /// `index` turned `turns` quarter turns clockwise seen from above (`0..4`), its layer
+    /// (`0..2048`), full bright or not, its AO byte (not kept when full bright) and light
+    /// palette index. Debug-asserts the ranges.
+    #[expect(clippy::too_many_arguments, reason = "every field of a box face quad")]
+    pub const fn model_box_face(
+        pos: [u32; 3],
+        face: Face,
+        layer: u16,
+        index: u16,
+        turns: u8,
+        bright: bool,
+        ao: u8,
+        light: u16,
+    ) -> Self {
+        use layout::*;
+        debug_assert!((layer as u32) <= BOX_LAYER_MASK && turns < 4);
+        let quad = Self::new(pos, 1, 1, face, layer)
+            .with_light_index(light)
+            .with_shape(SHAPE_BOX)
+            .with_box_index(index);
+        if bright {
+            let mut quad = quad.with_ao_byte(face as u8 | (turns & 3) << BOX_BRIGHT_TURN_SHIFT);
+            quad.geo = (quad.geo & !(7 << GEO_FACE_SHIFT)) | BOX_BRIGHT_FACE << GEO_FACE_SHIFT;
+            quad
+        } else {
+            let mut quad = quad.with_ao_byte(ao);
+            quad.geo |= ((turns & 1) as u32 * BOX_TURN_FLAG) << GEO_FLAGS_SHIFT;
+            quad.mat |= (((turns >> 1) & 1) as u32) << MAT_BOX_TURN_BIT;
+            quad
+        }
+    }
+    /// The quarter turns of a [`layout::SHAPE_BOX`] quad's box from its table entry (clockwise
+    /// seen from above, ADR 0052; 0 for another quad).
+    pub const fn box_turn(self) -> u8 {
+        use layout::*;
+        if self.shape() != SHAPE_BOX {
+            return 0;
+        }
+        if self.is_bright_box() {
+            return ((self.mat >> (MAT_AO_SHIFT + BOX_BRIGHT_TURN_SHIFT)) & 3) as u8;
+        }
+        let low = (self.geo >> GEO_FLAGS_SHIFT) & BOX_TURN_FLAG;
+        let high = (self.mat >> MAT_BOX_TURN_BIT) & 1;
+        (low | high << 1) as u8
     }
     /// Shape code (`layout::SHAPE_*`).
     pub const fn shape(self) -> u8 {
@@ -339,23 +423,33 @@ impl PackedQuad {
             | ((index as u32 & GEO_BOX_MASK) << GEO_BOX_SHIFT);
         self
     }
-    /// True if the [`layout::FLAG_EMISSIVE`] flag is set.
+    /// True if the quad is drawn full bright: the [`layout::FLAG_EMISSIVE`] flag is set, or
+    /// for a [`layout::SHAPE_BOX`] quad its face value is [`layout::BOX_BRIGHT_FACE`].
     pub const fn is_emissive(self) -> bool {
+        if self.shape() == layout::SHAPE_BOX {
+            return self.is_bright_box();
+        }
         self.flags() as u32 & layout::FLAG_EMISSIVE != 0
     }
-    /// Texture layer.
+    /// Texture layer (11 bits for a [`layout::SHAPE_BOX`] quad).
     pub const fn layer(self) -> u16 {
-        (self.mat & layout::MAT_LAYER_MASK) as u16
+        let mask = if self.shape() == layout::SHAPE_BOX {
+            layout::BOX_LAYER_MASK
+        } else {
+            layout::MAT_LAYER_MASK
+        };
+        (self.mat & mask) as u16
     }
     /// AO of corner `k` (0..=3, 3 = open; open for a [`layout::SHAPE_FLUID_SLOPE`] quad).
     pub const fn ao(self, k: usize) -> u8 {
         (self.ao_byte() >> (2 * k as u32)) & 3
     }
     /// The packed AO byte (corner `k` at bits `2k..2k+2`; open, `0xFF`, for a
-    /// [`layout::SHAPE_FLUID_SLOPE`] quad, whose AO bits hold corner heights, and for a plane
-    /// quad, whose AO bits hold its plane byte).
+    /// [`layout::SHAPE_FLUID_SLOPE`] quad, whose AO bits hold corner heights, for a plane quad,
+    /// whose AO bits hold its plane byte, and for a full bright box face, whose AO bits hold its
+    /// face and turns).
     pub const fn ao_byte(self) -> u8 {
-        if self.shape() == layout::SHAPE_FLUID_SLOPE || self.is_plane() {
+        if self.shape() == layout::SHAPE_FLUID_SLOPE || self.is_plane() || self.is_bright_box() {
             return 0xFF;
         }
         (self.mat >> layout::MAT_AO_SHIFT) as u8
@@ -474,6 +568,17 @@ pub fn pack_table_entry(entry: TableEntry) -> [u32; 2] {
         TableEntry::Box(b) => pack_model_box(b),
         TableEntry::Plane(p) => pack_plane_entry(p),
     }
+}
+
+/// The box a [`layout::SHAPE_BOX`] quad draws a face of: its table entry in `table` (the model
+/// box table the quad indexes) turned by its quarter turns ([`PackedQuad::box_turn`], ADR 0052).
+/// `None` for another quad, or an index outside the table or at a plane entry.
+pub fn quad_model_box(quad: PackedQuad, table: &[TableEntry]) -> Option<ModelBox> {
+    if quad.shape() != layout::SHAPE_BOX {
+        return None;
+    }
+    let entry = table.get(usize::from(quad.box_index()))?.as_box()?;
+    Some(entry.turned(quad.box_turn()))
 }
 
 /// The model box of a packed one ([`pack_model_box`]).
