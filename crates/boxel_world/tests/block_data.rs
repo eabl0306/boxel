@@ -2,7 +2,8 @@
 //! queue with the blocks, follows its block (kept through a change of state, dropped when the
 //! block becomes another, unless the batch keeps it), survives an unload and a restart near the
 //! origin and far from it (±2^31, 2^40 and the world limit), makes a generated chunk count as
-//! edited, and remeshes its chunk only when the block's mesh reads it.
+//! edited, remeshes its chunk only when the block's mesh reads it, and stays through a tick that
+//! changes its block when the tick keeps it.
 use boxel_app::App;
 use boxel_math::DVec3;
 use boxel_transform::Transform;
@@ -13,7 +14,10 @@ use boxel_voxel::{
 };
 use boxel_world::jobs::InlineExecutor;
 use boxel_world::persist::{ChunkStore, MemoryStore, PersistPlugin, PersistSettings, WorldStore};
-use boxel_world::{ChunkMap, ChunkViewer, DataEdit, EditQueue, WorldPlugin, WorldStats};
+use boxel_world::{
+    BlockTicks, BlockTicksPlugin, ChunkMap, ChunkViewer, DataEdit, EditQueue, TickContext,
+    TickHandler, WorldPlugin, WorldStats,
+};
 use boxel_worldgen::WorldGenerator;
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -100,7 +104,8 @@ fn start(backend: &Arc<dyn ChunkStore>, registry: &Arc<BlockRegistry>, at: Block
             ..Default::default()
         },
     })
-    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)));
+    .add_plugins(PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)))
+    .add_plugins(BlockTicksPlugin);
     app.insert_resource(PersistSettings {
         autosave: None,
         retry_after: Duration::ZERO,
@@ -294,6 +299,52 @@ fn data_follows_its_block() {
     assert_eq!(w.data(a), None);
     assert_eq!(w.data(c), None);
     assert!(w.app.world().resource::<EditQueue>().is_empty());
+}
+
+/// A chest's tick turns it into a barrel, keeping the data of a lit furnace's (`lit` 5) only.
+fn rebuild(cx: &mut TickContext<'_>, pos: BlockPos, _: BlockState) {
+    let barrel = cx.registry().by_name("test:barrel").unwrap();
+    let lit = cx.block_data(pos).and_then(|d| d.get("lit")).cloned();
+    if lit == Some(DataValue::Int(5)) {
+        cx.keep_data(pos);
+    }
+    cx.set(pos, barrel);
+}
+
+#[test]
+fn a_tick_keeps_data_through_a_change_of_block() {
+    let registry = registry();
+    let backend: Arc<dyn ChunkStore> = Arc::new(MemoryStore::new());
+    for o in [origins()[0], origins()[3]] {
+        let mut w = start(&backend, &registry, o);
+        let chest = registry.block_by_name("test:chest").unwrap();
+        w.app.world_mut().resource_mut::<BlockTicks>().register(
+            &registry,
+            chest,
+            TickHandler {
+                delay: 1,
+                reach: [0, 0, 0],
+                tick: rebuild,
+                react: None,
+            },
+        );
+        let closed = state(&registry, "test:chest[open=false]");
+        let (kept, lost) = (at(o, 1, 0, 2), at(o, 3, 0, 2));
+        for (p, lit) in [(kept, 5), (lost, 7)] {
+            w.queue().set_block(p, closed);
+            w.queue().set_data(p, Some(furnace(lit)));
+        }
+        w.settle();
+        for _ in 0..3 {
+            w.app.world_mut().resource_mut::<BlockTicks>().advance(1);
+            w.settle();
+        }
+        let barrel = state(&registry, "test:barrel");
+        assert_eq!(w.map().block_at(kept), Some(barrel));
+        assert_eq!(w.map().block_at(lost), Some(barrel));
+        assert_eq!(w.data(kept), Some(furnace(5)), "kept by the tick");
+        assert_eq!(w.data(lost), None, "another block");
+    }
 }
 
 #[test]

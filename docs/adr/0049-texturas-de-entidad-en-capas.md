@@ -36,6 +36,12 @@ medida de la cara, no.
 - El motor no nombra contenido: los rectángulos de cada textura de entidad, la geometría de
   Minecraft y qué capa va en qué cara son del juego.
 
+## Datos que pasan por un tick
+
+- `TickContext::keep_data(pos)`: un tick que cambia un bloque por otro conserva los datos de esa
+  celda (`EditQueue::keep_data` en el lote de sus escrituras). Lo pide el cofre de cobre: se oxida
+  en un tick aleatorio y es otro bloque, pero guarda sus ítems (ADR 0048 lo preveía).
+
 ## Lo que no se hizo
 
 - Partes animadas o en ángulos libres (tapas que se abren, banderas, los 16 giros de una cabeza):

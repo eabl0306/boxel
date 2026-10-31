@@ -216,6 +216,9 @@ pub struct BlockTicks {
     /// Other edits whose blocks or neighbors react ([`TickHandler::react`]), in order, with the
     /// game tick they happened at: run at the start of the next `run_ticks`.
     reactions: Vec<(BlockPos, u64)>,
+    /// The cells whose data the running ticks keep through a change of their block
+    /// ([`TickContext::keep_data`]), queued with the writes.
+    kept: Vec<BlockPos>,
     stats: BlockTickStats,
 }
 
@@ -234,6 +237,7 @@ impl BlockTicks {
         self.queue = Queue::default();
         self.echoes.clear();
         self.reactions.clear();
+        self.kept.clear();
         self.stats = BlockTickStats::default();
         self.random_done = 0;
     }
@@ -449,6 +453,13 @@ impl<'a> TickContext<'a> {
     /// systems, through the [`EditQueue`].
     pub fn block_data(&self, pos: BlockPos) -> Option<&'a boxel_voxel::BlockData> {
         self.map.block_data_at(pos)
+    }
+
+    /// Keeps the data of `pos` through this tick's change of its block to another block (a
+    /// copper chest that oxidizes keeps its items, ADR 0048): [`EditQueue::keep_data`] in the
+    /// batch of the tick's writes.
+    pub fn keep_data(&mut self, pos: BlockPos) {
+        self.ticks.kept.push(pos);
     }
 
     /// The block at `pos` (`None` where the chunk is not loaded: outside the handler's reach).
@@ -755,6 +766,9 @@ fn run_ticks(
     for edit in writes {
         queue.set_block(edit.pos, edit.state);
     }
+    for pos in ticks.kept.drain(..) {
+        queue.keep_data(pos);
+    }
     ticks.echoes = overlay;
 }
 
@@ -849,6 +863,9 @@ fn run_random_ticks(
         }
         for edit in writes {
             queue.set_block(edit.pos, edit.state);
+        }
+        for pos in ticks.kept.drain(..) {
+            queue.keep_data(pos);
         }
         ticks.echoes = overlay;
     }
