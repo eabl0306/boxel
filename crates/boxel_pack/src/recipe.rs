@@ -2,6 +2,8 @@
 //! renderer reads the recipes the game passes with the pack, and this crate never looks at them.
 //! The [`TextureStep`]s a recipe may end with (EW-XFORM, ADR 0044) turn, mirror or crop the
 //! texture on the CPU; [`apply_steps`] is public so a game paints its own layers the same way.
+//! A recipe's [`LayerPiece`]s build a layer from rectangles of other textures (EW-BER, ADR
+//! 0049): the faces of an entity texture placed where a block's box faces read them.
 
 use crate::FaceName;
 
@@ -45,6 +47,25 @@ pub struct LayerRecipe {
     /// rest of the recipe is not read. A right-hinge door: Minecraft mirrors the door's
     /// texture (the recipe's steps), Whimscape draws its own.
     pub own: Option<String>,
+    /// Pieces of textures composited bottom to top over a transparent layer (EW-BER, ADR 0049),
+    /// each read through its own steps and then the recipe's `steps`: the faces of an entity
+    /// texture (`entity/chest/normal`), cut out with [`TextureStep::Crop`] and set where a
+    /// block's box faces read them with [`TextureStep::Place`]. When not empty, the layer is
+    /// made of them and `block` and `fallback` are not read; the first piece's texture is
+    /// required, a missing later one is left out.
+    pub pieces: Vec<LayerPiece>,
+}
+
+/// One piece of a layer ([`LayerRecipe::pieces`]): a texture of the pack (`entity/...` reads
+/// `textures/entity/`, `block/...` the block textures) and the steps that turn it into its part
+/// of the layer.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LayerPiece {
+    /// The texture, `ns:path` or a bare path in the `minecraft` namespace
+    /// (`entity/shulker/shulker_red`).
+    pub texture: String,
+    /// Applied in order to the texture as the pack ships it ([`apply_steps`]).
+    pub steps: Vec<TextureStep>,
 }
 
 /// One step of a layer's transform ([`LayerRecipe::steps`]). Images are rows from the top; a
@@ -69,7 +90,22 @@ pub enum TextureStep {
         /// Units per image edge.
         grid: u16,
     },
+    /// Puts the image into the rectangle `[x, y, width, height]` of a transparent image of
+    /// `grid` units each way: the inverse of [`TextureStep::Crop`]. The new image has as many
+    /// texels per unit as the image has across the rectangle, so a piece cut from a 64 px
+    /// entity texture and placed on a 16 unit grid makes a 16 px layer (64 px for a pack
+    /// four times as fine). A `grid` of 0 or an empty rectangle keeps the image.
+    Place {
+        /// `[x, y, width, height]` in `1 / grid` of the new image's edge.
+        rect: [u16; 4],
+        /// Units per new image edge.
+        grid: u16,
+    },
 }
+
+/// The largest edge [`TextureStep::Place`] makes: a texel stretched across a 4096 px canvas is
+/// a recipe's mistake, not a texture.
+const MAX_PLACED_EDGE: u64 = 4096;
 
 impl TextureStep {
     /// The image `texels` (`width` x `height`, rows from the top) after this step, with its new
@@ -112,6 +148,37 @@ impl TextureStep {
                     return image(width, height, &|x, y| at(x, y));
                 }
                 image(x1 - x0, y1 - y0, &|x, y| at(x0 + x, y0 + y))
+            }
+            TextureStep::Place { rect, grid } => {
+                let [rx, ry, rw, rh] = rect.map(u64::from);
+                let grid = u64::from(grid);
+                if grid == 0 || rw == 0 || rh == 0 {
+                    return image(width, height, &|x, y| at(x, y));
+                }
+                // The canvas edge that gives the rectangle the image's texels, rounded.
+                let edge = |texels: u32, units: u64| {
+                    ((u64::from(texels) * grid + units / 2) / units).clamp(1, MAX_PLACED_EDGE)
+                };
+                let (cw, ch) = (edge(width, rw), edge(height, rh));
+                // The rectangle in canvas texels, kept inside the canvas.
+                let span = |start: u64, len: u64, edge: u64| {
+                    let lo = (start * edge / grid).min(edge);
+                    let hi = ((start + len) * edge / grid).min(edge);
+                    (lo, hi)
+                };
+                let (x0, x1) = span(rx, rw, cw);
+                let (y0, y1) = span(ry, rh, ch);
+                let (w, h) = (u64::from(width), u64::from(height));
+                image(cw as u32, ch as u32, &|x, y| {
+                    let (x, y) = (u64::from(x), u64::from(y));
+                    if x < x0 || x >= x1 || y < y0 || y >= y1 {
+                        return [0; 4];
+                    }
+                    // Nearest texel of the image (exact when the sizes agree).
+                    let sx = (x - x0) * w / (x1 - x0);
+                    let sy = (y - y0) * h / (y1 - y0);
+                    at(sx as u32, sy as u32)
+                })
             }
         }
     }
@@ -234,6 +301,62 @@ mod tests {
             },
         ] {
             assert_eq!(keep.apply(3, 2, &src), (3, 2, src.clone()));
+        }
+    }
+
+    #[test]
+    fn place_puts_a_piece_where_a_crop_took_it() {
+        // A 4 x 2 texel piece of a 64 px texture placed at [1, 6, 4, 2] of a 16 unit grid: a
+        // 16 x 16 image, the piece at x 1..5, y 6..8, transparent around it.
+        let piece: Vec<[u8; 4]> = (0..8u8).map(|i| [i, 0, 0, 255]).collect();
+        let place = TextureStep::Place {
+            rect: [1, 6, 4, 2],
+            grid: 16,
+        };
+        let (w, h, out) = place.apply(4, 2, &piece);
+        assert_eq!((w, h), (16, 16));
+        assert_eq!(out[6 * 16 + 1], [0, 0, 0, 255]);
+        assert_eq!(out[7 * 16 + 4], [7, 0, 0, 255]);
+        assert_eq!(out.iter().filter(|t| t[3] == 255).count(), 8);
+        assert_eq!(out[0], [0; 4]);
+        // Twice the texels (a pack twice as fine): a 32 px image, each texel 2 x 2.
+        let fine: Vec<[u8; 4]> = (0..32u8).map(|i| [i, 0, 0, 255]).collect();
+        let (w, h, out) = place.apply(8, 4, &fine);
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(out.iter().filter(|t| t[3] == 255).count(), 32);
+        assert_eq!(out[12 * 32 + 2], [0, 0, 0, 255]);
+        // Crop then place gives the texels back at the same spot of a 16 px texture.
+        let src: Vec<[u8; 4]> = (0..256u32).map(|i| [i as u8, 1, 0, 255]).collect();
+        let rect = [3, 5, 7, 4];
+        let back = apply_steps(
+            &[
+                TextureStep::Crop { rect, grid: 16 },
+                TextureStep::Place { rect, grid: 16 },
+            ],
+            16,
+            16,
+            &src,
+        );
+        assert_eq!((back.0, back.1), (16, 16));
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (3..10).contains(&x) && (5..9).contains(&y);
+                let want = if inside { src[y * 16 + x] } else { [0; 4] };
+                assert_eq!(back.2[y * 16 + x], want, "{x} {y}");
+            }
+        }
+        // A zero grid or an empty rectangle keeps the image.
+        for keep in [
+            TextureStep::Place {
+                rect: [0, 0, 0, 1],
+                grid: 16,
+            },
+            TextureStep::Place {
+                rect: [0, 0, 1, 1],
+                grid: 0,
+            },
+        ] {
+            assert_eq!(keep.apply(4, 2, &piece), (4, 2, piece.clone()));
         }
     }
 

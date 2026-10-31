@@ -32,6 +32,7 @@ fn recipe(
         quarter: false,
         steps: Vec::new(),
         own: None,
+        pieces: Vec::new(),
     }
 }
 
@@ -224,6 +225,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
             quarter: true,
             steps: Vec::new(),
             own: None,
+            pieces: Vec::new(),
             ..recipe(
                 "boxel:water_flow",
                 "water",
@@ -235,6 +237,7 @@ pub fn recipes() -> Vec<LayerRecipe> {
             quarter: true,
             steps: Vec::new(),
             own: None,
+            pieces: Vec::new(),
             ..recipe(
                 "boxel:lava_flow",
                 "lava",

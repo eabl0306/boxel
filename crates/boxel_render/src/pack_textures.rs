@@ -16,6 +16,10 @@
 //! A layer whose texture is animated (`.png.mcmeta`, water, lava, the sea lantern...) also keeps
 //! the finished layer of every frame its animation shows ([`LayerAnimation`], ADR 0028); the
 //! array holds the frame of tick 0.
+//!
+//! A recipe's pieces ([`LayerRecipe::pieces`], EW-BER, ADR 0049) may name entity textures
+//! (`entity/chest/normal`): those are read once, through [`GuiPack`], only the ones a recipe
+//! names.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,8 +28,8 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use boxel_pack::{
-    BlockState as PackState, LayerRecipe, ResourceId, ResourcePack, Texture, TextureStep, Timeline,
-    VariantList, apply_steps, condition_matches, parse_variant_key,
+    BlockState as PackState, GuiPack, LayerRecipe, ResourceId, ResourcePack, Texture, TextureStep,
+    Timeline, VariantList, apply_steps, condition_matches, parse_variant_key,
 };
 use boxel_voxel::{
     BlockModel, BlockRegistry, BlockState, FLUID_LEVEL, Face, RenderShape, TextureSpec,
@@ -129,8 +133,13 @@ pub fn load_block_textures(
         TextureSource::Pack(source) => {
             let pack = open_pack(&source.dir)?;
             let mut warnings = Vec::new();
+            let entity = entity_textures(&source.dir, &source.recipes, &mut warnings);
+            let textures = Textures {
+                pack: &pack,
+                entity: &entity,
+            };
             let (data, from_pack) =
-                pack_block_textures(registry, &pack, &source.recipes, &mut warnings);
+                pack_block_textures(registry, &textures, &source.recipes, &mut warnings);
             (data, from_pack, pack.warnings().len(), warnings)
         }
     };
@@ -152,11 +161,84 @@ fn open_pack(path: &Path) -> Result<ResourcePack, String> {
     ResourcePack::open(path).map_err(|e| format!("resource pack {}: {e}", path.display()))
 }
 
-/// One texture of a layer, composited bottom to top, with the tint baked into it.
+/// The textures a layer may read: the pack's block textures, and the entity textures the
+/// recipes' pieces name ([`entity_textures`]).
+struct Textures<'a> {
+    pack: &'a ResourcePack,
+    entity: &'a HashMap<ResourceId, Texture>,
+}
+
+impl Textures<'_> {
+    /// The texture `id` (`minecraft:block/stone`, `minecraft:entity/chest/normal`).
+    fn get(&self, id: &ResourceId) -> Option<&Texture> {
+        self.pack.texture(id).or_else(|| self.entity.get(id))
+    }
+}
+
+/// The entity textures (`entity/...`) the pieces of `recipes` name, read from the pack at `dir`
+/// with its overlays (ADR 0049). Each is one image, whatever its proportions (a skull's is
+/// 64 x 32): never split as a strip. A texture the pack lacks is left out (its layer warns when
+/// it is composed); a pack whose GUI side cannot be opened warns once.
+fn entity_textures(
+    dir: &Path,
+    recipes: &[LayerRecipe],
+    warnings: &mut Vec<String>,
+) -> HashMap<ResourceId, Texture> {
+    let wanted: BTreeMap<ResourceId, ()> = recipes
+        .iter()
+        .flat_map(|r| &r.pieces)
+        .map(|piece| ResourceId::parse(&piece.texture))
+        .filter(|id| id.path.starts_with("entity/"))
+        .map(|id| (id, ()))
+        .collect();
+    let mut out = HashMap::new();
+    if wanted.is_empty() {
+        return out;
+    }
+    let gui = match GuiPack::open(dir) {
+        Ok(gui) => gui,
+        Err(e) => {
+            warnings.push(format!("entity textures: {e}"));
+            return out;
+        }
+    };
+    for id in wanted.into_keys() {
+        match gui.texture(&id) {
+            Ok(Some(t)) => {
+                let texture = Texture {
+                    width: t.width,
+                    height: t.height,
+                    frames: vec![t.rgba.clone()],
+                    rgba: t.rgba,
+                    animation: None,
+                };
+                out.insert(id, texture);
+            }
+            Ok(None) => {}
+            Err(e) => warnings.push(format!("{id}: {e}")),
+        }
+    }
+    out
+}
+
+/// One texture of a layer, composited bottom to top, with the tint baked into it: read through
+/// its own `steps` first (a piece's, [`LayerRecipe::pieces`]; empty for the other parts).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Part {
     id: ResourceId,
     tint: Option<[u8; 3]>,
+    steps: Vec<TextureStep>,
+}
+
+impl Part {
+    /// The texture `id` with `tint` and no steps of its own.
+    fn new(id: ResourceId, tint: Option<[u8; 3]>) -> Self {
+        Self {
+            id,
+            tint,
+            steps: Vec::new(),
+        }
+    }
 }
 
 /// A layer the pack fills: its parts, how they are read ([`compose`]'s `quarter` and `steps`)
@@ -172,11 +254,11 @@ struct PackLayer {
 /// recipe in `recipes`; returns it and how many layers came from the pack.
 fn pack_block_textures(
     registry: &BlockRegistry,
-    pack: &ResourcePack,
+    pack: &Textures<'_>,
     recipes: &[LayerRecipe],
     warnings: &mut Vec<String>,
 ) -> (BlockTextureData, u32) {
-    let size = pack_texture_size(pack, warnings);
+    let size = pack_texture_size(pack.pack, warnings);
     check_recipes(registry, recipes, warnings);
     let specs = registry.textures();
     let shapes = layer_shapes(registry);
@@ -308,14 +390,14 @@ fn animated_flow(registry: &BlockRegistry, animations: &[LayerAnimation]) -> [bo
 /// pack texture has a valid animation (warnings name dropped frames). Layers composite one
 /// animation: a later animated part shows its tick 0 frame, with a warning.
 fn animated_part(
-    pack: &ResourcePack,
+    pack: &Textures<'_>,
     parts: &[Part],
     name: &str,
     warnings: &mut Vec<String>,
 ) -> Option<(usize, Timeline)> {
     let mut found: Option<(usize, Timeline)> = None;
     for (i, part) in parts.iter().enumerate() {
-        let Some(texture) = pack.texture(&part.id) else {
+        let Some(texture) = pack.get(&part.id) else {
             continue;
         };
         let mut problems = Vec::new();
@@ -425,7 +507,7 @@ fn finish_alpha(texels: &mut [[u8; 4]], shape: Option<RenderShape>) -> bool {
 /// the pack lacks its textures.
 fn pack_layer(
     registry: &BlockRegistry,
-    pack: &ResourcePack,
+    pack: &Textures<'_>,
     recipes: &[LayerRecipe],
     spec: &TextureSpec,
     size: u32,
@@ -438,10 +520,10 @@ fn pack_layer(
             .name
             .split_once(':')
             .map_or(spec.name.as_str(), |(_, p)| p);
-        let parts = vec![Part {
-            id: ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
-            tint: None,
-        }];
+        let parts = vec![Part::new(
+            ResourceId::new(ResourceId::DEFAULT_NAMESPACE, format!("block/{path}")),
+            None,
+        )];
         return match compose(pack, &parts, size, Read::PLAIN, warnings, &tick0) {
             Ok(texels) => Some(PackLayer {
                 parts,
@@ -457,10 +539,7 @@ fn pack_layer(
     };
     // The pack's own texture for the layer, as it is ([`LayerRecipe::own`]).
     if let Some(own) = &recipe.own {
-        let parts = vec![Part {
-            id: ResourceId::parse(own),
-            tint: None,
-        }];
+        let parts = vec![Part::new(ResourceId::parse(own), None)];
         let mut quiet = Vec::new();
         if let Ok(texels) = compose(pack, &parts, size, Read::PLAIN, &mut quiet, &tick0) {
             warnings.extend(quiet);
@@ -476,7 +555,31 @@ fn pack_layer(
         quarter: recipe.quarter,
         steps: &recipe.steps,
     };
-    if let Some(parts) = model_parts(pack, recipe, &recipe_values(registry, recipe)) {
+    // Pieces of other textures, each through its own steps (ADR 0049).
+    if !recipe.pieces.is_empty() {
+        let parts: Vec<Part> = recipe
+            .pieces
+            .iter()
+            .map(|piece| Part {
+                id: ResourceId::parse(&piece.texture),
+                tint: None,
+                steps: piece.steps.clone(),
+            })
+            .collect();
+        return match compose(pack, &parts, size, read, warnings, &tick0) {
+            Ok(texels) => Some(PackLayer {
+                parts,
+                quarter: recipe.quarter,
+                steps: recipe.steps.clone(),
+                texels,
+            }),
+            Err(missing) => {
+                warnings.push(format!("{}: no texture {missing}; procedural", spec.name));
+                None
+            }
+        };
+    }
+    if let Some(parts) = model_parts(pack.pack, recipe, &recipe_values(registry, recipe)) {
         match compose(pack, &parts, size, read, warnings, &tick0) {
             Ok(texels) => {
                 return Some(PackLayer {
@@ -495,10 +598,7 @@ fn pack_layer(
     let parts: Vec<Part> = recipe
         .fallback
         .iter()
-        .map(|(path, tint)| Part {
-            id: ResourceId::parse(path),
-            tint: *tint,
-        })
+        .map(|(path, tint)| Part::new(ResourceId::parse(path), *tint))
         .collect();
     match compose(pack, &parts, size, read, warnings, &tick0) {
         Ok(texels) => Some(PackLayer {
@@ -583,13 +683,13 @@ fn model_parts(
         .elements
         .iter()
         .filter_map(|element| element.faces.get(&recipe.face))
-        .map(|face| Part {
-            id: ResourceId::parse(&face.texture),
-            tint: if face.tintindex.is_some() {
+        .map(|face| {
+            let tint = if face.tintindex.is_some() {
                 recipe.tint
             } else {
                 None
-            },
+            };
+            Part::new(ResourceId::parse(&face.texture), tint)
         })
         .collect();
     (!parts.is_empty()).then_some(parts)
@@ -621,9 +721,10 @@ impl Read<'_> {
 /// first part is required (`Err` names it when missing); a missing later part is a warning.
 /// `read.quarter`: a frame of twice `size` gives its top-left quarter ([`LayerRecipe::quarter`]);
 /// `read.steps` then turn, mirror or crop each part at its own size, before it is scaled, so a
-/// crop keeps the pack's resolution (EW-XFORM, ADR 0044).
+/// crop keeps the pack's resolution (EW-XFORM, ADR 0044); a piece's own steps come before them
+/// (ADR 0049).
 fn compose(
-    pack: &ResourcePack,
+    pack: &Textures<'_>,
     parts: &[Part],
     size: u32,
     read: Read<'_>,
@@ -632,7 +733,7 @@ fn compose(
 ) -> Result<Vec<[u8; 4]>, String> {
     let mut out: Option<Vec<[u8; 4]>> = None;
     for (i, part) in parts.iter().enumerate() {
-        let Some(texture) = pack.texture(&part.id) else {
+        let Some(texture) = pack.get(&part.id) else {
             if out.is_none() {
                 return Err(part.id.to_string());
             }
@@ -645,6 +746,9 @@ fn compose(
                 .map(|i| frame[((i / size) * width + i % size) as usize])
                 .collect();
             (width, height) = (size, size);
+        }
+        if !part.steps.is_empty() {
+            (width, height, frame) = apply_steps(&part.steps, width, height, &frame);
         }
         if !read.steps.is_empty() {
             (width, height, frame) = apply_steps(read.steps, width, height, &frame);
@@ -904,6 +1008,7 @@ pub(crate) mod tests {
             quarter: false,
             steps: Vec::new(),
             own: None,
+            pieces: Vec::new(),
         };
         let source =
             TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![recipe]));
@@ -1143,6 +1248,7 @@ pub(crate) mod tests {
             quarter: false,
             steps: Vec::new(),
             own: None,
+            pieces: Vec::new(),
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", ""),
@@ -1216,6 +1322,7 @@ pub(crate) mod tests {
             quarter: false,
             steps: Vec::new(),
             own: None,
+            pieces: Vec::new(),
         };
         let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(vec![
             recipe("boxel:stone", "mygame:ruby", "mygame:block/no_such_texture"),
@@ -1617,6 +1724,7 @@ pub(crate) mod tests {
             quarter: false,
             steps,
             own: None,
+            pieces: Vec::new(),
         };
         let recipes = vec![
             recipe("arrow_r90", vec![TextureStep::Rotate(1)]),
@@ -1660,6 +1768,123 @@ pub(crate) mod tests {
         assert_eq!(texel(&data, r90, 0, 15), [90, 90, 90, 255]);
     }
 
+    /// EW-BER (ADR 0049): a recipe's pieces cut rectangles out of an entity texture (64 x 32,
+    /// as a skull's) and set them where a box face reads them, later pieces over earlier ones,
+    /// transparent elsewhere; a missing entity texture keeps the procedural layer.
+    #[test]
+    fn pieces_place_entity_texture_rectangles_into_a_layer() {
+        use boxel_pack::LayerPiece;
+        use boxel_voxel::{
+            BlockCollision, BlockDef, BlockModel, BlockRegistryBuilder, FaceTextures, TextureId,
+            TextureImage,
+        };
+        let mut b = BlockRegistryBuilder::new();
+        let mut layer = |name: &str| {
+            b.add_texture(TextureSpec {
+                name: format!("game:{name}"),
+                image: TextureImage::solid(16, [90, 90, 90, 255]),
+            })
+            .expect("layer")
+        };
+        let (front, lost) = (layer("front"), layer("lost"));
+        b.add_block(BlockDef {
+            name: "game:crate".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(front).with(Face::NegZ, lost),
+        })
+        .expect("crate");
+        let registry = b.build();
+        let pack = TempPack::new("pieces");
+        // Each texel names where it came from: red x * 4, green y * 8.
+        let path = pack
+            .0
+            .join("assets/minecraft/textures/entity/crate/test.png");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        RgbaImage {
+            width: 64,
+            height: 32,
+            data: (0..64 * 32u32)
+                .flat_map(|i| [(i % 64) as u8 * 4, (i / 64) as u8 * 8, 1, 255])
+                .collect(),
+        }
+        .save_png(&path)
+        .expect("png");
+        let piece = |texture: &str, crop: [u16; 4], place: [u16; 4]| LayerPiece {
+            texture: texture.to_string(),
+            steps: vec![
+                TextureStep::Crop {
+                    rect: crop,
+                    grid: 64,
+                },
+                TextureStep::Place {
+                    rect: place,
+                    grid: 16,
+                },
+            ],
+        };
+        let recipe = |layer: &str, pieces: Vec<LayerPiece>| LayerRecipe {
+            layer: format!("game:{layer}"),
+            block: String::new(),
+            state: String::new(),
+            variant: String::new(),
+            face: boxel_pack::FaceName::North,
+            tint: None,
+            fallback: Vec::new(),
+            quarter: false,
+            steps: Vec::new(),
+            own: None,
+            pieces,
+        };
+        // Texels x 14..28, y 7..12 to rows 2..7 (the grid counts 1/64 of each edge: y twice),
+        // then x 0..14, y 20..30 to rows 6..16, over the first.
+        let recipes = vec![
+            recipe(
+                "front",
+                vec![
+                    piece("entity/crate/test", [14, 14, 14, 10], [1, 2, 14, 5]),
+                    piece("entity/crate/test", [0, 40, 14, 20], [1, 6, 14, 10]),
+                ],
+            ),
+            recipe(
+                "lost",
+                vec![piece("entity/crate/missing", [0, 0, 8, 8], [0, 0, 16, 16])],
+            ),
+        ];
+        let source = TextureSource::Pack(PackSource::new(pack.0.clone()).with_recipes(recipes));
+        let (data, report) = load_block_textures(&registry, &source).expect("pack");
+        let at = |layer: TextureId, x: u32, y: u32| {
+            let t = texel(&data, usize::from(layer.0), x, y);
+            (u32::from(t[0]) / 4, u32::from(t[1]) / 8, t[3])
+        };
+        assert_eq!(at(front, 1, 2), (14, 7, 255));
+        assert_eq!(at(front, 5, 3), (18, 8, 255));
+        assert_eq!(at(front, 14, 5), (27, 10, 255));
+        // Row 6 is the second piece's top row.
+        assert_eq!(at(front, 1, 6), (0, 20, 255));
+        assert_eq!(at(front, 14, 15), (13, 29, 255));
+        // Around the pieces: transparent (a cutout layer).
+        assert_eq!(at(front, 0, 0).2, 0);
+        assert_eq!(at(front, 15, 9).2, 0);
+        assert_eq!(texel(&data, usize::from(lost.0), 3, 3), [90, 90, 90, 255]);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("game:lost: no texture minecraft:entity/crate/missing")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.starts_with("game:front")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
     /// EW-BOXTEX: a pack's own texture for a layer wins, as it is; without it the recipe reads
     /// as usual (its steps).
     #[test]
@@ -1676,6 +1901,7 @@ pub(crate) mod tests {
             quarter: false,
             steps: vec![TextureStep::MirrorX],
             own: Some("block/arrow_right".to_string()),
+            pieces: Vec::new(),
         };
         let red = |data: &BlockTextureData, x: u32| {
             u32::from(texel(data, layer_of(&registry, "game:arrow_mx"), x, 0)[0]) / 16
@@ -1732,6 +1958,7 @@ pub(crate) mod tests {
             quarter: false,
             steps,
             own: None,
+            pieces: Vec::new(),
         };
         let recipes = vec![
             recipe("arrow_mx", "arrow", vec![TextureStep::MirrorX]),
