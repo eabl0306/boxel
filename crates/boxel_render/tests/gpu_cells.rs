@@ -1,19 +1,26 @@
-//! Cell quads (EW-ITEM, ADR 0050) on every tier. Self-skips without an adapter unless
-//! `BOXEL_REQUIRE_GPU=1`.
+//! Cell quads (EW-ITEM, ADR 0050; block layers, ADR 0053) on every tier. Self-skips without an
+//! adapter unless `BOXEL_REQUIRE_GPU=1`.
 //!
 //! A stone wall meshed by the real `Mesher` with a row of test frames in front of it whose cells
 //! hold data: a red item, a green one clear on its right half, the red one spun 45 degrees, a
-//! white one, and the white one drawn full bright with a blue tint. For every adapter (filtered
+//! white one, the white one drawn full bright with a blue tint, and a stone block drawn small
+//! from the block texture array (`model_quads`, `CellImage::Block`). For every adapter (filtered
 //! by `WGPU_BACKEND` / `WGPU_ADAPTER_NAME`) and every tier a local capability check allows (the
 //! one of `gpu_tiers.rs`), a `VoxelRenderer` with the cell textures draws the wall and frames
 //! without data, and with it. Asserts:
 //!
 //! - each item covers the pixel of its center, where `CellQuad::from_plane` puts it, and the
-//!   clear half of the green one leaves the wall seen;
+//!   clear half of the green one leaves the wall seen; so does the small stone block;
 //! - the spun item shows where the turn takes its corners and not where they were;
 //! - the full bright item is its tint exactly, the plain white one is shaded;
 //! - every tier draws the same pixels as the best tier of its adapter (0.1 % of the pixels,
 //!   channel tolerance 2).
+//!
+//! A second scene draws a row of demo blocks (a cube, stairs, a fence, a torch, a plant) as
+//! terrain, then the same blocks as cell quads of block layers from cells that draw nothing as a
+//! block (their chunk's mesh has cell quads only): both look the same (0.5 % of the pixels,
+//! channel tolerance 8: the terrain's edge growth), on every tier, and the second is the same on
+//! every tier (0.1 %).
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cells/` (every image with
 //! `GPU_CELLS_SAVE=1`).
@@ -29,8 +36,8 @@ use boxel_render::{DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, ViewParams, V
 use boxel_transform::Transform;
 use boxel_voxel::{
     Axis, BlockCollision, BlockData, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel,
-    CellQuad, CellQuadRule, ChunkData, DataValue, Face, FaceTextures, LocalPos, ModelBox,
-    ModelPlane, PlaneKind, RenderShape, TextureImage, TextureSpec,
+    CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face, FaceTextures, LocalPos,
+    ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage, TextureSpec, model_quads,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -183,10 +190,26 @@ const ROW: [(u32, (u16, u8, bool)); 5] = [
     (16, (WHITE, 0, false)),
     (18, (WHITE, 0, true)),
 ];
+/// The frame at (20, 10, 19) holds a stone block drawn small: its data has `block` 1.
+const BLOCK_X: u32 = 20;
+/// Where the small stone block is in its cell: a quarter of a block, its back 1/16 off the board.
+const SMALL: ([f32; 3], f32) = ([0.375, 0.375, 0.6875], 0.25);
+
+/// The twin row (the second scene): cell (x, 10, 19) and the demo state drawn there.
+const TWINS: [(u32, &str); 5] = [
+    (10, "boxel:stone"),
+    (12, "boxel:oak_stairs[facing=east]"),
+    (14, "boxel:oak_fence[north=true,south=true]"),
+    (16, "boxel:torch"),
+    (18, "boxel:poppy"),
+];
 
 struct Scene {
     registry: BlockRegistry,
     frame: BlockState,
+    /// `test:twin`: draws nothing as a block, and the demo state of its data's `twin` index in
+    /// [`TWINS`] from its cell quads.
+    twin: BlockState,
 }
 
 /// The demo blocks and `test:frame`: a thin board against the wall whose cells draw their item.
@@ -213,22 +236,79 @@ fn scene() -> Scene {
         })
         .expect("frame");
     let id = b.block_by_name("test:frame").expect("id");
-    let rule = CellQuadRule::new(|_, _| {
-        Some(Arc::new(|data: &BlockData, out: &mut Vec<CellQuad>| {
-            let int = |name| data.int(name).unwrap_or(0);
-            let quad = CellQuad::from_plane(&item_plane(int("spin") as u8), int("image") as u16)
-                .shaded_as(Face::NegZ);
-            out.push(if int("bright") == 1 {
-                quad.with_full_bright(true).with_tint(BLUE_TINT)
-            } else {
-                quad
-            });
-        }))
+    let rule = CellQuadRule::new(|registry, _| {
+        let stone = registry.by_name("boxel:stone").expect("stone");
+        let mut small = Vec::new();
+        model_quads(registry, stone, &mut small);
+        let (at, scale) = SMALL;
+        for q in &mut small {
+            q.corners = q
+                .corners
+                .map(|c| std::array::from_fn(|a| at[a] + c[a] * scale));
+        }
+        Some(Arc::new(
+            move |data: &BlockData, out: &mut Vec<CellQuad>| {
+                let int = |name| data.int(name).unwrap_or(0);
+                if int("block") == 1 {
+                    out.extend_from_slice(&small);
+                    return;
+                }
+                let quad =
+                    CellQuad::from_plane(&item_plane(int("spin") as u8), int("image") as u16)
+                        .shaded_as(Face::NegZ);
+                out.push(if int("bright") == 1 {
+                    quad.with_full_bright(true).with_tint(BLUE_TINT)
+                } else {
+                    quad
+                });
+            },
+        ))
     });
     b.set_cell_quads(id, rule).expect("rule");
+    // The twin: no boxes, only an outline; its cell quads are a demo block's model.
+    let empty = b
+        .add_box_model(BoxModel {
+            outline: vec![CollisionBox::new([0; 3], [16; 3])],
+            ..BoxModel::default()
+        })
+        .expect("empty model");
+    let twin = b
+        .add_block(BlockDef {
+            name: "test:twin".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Boxes(empty),
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(planks),
+        })
+        .expect("twin");
+    let twin_id = b.block_by_name("test:twin").expect("twin id");
+    let rule = CellQuadRule::new(|registry, _| {
+        let models: Vec<Vec<CellQuad>> = TWINS
+            .iter()
+            .map(|(_, name)| {
+                let mut quads = Vec::new();
+                model_quads(
+                    registry,
+                    registry.parse_state(name).expect(name),
+                    &mut quads,
+                );
+                quads
+            })
+            .collect();
+        Some(Arc::new(
+            move |data: &BlockData, out: &mut Vec<CellQuad>| {
+                let k = data.int("twin").unwrap_or(0) as usize;
+                out.extend_from_slice(&models[k]);
+            },
+        ))
+    });
+    b.set_cell_quads(twin_id, rule).expect("twin rule");
     Scene {
         registry: b.build(),
         frame,
+        twin,
     }
 }
 
@@ -242,7 +322,7 @@ fn mesh(scene: &Scene, materials: &MaterialTable, with_items: bool) -> ChunkMesh
             dense[LocalPos::new(x, y, 20).index()] = stone;
         }
     }
-    for &(x, _) in &ROW {
+    for x in ROW.map(|(x, _)| x).into_iter().chain([BLOCK_X]) {
         dense[LocalPos::new(x, 10, 19).index()] = scene.frame;
     }
     let mut chunk = ChunkData::from_dense(&dense);
@@ -254,6 +334,8 @@ fn mesh(scene: &Scene, materials: &MaterialTable, with_items: bool) -> ChunkMesh
                 .with("bright", DataValue::Int(i64::from(bright)));
             chunk.set_block_data(LocalPos::new(x, 10, 19), Some(data));
         }
+        let block = BlockData::new().with("block", DataValue::Int(1));
+        chunk.set_block_data(LocalPos::new(BLOCK_X, 10, 19), Some(block));
     }
     let input = MeshInput {
         center: &chunk,
@@ -263,8 +345,38 @@ fn mesh(scene: &Scene, materials: &MaterialTable, with_items: bool) -> ChunkMesh
     let mesh = Mesher::new().mesh_chunk(&input, materials, MeshOptions::default());
     assert_eq!(
         mesh.cell_quads.len(),
-        if with_items { ROW.len() } else { 0 }
+        if with_items { ROW.len() + 6 } else { 0 }
     );
+    mesh
+}
+
+/// The twin row as terrain (`terrain`), or as `test:twin` cells drawing the same blocks from
+/// their cell quads (a mesh of cell quads only), meshed.
+fn twins_mesh(scene: &Scene, materials: &MaterialTable, terrain: bool) -> ChunkMesh {
+    let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
+    for &(x, name) in &TWINS {
+        dense[LocalPos::new(x, 10, 19).index()] = if terrain {
+            scene.registry.parse_state(name).expect(name)
+        } else {
+            scene.twin
+        };
+    }
+    let mut chunk = ChunkData::from_dense(&dense);
+    if !terrain {
+        for (k, &(x, _)) in TWINS.iter().enumerate() {
+            let data = BlockData::new().with("twin", DataValue::Int(k as i64));
+            chunk.set_block_data(LocalPos::new(x, 10, 19), Some(data));
+        }
+    }
+    let input = MeshInput {
+        center: &chunk,
+        neighbors: [None; 26],
+        light: None,
+    };
+    let mesh = Mesher::new().mesh_chunk(&input, materials, MeshOptions::default());
+    assert_eq!(mesh.quads.is_empty(), !terrain);
+    assert_eq!(mesh.cell_quads.is_empty(), terrain);
+    assert!(!mesh.is_empty());
     mesh
 }
 
@@ -348,8 +460,15 @@ fn render_tier(
         .map_err(|e| e.to_string())?;
     let items = render(&device, &queue, &mut renderer, &view)?;
     let stats = renderer.stats().cells;
-    if (stats.chunks, stats.quads, stats.drawn, stats.layers)
-        != (1, ROW.len() as u32, ROW.len() as u32, 3)
+    let quads = ROW.len() as u32 + 6;
+    if (
+        stats.chunks,
+        stats.quads,
+        stats.block_quads,
+        stats.drawn,
+        stats.draws,
+        stats.layers,
+    ) != (1, quads, 6, quads, 2, 3)
     {
         return Err(format!("cell stats {stats:?}"));
     }
@@ -475,6 +594,21 @@ fn check_tier(report: &mut Report, what: &str, i: &TierImages) {
     if white[..3].iter().any(|c| !(120..=240).contains(c)) {
         report.fail(format!("{what}: the white item is {white:?}"), &images);
     }
+    // The small stone block: its front face covers the middle of its cell, a little out of the
+    // board; past its edge the board shows.
+    let (at, scale) = SMALL;
+    let front = DVec3::new(
+        f64::from(BLOCK_X) + f64::from(at[0] + scale / 2.0),
+        10.0 + f64::from(at[1] + scale / 2.0),
+        19.0 + f64::from(at[2]),
+    );
+    if !drawn(&i.bare, &i.items, project(&view, front)) {
+        report.fail(format!("{what}: the small block is not drawn"), &images);
+    }
+    let past = front + DVec3::new(0.2, 0.0, 0.0);
+    if drawn(&i.bare, &i.items, project(&view, past)) {
+        report.fail(format!("{what}: the small block is too big"), &images);
+    }
 }
 
 #[test]
@@ -528,6 +662,149 @@ fn cell_quads_are_drawn_alike_on_every_tier() {
                     &[
                         (&format!("{label}_{best}_items"), &b.items),
                         (&format!("{label}_{tier}_items"), &t.items),
+                    ],
+                );
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+/// The twin row as terrain, then as cell quads of block layers (a mesh of cell quads only).
+struct TwinImages {
+    terrain: RgbaImage,
+    cells: RgbaImage,
+}
+
+fn render_twins(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+) -> Result<TwinImages, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let materials = MaterialTable::from_registry(&scene.registry);
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        &RendererConfig::default(),
+        &boxel_render::generate_block_textures(scene.registry.textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    renderer.set_model_boxes(&queue, materials.model_boxes());
+    renderer.set_cell_textures(&device, &queue, &Arc::new(cell_textures()));
+    let view = view();
+    renderer
+        .upsert_chunk(
+            1,
+            I64Vec3::ZERO,
+            Arc::new(twins_mesh(scene, &materials, true)),
+        )
+        .map_err(|e| e.to_string())?;
+    let terrain = render(&device, &queue, &mut renderer, &view)?;
+    renderer
+        .upsert_chunk(
+            1,
+            I64Vec3::ZERO,
+            Arc::new(twins_mesh(scene, &materials, false)),
+        )
+        .map_err(|e| e.to_string())?;
+    let cells = render(&device, &queue, &mut renderer, &view)?;
+    let stats = renderer.stats();
+    if (stats.cells.chunks, stats.cells.draws) != (1, 1) || stats.cells.block_quads == 0 {
+        return Err(format!("twin cell stats {:?}", stats.cells));
+    }
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(TwinImages { terrain, cells })
+}
+
+/// Blocks drawn from cell quads of block layers ([`model_quads`]) look as the terrain draws
+/// them, on every tier, and the same on every tier.
+#[test]
+fn blocks_drawn_by_cell_quads_look_like_the_terrain() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = scene();
+    let mut report = Report::new();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        let mut tiers = Vec::new();
+        for tier in allowed_tiers(&caps) {
+            match render_twins(adapter, &caps, tier, &scene) {
+                Ok(images) => tiers.push((tier, images)),
+                Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
+            }
+        }
+        for (tier, i) in &tiers {
+            rendered += 1;
+            let what = format!("{label}_{tier}_twins");
+            let images = [
+                (format!("{what}_terrain"), &i.terrain),
+                (format!("{what}_cells"), &i.cells),
+            ];
+            let images: Vec<(&str, &RgbaImage)> =
+                images.iter().map(|(n, im)| (n.as_str(), *im)).collect();
+            if std::env::var_os("GPU_CELLS_SAVE").is_some() {
+                report.save(&images);
+            }
+            let diff = i.terrain.compare(&i.cells, 8);
+            eprintln!(
+                "gpu_cells: {what}: cell quads vs terrain: {:.4} % of pixels differ, max channel {}",
+                diff.fraction() * 100.0,
+                diff.max_channel_diff
+            );
+            if diff.fraction() > 0.005 {
+                report.fail(
+                    format!(
+                        "{what}: cell quads vs terrain: {:.4} % of pixels differ",
+                        diff.fraction() * 100.0
+                    ),
+                    &images,
+                );
+            }
+            // Something is drawn: the stone's middle is not the sky.
+            let view = view();
+            let sky = pixel(&i.cells, (2, 2));
+            let stone = pixel(&i.cells, project(&view, DVec3::new(10.5, 10.5, 19.0)));
+            if (0..3).all(|c| stone[c].abs_diff(sky[c]) <= 8) {
+                report.fail(format!("{what}: the twins are not drawn"), &images);
+            }
+        }
+        let Some(((best, b), rest)) = tiers.split_first() else {
+            continue;
+        };
+        for (tier, t) in rest {
+            let diff = b.cells.compare(&t.cells, 2);
+            if diff.fraction() > MAX_DIFF {
+                report.fail(
+                    format!(
+                        "{label}: twins {tier} vs {best}: {:.4} % of pixels differ",
+                        diff.fraction() * 100.0
+                    ),
+                    &[
+                        (&format!("{label}_{best}_twins"), &b.cells),
+                        (&format!("{label}_{tier}_twins"), &t.cells),
                     ],
                 );
             }

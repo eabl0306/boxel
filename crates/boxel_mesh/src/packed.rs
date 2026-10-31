@@ -687,9 +687,10 @@ impl ChunkMesh {
         mesh.hash = mesh.compute_hash();
         mesh
     }
-    /// No quads.
+    /// Nothing to draw: no quads and no cell quads (ADR 0053: a mesh of cell quads only, a sign
+    /// alone in its chunk, is drawn).
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty()
+        self.quads.is_empty() && self.cell_quads.is_empty()
     }
     /// Total quads.
     pub fn total_quads(&self) -> u32 {

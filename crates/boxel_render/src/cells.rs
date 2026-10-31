@@ -3,14 +3,18 @@
 //! the main pass right after the solid terrain, with one pipeline shared by every tier
 //! (`cell.wgsl`: one uniform block, one texture array and its sampler, plain vertices).
 //!
-//! The images are a texture array of their own, the cell textures, which the content gives
-//! ([`crate::CellTextures`]): the block texture array is almost full and Low binds one texture
-//! per pipeline, so the images cannot share the block layers nor sit beside them in the terrain
-//! pipelines. The vertices of every chunk with cell quads live in one vertex buffer, rebuilt
-//! when one of those chunks changes (cell quads are few: an item a frame); a camera move
-//! changes nothing, since the shader subtracts the render origin as the terrain does. Each
-//! frame the chunks inside the GPU window and the frustum are drawn, runs of consecutive ones
-//! as one draw. Without cell quads nothing of this is built and nothing runs.
+//! A quad's image is a layer of one of two texture arrays: the cell textures, which the content
+//! gives ([`crate::CellTextures`]), or the block textures the terrain draws with (a block drawn
+//! small in a frame, ADR 0053). The block texture array is almost full and Low binds one texture
+//! per pipeline, so the cell images cannot share the block layers nor sit beside them in the
+//! terrain pipelines; and the pipeline here binds one array too. So the quads are kept in two
+//! lists, one per array, each drawn with the same pipeline and its own bind group: the shader and
+//! its bindings are the same on every tier, only group 0 changes between the two draws. The
+//! vertices of every chunk with cell quads live in one vertex buffer per list, rebuilt when one
+//! of those chunks changes (cell quads are few: an item a frame); a camera move changes nothing,
+//! since the shader subtracts the render origin as the terrain does. Each frame the chunks inside
+//! the GPU window and the frustum are drawn, runs of consecutive ones as one draw. Without cell
+//! quads nothing of this is built and nothing runs.
 
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
@@ -20,6 +24,7 @@ use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, LitCellQuad};
 use boxel_shaders::gpu::{CellVertex, bindings, cell};
 use boxel_shaders::{ShaderModuleId, create_module};
+use boxel_voxel::CellImage;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -36,6 +41,8 @@ pub struct CellStats {
     pub chunks: u32,
     /// Their cell quads.
     pub quads: u32,
+    /// Those of them that show a block layer ([`CellImage::Block`], ADR 0053).
+    pub block_quads: u32,
     /// Quads drawn this frame (inside the window and the frustum).
     pub drawn: u32,
     /// Draw calls this frame.
@@ -86,6 +93,29 @@ impl CellStore {
     }
 }
 
+/// A bind group of the cell pipeline's group 0: `view` (a `D2Array`) and `sampler`.
+fn texture_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("boxel cell textures"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
 /// The 6 vertices of `q` (two triangles) in a chunk whose GPU origin is `origin`.
 pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6] {
     let c = &q.quad;
@@ -103,26 +133,138 @@ pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6
     })
 }
 
+/// The cell quads whose images are layers of one texture array: their vertices, each chunk's
+/// range of them and this frame's draws.
+#[derive(Default)]
+struct QuadList {
+    vertex: Option<wgpu::Buffer>,
+    /// Vertices `vertex` holds.
+    vertex_capacity: usize,
+    vertices: Vec<CellVertex>,
+    /// Per chunk with quads in this list, in the store's order: its origin and its vertex range.
+    ranges: Vec<(I64Vec3, Range<u32>)>,
+    /// This frame's draws (merged vertex ranges).
+    draws: Vec<Range<u32>>,
+}
+
+impl QuadList {
+    /// This frame's draws: the chunks inside the GPU window (`chunks`) and the frustum of
+    /// `view`, runs of consecutive ones merged.
+    fn pick(&mut self, chunks: &ChunkTable, view: &ViewParams) {
+        self.draws.clear();
+        for (origin, range) in &self.ranges {
+            if !chunks.in_window(*origin) {
+                continue;
+            }
+            let min = origin.saturating_sub(view.render_origin).as_vec3();
+            let max = min + Vec3::splat(CHUNK_EDGE);
+            if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
+                continue;
+            }
+            match self.draws.last_mut() {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => self.draws.push(range.clone()),
+            }
+        }
+    }
+
+    /// Writes the vertices into the vertex buffer (grown to fit); true if it wrote any.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        if self.vertices.is_empty() {
+            return false;
+        }
+        if self.vertex.is_none() || self.vertex_capacity < self.vertices.len() {
+            let capacity = self.vertices.len().next_power_of_two().max(6 * 256);
+            self.vertex = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("boxel cell vertices"),
+                size: (capacity * size_of::<CellVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.vertex_capacity = capacity;
+        }
+        let Some(buffer) = &self.vertex else {
+            return false;
+        };
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.vertices));
+        true
+    }
+
+    /// Draws this frame's quads with `group` as group 0; false if there were none.
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, group: &wgpu::BindGroup) -> bool {
+        let Some(vertex) = &self.vertex else {
+            return false;
+        };
+        if self.draws.is_empty() {
+            return false;
+        }
+        pass.set_bind_group(cell::GROUP_TEXTURES, group, &[]);
+        pass.set_vertex_buffer(0, vertex.slice(..));
+        for range in &self.draws {
+            pass.draw(range.clone(), 0..1);
+        }
+        true
+    }
+
+    fn drawn(&self) -> u32 {
+        self.draws.iter().map(|r| r.len() as u32).sum::<u32>() / 6
+    }
+}
+
+/// Index in [`CellPass::lists`] of the quads whose images are in `source`.
+const fn list_of(source: CellImage) -> usize {
+    match source {
+        CellImage::Cell => 0,
+        CellImage::Block => 1,
+    }
+}
+
+/// The vertices of every chunk of `store` in `lists`, each quad in the list of its texture array
+/// ([`list_of`]), each chunk's run of a list recorded with its origin.
+fn fill(lists: &mut [QuadList; 2], store: &CellStore) {
+    for list in lists.iter_mut() {
+        list.vertices.clear();
+        list.ranges.clear();
+    }
+    for (origin, mesh) in store.chunks.values() {
+        let starts = lists.each_ref().map(|l| l.vertices.len() as u32);
+        let gpu = wrap_to_i32(*origin).to_array();
+        for q in &mesh.cell_quads {
+            lists[list_of(q.quad.source)]
+                .vertices
+                .extend(quad_vertices(gpu, q));
+        }
+        for (list, start) in lists.iter_mut().zip(starts) {
+            let end = list.vertices.len() as u32;
+            if end > start {
+                list.ranges.push((*origin, start..end));
+            }
+        }
+    }
+}
+
 /// The pipeline, the cell textures and the vertices of the cell quads (one per renderer).
 pub(crate) struct CellPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     /// The cell textures and their bind group, with the data they were made from.
     textures: Option<(Arc<BlockTextureData>, wgpu::Texture, wgpu::BindGroup)>,
-    vertex: Option<wgpu::Buffer>,
-    /// Vertices `vertex` holds.
-    vertex_capacity: usize,
-    vertices: Vec<CellVertex>,
-    /// Per chunk in the store's order: its origin and its vertex range.
-    ranges: Vec<(I64Vec3, Range<u32>)>,
-    /// This frame's draws (merged vertex ranges).
-    draws: Vec<Range<u32>>,
+    /// The block textures (the terrain's array, animated layers included) in this pipeline's
+    /// layout.
+    blocks: wgpu::BindGroup,
+    /// The quads of each texture array: the cell textures', then the block textures'.
+    lists: [QuadList; 2],
     stats: CellStats,
 }
 
 impl CellPass {
-    /// The pipeline for `device`; `view_layout` is the renderer's group 1 (the `View` uniform).
-    pub(crate) fn new(device: &wgpu::Device, view_layout: &wgpu::BindGroupLayout) -> Self {
+    /// The pipeline for `device`; `view_layout` is the renderer's group 1 (the `View` uniform),
+    /// `block_texture` the terrain's block texture array.
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        view_layout: &wgpu::BindGroupLayout,
+        block_texture: &wgpu::Texture,
+    ) -> Self {
         let module = create_module(device, ShaderModuleId::Cell);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("boxel cell textures"),
@@ -210,15 +352,18 @@ impl CellPass {
             multiview_mask: None,
             cache: None,
         });
+        let blocks = texture_group(
+            device,
+            &layout,
+            &crate::renderer::array_view(block_texture),
+            &crate::renderer::block_sampler(device),
+        );
         Self {
             pipeline,
             layout,
             textures: None,
-            vertex: None,
-            vertex_capacity: 0,
-            vertices: Vec::new(),
-            ranges: Vec::new(),
-            draws: Vec::new(),
+            blocks,
+            lists: Default::default(),
             stats: CellStats::default(),
         }
     }
@@ -242,20 +387,7 @@ impl CellPass {
         self.stats.layers = 0;
         let (texture, view, sampler) =
             crate::renderer::block_textures(device, queue, data, &device.limits())?;
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("boxel cell textures"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let group = texture_group(device, &self.layout, &view, &sampler);
         self.stats.layers = data.layers;
         self.textures = Some((Arc::clone(data), texture, group));
         Ok(())
@@ -273,80 +405,43 @@ impl CellPass {
     ) {
         if store.dirty {
             store.dirty = false;
-            self.vertices.clear();
-            self.ranges.clear();
-            for (origin, mesh) in store.chunks.values() {
-                let start = self.vertices.len() as u32;
-                let gpu = wrap_to_i32(*origin).to_array();
-                for q in &mesh.cell_quads {
-                    self.vertices.extend(quad_vertices(gpu, q));
-                }
-                self.ranges
-                    .push((*origin, start..self.vertices.len() as u32));
+            fill(&mut self.lists, store);
+            let mut wrote = false;
+            for list in &mut self.lists {
+                wrote |= list.upload(device, queue);
             }
-            self.upload(device, queue);
+            self.stats.uploads += u64::from(wrote);
         }
-        self.stats.chunks = self.ranges.len() as u32;
-        self.stats.quads = self.vertices.len() as u32 / 6;
-        self.draws.clear();
-        for (origin, range) in &self.ranges {
-            if !chunks.in_window(*origin) {
-                continue;
-            }
-            let min = origin.saturating_sub(view.render_origin).as_vec3();
-            let max = min + Vec3::splat(CHUNK_EDGE);
-            if !view.frustum.intersects_aabb(&Aabb::new(min, max)) {
-                continue;
-            }
-            match self.draws.last_mut() {
-                Some(last) if last.end == range.start => last.end = range.end,
-                _ => self.draws.push(range.clone()),
-            }
+        self.stats.chunks = store.chunks.len() as u32;
+        let quads = self.lists.each_ref().map(|l| l.vertices.len() as u32 / 6);
+        self.stats.quads = quads[0] + quads[1];
+        self.stats.block_quads = quads[1];
+        for list in &mut self.lists {
+            list.pick(chunks, view);
         }
-        self.stats.drawn = self.draws.iter().map(|r| r.len() as u32).sum::<u32>() / 6;
-        self.stats.draws = if self.textures.is_some() {
-            self.draws.len() as u32
+        self.stats.drawn = self.lists.iter().map(QuadList::drawn).sum();
+        let cells = if self.textures.is_some() {
+            self.lists[0].draws.len() as u32
         } else {
             0
         };
+        self.stats.draws = cells + self.lists[1].draws.len() as u32;
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.vertices.is_empty() {
-            return;
-        }
-        if self.vertex.is_none() || self.vertex_capacity < self.vertices.len() {
-            let capacity = self.vertices.len().next_power_of_two().max(6 * 256);
-            self.vertex = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("boxel cell vertices"),
-                size: (capacity * size_of::<CellVertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.vertex_capacity = capacity;
-        }
-        if let Some(buffer) = &self.vertex {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.vertices));
-            self.stats.uploads += 1;
-        }
-    }
-
-    /// Draws this frame's cell quads into `pass` (group 1 already holds the View); leaves group
-    /// 0 bound to the cell textures. False if it drew nothing.
+    /// Draws this frame's cell quads into `pass` (group 1 already holds the View): those of the
+    /// cell textures (once the content gave them), then those of the block textures. Leaves group
+    /// 0 bound to one of them. False if it drew nothing.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let (Some((_, _, group)), Some(vertex)) = (&self.textures, &self.vertex) else {
-            return false;
-        };
-        if self.draws.is_empty() {
+        if self.lists.iter().all(|l| l.draws.is_empty()) {
             return false;
         }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(cell::GROUP_TEXTURES, group, &[]);
-        pass.set_vertex_buffer(0, vertex.slice(..));
-        for range in &self.draws {
-            pass.draw(range.clone(), 0..1);
+        let mut drew = false;
+        if let Some((_, _, group)) = &self.textures {
+            drew |= self.lists[0].draw(pass, group);
         }
-        true
+        drew |= self.lists[1].draw(pass, &self.blocks);
+        drew
     }
 
     pub(crate) fn stats(&self) -> CellStats {
@@ -359,11 +454,38 @@ mod tests {
     use super::*;
     use boxel_voxel::{CellQuad, Face, LightValue};
 
+    /// A mesh of `cells` quads of cell images then `blocks` of block layers.
+    fn mixed(cells: usize, blocks: usize) -> Arc<ChunkMesh> {
+        let mut m = (*mesh(cells + blocks)).clone();
+        for q in &mut m.cell_quads[cells..] {
+            q.quad.source = CellImage::Block;
+        }
+        Arc::new(m)
+    }
+
+    /// Each quad goes to the list of its texture array, each chunk's run of a list recorded
+    /// with its origin; a chunk with none in a list has no run there.
+    #[test]
+    fn quads_are_listed_by_their_texture_array() {
+        let mut store = CellStore::default();
+        let (a, b) = (I64Vec3::new(0, 0, 0), I64Vec3::new(32, 0, 0));
+        store.upsert(1, a, &mixed(2, 3));
+        store.upsert(2, b, &mixed(1, 0));
+        let mut lists: [QuadList; 2] = Default::default();
+        fill(&mut lists, &store);
+        assert_eq!(lists[0].vertices.len(), 6 * 3);
+        assert_eq!(lists[1].vertices.len(), 6 * 3);
+        assert_eq!(lists[0].ranges, vec![(a, 0..12), (b, 12..18)]);
+        assert_eq!(lists[1].ranges, vec![(a, 0..18)]);
+        assert_eq!(list_of(CellImage::Block), 1);
+    }
+
     fn mesh(quads: usize) -> Arc<ChunkMesh> {
         let quad = CellQuad {
             corners: [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
             uv: [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
             image: 5,
+            source: CellImage::Cell,
             face: Face::NegZ,
             full_bright: true,
             tint: [1, 2, 3],

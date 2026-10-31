@@ -865,7 +865,7 @@ pub(crate) fn upsert_resident(
     origin: I64Vec3,
     mesh: &Arc<ChunkMesh>,
 ) -> Result<(), Refusal> {
-    debug_assert!(!mesh.is_empty());
+    debug_assert!(!mesh.quads.is_empty());
     if chunks.slot_for(id).is_none() {
         return Err(Refusal::Table);
     }

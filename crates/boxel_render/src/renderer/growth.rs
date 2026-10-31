@@ -243,7 +243,8 @@ impl VoxelRenderer {
             let ChunkOp::Upsert { id, mesh, .. } = op else {
                 continue;
             };
-            if mesh.is_empty() {
+            // No terrain quads (an empty mesh, or cell quads only): no chunk memory.
+            if mesh.quads.is_empty() {
                 continue;
             }
             let class = PageClass::of(&bucket_counts(mesh));

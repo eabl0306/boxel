@@ -199,3 +199,90 @@ fn the_rule_binds_each_state_once_with_the_registry() {
             .is_none()
     );
 }
+
+/// A block that draws nothing as a block (a box model without boxes) and one quad from its data:
+/// a chunk holding only it, with data, has a mesh of cell quads only, and that mesh is not empty
+/// (ADR 0053: streaming and the renderer draw it). Without data the mesh is empty.
+#[test]
+fn a_mesh_of_cell_quads_only_is_not_empty() {
+    let mut b = boxel_voxel::testing::builder();
+    let model = b
+        .add_box_model(BoxModel {
+            outline: vec![boxel_voxel::CollisionBox::new([4, 0, 4], [12, 16, 12])],
+            ..BoxModel::default()
+        })
+        .expect("model");
+    let sign = b
+        .add_block(BlockDef {
+            name: "test:sign".to_string(),
+            shape: RenderShape::Cutout,
+            model: BlockModel::Boxes(model),
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(boxel_voxel::TextureId(0)),
+        })
+        .expect("sign");
+    let block = b.block_by_name("test:sign").expect("block");
+    let rule = CellQuadRule::new(|_, _| {
+        Some(Arc::new(|_: &BlockData, out: &mut Vec<CellQuad>| {
+            out.push(CellQuad::from_plane(&item_plane(0), 1));
+        }))
+    });
+    b.set_cell_quads(block, rule).expect("rule");
+    let registry = b.build();
+    let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
+    dense[LocalPos::new(7, 7, 7).index()] = sign;
+    let mut chunk = ChunkData::from_dense(&dense);
+    let bare = mesh(&registry, &chunk, None);
+    assert!(bare.is_empty());
+    chunk.set_block_data(LocalPos::new(7, 7, 7), Some(BlockData::new()));
+    let drawn = mesh(&registry, &chunk, None);
+    assert!(drawn.quads.is_empty());
+    assert_eq!(drawn.cell_quads.len(), 1);
+    assert!(!drawn.is_empty());
+}
+
+/// `model_quads` draws a block alone in its cell with as many quads as the mesher does there,
+/// and on the same faces: the CPU twin leaves out the same faces.
+#[test]
+fn model_quads_draw_what_the_mesher_draws_for_a_lone_block() {
+    let (registry, frames) = registry(false);
+    let table = MaterialTable::from_registry(&registry);
+    for name in [
+        "test:solid",
+        "test:slab",
+        "test:boxes",
+        "test:plant",
+        "test:cutout",
+        "test:frame",
+    ] {
+        let s = if name == "test:frame" {
+            frames[0]
+        } else {
+            registry.by_name(name).expect(name)
+        };
+        let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
+        dense[LocalPos::new(9, 9, 9).index()] = s;
+        let chunk = ChunkData::from_dense(&dense);
+        let input = MeshInput {
+            center: &chunk,
+            neighbors: [None; 26],
+            light: None,
+        };
+        let terrain = Mesher::new().mesh_chunk(&input, &table, MeshOptions::default());
+        let mut quads = Vec::new();
+        boxel_voxel::model_quads(&registry, s, &mut quads);
+        assert_eq!(quads.len(), terrain.quads.len(), "{name}");
+        let mut faces: Vec<Face> = terrain.quads.iter().map(|q| q.face()).collect();
+        let mut twin: Vec<Face> = quads.iter().map(|q| q.face).collect();
+        if registry.model(s) == BlockModel::Cross {
+            // A cross's quads are faces PosX and PosZ in the mesh, shaded as PosY.
+            assert!(twin.iter().all(|&f| f == Face::PosY), "{name}");
+            continue;
+        }
+        faces.sort_by_key(|f| f.index());
+        twin.sort_by_key(|f| f.index());
+        assert_eq!(faces, twin, "{name}");
+    }
+}

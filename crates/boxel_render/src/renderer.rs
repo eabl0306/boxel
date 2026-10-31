@@ -1122,7 +1122,11 @@ impl VoxelRenderer {
         if self.cells.is_none() {
             let mut pass = None;
             let built = boxel_gfx::run_in_error_scopes(device, || {
-                pass = Some(CellPass::new(device, &self.view_layout));
+                pass = Some(CellPass::new(
+                    device,
+                    &self.view_layout,
+                    &self.block_texture,
+                ));
                 Ok(())
             });
             match (built, pass) {
@@ -1315,11 +1319,13 @@ impl VoxelRenderer {
         mesh: Arc<ChunkMesh>,
         caller: bool,
     ) -> Result<(), RendererError> {
-        if mesh.is_empty() {
-            self.remove_chunk(id);
+        self.cell_store.upsert(id, origin, &mesh);
+        if mesh.quads.is_empty() {
+            // Nothing for the terrain (an empty mesh, or one of cell quads only: a sign alone in
+            // its chunk, ADR 0053); its cell quads, if any, are in the cell store.
+            self.remove_resident_chunk(id);
             return Ok(());
         }
-        self.cell_store.upsert(id, origin, &mesh);
         debug_assert!(
             mesh.palette.is_empty()
                 || mesh
@@ -1373,8 +1379,13 @@ impl VoxelRenderer {
     }
     /// Removes a chunk; returns false if unknown. Reaches the GPU with the next `render`.
     pub fn remove_chunk(&mut self, id: u64) -> bool {
-        self.refused.shown(id);
         self.cell_store.remove(id);
+        self.remove_resident_chunk(id)
+    }
+    /// Removes a chunk's terrain quads (its cell quads stay in the cell store); returns false if
+    /// none were resident.
+    fn remove_resident_chunk(&mut self, id: u64) -> bool {
+        self.refused.shown(id);
         let Some(quads) = self.chunks.get(id).map(|(_, r)| r.alloc.alloc.size) else {
             return false;
         };
@@ -2093,12 +2104,23 @@ pub(crate) fn block_textures(
         wgpu::util::TextureDataOrder::LayerMajor,
         data,
     );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+    let view = array_view(&texture);
+    let sampler = block_sampler(device);
+    Ok((texture, view, sampler))
+}
+
+/// The `D2Array` view of a texture array made by [`block_textures`].
+pub(crate) fn array_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("boxel block textures"),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
-    });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    })
+}
+
+/// The block sampler: `Repeat`, mag `Nearest`, min and mip `Linear`.
+pub(crate) fn block_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("boxel blocks"),
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
@@ -2107,8 +2129,7 @@ pub(crate) fn block_textures(
         min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
-    });
-    Ok((texture, view, sampler))
+    })
 }
 
 #[cfg(test)]
