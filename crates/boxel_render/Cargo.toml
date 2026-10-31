@@ -70,5 +70,9 @@ harness = false
 name = "models"
 harness = false
 
+[[bench]]
+name = "cells"
+harness = false
+
 [lints]
 workspace = true

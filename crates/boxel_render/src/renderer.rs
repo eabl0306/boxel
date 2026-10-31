@@ -1,5 +1,5 @@
 use crate::arena::QUAD_BYTES;
-use crate::cells::{CellPass, CellStats, CellStore};
+use crate::cells::{CellPass, CellStats, CellStore, MovingCellQuad};
 use crate::chunk_table::ChunkTable;
 use crate::distance_fog::DistanceFog;
 use crate::fog::{FogInput, FogPass};
@@ -28,7 +28,7 @@ use boxel_mesh::{ChunkMesh, pack_table_entry};
 use boxel_shaders::gpu::{
     VIEW_BOX_CAPACITY, VIEW_BOXES_OFFSET, VIEW_BUFFER_SIZE, ViewUniform, bindings,
 };
-use boxel_voxel::{CHUNK_SHIFT, ChunkPos, TableEntry};
+use boxel_voxel::{CHUNK_SHIFT, ChunkPos, LightValue, TableEntry};
 use boxel_world::VisibleSet;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -313,6 +313,8 @@ pub struct VoxelRenderer {
     cells: Option<CellPass>,
     /// The cell quad pipeline could not be created on this device: no cell quad is drawn.
     cells_failed: bool,
+    /// Moving cell quads were given (ADR 0054): the cell quad pass is needed.
+    moving_cells: bool,
     /// The cell textures given last ([`VoxelRenderer::set_cell_textures`]).
     cell_textures: Option<Arc<BlockTextureData>>,
     /// The fog passes (ADR 0030), from the first [`VoxelRenderer::set_fog`] with input.
@@ -824,6 +826,7 @@ impl VoxelRenderer {
             cell_store: CellStore::default(),
             cells: None,
             cells_failed: false,
+            moving_cells: false,
             cell_textures: None,
             fog: None,
             fog_failed: false,
@@ -1112,10 +1115,39 @@ impl VoxelRenderer {
         self.prepare_cells(device, queue);
     }
 
+    /// Sets the moving cell quads (ADR 0054) of the next [`VoxelRenderer::render`] calls, each
+    /// with its light: quads the content gives for a frame, not baked into a chunk mesh (a lid
+    /// that opens, a beam that turns), drawn by the cell quad pass after the chunks' cell quads,
+    /// without culling. A list equal to the last one uploads nothing. Gives back the previous
+    /// list, to fill again without allocating. [`crate::MovingCellQuads`] does this from the
+    /// render plugin.
+    pub fn set_moving_cell_quads(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: Vec<(MovingCellQuad, LightValue)>,
+    ) -> Vec<(MovingCellQuad, LightValue)> {
+        if self.cells.is_none() && !quads.is_empty() {
+            self.moving_cells = true;
+            self.prepare_cells(device, queue);
+        }
+        match &mut self.cells {
+            Some(pass) => pass.set_moving(device, queue, quads),
+            None => {
+                let mut quads = quads;
+                quads.clear();
+                quads
+            }
+        }
+    }
+
     /// Builds the cell quad pass once it is needed and gives it the cell textures.
     fn prepare_cells(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.cells_failed
-            || (self.cells.is_none() && self.cell_store.is_empty() && self.cell_textures.is_none())
+            || (self.cells.is_none()
+                && self.cell_store.is_empty()
+                && self.cell_textures.is_none()
+                && !self.moving_cells)
         {
             return;
         }

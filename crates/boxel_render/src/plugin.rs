@@ -36,7 +36,7 @@ use boxel_gfx::{
 use boxel_math::{Quat, UVec2};
 use boxel_mesh::MaterialTable;
 use boxel_transform::Transform;
-use boxel_voxel::{BlockRegistry, BlockRegistryBuilder, ChunkPos};
+use boxel_voxel::{BlockPos, BlockRegistry, BlockRegistryBuilder, ChunkPos, LightValue};
 use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{
@@ -151,6 +151,15 @@ impl Default for RenderSettings {
 /// one too, takes the current value at its next frame.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct CellTextures(pub Option<Arc<BlockTextureData>>);
+
+/// The moving cell quads of this frame (ADR 0054): quads the content draws without baking them
+/// into a chunk mesh (a lid that opens, a bell that swings, a beam that turns). The render
+/// plugin lights each at its cell and draws them all, every frame, until the content changes
+/// the list: fill it again (or clear it) each frame something moves. Nothing is drawn or
+/// uploaded while it stays empty, and a frame whose list is the last one's uploads nothing. It
+/// belongs to the open world: emptied when the world closes.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct MovingCellQuads(pub Vec<crate::MovingCellQuad>);
 
 /// Presentation setting (vsync), read by the renderer every frame. A change reconfigures the
 /// surface on the same device in the next `Render` (`RenderSystems::Setup`): no new device, no
@@ -383,6 +392,7 @@ impl Plugin for RenderPlugin {
             .init_resource::<OverlayDraw>()
             .init_resource::<BlockOutline>()
             .init_resource::<CellTextures>()
+            .init_resource::<MovingCellQuads>()
             .init_resource::<GpuState>()
             .init_resource::<InstanceState>()
             .init_resource::<LkgRes>()
@@ -432,6 +442,7 @@ impl Plugin for RenderPlugin {
                 crate::model::extract_models
                     .after(extract)
                     .in_set(RenderSystems::Extract),
+                extract_moving_cells.in_set(RenderSystems::Extract),
                 prepare.in_set(RenderSystems::Prepare),
                 draw.in_set(RenderSystems::Draw),
                 cleanup.in_set(RenderSystems::Cleanup),
@@ -439,7 +450,8 @@ impl Plugin for RenderPlugin {
         )
         .add_systems(Shutdown, shutdown)
         .add_systems(WorldTeardown, forget_world.in_set(TeardownSystems::Render))
-        .world_resource::<BlockOutline>(|o| o.block.is_none());
+        .world_resource::<BlockOutline>(|o| o.block.is_none())
+        .world_resource::<MovingCellQuads>(|m| m.0.is_empty());
         #[cfg(feature = "ui")]
         app.add_systems(Render, crate::ui::extract_ui.in_set(RenderSystems::Extract));
     }
@@ -447,6 +459,32 @@ impl Plugin for RenderPlugin {
 
 // ---------------------------------------------------------------------------------------------
 // Private state
+
+/// Copies [`MovingCellQuads`] into the frame, each quad with its cell's light (open sky where
+/// the world has none), probed once per run of quads of one cell.
+fn extract_moving_cells(
+    mut frame: ResMut<ExtractedFrame>,
+    moving: Res<MovingCellQuads>,
+    chunks: Option<Res<ChunkMap>>,
+) {
+    let frame = &mut *frame;
+    frame.moving_cells.clear();
+    let mut last: Option<(BlockPos, LightValue)> = None;
+    for &q in &moving.0 {
+        let light = match last {
+            Some((cell, light)) if cell == q.cell => light,
+            _ => {
+                let light = chunks
+                    .as_deref()
+                    .and_then(|map| map.light_at(q.cell))
+                    .unwrap_or(LightValue::FULL_SKY);
+                last = Some((q.cell, light));
+                light
+            }
+        };
+        frame.moving_cells.push((q, light));
+    }
+}
 
 /// Offscreen frames (`render_when_hidden`) allowed in flight before `Draw` waits for the GPU.
 const MAX_OFFSCREEN_IN_FLIGHT: usize = 2;
@@ -502,13 +540,18 @@ impl Resync {
 
 /// `WorldTeardown`, `TeardownSystems::Render`: the renderer forgets the closed world in its
 /// next frame (every chunk, refusal, cull set and far LOD node of it, [`Resync::World`]), and the
-/// block outline goes. Without a ready device nothing is needed: every new device starts with a
-/// resync.
-fn forget_world(mut gpu: ResMut<GpuState>, mut outline: ResMut<BlockOutline>) {
+/// block outline and the moving cell quads go. Without a ready device nothing is needed: every
+/// new device starts with a resync.
+fn forget_world(
+    mut gpu: ResMut<GpuState>,
+    mut outline: ResMut<BlockOutline>,
+    mut moving: ResMut<MovingCellQuads>,
+) {
     if let GpuStage::Ready(ready) = &mut gpu.stage {
         ready.resync.raise(Resync::World);
     }
     outline.block = None;
+    moving.0.clear();
 }
 
 /// Selected device with its surface and renderer. Field order is the drop order (renderer,
@@ -732,6 +775,8 @@ pub(crate) struct ExtractedFrame {
     pub(crate) models: Vec<crate::model::ModelDraw>,
     /// A copy of [`CellTextures`].
     cell_textures: Option<Arc<BlockTextureData>>,
+    /// [`MovingCellQuads`] with the light of each quad's cell.
+    moving_cells: Vec<(crate::MovingCellQuad, LightValue)>,
     /// The chunks the camera may see this frame (cave culling), `None` when off.
     visibility: Option<Arc<VisibleSet>>,
     /// This frame's fog (`crate::fog::FogPlugin`'s extract), `None` without the plugin.
@@ -1736,6 +1781,10 @@ fn prepare(
             .renderer
             .set_cell_textures(&ready.ctx.device, queue, textures);
     }
+    let moving = std::mem::take(&mut frame.moving_cells);
+    frame.moving_cells = ready
+        .renderer
+        .set_moving_cell_quads(&ready.ctx.device, queue, moving);
     let camera = frame.camera.map_or(Quat::IDENTITY, |(_, t)| t.rotation);
     let models = std::mem::take(&mut frame.models);
     frame.models = ready.renderer.set_models(&ready.ctx.device, models, camera);

@@ -61,7 +61,7 @@ mod sort;
 mod targets;
 mod upload;
 
-pub use cells::CellStats;
+pub use cells::{CellStats, MovingCellQuad};
 pub use distance_fog::{DistanceFog, DistanceFogError};
 pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
 pub use memory::{
@@ -76,9 +76,9 @@ pub use pack_textures::{
 };
 pub use path::{CullCounts, cull_counts};
 pub use plugin::{
-    CellTextures, DebugDestroyDevice, GpuFailed, GpuReady, PresentSettings, Render, RenderInfo,
-    RenderPlugin, RenderSettings, RenderSystems, RequestScreenshot, Resync, ScreenshotSaved,
-    SurfaceInfo,
+    CellTextures, DebugDestroyDevice, GpuFailed, GpuReady, MovingCellQuads, PresentSettings,
+    Render, RenderInfo, RenderPlugin, RenderSettings, RenderSystems, RequestScreenshot, Resync,
+    ScreenshotSaved, SurfaceInfo,
 };
 #[doc(hidden)]
 pub use plugin::{DebugAllocProbe, frame_visibility, frame_visibility_with};

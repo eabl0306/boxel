@@ -20,7 +20,8 @@
 //! terrain, then the same blocks as cell quads of block layers from cells that draw nothing as a
 //! block (their chunk's mesh has cell quads only): both look the same (0.5 % of the pixels,
 //! channel tolerance 8: the terrain's edge growth), on every tier, and the second is the same on
-//! every tier (0.1 %).
+//! every tier (0.1 %). Then the same quads again as moving cell quads (ADR 0054), with no chunk
+//! at all: the same pixels as the baked ones (channel tolerance 2).
 //!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cells/` (every image with
 //! `GPU_CELLS_SAVE=1`).
@@ -32,12 +33,15 @@ use boxel_gfx::{
 };
 use boxel_math::{DVec3, I64Vec3, UVec2};
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
-use boxel_render::{DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, ViewParams, VoxelRenderer};
+use boxel_render::{
+    DEFAULT_SKY_COLOR, DistanceFog, MovingCellQuad, RendererConfig, ViewParams, VoxelRenderer,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{
-    Axis, BlockCollision, BlockData, BlockDef, BlockModel, BlockRegistry, BlockState, BoxModel,
-    CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face, FaceTextures, LocalPos,
-    ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage, TextureSpec, model_quads,
+    Axis, BlockCollision, BlockData, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState,
+    BoxModel, CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face, FaceTextures,
+    LightValue, LocalPos, ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage, TextureSpec,
+    model_quads,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -679,10 +683,30 @@ fn cell_quads_are_drawn_alike_on_every_tier() {
     );
 }
 
-/// The twin row as terrain, then as cell quads of block layers (a mesh of cell quads only).
+/// The twin row as terrain, then as cell quads of block layers (a mesh of cell quads only), then
+/// as the same quads moving (no chunk).
 struct TwinImages {
     terrain: RgbaImage,
     cells: RgbaImage,
+    moving: RgbaImage,
+}
+
+/// The twins' quads as moving cell quads from their cells, lit as a mesh without light is (open
+/// sky).
+fn twins_moving(scene: &Scene) -> Vec<(MovingCellQuad, LightValue)> {
+    let mut out = Vec::new();
+    for &(x, name) in &TWINS {
+        let mut quads = Vec::new();
+        let state = scene.registry.parse_state(name).expect(name);
+        model_quads(&scene.registry, state, &mut quads);
+        let cell = BlockPos::new(i64::from(x), 10, 19);
+        out.extend(
+            quads
+                .into_iter()
+                .map(|quad| (MovingCellQuad { cell, quad }, LightValue::FULL_SKY)),
+        );
+    }
+    out
 }
 
 fn render_twins(
@@ -726,11 +750,37 @@ fn render_twins(
     if (stats.cells.chunks, stats.cells.draws) != (1, 1) || stats.cells.block_quads == 0 {
         return Err(format!("twin cell stats {:?}", stats.cells));
     }
+    renderer.remove_chunk(1);
+    let moving = twins_moving(scene);
+    let count = moving.len() as u32;
+    let _ = renderer.set_moving_cell_quads(&device, &queue, moving);
+    let moving = render(&device, &queue, &mut renderer, &view)?;
+    let stats = renderer.stats().cells;
+    if (
+        stats.chunks,
+        stats.moving,
+        stats.drawn,
+        stats.draws,
+        stats.moving_uploads,
+    ) != (0, count, count, 1, 1)
+    {
+        return Err(format!("moving cell stats {stats:?}"));
+    }
+    // The same list again uploads nothing.
+    let _ = renderer.set_moving_cell_quads(&device, &queue, twins_moving(scene));
+    let _ = render(&device, &queue, &mut renderer, &view)?;
+    if renderer.stats().cells.moving_uploads != 1 {
+        return Err(format!("moving cell stats {:?}", renderer.stats().cells));
+    }
     let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
     if !errors.is_empty() {
         return Err(format!("uncaptured errors: {errors:?}"));
     }
-    Ok(TwinImages { terrain, cells })
+    Ok(TwinImages {
+        terrain,
+        cells,
+        moving,
+    })
 }
 
 /// Blocks drawn from cell quads of block layers ([`model_quads`]) look as the terrain draws
@@ -762,6 +812,7 @@ fn blocks_drawn_by_cell_quads_look_like_the_terrain() {
             let images = [
                 (format!("{what}_terrain"), &i.terrain),
                 (format!("{what}_cells"), &i.cells),
+                (format!("{what}_moving"), &i.moving),
             ];
             let images: Vec<(&str, &RgbaImage)> =
                 images.iter().map(|(n, im)| (n.as_str(), *im)).collect();
@@ -779,6 +830,20 @@ fn blocks_drawn_by_cell_quads_look_like_the_terrain() {
                     format!(
                         "{what}: cell quads vs terrain: {:.4} % of pixels differ",
                         diff.fraction() * 100.0
+                    ),
+                    &images,
+                );
+            }
+            let moving = i.cells.compare(&i.moving, 2);
+            eprintln!(
+                "gpu_cells: {what}: moving vs baked cell quads: {:.4} % of pixels differ",
+                moving.fraction() * 100.0
+            );
+            if moving.fraction() > 0.0 {
+                report.fail(
+                    format!(
+                        "{what}: moving vs baked cell quads: {:.4} % of pixels differ",
+                        moving.fraction() * 100.0
                     ),
                     &images,
                 );

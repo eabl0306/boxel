@@ -1,5 +1,5 @@
-//! Hooks for `benches/chunk_memory.rs` (ADR 0035): the CPU halves of chunk memory without a GPU.
-//! Not API.
+//! Hooks for `benches/chunk_memory.rs` (ADR 0035): the CPU halves of chunk memory without a GPU;
+//! and for `benches/cells.rs` (ADR 0054): the CPU half of the moving cell quads. Not API.
 use crate::ChunkMemorySettings;
 use crate::arena::ArenaAllocator;
 use crate::chunk_table::{ChunkRecord, ChunkTable};
@@ -231,5 +231,25 @@ fn facts() -> crate::memory::DeviceFacts {
         page_limit: (128 << 20) / 8,
         slot_limit: crate::memory::MAX_SLOTS,
         class: wgpu::DeviceType::DiscreteGpu,
+    }
+}
+
+/// The CPU half of the moving cell quads (ADR 0054) of one frame: the list compared with the
+/// last one and, when it differs, its vertices written (the upload itself is the GPU's).
+#[derive(Default)]
+pub struct MovingBench {
+    last: Vec<(crate::MovingCellQuad, boxel_voxel::LightValue)>,
+    lists: [crate::cells::QuadListBench; 2],
+}
+
+impl MovingBench {
+    /// One frame given `quads`: the vertices written (0 when they are the last frame's).
+    pub fn frame(&mut self, quads: &[(crate::MovingCellQuad, boxel_voxel::LightValue)]) -> usize {
+        if quads == self.last.as_slice() {
+            return 0;
+        }
+        self.last.clear();
+        self.last.extend_from_slice(quads);
+        crate::cells::fill_moving_bench(&mut self.lists, quads)
     }
 }

@@ -15,6 +15,11 @@
 //! since the shader subtracts the render origin as the terrain does. Each frame the chunks inside
 //! the GPU window and the frustum are drawn, runs of consecutive ones as one draw. Without cell
 //! quads nothing of this is built and nothing runs.
+//!
+//! The content can also give quads that are not in any mesh, for the frames it gives them
+//! ([`MovingCellQuad`], ADR 0054): what moves (a lid that opens, a bell that swings, a beam that
+//! turns). They are drawn by the same pipeline after the chunks' quads, in two more lists (one
+//! per texture array) rebuilt and uploaded only on a frame whose list differs from the last one.
 
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
@@ -24,7 +29,7 @@ use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, LitCellQuad};
 use boxel_shaders::gpu::{CellVertex, bindings, cell};
 use boxel_shaders::{ShaderModuleId, create_module};
-use boxel_voxel::CellImage;
+use boxel_voxel::{BlockPos, CellImage, CellQuad, LightValue};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -51,6 +56,24 @@ pub struct CellStats {
     pub uploads: u64,
     /// Layers of the cell texture array (0 until the content gives it).
     pub layers: u32,
+    /// Moving cell quads of the last frame ([`MovingCellQuad`], ADR 0054), all drawn.
+    pub moving: u32,
+    /// Uploads of their vertices so far (one per frame whose list changed).
+    pub moving_uploads: u64,
+}
+
+/// A cell quad the content gives for one frame, not baked into a chunk mesh (ADR 0054): a part
+/// that moves (a lid that opens, a bell that swings, a beam that turns), drawn like the chunks'
+/// cell quads (the same pipeline, both texture arrays, lit by its cell's light without ambient
+/// occlusion) but not culled: give only what may show. The render plugin draws the
+/// [`crate::MovingCellQuads`] of each frame, lit at their cells.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MovingCellQuad {
+    /// The cell whose min corner the quad's corners start from: it may reach out of it (a beam
+    /// rises hundreds of blocks), and its light is that cell's.
+    pub cell: BlockPos,
+    /// The quad, its corners in blocks from `cell`'s min corner.
+    pub quad: CellQuad,
 }
 
 /// The chunks with cell quads, by id (a `BTreeMap`: the vertex order is the same every time).
@@ -209,6 +232,14 @@ impl QuadList {
     fn drawn(&self) -> u32 {
         self.draws.iter().map(|r| r.len() as u32).sum::<u32>() / 6
     }
+
+    /// Draws every vertex this frame (the moving quads: not culled).
+    fn pick_all(&mut self) {
+        self.draws.clear();
+        if !self.vertices.is_empty() {
+            self.draws.push(0..self.vertices.len() as u32);
+        }
+    }
 }
 
 /// Index in [`CellPass::lists`] of the quads whose images are in `source`.
@@ -243,6 +274,45 @@ fn fill(lists: &mut [QuadList; 2], store: &CellStore) {
     }
 }
 
+/// The vertices of the moving quads `quads` (each with its light) in `lists`, each quad in the
+/// list of its texture array, placed from its cell.
+fn fill_moving(lists: &mut [QuadList; 2], quads: &[(MovingCellQuad, LightValue)]) {
+    for list in lists.iter_mut() {
+        list.vertices.clear();
+        list.ranges.clear();
+    }
+    for &(moving, light) in quads {
+        let cell = moving.cell;
+        let origin = wrap_to_i32(I64Vec3::new(cell.x, cell.y, cell.z)).to_array();
+        let lit = LitCellQuad {
+            quad: moving.quad,
+            light,
+        };
+        lists[list_of(moving.quad.source)]
+            .vertices
+            .extend(quad_vertices(origin, &lit));
+    }
+}
+
+/// A quad list for `benches/cells.rs` (`crate::bench::MovingBench`).
+#[derive(Default)]
+pub(crate) struct QuadListBench(QuadList);
+
+/// [`fill_moving`] into bench lists: the vertices written.
+pub(crate) fn fill_moving_bench(
+    lists: &mut [QuadListBench; 2],
+    quads: &[(MovingCellQuad, LightValue)],
+) -> usize {
+    let [a, b] = lists;
+    let mut pair = [std::mem::take(&mut a.0), std::mem::take(&mut b.0)];
+    fill_moving(&mut pair, quads);
+    let n = pair[0].vertices.len() + pair[1].vertices.len();
+    let [x, y] = pair;
+    a.0 = x;
+    b.0 = y;
+    n
+}
+
 /// The pipeline, the cell textures and the vertices of the cell quads (one per renderer).
 pub(crate) struct CellPass {
     pipeline: wgpu::RenderPipeline,
@@ -254,6 +324,11 @@ pub(crate) struct CellPass {
     blocks: wgpu::BindGroup,
     /// The quads of each texture array: the cell textures', then the block textures'.
     lists: [QuadList; 2],
+    /// The moving quads (ADR 0054) of each texture array, in the same order.
+    moving: [QuadList; 2],
+    /// The moving quads given last, with their light: a frame that gives the same uploads
+    /// nothing.
+    moving_input: Vec<(MovingCellQuad, LightValue)>,
     stats: CellStats,
 }
 
@@ -364,8 +439,31 @@ impl CellPass {
             textures: None,
             blocks,
             lists: Default::default(),
+            moving: Default::default(),
+            moving_input: Vec::new(),
             stats: CellStats::default(),
         }
+    }
+
+    /// Uses `quads` as the moving quads from the next [`CellPass::prepare`] on (uploaded then if
+    /// they differ from the last ones); gives back the previous list, to fill again.
+    pub(crate) fn set_moving(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: Vec<(MovingCellQuad, LightValue)>,
+    ) -> Vec<(MovingCellQuad, LightValue)> {
+        if quads == self.moving_input {
+            return quads;
+        }
+        let old = std::mem::replace(&mut self.moving_input, quads);
+        fill_moving(&mut self.moving, &self.moving_input);
+        let mut wrote = false;
+        for list in &mut self.moving {
+            wrote |= list.upload(device, queue);
+        }
+        self.stats.moving_uploads += u64::from(wrote);
+        old
     }
 
     /// Uses `data` as the cell textures (nothing to do if they are the ones in use). A texture
@@ -419,28 +517,40 @@ impl CellPass {
         for list in &mut self.lists {
             list.pick(chunks, view);
         }
-        self.stats.drawn = self.lists.iter().map(QuadList::drawn).sum();
+        for list in &mut self.moving {
+            list.pick_all();
+        }
+        self.stats.moving = self.moving_input.len() as u32;
+        let all = || self.lists.iter().chain(&self.moving);
+        self.stats.drawn = all().map(QuadList::drawn).sum();
         let cells = if self.textures.is_some() {
-            self.lists[0].draws.len() as u32
+            (self.lists[0].draws.len() + self.moving[0].draws.len()) as u32
         } else {
             0
         };
-        self.stats.draws = cells + self.lists[1].draws.len() as u32;
+        self.stats.draws = cells + (self.lists[1].draws.len() + self.moving[1].draws.len()) as u32;
     }
 
     /// Draws this frame's cell quads into `pass` (group 1 already holds the View): those of the
     /// cell textures (once the content gave them), then those of the block textures. Leaves group
     /// 0 bound to one of them. False if it drew nothing.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
-        if self.lists.iter().all(|l| l.draws.is_empty()) {
+        if self
+            .lists
+            .iter()
+            .chain(&self.moving)
+            .all(|l| l.draws.is_empty())
+        {
             return false;
         }
         pass.set_pipeline(&self.pipeline);
         let mut drew = false;
         if let Some((_, _, group)) = &self.textures {
             drew |= self.lists[0].draw(pass, group);
+            drew |= self.moving[0].draw(pass, group);
         }
         drew |= self.lists[1].draw(pass, &self.blocks);
+        drew |= self.moving[1].draw(pass, &self.blocks);
         drew
     }
 
@@ -478,6 +588,49 @@ mod tests {
         assert_eq!(lists[0].ranges, vec![(a, 0..12), (b, 12..18)]);
         assert_eq!(lists[1].ranges, vec![(a, 0..18)]);
         assert_eq!(list_of(CellImage::Block), 1);
+    }
+
+    /// Moving quads go to the list of their texture array, placed from their cell (wrapped to
+    /// i32 as a chunk origin is) with their light, and all of them are drawn.
+    #[test]
+    fn moving_quads_are_listed_from_their_cell() {
+        let quad = mesh(1).cell_quads[0].quad;
+        let far = BlockPos::new((1 << 40) + 3, -7, 12);
+        let quads = vec![
+            (
+                MovingCellQuad {
+                    cell: BlockPos::new(1, 2, 3),
+                    quad,
+                },
+                LightValue(0x1234),
+            ),
+            (
+                MovingCellQuad {
+                    cell: far,
+                    quad: CellQuad {
+                        source: CellImage::Block,
+                        ..quad
+                    },
+                },
+                LightValue::FULL_SKY,
+            ),
+        ];
+        let mut lists: [QuadList; 2] = Default::default();
+        fill_moving(&mut lists, &quads);
+        assert_eq!((lists[0].vertices.len(), lists[1].vertices.len()), (6, 6));
+        assert!(lists[0].vertices.iter().all(|v| v.origin == [1, 2, 3]));
+        let wrapped = wrap_to_i32(I64Vec3::new(far.x, far.y, far.z)).to_array();
+        assert!(lists[1].vertices.iter().all(|v| v.origin == wrapped));
+        assert_eq!(lists[0].vertices[0].data[0] >> cell::LIGHT_SHIFT, 0x1234);
+        assert_eq!(lists[0].vertices[0].pos, quad.corners[0]);
+        for list in &mut lists {
+            list.pick_all();
+        }
+        assert_eq!(lists[0].draws, vec![0..6]);
+        assert_eq!(lists[0].drawn() + lists[1].drawn(), 2);
+        fill_moving(&mut lists, &[]);
+        lists[0].pick_all();
+        assert!(lists[0].vertices.is_empty() && lists[0].draws.is_empty());
     }
 
     fn mesh(quads: usize) -> Arc<ChunkMesh> {
