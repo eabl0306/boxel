@@ -1392,10 +1392,11 @@ fn lod_seams_are_drawn_where_a_seam_can_show() {
     assert_eq!(bucket_quads(5, [10, 20], 0, 0, true), 0, "never below zero");
 }
 
-/// The cell quad pipeline (ADR 0050) runs on every tier, the Low one on GL included: one uniform
-/// block (the View) and one texture/sampler pair (the cell texture array), no storage buffer or
-/// immediates; the vertex is the four attributes `CellVertex` gives, the data reaches the
-/// fragment flat, and the shader's bit layout is `boxel_shaders::gpu::cell`'s.
+/// The cell quad pipelines (ADR 0050, the translucent one of ADR 0055) run on every tier, the
+/// Low one on GL included: one uniform block (the View) and one texture/sampler pair (the cell
+/// texture array) per entry point, no storage buffer or immediates; the vertex is the four
+/// attributes `CellVertex` gives, the data reaches the fragment flat, and the shader's bit
+/// layout is `boxel_shaders::gpu::cell`'s.
 #[test]
 fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
     use boxel_shaders::gpu::cell;
@@ -1445,7 +1446,14 @@ fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
         seen.push((ep.name.as_str(), (uniforms, textures, samplers)));
     }
     seen.sort_unstable();
-    assert_eq!(seen, [("fs_cell", (1, 1, 1)), ("vs_cell", (1, 0, 0))]);
+    assert_eq!(
+        seen,
+        [
+            ("fs_cell", (1, 1, 1)),
+            ("fs_cell_translucent", (1, 1, 1)),
+            ("vs_cell", (1, 0, 0))
+        ]
+    );
     let vs = module
         .entry_points
         .iter()
@@ -1497,4 +1505,8 @@ fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
     assert_eq!(const_u32(&module, "CELL_FACE_SHIFT"), cell::FACE_SHIFT);
     assert_eq!(const_u32(&module, "CELL_BRIGHT_BIT"), cell::FULL_BRIGHT);
     assert_eq!(const_u32(&module, "CELL_LIGHT_SHIFT"), cell::LIGHT_SHIFT);
+    assert_eq!(
+        const_u32(&module, "CELL_OPACITY_SHIFT"),
+        cell::OPACITY_SHIFT
+    );
 }

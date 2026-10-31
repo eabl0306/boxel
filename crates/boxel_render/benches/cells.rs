@@ -6,11 +6,18 @@
 //!   written again.
 //! - `cells/still/N`: the same `N` quads as the last frame: compared, nothing written.
 //!
+//! - `cells/sort/N`: `N` translucent quads (ADR 0055) sorted for an eye that moves every frame:
+//!   their distances, the order and the indices.
+//!
 //! An open chest gives about 30 quads, a beacon's beam 4 per part of its color, a ringing bell
-//! about 12.
+//! about 12; a stained glass block in a frame 6, a banner 6 per pattern.
+use boxel_camera::{Camera, CameraView};
+use boxel_math::DVec3;
 use boxel_render::MovingCellQuad;
-use boxel_render::bench::MovingBench;
-use boxel_voxel::{BlockPos, CellImage, CellQuad, Face, LightValue};
+use boxel_render::bench::{MovingBench, SortBench};
+use boxel_render::{DistanceFog, ViewParams};
+use boxel_transform::Transform;
+use boxel_voxel::{BlockPos, CellBlend, CellImage, CellQuad, Face, LightValue};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -36,6 +43,7 @@ fn quads(n: usize, angle: f32) -> Vec<(MovingCellQuad, LightValue)> {
                 face: Face::PosY,
                 full_bright: false,
                 tint: [255; 3],
+                blend: CellBlend::Cutout,
             };
             let cell = BlockPos::new((i / 30) as i64, 64, 0);
             (MovingCellQuad { cell, quad }, LightValue::FULL_SKY)
@@ -64,5 +72,38 @@ fn bench(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench);
+/// A view from `eye` looking along +x.
+fn view_at(eye: DVec3) -> ViewParams {
+    let camera = Camera::default();
+    let transform = Transform::from_yaw_pitch(eye, -std::f32::consts::FRAC_PI_2, 0.0);
+    let view = CameraView::compute(&camera, &transform, 16.0 / 9.0);
+    ViewParams::from_camera(&view, &camera, [0.0; 4], DistanceFog::default())
+}
+
+fn sort(c: &mut Criterion) {
+    for n in [300, 3000] {
+        let quads: Vec<_> = quads(n, 0.0)
+            .into_iter()
+            .map(|(m, light)| {
+                let quad = m.quad.with_blend(CellBlend::TRANSLUCENT);
+                (MovingCellQuad { quad, ..m }, light)
+            })
+            .collect();
+        let mut sort = SortBench::new(&quads);
+        // Two eyes a step apart, one after the other: each frame sorts again.
+        let views = [
+            view_at(DVec3::new(-4.0, 66.0, 0.5)),
+            view_at(DVec3::new(-3.9, 66.0, 0.6)),
+        ];
+        let mut k = 0;
+        c.bench_function(&format!("cells/sort/{n}"), |b| {
+            b.iter(|| {
+                k ^= 1;
+                black_box(sort.sort(&views[k]))
+            });
+        });
+    }
+}
+
+criterion_group!(benches, bench, sort);
 criterion_main!(benches);

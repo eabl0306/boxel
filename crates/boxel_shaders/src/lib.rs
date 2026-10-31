@@ -229,7 +229,11 @@ impl ShaderModuleId {
                 ("fs_model_opaque", Stage::Fragment),
                 ("fs_model_cutout", Stage::Fragment),
             ],
-            ShaderModuleId::Cell => &[("vs_cell", Stage::Vertex), ("fs_cell", Stage::Fragment)],
+            ShaderModuleId::Cell => &[
+                ("vs_cell", Stage::Vertex),
+                ("fs_cell", Stage::Fragment),
+                ("fs_cell_translucent", Stage::Fragment),
+            ],
         }
     }
 

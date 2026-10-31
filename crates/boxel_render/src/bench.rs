@@ -1,5 +1,6 @@
 //! Hooks for `benches/chunk_memory.rs` (ADR 0035): the CPU halves of chunk memory without a GPU;
-//! and for `benches/cells.rs` (ADR 0054): the CPU half of the moving cell quads. Not API.
+//! and for `benches/cells.rs` (ADR 0054, 0055): the CPU half of the moving cell quads and of the
+//! translucent ones' sort. Not API.
 use crate::ChunkMemorySettings;
 use crate::arena::ArenaAllocator;
 use crate::chunk_table::{ChunkRecord, ChunkTable};
@@ -239,7 +240,7 @@ fn facts() -> crate::memory::DeviceFacts {
 #[derive(Default)]
 pub struct MovingBench {
     last: Vec<(crate::MovingCellQuad, boxel_voxel::LightValue)>,
-    lists: [crate::cells::QuadListBench; 2],
+    lists: crate::cells::QuadListBench,
 }
 
 impl MovingBench {
@@ -251,5 +252,21 @@ impl MovingBench {
         self.last.clear();
         self.last.extend_from_slice(quads);
         crate::cells::fill_moving_bench(&mut self.lists, quads)
+    }
+}
+
+/// The sort of the translucent cell quads (ADR 0055) for one eye: their distances, the order and
+/// the indices written (the upload is the GPU's).
+pub struct SortBench(crate::cells::SortBench);
+
+impl SortBench {
+    /// `quads` as moving quads, all drawn.
+    pub fn new(quads: &[(crate::MovingCellQuad, boxel_voxel::LightValue)]) -> Self {
+        Self(crate::cells::SortBench::new(quads))
+    }
+
+    /// Sorts for `view`: the indices written.
+    pub fn sort(&mut self, view: &ViewParams) -> usize {
+        self.0.sort(view)
     }
 }

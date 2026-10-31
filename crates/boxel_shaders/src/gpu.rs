@@ -480,7 +480,7 @@ pub struct CellVertex {
     pub uv: [f32; 2],
     /// `[0]`: the image layer, the face ([`cell::FACE_SHIFT`]), the full bright bit
     /// ([`cell::FULL_BRIGHT`]) and the cell's light ([`cell::LIGHT_SHIFT`]); `[1]`: the tint,
-    /// sRGB `0xRRGGBB`.
+    /// sRGB `0xRRGGBB`, and a translucent quad's opacity ([`cell::OPACITY_SHIFT`]).
     pub data: [u32; 2],
 }
 
@@ -494,6 +494,9 @@ pub mod cell {
     pub const FULL_BRIGHT: u32 = 0x8000;
     /// Where the cell's `boxel_voxel::LightValue` sits in `CellVertex::data[0]` (16 bits).
     pub const LIGHT_SHIFT: u32 = 16;
+    /// Where a translucent quad's opacity sits in `CellVertex::data[1]` (8 bits, 0 for a cutout
+    /// quad; ADR 0055).
+    pub const OPACITY_SHIFT: u32 = 24;
     /// Group of the cell texture array (binding 0) and its sampler (binding 1). The `View`
     /// uniform stays in [`super::bindings::GROUP_VIEW`].
     pub const GROUP_TEXTURES: u32 = 0;

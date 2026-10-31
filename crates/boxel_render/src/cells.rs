@@ -20,6 +20,18 @@
 //! ([`MovingCellQuad`], ADR 0054): what moves (a lid that opens, a bell that swings, a beam that
 //! turns). They are drawn by the same pipeline after the chunks' quads, in two more lists (one
 //! per texture array) rebuilt and uploaded only on a frame whose list differs from the last one.
+//!
+//! Translucent cell quads ([`CellBlend::Translucent`], ADR 0055: a stained glass block in a
+//! frame, a banner's pattern) are kept apart, in four more lists (the chunks' and the moving
+//! ones, per texture array), and drawn last with a second pipeline of the same shader that
+//! blends and writes depth, as Minecraft's translucent items: back to front by the distance from
+//! the eye to each quad's nearest point, without the quads whose face looks away from the eye.
+//! Glows ([`CellBlend::Glow`]: the beacon beam's outer layer) are sorted with them and drawn by
+//! a third pipeline that writes no depth. The sort writes only an index buffer (6 indices a
+//! quad); it runs on a frame whose eye, drawn chunks or quads changed. The pass draws before the
+//! terrain's translucent quads, so water or glass in front of a translucent cell quad tints it,
+//! and the fog and clouds see a translucent one as opaque (they read the depth) and paint over a
+//! glow.
 
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
@@ -29,7 +41,7 @@ use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, LitCellQuad};
 use boxel_shaders::gpu::{CellVertex, bindings, cell};
 use boxel_shaders::{ShaderModuleId, create_module};
-use boxel_voxel::{BlockPos, CellImage, CellQuad, LightValue};
+use boxel_voxel::{BlockPos, CellBlend, CellImage, CellQuad, LightValue};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -60,6 +72,11 @@ pub struct CellStats {
     pub moving: u32,
     /// Uploads of their vertices so far (one per frame whose list changed).
     pub moving_uploads: u64,
+    /// Translucent cell quads drawn this frame (ADR 0055), baked or moving, those facing the eye.
+    pub translucent: u32,
+    /// Sorts of the translucent quads so far (one per frame whose eye, drawn chunks or quads
+    /// changed).
+    pub sorts: u64,
 }
 
 /// A cell quad the content gives for one frame, not baked into a chunk mesh (ADR 0054): a part
@@ -147,13 +164,64 @@ pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6
         | if c.full_bright { cell::FULL_BRIGHT } else { 0 }
         | u32::from(q.light.0) << cell::LIGHT_SHIFT;
     let [r, g, b] = c.tint.map(u32::from);
-    let data = [data0, r << 16 | g << 8 | b];
+    let opacity = u32::from(c.blend.opacity());
+    let data = [data0, opacity << cell::OPACITY_SHIFT | r << 16 | g << 8 | b];
     TRIANGLES.map(|k| CellVertex {
         origin,
         pos: c.corners[k],
         uv: c.uv[k],
         data,
     })
+}
+
+/// A translucent quad as the sort sees it (ADR 0055): its corner 0 and its two edges from it, in
+/// blocks from `origin` (its chunk's min corner, or its cell's), and the side it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SortQuad {
+    origin: I64Vec3,
+    corner: Vec3,
+    u: Vec3,
+    v: Vec3,
+    /// The quad's normal toward the side its face looks to; zero when that face lies along the
+    /// quad (a plane shaded as `PosY` across it): both sides show.
+    facing: Vec3,
+    /// A glow ([`CellBlend::Glow`]): drawn without writing depth.
+    glow: bool,
+}
+
+impl SortQuad {
+    fn new(origin: I64Vec3, q: &CellQuad) -> Self {
+        let [c0, c1, c2, _] = q.corners.map(Vec3::from_array);
+        let (u, v) = (c1 - c0, c2 - c0);
+        let normal = u.cross(v);
+        let face = q.face.normal().as_vec3();
+        let along = normal.dot(face);
+        let facing = if along.abs() > 0.5 * normal.length() {
+            normal * along.signum()
+        } else {
+            Vec3::ZERO
+        };
+        Self {
+            origin,
+            corner: c0,
+            u,
+            v,
+            facing,
+            glow: matches!(q.blend, CellBlend::Glow(_)),
+        }
+    }
+
+    /// The squared distance from `eye` (blocks from `origin`) to the quad's nearest point (its
+    /// parallelogram clamped along each edge), or `None` if its face looks away from `eye`.
+    fn distance(&self, eye: Vec3) -> Option<f32> {
+        let d = eye - self.corner;
+        if self.facing != Vec3::ZERO && self.facing.dot(d) <= 0.0 {
+            return None;
+        }
+        let along = |e: Vec3| (d.dot(e) / e.length_squared().max(1e-12)).clamp(0.0, 1.0);
+        let nearest = self.corner + self.u * along(self.u) + self.v * along(self.v);
+        Some((eye - nearest).length_squared())
+    }
 }
 
 /// The cell quads whose images are layers of one texture array: their vertices, each chunk's
@@ -168,6 +236,8 @@ struct QuadList {
     ranges: Vec<(I64Vec3, Range<u32>)>,
     /// This frame's draws (merged vertex ranges).
     draws: Vec<Range<u32>>,
+    /// Per quad (6 vertices), a translucent list's: where the sort reads it.
+    sort: Vec<SortQuad>,
 }
 
 impl QuadList {
@@ -240,6 +310,132 @@ impl QuadList {
             self.draws.push(0..self.vertices.len() as u32);
         }
     }
+
+    fn clear(&mut self) {
+        self.vertices.clear();
+        self.ranges.clear();
+        self.sort.clear();
+    }
+
+    /// Appends `q` (corners from `origin`, whose GPU origin is `gpu`), with its sort entry.
+    fn push(&mut self, origin: I64Vec3, gpu: [i32; 3], q: &LitCellQuad) {
+        self.vertices.extend(quad_vertices(gpu, q));
+        if q.quad.blend.is_translucent() {
+            self.sort.push(SortQuad::new(origin, &q.quad));
+        }
+    }
+}
+
+/// The lists of one kind of quads (from the chunks, or moving): the cutout ones and the
+/// translucent ones (ADR 0055) per texture array, `[cell, block]` each.
+#[derive(Default)]
+struct Lists {
+    cutout: [QuadList; 2],
+    translucent: [QuadList; 2],
+}
+
+impl Lists {
+    fn clear(&mut self) {
+        for list in self.cutout.iter_mut().chain(&mut self.translucent) {
+            list.clear();
+        }
+    }
+
+    fn list(&mut self, q: &CellQuad) -> &mut QuadList {
+        let lists = if q.blend.is_translucent() {
+            &mut self.translucent
+        } else {
+            &mut self.cutout
+        };
+        &mut lists[list_of(q.source)]
+    }
+
+    fn all(&self) -> impl Iterator<Item = &QuadList> {
+        self.cutout.iter().chain(&self.translucent)
+    }
+
+    /// Uploads every list's vertices; true if it wrote any.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let mut wrote = false;
+        for list in self.cutout.iter_mut().chain(&mut self.translucent) {
+            wrote |= list.upload(device, queue);
+        }
+        wrote
+    }
+}
+
+/// Which translucent list a sorted quad is in: the chunks' (`0`, `1`) or the moving ones' (`2`,
+/// `3`), by texture array (`list_of`).
+type ListId = u8;
+
+/// The translucent quads' order this frame (ADR 0055): an index buffer of the quads that face
+/// the eye, back to front, drawn as runs of one list.
+#[derive(Default)]
+struct Sorted {
+    index: Option<wgpu::Buffer>,
+    /// Indices `index` holds.
+    index_capacity: usize,
+    indices: Vec<u32>,
+    /// This frame's draws: each run's list, whether its quads are glows, and its range of
+    /// `indices`.
+    runs: Vec<(ListId, bool, Range<u32>)>,
+    /// The quads that face the eye: squared distance, list and quad.
+    order: Vec<(f32, ListId, u32)>,
+    /// The eye of the last sort (its render origin and the bits of its offset from it); `None`
+    /// after a change: sort again.
+    eye: Option<(I64Vec3, [u32; 3])>,
+}
+
+impl Sorted {
+    /// Sorts the drawn quads of `lists` (the chunks' translucent lists, then the moving ones) for
+    /// the eye of `view`: far first, ties by list and quad (the same order every time).
+    fn sort(&mut self, lists: [&QuadList; 4], view: &ViewParams) {
+        self.order.clear();
+        for (id, list) in lists.iter().enumerate() {
+            for range in &list.draws {
+                for quad in range.start / 6..range.end / 6 {
+                    let q = &list.sort[quad as usize];
+                    let offset = q.origin.saturating_sub(view.render_origin).as_vec3();
+                    if let Some(d) = q.distance(view.eye_rel - offset) {
+                        self.order.push((d, id as ListId, quad));
+                    }
+                }
+            }
+        }
+        self.order
+            .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        self.indices.clear();
+        self.runs.clear();
+        for &(_, id, quad) in &self.order {
+            let glow = lists[usize::from(id)].sort[quad as usize].glow;
+            let at = self.indices.len() as u32;
+            match self.runs.last_mut() {
+                Some((last, g, range)) if *last == id && *g == glow => range.end = at + 6,
+                _ => self.runs.push((id, glow, at..at + 6)),
+            }
+            self.indices.extend(quad * 6..quad * 6 + 6);
+        }
+    }
+
+    /// Writes the indices into the index buffer (grown to fit).
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.indices.is_empty() {
+            return;
+        }
+        if self.index.is_none() || self.index_capacity < self.indices.len() {
+            let capacity = self.indices.len().next_power_of_two().max(6 * 256);
+            self.index = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("boxel translucent cell indices"),
+                size: (capacity * size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.index_capacity = capacity;
+        }
+        if let Some(buffer) = &self.index {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.indices));
+        }
+    }
 }
 
 /// Index in [`CellPass::lists`] of the quads whose images are in `source`.
@@ -250,22 +446,21 @@ const fn list_of(source: CellImage) -> usize {
     }
 }
 
-/// The vertices of every chunk of `store` in `lists`, each quad in the list of its texture array
-/// ([`list_of`]), each chunk's run of a list recorded with its origin.
-fn fill(lists: &mut [QuadList; 2], store: &CellStore) {
-    for list in lists.iter_mut() {
-        list.vertices.clear();
-        list.ranges.clear();
-    }
+/// The vertices of every chunk of `store` in `lists`, each quad in the list of its blend and
+/// texture array ([`Lists::list`]), each chunk's run of a list recorded with its origin.
+fn fill(lists: &mut Lists, store: &CellStore) {
+    lists.clear();
     for (origin, mesh) in store.chunks.values() {
-        let starts = lists.each_ref().map(|l| l.vertices.len() as u32);
+        let starts = lists
+            .all()
+            .map(|l| l.vertices.len() as u32)
+            .collect::<Vec<_>>();
         let gpu = wrap_to_i32(*origin).to_array();
         for q in &mesh.cell_quads {
-            lists[list_of(q.quad.source)]
-                .vertices
-                .extend(quad_vertices(gpu, q));
+            lists.list(&q.quad).push(*origin, gpu, q);
         }
-        for (list, start) in lists.iter_mut().zip(starts) {
+        let all = lists.cutout.iter_mut().chain(&mut lists.translucent);
+        for (list, start) in all.zip(starts) {
             let end = list.vertices.len() as u32;
             if end > start {
                 list.ranges.push((*origin, start..end));
@@ -275,65 +470,88 @@ fn fill(lists: &mut [QuadList; 2], store: &CellStore) {
 }
 
 /// The vertices of the moving quads `quads` (each with its light) in `lists`, each quad in the
-/// list of its texture array, placed from its cell.
-fn fill_moving(lists: &mut [QuadList; 2], quads: &[(MovingCellQuad, LightValue)]) {
-    for list in lists.iter_mut() {
-        list.vertices.clear();
-        list.ranges.clear();
-    }
+/// list of its blend and texture array, placed from its cell.
+fn fill_moving(lists: &mut Lists, quads: &[(MovingCellQuad, LightValue)]) {
+    lists.clear();
     for &(moving, light) in quads {
-        let cell = moving.cell;
-        let origin = wrap_to_i32(I64Vec3::new(cell.x, cell.y, cell.z)).to_array();
+        let cell = I64Vec3::new(moving.cell.x, moving.cell.y, moving.cell.z);
         let lit = LitCellQuad {
             quad: moving.quad,
             light,
         };
-        lists[list_of(moving.quad.source)]
-            .vertices
-            .extend(quad_vertices(origin, &lit));
+        lists
+            .list(&moving.quad)
+            .push(cell, wrap_to_i32(cell).to_array(), &lit);
     }
 }
 
-/// A quad list for `benches/cells.rs` (`crate::bench::MovingBench`).
+/// The lists of the moving quads for `benches/cells.rs` (`crate::bench::MovingBench`).
 #[derive(Default)]
-pub(crate) struct QuadListBench(QuadList);
+pub(crate) struct QuadListBench(Lists);
 
 /// [`fill_moving`] into bench lists: the vertices written.
 pub(crate) fn fill_moving_bench(
-    lists: &mut [QuadListBench; 2],
+    lists: &mut QuadListBench,
     quads: &[(MovingCellQuad, LightValue)],
 ) -> usize {
-    let [a, b] = lists;
-    let mut pair = [std::mem::take(&mut a.0), std::mem::take(&mut b.0)];
-    fill_moving(&mut pair, quads);
-    let n = pair[0].vertices.len() + pair[1].vertices.len();
-    let [x, y] = pair;
-    a.0 = x;
-    b.0 = y;
-    n
+    fill_moving(&mut lists.0, quads);
+    lists.0.all().map(|l| l.vertices.len()).sum()
 }
 
-/// The pipeline, the cell textures and the vertices of the cell quads (one per renderer).
+/// The translucent quads of one frame for `benches/cells.rs` (`crate::bench::SortBench`): the
+/// moving lists filled once, sorted for each eye.
+#[derive(Default)]
+pub(crate) struct SortBench {
+    lists: Lists,
+    sorted: Sorted,
+}
+
+impl SortBench {
+    pub(crate) fn new(quads: &[(MovingCellQuad, LightValue)]) -> Self {
+        let mut bench = Self::default();
+        fill_moving(&mut bench.lists, quads);
+        for list in &mut bench.lists.translucent {
+            list.pick_all();
+        }
+        bench
+    }
+
+    /// Sorts for `view`: the indices written.
+    pub(crate) fn sort(&mut self, view: &ViewParams) -> usize {
+        let empty = QuadList::default();
+        let [a, b] = &self.lists.translucent;
+        self.sorted.sort([&empty, &empty, a, b], view);
+        self.sorted.indices.len()
+    }
+}
+
+/// The pipelines, the cell textures and the vertices of the cell quads (one per renderer).
 pub(crate) struct CellPass {
     pipeline: wgpu::RenderPipeline,
+    /// The same shader blending its translucent fragment (ADR 0055), writing depth; and the
+    /// same without writing it, for the glows.
+    translucent: wgpu::RenderPipeline,
+    glow: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     /// The cell textures and their bind group, with the data they were made from.
     textures: Option<(Arc<BlockTextureData>, wgpu::Texture, wgpu::BindGroup)>,
     /// The block textures (the terrain's array, animated layers included) in this pipeline's
     /// layout.
     blocks: wgpu::BindGroup,
-    /// The quads of each texture array: the cell textures', then the block textures'.
-    lists: [QuadList; 2],
-    /// The moving quads (ADR 0054) of each texture array, in the same order.
-    moving: [QuadList; 2],
+    /// The quads of the chunks.
+    lists: Lists,
+    /// The moving quads (ADR 0054).
+    moving: Lists,
     /// The moving quads given last, with their light: a frame that gives the same uploads
     /// nothing.
     moving_input: Vec<(MovingCellQuad, LightValue)>,
+    /// This frame's order of the translucent quads.
+    sorted: Sorted,
     stats: CellStats,
 }
 
 impl CellPass {
-    /// The pipeline for `device`; `view_layout` is the renderer's group 1 (the `View` uniform),
+    /// The pipelines for `device`; `view_layout` is the renderer's group 1 (the `View` uniform),
     /// `block_texture` the terrain's block texture array.
     pub(crate) fn new(
         device: &wgpu::Device,
@@ -382,51 +600,60 @@ impl CellPass {
             attribute(wgpu::VertexFormat::Float32x2, o2, 2),
             attribute(wgpu::VertexFormat::Uint32x2, o3, 3),
         ];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("boxel cell"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_cell"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<CellVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attributes,
-                })],
-            },
-            // Both sides, as the terrain's cutout bucket.
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            // Tested and written like the terrain (reverse-Z).
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_cell"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: MAIN_COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let build = |label: &str, fragment: &str, blend: Option<wgpu::BlendState>, depth: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_cell"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: size_of::<CellVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    })],
+                },
+                // Both sides, as the terrain's cutout bucket (the sort drops the translucent
+                // quads that look away).
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                // Tested and written like the terrain (reverse-Z); the translucent quads too, as
+                // Minecraft's translucent items: drawn back to front, the ones behind still show.
+                // A glow is only tested.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fragment),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: MAIN_COLOR_FORMAT,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = build("boxel cell", "fs_cell", None, true);
+        let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
+        let translucent = build("boxel cell translucent", "fs_cell_translucent", blend, true);
+        let glow = build("boxel cell glow", "fs_cell_translucent", blend, false);
         let blocks = texture_group(
             device,
             &layout,
@@ -435,12 +662,15 @@ impl CellPass {
         );
         Self {
             pipeline,
+            translucent,
+            glow,
             layout,
             textures: None,
             blocks,
-            lists: Default::default(),
-            moving: Default::default(),
+            lists: Lists::default(),
+            moving: Lists::default(),
             moving_input: Vec::new(),
+            sorted: Sorted::default(),
             stats: CellStats::default(),
         }
     }
@@ -458,11 +688,9 @@ impl CellPass {
         }
         let old = std::mem::replace(&mut self.moving_input, quads);
         fill_moving(&mut self.moving, &self.moving_input);
-        let mut wrote = false;
-        for list in &mut self.moving {
-            wrote |= list.upload(device, queue);
-        }
+        let wrote = self.moving.upload(device, queue);
         self.stats.moving_uploads += u64::from(wrote);
+        self.sorted.eye = None;
         old
     }
 
@@ -492,7 +720,8 @@ impl CellPass {
     }
 
     /// Uploads the vertices if the store changed, then picks this frame's draws: the chunks
-    /// inside the GPU window (`chunks`) and the frustum of `view`.
+    /// inside the GPU window (`chunks`) and the frustum of `view`; and sorts the translucent
+    /// quads for its eye if it, the drawn chunks or the quads changed.
     pub(crate) fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -504,53 +733,131 @@ impl CellPass {
         if store.dirty {
             store.dirty = false;
             fill(&mut self.lists, store);
-            let mut wrote = false;
-            for list in &mut self.lists {
-                wrote |= list.upload(device, queue);
-            }
+            let wrote = self.lists.upload(device, queue);
             self.stats.uploads += u64::from(wrote);
+            self.sorted.eye = None;
         }
         self.stats.chunks = store.chunks.len() as u32;
-        let quads = self.lists.each_ref().map(|l| l.vertices.len() as u32 / 6);
-        self.stats.quads = quads[0] + quads[1];
-        self.stats.block_quads = quads[1];
-        for list in &mut self.lists {
+        let count = |l: &QuadList| l.vertices.len() as u32 / 6;
+        let [cell, block] =
+            [0, 1].map(|k| count(&self.lists.cutout[k]) + count(&self.lists.translucent[k]));
+        self.stats.quads = cell + block;
+        self.stats.block_quads = block;
+        for list in &mut self.lists.cutout {
             list.pick(chunks, view);
         }
-        for list in &mut self.moving {
+        let mut changed = false;
+        for list in &mut self.lists.translucent {
+            let before = std::mem::take(&mut list.draws);
+            list.pick(chunks, view);
+            changed |= before != list.draws;
+        }
+        for list in self
+            .moving
+            .cutout
+            .iter_mut()
+            .chain(&mut self.moving.translucent)
+        {
             list.pick_all();
         }
+        let eye = (
+            view.render_origin,
+            view.eye_rel.to_array().map(f32::to_bits),
+        );
+        let none = self
+            .lists
+            .translucent
+            .iter()
+            .chain(&self.moving.translucent)
+            .all(|l| l.vertices.is_empty());
+        if none && self.sorted.order.is_empty() {
+            self.sorted.runs.clear();
+        } else if changed || self.sorted.eye != Some(eye) {
+            let [a, b] = &self.lists.translucent;
+            let [c, d] = &self.moving.translucent;
+            self.sorted.sort([a, b, c, d], view);
+            self.sorted.upload(device, queue);
+            self.sorted.eye = Some(eye);
+            self.stats.sorts += 1;
+        }
         self.stats.moving = self.moving_input.len() as u32;
-        let all = || self.lists.iter().chain(&self.moving);
-        self.stats.drawn = all().map(QuadList::drawn).sum();
+        self.stats.translucent = self.sorted.order.len() as u32;
+        let cutout = || self.lists.cutout.iter().chain(&self.moving.cutout);
+        self.stats.drawn = cutout().map(QuadList::drawn).sum::<u32>() + self.stats.translucent;
         let cells = if self.textures.is_some() {
-            (self.lists[0].draws.len() + self.moving[0].draws.len()) as u32
+            (self.lists.cutout[0].draws.len() + self.moving.cutout[0].draws.len()) as u32
+                + self.sorted.runs.iter().filter(|r| r.0 % 2 == 0).count() as u32
         } else {
             0
         };
-        self.stats.draws = cells + (self.lists[1].draws.len() + self.moving[1].draws.len()) as u32;
+        let blocks = self.lists.cutout[1].draws.len() + self.moving.cutout[1].draws.len();
+        self.stats.draws =
+            cells + (blocks + self.sorted.runs.iter().filter(|r| r.0 % 2 == 1).count()) as u32;
     }
 
-    /// Draws this frame's cell quads into `pass` (group 1 already holds the View): those of the
-    /// cell textures (once the content gave them), then those of the block textures. Leaves group
-    /// 0 bound to one of them. False if it drew nothing.
+    /// Draws this frame's cell quads into `pass` (group 1 already holds the View): the cutout
+    /// ones of the cell textures (once the content gave them), then those of the block textures,
+    /// then the translucent ones back to front. Leaves group 0 bound to one of the arrays. False
+    /// if it drew nothing.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
-        if self
-            .lists
-            .iter()
-            .chain(&self.moving)
-            .all(|l| l.draws.is_empty())
-        {
+        let cutout = || self.lists.cutout.iter().chain(&self.moving.cutout);
+        if cutout().all(|l| l.draws.is_empty()) && self.sorted.runs.is_empty() {
             return false;
         }
-        pass.set_pipeline(&self.pipeline);
         let mut drew = false;
-        if let Some((_, _, group)) = &self.textures {
-            drew |= self.lists[0].draw(pass, group);
-            drew |= self.moving[0].draw(pass, group);
+        if cutout().any(|l| !l.draws.is_empty()) {
+            pass.set_pipeline(&self.pipeline);
+            if let Some((_, _, group)) = &self.textures {
+                drew |= self.lists.cutout[0].draw(pass, group);
+                drew |= self.moving.cutout[0].draw(pass, group);
+            }
+            drew |= self.lists.cutout[1].draw(pass, &self.blocks);
+            drew |= self.moving.cutout[1].draw(pass, &self.blocks);
         }
-        drew |= self.lists[1].draw(pass, &self.blocks);
-        drew |= self.moving[1].draw(pass, &self.blocks);
+        drew | self.draw_translucent(pass)
+    }
+
+    /// The translucent quads in this frame's order, a draw per run of one list.
+    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
+        let Some(index) = &self.sorted.index else {
+            return false;
+        };
+        let lists = [
+            &self.lists.translucent[0],
+            &self.lists.translucent[1],
+            &self.moving.translucent[0],
+            &self.moving.translucent[1],
+        ];
+        let mut bound = None;
+        let mut pipeline = None;
+        let mut drew = false;
+        for (id, glow, range) in &self.sorted.runs {
+            let group = if id % 2 == 0 {
+                match &self.textures {
+                    Some((_, _, group)) => group,
+                    None => continue,
+                }
+            } else {
+                &self.blocks
+            };
+            let Some(vertex) = &lists[usize::from(*id)].vertex else {
+                continue;
+            };
+            if !drew {
+                pass.set_index_buffer(index.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            if pipeline != Some(*glow) {
+                pass.set_pipeline(if *glow { &self.glow } else { &self.translucent });
+                pipeline = Some(*glow);
+            }
+            if bound != Some(*id) {
+                pass.set_bind_group(cell::GROUP_TEXTURES, group, &[]);
+                pass.set_vertex_buffer(0, vertex.slice(..));
+                bound = Some(*id);
+            }
+            pass.draw_indexed(range.clone(), 0, 0..1);
+            drew = true;
+        }
         drew
     }
 
@@ -581,13 +888,15 @@ mod tests {
         let (a, b) = (I64Vec3::new(0, 0, 0), I64Vec3::new(32, 0, 0));
         store.upsert(1, a, &mixed(2, 3));
         store.upsert(2, b, &mixed(1, 0));
-        let mut lists: [QuadList; 2] = Default::default();
+        let mut lists = Lists::default();
         fill(&mut lists, &store);
+        let lists = &lists.cutout;
         assert_eq!(lists[0].vertices.len(), 6 * 3);
         assert_eq!(lists[1].vertices.len(), 6 * 3);
         assert_eq!(lists[0].ranges, vec![(a, 0..12), (b, 12..18)]);
         assert_eq!(lists[1].ranges, vec![(a, 0..18)]);
         assert_eq!(list_of(CellImage::Block), 1);
+        assert!(lists[0].sort.is_empty());
     }
 
     /// Moving quads go to the list of their texture array, placed from their cell (wrapped to
@@ -615,22 +924,23 @@ mod tests {
                 LightValue::FULL_SKY,
             ),
         ];
-        let mut lists: [QuadList; 2] = Default::default();
-        fill_moving(&mut lists, &quads);
+        let mut all = Lists::default();
+        fill_moving(&mut all, &quads);
+        let lists = &mut all.cutout;
         assert_eq!((lists[0].vertices.len(), lists[1].vertices.len()), (6, 6));
         assert!(lists[0].vertices.iter().all(|v| v.origin == [1, 2, 3]));
         let wrapped = wrap_to_i32(I64Vec3::new(far.x, far.y, far.z)).to_array();
         assert!(lists[1].vertices.iter().all(|v| v.origin == wrapped));
         assert_eq!(lists[0].vertices[0].data[0] >> cell::LIGHT_SHIFT, 0x1234);
         assert_eq!(lists[0].vertices[0].pos, quad.corners[0]);
-        for list in &mut lists {
+        for list in lists.iter_mut() {
             list.pick_all();
         }
         assert_eq!(lists[0].draws, vec![0..6]);
         assert_eq!(lists[0].drawn() + lists[1].drawn(), 2);
-        fill_moving(&mut lists, &[]);
-        lists[0].pick_all();
-        assert!(lists[0].vertices.is_empty() && lists[0].draws.is_empty());
+        fill_moving(&mut all, &[]);
+        all.cutout[0].pick_all();
+        assert!(all.cutout[0].vertices.is_empty() && all.cutout[0].draws.is_empty());
     }
 
     fn mesh(quads: usize) -> Arc<ChunkMesh> {
@@ -642,6 +952,7 @@ mod tests {
             face: Face::NegZ,
             full_bright: true,
             tint: [1, 2, 3],
+            blend: CellBlend::Cutout,
         };
         Arc::new(ChunkMesh {
             cell_quads: vec![
@@ -653,6 +964,75 @@ mod tests {
             ],
             ..ChunkMesh::default()
         })
+    }
+
+    fn view_at(eye: boxel_math::DVec3) -> ViewParams {
+        let camera = boxel_camera::Camera::default();
+        let transform = boxel_transform::Transform::from_yaw_pitch(eye, 0.0, 0.0);
+        let cv = boxel_camera::CameraView::compute(&camera, &transform, 16.0 / 9.0);
+        ViewParams::from_camera(&cv, &camera, [0.0; 4], crate::DistanceFog::default())
+    }
+
+    /// A translucent quad across Z at depth `z` of cell (0, 0, 0), shaded as `face`.
+    fn pane(z: f32, face: Face) -> MovingCellQuad {
+        let quad = mesh(1).cell_quads[0].quad;
+        MovingCellQuad {
+            cell: BlockPos::new(0, 0, 0),
+            quad: CellQuad {
+                corners: quad.corners.map(|[x, y, _]| [x, y, z]),
+                face,
+                ..quad
+            }
+            .with_blend(CellBlend::Translucent(128)),
+        }
+    }
+
+    /// Translucent quads go to the translucent lists with their opacity packed, and sort back to
+    /// front by the distance to their nearest point; one whose face looks away is not drawn,
+    /// nor one seen from behind its face; a plane shaded along it shows from both sides.
+    #[test]
+    fn translucent_quads_sort_back_to_front_facing_the_eye() {
+        let mut glow = pane(0.1, Face::NegZ);
+        glow.quad.blend = CellBlend::Glow(32);
+        let quads: Vec<_> = [
+            pane(0.2, Face::NegZ),
+            pane(0.8, Face::NegZ),
+            pane(0.5, Face::PosZ),
+            pane(0.6, Face::PosY),
+            glow,
+        ]
+        .into_iter()
+        .map(|q| (q, LightValue::FULL_SKY))
+        .collect();
+        let mut sort = SortBench::new(&quads);
+        let lists = &sort.lists;
+        assert!(lists.cutout.iter().all(|l| l.vertices.is_empty()));
+        assert_eq!(lists.translucent[0].sort.len(), 5);
+        assert_eq!(
+            lists.translucent[0].vertices[24].data[1] >> cell::OPACITY_SHIFT,
+            32
+        );
+        let v = lists.translucent[0].vertices[0];
+        assert_eq!(v.data[1] >> cell::OPACITY_SHIFT, 128);
+        assert_eq!(v.data[1] & 0xFF_FFFF, 0x01_02_03);
+        // The eye in front (-Z side): the PosZ one looks away; far first, the glow nearest, in a
+        // run of its own (its pipeline writes no depth).
+        assert_eq!(
+            sort.sort(&view_at(boxel_math::DVec3::new(0.5, 0.5, -3.0))),
+            24
+        );
+        let order: Vec<u32> = sort.sorted.order.iter().map(|o| o.2).collect();
+        assert_eq!(order, vec![1, 3, 0, 4]);
+        assert_eq!(sort.sorted.runs, vec![(2, false, 0..18), (2, true, 18..24)]);
+        assert_eq!(sort.sorted.indices[..6], [6, 7, 8, 9, 10, 11]);
+        // From behind (+Z side): only the PosZ one and the plane, nearest last.
+        sort.sort(&view_at(boxel_math::DVec3::new(0.5, 0.5, 4.0)));
+        let order: Vec<u32> = sort.sorted.order.iter().map(|o| o.2).collect();
+        assert_eq!(order, vec![2, 3]);
+        // A quad seen past its edge: its nearest point is on that edge.
+        let q = SortQuad::new(I64Vec3::ZERO, &pane(0.0, Face::NegZ).quad);
+        assert_eq!(q.distance(Vec3::new(3.0, 0.5, -4.0)), Some(4.0 + 16.0));
+        assert_eq!(q.distance(Vec3::new(3.0, 0.5, 4.0)), None);
     }
 
     #[test]

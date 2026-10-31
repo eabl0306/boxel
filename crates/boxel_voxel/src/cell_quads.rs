@@ -28,9 +28,48 @@ pub enum CellImage {
     Block,
 }
 
+/// How a [`CellQuad`] covers what is behind it (ADR 0055).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CellBlend {
+    /// Alpha-tested like a cutout block: a texel shows whole (alpha at least a half) or not at
+    /// all, from both sides.
+    #[default]
+    Cutout,
+    /// Blended over what is behind it by its image's alpha times this much (`255` keeps the
+    /// image's alpha), as Minecraft's translucent items: drawn after the cutout cell quads, back
+    /// to front with the other blended ones, before the terrain's translucent quads, and writing
+    /// depth. Seen only from the side its [`CellQuad::face`] looks to (Minecraft culls the back
+    /// of a translucent item), from both when that face lies along the quad. Texels of the
+    /// image's alpha under a tenth are not drawn (Minecraft's item shader).
+    Translucent(u8),
+    /// Blended as [`CellBlend::Translucent`], but writing no depth: a glow that hides nothing
+    /// behind it, not even the clouds, which paint over it (the beacon beam's outer layer at
+    /// `32`, as Minecraft's beacon beam).
+    Glow(u8),
+}
+
+impl CellBlend {
+    /// Blended by its image's own alpha.
+    pub const TRANSLUCENT: Self = Self::Translucent(255);
+
+    /// True if blended ([`CellBlend::Translucent`] or [`CellBlend::Glow`]).
+    pub const fn is_translucent(self) -> bool {
+        !matches!(self, Self::Cutout)
+    }
+
+    /// What a blended quad multiplies its image's alpha by (`0` for a cutout one).
+    pub const fn opacity(self) -> u8 {
+        match self {
+            Self::Cutout => 0,
+            Self::Translucent(a) | Self::Glow(a) => a,
+        }
+    }
+}
+
 /// One quad a cell draws from its data, in its cell: four corners anywhere in it, each with the
-/// point of the image it shows. Drawn from both sides, alpha-tested like a cutout block, lit by
-/// its cell's light without ambient occlusion, shaded like the cube face [`CellQuad::face`].
+/// point of the image it shows. Alpha-tested like a cutout block and drawn from both sides, or
+/// blended ([`CellQuad::blend`]); lit by its cell's light without ambient occlusion, shaded like
+/// the cube face [`CellQuad::face`].
 #[derive(Clone, Copy, Debug)]
 pub struct CellQuad {
     /// Where each corner is in the cell, in blocks (`0..=1` on each axis for a quad inside it).
@@ -50,6 +89,8 @@ pub struct CellQuad {
     pub full_bright: bool,
     /// What the image's color is multiplied by (sRGB, `[255; 3]` keeps it).
     pub tint: [u8; 3],
+    /// Alpha-tested or blended.
+    pub blend: CellBlend,
 }
 
 impl CellQuad {
@@ -66,6 +107,7 @@ impl CellQuad {
             face: Face::PosY,
             full_bright: false,
             tint: [255; 3],
+            blend: CellBlend::Cutout,
         }
     }
 
@@ -87,6 +129,13 @@ impl CellQuad {
     #[must_use]
     pub const fn with_tint(mut self, tint: [u8; 3]) -> Self {
         self.tint = tint;
+        self
+    }
+
+    /// The same quad alpha-tested or blended as `blend`.
+    #[must_use]
+    pub const fn with_blend(mut self, blend: CellBlend) -> Self {
+        self.blend = blend;
         self
     }
 
@@ -116,6 +165,7 @@ impl CellQuad {
         Face,
         bool,
         [u8; 3],
+        CellBlend,
     ) {
         (
             self.corners.map(|c| c.map(f32::to_bits)),
@@ -125,6 +175,7 @@ impl CellQuad {
             self.face,
             self.full_bright,
             self.tint,
+            self.blend,
         )
     }
 }
@@ -148,15 +199,18 @@ impl Hash for CellQuad {
 /// shader's cube faces, crosses, box faces and planes (`common.wgsl`, `decode_quad`), with the
 /// same corners, texture points and layers, and the same box faces the mesher leaves out (those
 /// another box of the model covers, the hidden ones). Each is shaded as its face (crosses and
-/// planes as `PosY`, full brightness, as the terrain does). A fluid or a block not drawn gives
-/// nothing. Appended to `out`.
+/// planes as `PosY`, full brightness, as the terrain does). A translucent state's quads are
+/// blended ([`CellBlend::TRANSLUCENT`], as Minecraft draws a translucent block's item), the
+/// others alpha-tested. A fluid or a block not drawn gives nothing. Appended to `out`.
 ///
 /// What a rule turns, scales and moves to draw a block small (ADR 0053: a block in an item
 /// frame); the light is its cell's and there is no ambient occlusion, as for every cell quad.
 pub fn model_quads(registry: &BlockRegistry, s: BlockState, out: &mut Vec<CellQuad>) {
-    if registry.shape(s) == crate::RenderShape::None {
-        return;
-    }
+    let blend = match registry.shape(s) {
+        crate::RenderShape::None => return,
+        crate::RenderShape::Translucent => CellBlend::TRANSLUCENT,
+        crate::RenderShape::Opaque | crate::RenderShape::Cutout => CellBlend::Cutout,
+    };
     let quad = |corners: [[f32; 3]; 4], uv: [[f32; 2]; 4], layer: u16, face: Face| CellQuad {
         corners,
         uv,
@@ -165,6 +219,7 @@ pub fn model_quads(registry: &BlockRegistry, s: BlockState, out: &mut Vec<CellQu
         face,
         full_bright: false,
         tint: [255; 3],
+        blend,
     };
     match registry.model(s) {
         BlockModel::Fluid => {}
@@ -223,6 +278,7 @@ pub fn model_quads(registry: &BlockRegistry, s: BlockState, out: &mut Vec<CellQu
                     .0;
                 out.push(CellQuad {
                     source: CellImage::Block,
+                    blend,
                     ..CellQuad::from_plane(plane, layer)
                 });
             }
@@ -406,6 +462,31 @@ mod tests {
         assert_eq!(south.corners[0], [0.0, 0.0, 1.0]);
         assert_eq!(south.uv[0], [0.0, 1.0]);
         assert_eq!(south.uv[3], [1.0, 0.0]);
+    }
+
+    /// A translucent block's quads blend by their layer's alpha (ADR 0055); an opaque or cutout
+    /// block's are alpha-tested.
+    #[test]
+    fn a_translucent_block_draws_blended_quads() {
+        let registry = crate::testing::registry();
+        let mut out = Vec::new();
+        model_quads(&registry, state(&registry, "test:glass"), &mut out);
+        assert_eq!(out.len(), 6);
+        assert!(out.iter().all(|q| q.blend == CellBlend::TRANSLUCENT));
+        for name in ["test:solid", "test:plant", "test:slab"] {
+            out.clear();
+            model_quads(&registry, state(&registry, name), &mut out);
+            assert!(out.iter().all(|q| q.blend == CellBlend::Cutout), "{name}");
+        }
+        let q = out[0];
+        assert_ne!(q, q.with_blend(CellBlend::Translucent(32)));
+        assert_ne!(
+            q.with_blend(CellBlend::Glow(32)),
+            q.with_blend(CellBlend::Translucent(32))
+        );
+        assert!(CellBlend::Glow(32).is_translucent() && !CellBlend::Cutout.is_translucent());
+        assert_eq!(CellBlend::Glow(32).opacity(), 32);
+        assert_eq!(CellBlend::Cutout.opacity(), 0);
     }
 
     /// A slab's sides show the lower half of the layer; a cross is two diagonals; a fluid and

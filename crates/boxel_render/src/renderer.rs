@@ -1719,7 +1719,8 @@ impl VoxelRenderer {
             // The entity models with the solid terrain, before the outline (an edge behind a
             // model stays hidden) and the water (which tints a model behind it).
             draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
-            // The cell quads (ADR 0050) with them, for the same reasons.
+            // The cell quads (ADR 0050) with them, for the same reasons: the translucent ones
+            // too, blended and writing depth, so water in front tints them (ADR 0055).
             draw_cells(self.cells.as_ref(), &self.materials, &mut pass);
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);

@@ -12,9 +12,11 @@
 //   uv     = the point of the image it shows (a fraction of it)
 //   data.x = image layer (12 bits) | face (3 bits) << 12 | full bright (1 bit) << 15 | the
 //            cell's LightValue << 16
-//   data.y = tint, sRGB 0xRRGGBB
-// The fragment is a cutout terrain fragment: alpha test, then shade_fragment with the quad's
-// face, its cell's light at the 4 corners and AO open.
+//   data.y = tint, sRGB 0xRRGGBB | opacity (8 bits, translucent quads only) << 24
+// fs_cell is a cutout terrain fragment: alpha test, then shade_fragment with the quad's face,
+// its cell's light at the 4 corners and AO open. fs_cell_translucent (ADR 0055, its pipeline
+// blends and writes depth) shades the same way and gives the image's alpha times the opacity,
+// dropping texels of alpha under a tenth as Minecraft's translucent item shader does.
 
 @group(0) @binding(0) var cell_textures: texture_2d_array<f32>;
 @group(0) @binding(1) var cell_sampler: sampler;
@@ -24,6 +26,9 @@ const CELL_LAYER_MASK: u32 = 0xFFFu;
 const CELL_FACE_SHIFT: u32 = 12u;
 const CELL_BRIGHT_BIT: u32 = 0x8000u;
 const CELL_LIGHT_SHIFT: u32 = 16u;
+const CELL_OPACITY_SHIFT: u32 = 24u;
+// Texels under this alpha are not drawn by a translucent quad (Minecraft's `color.a < 0.1`).
+const CELL_MIN_ALPHA: f32 = 0.1;
 
 struct CellOut {
   @builtin(position) clip: vec4<f32>,
@@ -56,10 +61,8 @@ fn cell_linear(c: vec3<f32>) -> vec3<f32> {
   return select(high, low, c <= vec3(0.04045));
 }
 
-@fragment
-fn fs_cell(i: CellOut) -> @location(0) vec4<f32> {
-  let albedo = textureSample(cell_textures, cell_sampler, i.uv, i.data.x & CELL_LAYER_MASK);
-  if (!alpha_test_passes(albedo)) { discard; }
+// The quad's texel `albedo` shaded as a terrain fragment: tint, face, the cell's light, fog.
+fn cell_shade(albedo: vec4<f32>, i: CellOut) -> vec4<f32> {
   let tint = vec3<f32>((vec3(i.data.y) >> vec3(16u, 8u, 0u)) & vec3(255u)) / 255.0;
   let light = i.data.x >> CELL_LIGHT_SHIFT;
   let corners = light | (light << 16u);
@@ -73,4 +76,19 @@ fn fs_cell(i: CellOut) -> @location(0) vec4<f32> {
   v.light = vec2(corners, corners);
   v.ao = 0xFFu | select(0u, FLAG_EMISSIVE << 8u, (i.data.x & CELL_BRIGHT_BIT) != 0u);
   return shade_fragment(vec4(albedo.rgb * cell_linear(tint), albedo.a), v, view);
+}
+
+@fragment
+fn fs_cell(i: CellOut) -> @location(0) vec4<f32> {
+  let albedo = textureSample(cell_textures, cell_sampler, i.uv, i.data.x & CELL_LAYER_MASK);
+  if (!alpha_test_passes(albedo)) { discard; }
+  return cell_shade(albedo, i);
+}
+
+@fragment
+fn fs_cell_translucent(i: CellOut) -> @location(0) vec4<f32> {
+  let albedo = textureSample(cell_textures, cell_sampler, i.uv, i.data.x & CELL_LAYER_MASK);
+  if (albedo.a < CELL_MIN_ALPHA) { discard; }
+  let opacity = f32(i.data.y >> CELL_OPACITY_SHIFT) / 255.0;
+  return vec4(cell_shade(albedo, i).rgb, albedo.a * opacity);
 }

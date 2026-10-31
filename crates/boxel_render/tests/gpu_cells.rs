@@ -23,6 +23,14 @@
 //! every tier (0.1 %). Then the same quads again as moving cell quads (ADR 0054), with no chunk
 //! at all: the same pixels as the baked ones (channel tolerance 2).
 //!
+//! A third scene draws translucent cell quads (ADR 0055) over the wall: a half red one is the
+//! mean of the wall and the cutout red in linear light; a red one behind a blue one shows
+//! through it whatever the mesh's order (the same pixels both ways); one whose face looks away
+//! is not drawn; a small glass block (`model_quads` of a translucent block) is; terrain glass in
+//! front of one tints it; a glow (`CellBlend::Glow`) blends the same way and leaves the terrain
+//! glass behind it seen, where a translucent quad there hides it; the same quads moving give the
+//! same pixels; and every tier draws the same pixels (0.1 %).
+//!
 //! Failing images are saved under `CARGO_TARGET_TMPDIR/gpu_cells/` (every image with
 //! `GPU_CELLS_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
@@ -32,16 +40,16 @@ use boxel_gfx::{
     run_in_error_scopes, submit_and_wait, tier_request,
 };
 use boxel_math::{DVec3, I64Vec3, UVec2};
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
+use boxel_mesh::{ChunkMesh, LitCellQuad, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_render::{
     DEFAULT_SKY_COLOR, DistanceFog, MovingCellQuad, RendererConfig, ViewParams, VoxelRenderer,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
     Axis, BlockCollision, BlockData, BlockDef, BlockModel, BlockPos, BlockRegistry, BlockState,
-    BoxModel, CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face, FaceTextures,
-    LightValue, LocalPos, ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage, TextureSpec,
-    model_quads,
+    BoxModel, CellBlend, CellQuad, CellQuadRule, ChunkData, CollisionBox, DataValue, Face,
+    FaceTextures, LightValue, LocalPos, ModelBox, ModelPlane, PlaneKind, RenderShape, TextureImage,
+    TextureSpec, model_quads,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -870,6 +878,389 @@ fn blocks_drawn_by_cell_quads_look_like_the_terrain() {
                     &[
                         (&format!("{label}_{best}_twins"), &b.cells),
                         (&format!("{label}_{tier}_twins"), &t.cells),
+                    ],
+                );
+            }
+        }
+    }
+    assert!(
+        report.failures.is_empty(),
+        "{} failures:\n{}",
+        report.failures.len(),
+        report.failures.join("\n")
+    );
+    assert!(
+        rendered > 0 || !gpu_tests_required(),
+        "BOXEL_REQUIRE_GPU=1 but no tier could render"
+    );
+}
+
+// ---------------------------------------------------------------- translucent (ADR 0055)
+
+/// The translucent row's opacity: half.
+const HALF: CellBlend = CellBlend::Translucent(128);
+/// The translucent quad at this x is seen through the terrain glass at [`GLASS`].
+const BEHIND_GLASS: u32 = 22;
+const GLASS: (u32, u32, u32) = (19, 10, 16);
+/// A cell whose quad (at its middle depth) the eye sees the terrain glass through.
+const IN_FRONT: (i64, i64, i64) = (18, 10, 15);
+
+/// The translucent row, each quad in its cell (x, 10, 19): a cutout red item at 10 (the
+/// reference), a half red one at 12, a half red one behind a half blue one at 14 (`far_first`:
+/// the far one first in the mesh, else the near one), the half blue one alone at 16, a half
+/// red one whose face looks away at 18, a small glass block (`model_quads`, block layers) at 20,
+/// a half red one behind terrain glass at 22. Over it, at y 12, a cutout red one at 10 and a
+/// half red glow at 12; and a half red one blended as `in_front` in front of the terrain glass,
+/// at [`IN_FRONT`].
+fn translucent_quads(
+    scene: &Scene,
+    far_first: bool,
+    in_front: CellBlend,
+) -> Vec<(BlockPos, CellQuad)> {
+    let item = |image, z: f32| {
+        let q = CellQuad::from_plane(&item_plane(0), image).shaded_as(Face::NegZ);
+        CellQuad {
+            corners: q.corners.map(|[x, y, _]| [x, y, z]),
+            ..q
+        }
+    };
+    let red = item(RED, 0.875).with_blend(HALF);
+    let blue = item(WHITE, 0.5).with_blend(HALF).with_tint(BLUE_TINT);
+    let at = |x: i64| BlockPos::new(x, 10, 19);
+    let mut out = vec![(at(10), item(RED, 0.875)), (at(12), red)];
+    if far_first {
+        out.extend([(at(14), red), (at(14), blue)]);
+    } else {
+        out.extend([(at(14), blue), (at(14), red)]);
+    }
+    out.push((at(16), blue));
+    out.push((at(18), red.shaded_as(Face::PosZ)));
+    let glass = scene.registry.by_name("boxel:glass").expect("glass");
+    let mut small = Vec::new();
+    model_quads(&scene.registry, glass, &mut small);
+    let (corner, scale) = SMALL;
+    out.extend(small.into_iter().map(|mut q| {
+        q.corners = q
+            .corners
+            .map(|c| std::array::from_fn(|a| corner[a] + c[a] * scale));
+        (at(i64::from(BLOCK_X)), q)
+    }));
+    out.push((at(i64::from(BEHIND_GLASS)), red));
+    let up = |x: i64| BlockPos::new(x, 12, 19);
+    out.push((up(10), item(RED, 0.875)));
+    out.push((up(12), red.with_blend(CellBlend::Glow(128))));
+    let (x, y, z) = IN_FRONT;
+    out.push((BlockPos::new(x, y, z), item(RED, 0.5).with_blend(in_front)));
+    out
+}
+
+/// The wall and frames of [`mesh`] with terrain glass at [`GLASS`] if `glass`, and `quads` baked
+/// as its cell quads (open sky light), or none.
+fn glass_mesh(
+    scene: &Scene,
+    materials: &MaterialTable,
+    quads: &[(BlockPos, CellQuad)],
+    glass: bool,
+) -> ChunkMesh {
+    let stone = scene.registry.by_name("boxel:stone").expect("stone");
+    let glass_state = scene.registry.by_name("boxel:glass").expect("glass");
+    let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
+    for x in 6..26 {
+        for y in 6..16 {
+            dense[LocalPos::new(x, y, 20).index()] = stone;
+        }
+    }
+    for x in ROW.map(|(x, _)| x).into_iter().chain([BLOCK_X]) {
+        dense[LocalPos::new(x, 10, 19).index()] = scene.frame;
+    }
+    if glass {
+        let (x, y, z) = GLASS;
+        dense[LocalPos::new(x, y, z).index()] = glass_state;
+    }
+    let chunk = ChunkData::from_dense(&dense);
+    let input = MeshInput {
+        center: &chunk,
+        neighbors: [None; 26],
+        light: None,
+    };
+    let mut mesh = Mesher::new().mesh_chunk(&input, materials, MeshOptions::default());
+    mesh.cell_quads = quads
+        .iter()
+        .map(|&(cell, quad)| LitCellQuad {
+            quad: quad.moved([cell.x as f32, cell.y as f32, cell.z as f32]),
+            light: LightValue::FULL_SKY,
+        })
+        .collect();
+    mesh.hash = mesh.compute_hash();
+    mesh
+}
+
+/// The wall alone, the translucent row baked in either order, moving (no cell quads in the
+/// chunk), baked without the terrain glass, and baked with a translucent quad instead of the glow
+/// in front of the glass.
+struct TranslucentImages {
+    bare: RgbaImage,
+    no_glass: RgbaImage,
+    depth_in_front: RgbaImage,
+    near_first: RgbaImage,
+    far_first: RgbaImage,
+    moving: RgbaImage,
+}
+
+fn render_translucent(
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    tier: Tier,
+    scene: &Scene,
+) -> Result<TranslucentImages, String> {
+    let (device, queue, errors) = device_for(adapter, caps, tier)?;
+    let materials = MaterialTable::from_registry(&scene.registry);
+    let mut renderer = VoxelRenderer::new(
+        &device,
+        &queue,
+        tier,
+        // The terrain glass sorted in the frame (the same order in every image).
+        &RendererConfig {
+            translucent_sort: boxel_render::TranslucentSort::Inline,
+            ..RendererConfig::default()
+        },
+        &boxel_render::generate_block_textures(scene.registry.textures()),
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        UVec2::new(WIDTH, HEIGHT),
+    )
+    .map_err(|e| format!("VoxelRenderer::new: {e}"))?;
+    renderer.set_model_boxes(&queue, materials.model_boxes());
+    renderer.set_cell_textures(&device, &queue, &Arc::new(cell_textures()));
+    let view = view();
+    let draw = |renderer: &mut VoxelRenderer, quads: &[(BlockPos, CellQuad)]| {
+        let mesh = glass_mesh(scene, &materials, quads, true);
+        renderer
+            .upsert_chunk(1, I64Vec3::ZERO, Arc::new(mesh))
+            .map_err(|e| e.to_string())?;
+        render(&device, &queue, renderer, &view)
+    };
+    let bare = draw(&mut renderer, &[])?;
+    let glow = CellBlend::Glow(128);
+    let near_first = draw(&mut renderer, &translucent_quads(scene, false, glow))?;
+    let stats = renderer.stats().cells;
+    // Translucent: 6 flat ones less the one looking away, the glass block's 2 faces toward the
+    // eye, the glow and the one in front of the glass; and the two cutout reds.
+    if (stats.translucent, stats.drawn) != (9, 11) || stats.sorts == 0 {
+        return Err(format!("translucent cell stats {stats:?}"));
+    }
+    let far_first = draw(&mut renderer, &translucent_quads(scene, true, glow))?;
+    let depth_in_front = draw(&mut renderer, &translucent_quads(scene, false, HALF))?;
+    let _ = draw(&mut renderer, &[])?;
+    let moving: Vec<_> = translucent_quads(scene, false, glow)
+        .into_iter()
+        .map(|(cell, quad)| (MovingCellQuad { cell, quad }, LightValue::FULL_SKY))
+        .collect();
+    let _ = renderer.set_moving_cell_quads(&device, &queue, moving);
+    let moving = render(&device, &queue, &mut renderer, &view)?;
+    let _ = renderer.set_moving_cell_quads(&device, &queue, Vec::new());
+    let mesh = glass_mesh(
+        scene,
+        &materials,
+        &translucent_quads(scene, false, glow),
+        false,
+    );
+    renderer
+        .upsert_chunk(1, I64Vec3::ZERO, Arc::new(mesh))
+        .map_err(|e| e.to_string())?;
+    let no_glass = render(&device, &queue, &mut renderer, &view)?;
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(TranslucentImages {
+        bare,
+        no_glass,
+        depth_in_front,
+        near_first,
+        far_first,
+        moving,
+    })
+}
+
+fn srgb_to_linear(c: u8) -> f64 {
+    let c = f64::from(c) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f64) -> u8 {
+    let c = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (c * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn check_translucent(report: &mut Report, what: &str, i: &TranslucentImages) {
+    let view = view();
+    let images = [
+        ("bare", &i.bare),
+        ("near_first", &i.near_first),
+        ("far_first", &i.far_first),
+        ("moving", &i.moving),
+        ("no_glass", &i.no_glass),
+        ("depth_in_front", &i.depth_in_front),
+    ];
+    let at = |x: u32| project(&view, on_item(x, 0, (0.5, 0.5)));
+    // Half red over the wall: the mean of the cutout red and the wall, in linear light.
+    let (red, wall, half) = (
+        pixel(&i.near_first, at(10)),
+        pixel(&i.bare, at(12)),
+        pixel(&i.near_first, at(12)),
+    );
+    let want: Vec<u8> = (0..3)
+        .map(|c| linear_to_srgb((srgb_to_linear(red[c]) + srgb_to_linear(wall[c])) * 0.5))
+        .collect();
+    if (0..3).any(|c| half[c].abs_diff(want[c]) > 4) {
+        report.fail(
+            format!("{what}: half red over the wall is {half:?}, want {want:?}"),
+            &images,
+        );
+    }
+    // The red one behind the blue one shows through it, in either mesh order.
+    let (both, blue) = (pixel(&i.near_first, at(14)), pixel(&i.near_first, at(16)));
+    if both[0] < blue[0].saturating_add(10) {
+        report.fail(
+            format!("{what}: red behind blue is {both:?}, blue alone {blue:?}"),
+            &images,
+        );
+    }
+    let order = i.near_first.compare(&i.far_first, 0);
+    if order.fraction() > 0.0 {
+        report.fail(
+            format!(
+                "{what}: the mesh order changes {:.4} % of the pixels",
+                order.fraction() * 100.0
+            ),
+            &images,
+        );
+    }
+    // Looking away: not drawn.
+    if drawn(&i.bare, &i.near_first, at(18)) {
+        report.fail(format!("{what}: a quad looking away is drawn"), &images);
+    }
+    // The small glass block, and the terrain glass over the half red one.
+    let (corner, scale) = SMALL;
+    let front = DVec3::new(
+        f64::from(BLOCK_X) + f64::from(corner[0] + scale / 2.0),
+        10.0 + f64::from(corner[1] + scale / 2.0),
+        19.0 + f64::from(corner[2]),
+    );
+    if !drawn(&i.bare, &i.near_first, project(&view, front)) {
+        report.fail(format!("{what}: the small glass is not drawn"), &images);
+    }
+    // A glow at half is the same mean; one in front of the terrain glass leaves it seen (it
+    // writes no depth), where a translucent quad hides it.
+    let up = |x: u32| {
+        let p = on_item(x, 0, (0.5, 0.5));
+        project(&view, DVec3::new(p.x, p.y + 2.0, p.z))
+    };
+    let (red_up, wall_up, glow) = (
+        pixel(&i.near_first, up(10)),
+        pixel(&i.bare, up(12)),
+        pixel(&i.near_first, up(12)),
+    );
+    let want: Vec<u8> = (0..3)
+        .map(|c| linear_to_srgb((srgb_to_linear(red_up[c]) + srgb_to_linear(wall_up[c])) * 0.5))
+        .collect();
+    if (0..3).any(|c| glow[c].abs_diff(want[c]) > 4) {
+        report.fail(
+            format!("{what}: a half red glow over the wall is {glow:?}, want {want:?}"),
+            &images,
+        );
+    }
+    let (x, y, z) = IN_FRONT;
+    let front = project(
+        &view,
+        DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+    );
+    if !drawn(&i.depth_in_front, &i.near_first, front) {
+        report.fail(
+            format!("{what}: a glow in front of the terrain glass hides it"),
+            &images,
+        );
+    }
+    if !drawn(&i.no_glass, &i.near_first, at(BEHIND_GLASS)) {
+        report.fail(
+            format!("{what}: the terrain glass does not tint the quad behind it"),
+            &images,
+        );
+    }
+    let moving = i.near_first.compare(&i.moving, 2);
+    if moving.fraction() > 0.0 {
+        report.fail(
+            format!(
+                "{what}: moving vs baked translucent quads: {:.4} % of pixels differ",
+                moving.fraction() * 100.0
+            ),
+            &images,
+        );
+    }
+}
+
+/// Translucent cell quads (ADR 0055) blend by their alpha, back to front whatever the mesh's
+/// order, without the ones looking away, under the terrain's glass, moving as baked, the same on
+/// every tier.
+#[test]
+fn translucent_cell_quads_blend_back_to_front_on_every_tier() {
+    let (_instance, adapters) = adapters();
+    if adapters.is_empty() {
+        assert!(!gpu_tests_required(), "BOXEL_REQUIRE_GPU=1 but no adapter");
+        eprintln!("skipping: no adapter");
+        return;
+    }
+    let scene = scene();
+    let mut report = Report::new();
+    let mut rendered = 0;
+    for adapter in &adapters {
+        let caps = AdapterCaps::from_adapter(adapter);
+        let label = adapter_label(&caps);
+        let mut tiers = Vec::new();
+        for tier in allowed_tiers(&caps) {
+            match render_translucent(adapter, &caps, tier, &scene) {
+                Ok(images) => tiers.push((tier, images)),
+                Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
+            }
+        }
+        for (tier, i) in &tiers {
+            rendered += 1;
+            let what = format!("{label}_{tier}_translucent");
+            if std::env::var_os("GPU_CELLS_SAVE").is_some() {
+                report.save(&[
+                    (&format!("{what}_bare"), &i.bare),
+                    (&format!("{what}_quads"), &i.near_first),
+                ]);
+            }
+            check_translucent(&mut report, &what, i);
+        }
+        let Some(((best, b), rest)) = tiers.split_first() else {
+            continue;
+        };
+        for (tier, t) in rest {
+            let diff = b.near_first.compare(&t.near_first, 2);
+            eprintln!(
+                "gpu_cells: {label}: translucent {tier} vs {best}: {:.4} % of pixels differ, max channel {}",
+                diff.fraction() * 100.0,
+                diff.max_channel_diff
+            );
+            if diff.fraction() > MAX_DIFF {
+                report.fail(
+                    format!(
+                        "{label}: translucent {tier} vs {best}: {:.4} % of pixels differ",
+                        diff.fraction() * 100.0
+                    ),
+                    &[
+                        (&format!("{label}_{best}_translucent"), &b.near_first),
+                        (&format!("{label}_{tier}_translucent"), &t.near_first),
                     ],
                 );
             }
