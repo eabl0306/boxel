@@ -56,7 +56,15 @@ una mitad, su propia regla la vuelve atrás.
   como una edición (época nueva, el mismo camino que un bloque). Los demás datos no remallan.
 - El mesher ya recibe el `ChunkData` del centro (`MeshInput::center`) y con él sus datos: leer
   `block_data_cells` no copia nada. E8 agrega un paso después de los bloques especiales que
-  recorre esas celdas y hornea el ítem en los quads del chunk.
+  recorre esas celdas y emite quads del chunk.
+- Forma del paso, con los planos del ADR 0046: cada ítem es un quad de plano (`SHAPE_CROSS`)
+  armado desde los datos de la celda: la entrada de la tabla de cajas, el byte de plano (tipo y
+  `spin`, el giro de 45 grados del marco), la cara (los cuartos de vuelta del bloque) y la capa del
+  ítem. La entrada tiene que estar en la tabla antes de mallar: hoy los planos salen solo del
+  `BoxModel` de un material. E8 registra en el registro unas pocas entradas para ítems (un plano
+  `Mid` de textura entera sirve para todo ítem plano, en cada posición de marco o estante) y el
+  juego da, por ítem, su capa o su modelo de bloque chico. La capa va en el quad, así que no
+  cuesta entradas por ítem.
 - Lo que E8 tiene que cuidar: `trivially_empty` da malla vacía a un chunk uniforme sin mirar
   datos (un chunk lleno de marcos no es uniforme, pero conviene que el paso lo compruebe), y el
   ítem de una celda solo se dibuja dentro de su chunk.
