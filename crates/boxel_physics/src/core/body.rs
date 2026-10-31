@@ -25,9 +25,10 @@
 
 use super::shape::LocalBox;
 use super::source::{CollisionTable, VoxelSource};
+use super::surface::Tread;
+use super::sweep::{StepUp, SweepConfig, SweepOut, Unloaded, move_box_treading};
 #[cfg(doc)]
-use super::sweep::move_box;
-use super::sweep::{StepUp, SweepConfig, SweepOut, Unloaded, move_box_stepping};
+use super::sweep::{move_box, move_box_stepping};
 use boxel_math::DVec3;
 use boxel_voxel::{BlockPos, Face, WorldPos};
 
@@ -264,6 +265,7 @@ pub fn step_body<S: VoxelSource + ?Sized>(
         settings,
         params,
         StepUp::NONE,
+        Tread::default(),
     )
 }
 
@@ -274,6 +276,8 @@ pub fn step_body<S: VoxelSource + ?Sized>(
 /// each clipped axis and reports the impacts. `vel` is the velocity [`integrate_velocity`] gave
 /// for this step. An obstacle clips like a block but is never an impact (impacts are hits on
 /// blocks). A step-up that went over a ledge is not a clip: the velocity across is kept.
+/// `tread` is the body, for the blocks whose collision holds only some bodies
+/// ([`move_box_treading`], ADR 0047).
 ///
 /// # Errors
 ///
@@ -288,9 +292,10 @@ pub fn move_body<S: VoxelSource + ?Sized>(
     settings: &BodySettings,
     params: &StepParams,
     step: StepUp,
+    tread: Tread,
 ) -> Result<BodyStep, Unloaded> {
     let mut v = vel;
-    let sweep = move_box_stepping(
+    let sweep = move_box_treading(
         src,
         table,
         pos,
@@ -299,6 +304,7 @@ pub fn move_body<S: VoxelSource + ?Sized>(
         obstacles,
         &params.sweep,
         step,
+        tread,
     )?;
     let mut impacts = [None; 3];
     for (axis, impact) in impacts.iter_mut().enumerate() {

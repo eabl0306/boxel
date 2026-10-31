@@ -7,7 +7,10 @@
 //! projectiles that never tunnel, sleeping bodies and a parallel step; from P5, blocks made of
 //! boxes (slabs) and characters that step up low ledges; from ADR 0026, collision boxes that
 //! reach into the cell above (fences 1.5 blocks tall) and characters that sneak (never off an
-//! edge, crouching where there is no room to stand), sprint (with the sprint-jump) and fly.
+//! edge, crouching where there is no room to stand), sprint (with the sprint-jump) and fly; from
+//! ADR 0047, block surfaces ([`Surface`], [`BlockSurfaces`]): slippery and slow ground, cells
+//! that hold bodies back, climbing, sliding down a side, blocks that hold only bodies above them,
+//! and [`Treads`] for the game to say which of those a body walks on.
 //!
 //! Two layers:
 //! - [`core`] is pure (no ECS): the [`CollisionTable`] (how each block state collides, derived
@@ -69,22 +72,24 @@ pub use crate::components::{
     BodyPosition, CharacterController, Collider, CollisionEnded, CollisionStarted, Contacts,
     Crouch, FLIGHT_VERTICAL_DRAG, Frozen, Interpolated, MoveIntent, OnBlock, OnEntity,
     PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, ProjectileHit, ProjectileTarget,
-    ReportContacts, Response, RigidBody, Sleeping, Teleport, Velocity, VoxelImpact,
+    ReportContacts, Response, RigidBody, Sleeping, SurfaceContacts, Teleport, Treads, Velocity,
+    VoxelImpact,
 };
 pub use crate::contacts::{BodyFilter, BodyHit, BodyIndex};
 #[doc(hidden)]
 pub use crate::core::move_box_stepping_unpruned;
 pub use crate::core::{
-    BlockBounds, BodyImpact, BodySettings, BodyStep, CollisionLayers, CollisionShape,
-    CollisionTable, Contact, EDGE_MARGIN, Grid, GridSlot, LocalBox, MAX_RAY_DISTANCE,
-    MAX_SWEEP_DISTANCE, Probe, RayResult, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp,
-    SweepConfig, SweepOut, TestWorld, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order,
-    guard_edge, integrate_velocity, move_body, move_box, move_box_stepping, predict,
-    raycast_voxels, shape_contact, step_body,
+    BlockBounds, BodyImpact, BodySettings, BodyStep, Climb, CollisionLayers, CollisionShape,
+    CollisionTable, Contact, Drag, EDGE_MARGIN, Grid, GridSlot, HOLD_TOLERANCE, Hold, Inside,
+    LocalBox, MAX_RAY_DISTANCE, MAX_SWEEP_DISTANCE, Probe, RayResult, SLIDE_ACROSS, SLIDE_CUT_FROM,
+    SLIDE_FROM, STOP_SPEED, Shape, ShapeHit, StepParams, StepUp, Surface, SweepConfig, SweepOut,
+    TestWorld, Tread, Unloaded, VoxelFilter, VoxelHit, VoxelSource, axis_order, guard_edge,
+    integrate_velocity, move_body, move_box, move_box_stepping, move_box_treading, predict,
+    raycast_voxels, sense_inside, shape_contact, step_body,
 };
 pub use boxel_voxel::WorldPos;
 pub use persist::{BODY_CODEC, BODY_CODEC_VERSION, BodyCodec};
-pub use plugin::{PhysicsContent, PhysicsPlugin};
+pub use plugin::{BlockSurfaces, PhysicsContent, PhysicsPlugin};
 pub use query::{PhysicsQuery, RayFilter, RayHit};
 pub use source::ChunkSource;
 pub use swim::{

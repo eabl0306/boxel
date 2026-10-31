@@ -30,7 +30,8 @@
 //! step of movement, and the result of a move depends on the axis order (frozen by tests).
 
 use super::shape::LocalBox;
-use super::source::{CollisionShape, CollisionTable, Probe, VoxelSource};
+use super::source::{CollisionShape, CollisionTable, INSIDE, Probe, VoxelSource, WET as WET_BIT};
+use super::surface::Tread;
 use boxel_math::DVec3;
 use boxel_voxel::{BlockPos, CHUNK_MASK, CHUNK_SIZE, ChunkPos, Face, WorldPos};
 
@@ -93,6 +94,10 @@ pub struct SweepOut {
     pub in_fluid: bool,
     /// The box started inside full blocks and was pushed out first.
     pub depenetrated: bool,
+    /// The box ends overlapping a block whose surface acts on the bodies in its cell
+    /// ([`CollisionTable::acts_inside`], ADR 0047): the body's next step looks at those cells
+    /// ([`crate::core::sense_inside`]).
+    pub near_surface: bool,
 }
 
 impl SweepOut {
@@ -215,7 +220,47 @@ pub fn move_box_stepping<S: VoxelSource + ?Sized>(
     cfg: &SweepConfig,
     step: StepUp,
 ) -> Result<SweepOut, Unloaded> {
-    stepping(src, table, start, shape, d, obstacles, cfg, step, true)
+    stepping(
+        src,
+        table,
+        start,
+        shape,
+        d,
+        obstacles,
+        cfg,
+        step,
+        true,
+        Tread::default(),
+    )
+}
+
+/// [`move_box_stepping`] for a body `tread`: the blocks whose collision holds only some bodies
+/// ([`crate::core::Hold`], ADR 0047) collide for it only if it is above them at the start of the
+/// move (its bottom then), does not descend and has their treads. [`move_box_stepping`] is this
+/// with [`Tread::default`] (a body that does not sneak and has no treads).
+///
+/// # Errors
+///
+/// [`Unloaded`], as [`move_box_stepping`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "move_box_stepping's arguments and the body's tread"
+)]
+#[inline(always)]
+pub fn move_box_treading<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    start: WorldPos,
+    shape: LocalBox,
+    d: DVec3,
+    obstacles: &[LocalBox],
+    cfg: &SweepConfig,
+    step: StepUp,
+    tread: Tread,
+) -> Result<SweepOut, Unloaded> {
+    stepping(
+        src, table, start, shape, d, obstacles, cfg, step, true, tread,
+    )
 }
 
 /// [`move_box_stepping`] that always tries the lifted moves (no early skip): the reference the
@@ -235,7 +280,18 @@ pub fn move_box_stepping_unpruned<S: VoxelSource + ?Sized>(
     cfg: &SweepConfig,
     step: StepUp,
 ) -> Result<SweepOut, Unloaded> {
-    stepping(src, table, start, shape, d, obstacles, cfg, step, false)
+    stepping(
+        src,
+        table,
+        start,
+        shape,
+        d,
+        obstacles,
+        cfg,
+        step,
+        false,
+        Tread::default(),
+    )
 }
 
 /// [`move_box_stepping`]; `prune` allows skipping a step-up that cannot win.
@@ -253,6 +309,7 @@ fn stepping<S: VoxelSource + ?Sized>(
     cfg: &SweepConfig,
     step: StepUp,
     prune: bool,
+    tread: Tread,
 ) -> Result<SweepOut, Unloaded> {
     // A hand-built start may be outside the canonical form (a NaN frac, a block past i64 room).
     let start = start.normalize();
@@ -273,6 +330,7 @@ fn stepping<S: VoxelSource + ?Sized>(
         max_depenetration,
         step,
         prune,
+        tread,
     };
     // Away from tall blocks the move reads as without them (the same result, fewer reads).
     if table.reach() > 0.0 && !region_tall_free(src, table, &mv) {
@@ -298,6 +356,8 @@ struct Move<'o> {
     step: StepUp,
     /// Skipping a step-up that cannot win is allowed.
     prune: bool,
+    /// The body, for the blocks with a hold.
+    tread: Tread,
 }
 
 /// No block that `mv` reads only for tall boxes can hold one ([`tall_free_blocks`]): read
@@ -371,12 +431,16 @@ fn stepping_on<S: VoxelSource + ?Sized, const TALL: bool>(
         max_depenetration,
         step,
         prune,
+        tread,
     } = *mv;
     let mut grid = Grid::<S, TALL> {
         src,
         table,
         origin: start.block,
         eps,
+        holds: table.has_holds(),
+        tread,
+        bottom: start.frac.y + shape.min.y,
     };
     let mut pos = start.frac;
     let depenetrated = inside || grid.any_solid(shape.translate(pos))?;
@@ -398,7 +462,7 @@ fn stepping_on<S: VoxelSource + ?Sized, const TALL: bool>(
         out = lifted;
     }
     let pos = out.pos;
-    let in_fluid = grid.any_fluid(shape.translate(pos))?;
+    let (in_fluid, near_surface) = grid.inside(shape.translate(pos))?;
     let end = WorldPos::from_block(start.block, pos);
     // `end` holds `pos` exactly unless it was clamped at the world limit (or a tiny negative
     // frac carried): then the movement is measured to the end itself.
@@ -415,6 +479,7 @@ fn stepping_on<S: VoxelSource + ?Sized, const TALL: bool>(
         blocks: out.blocks,
         in_fluid,
         depenetrated,
+        near_surface,
     })
 }
 
@@ -509,7 +574,7 @@ fn others(axis: usize) -> (usize, usize) {
 /// box overlaps by more than `eps` (none when the box is not larger than `2 * eps`, which
 /// [`move_box`] prevents by widening such shapes).
 #[inline]
-fn footprint(min: f64, max: f64, eps: f64) -> (i64, i64) {
+pub(crate) fn footprint(min: f64, max: f64, eps: f64) -> (i64, i64) {
     ((min + eps).floor() as i64, (max - eps).ceil() as i64 - 1)
 }
 
@@ -598,6 +663,12 @@ struct Grid<'a, S: ?Sized, const TALL: bool> {
     table: &'a CollisionTable,
     origin: BlockPos,
     eps: f64,
+    /// The table has blocks with a hold ([`CollisionTable::has_holds`]).
+    holds: bool,
+    /// The body, for those blocks.
+    tread: Tread,
+    /// The bottom of the body's box at the start of the move, in the frame.
+    bottom: f64,
 }
 
 impl<'a, S: VoxelSource + ?Sized, const TALL: bool> Grid<'a, S, TALL> {
@@ -634,7 +705,16 @@ impl<'a, S: VoxelSource + ?Sized, const TALL: bool> Grid<'a, S, TALL> {
             Probe::Block(state) if TALL && under && !self.table.is_tall(state) => {
                 Ok(CollisionShape::Empty)
             }
-            Probe::Block(state) => Ok(self.table.shape(state)),
+            Probe::Block(state) => {
+                let shape = self.table.shape(state);
+                if self.holds
+                    && let Some(hold) = self.table.surface(state).hold
+                    && !self.tread.held(hold, shape, b[1] as f64, self.bottom)
+                {
+                    return Ok(CollisionShape::Empty);
+                }
+                Ok(shape)
+            }
             Probe::Unloaded => Err(Unloaded { block }),
         }
     }
@@ -730,23 +810,30 @@ impl<'a, S: VoxelSource + ?Sized, const TALL: bool> Grid<'a, S, TALL> {
         Ok(false)
     }
 
-    /// Some block that holds a fluid ([`CollisionTable::is_wet`]) overlaps `bx` by more than
+    /// Whether some block that holds a fluid ([`CollisionTable::is_wet`]), and some block whose
+    /// surface acts inside its cell ([`CollisionTable::acts_inside`]), overlaps `bx` by more than
     /// `eps` on every axis.
-    fn any_fluid(&mut self, bx: LocalBox) -> Result<bool, Unloaded> {
+    fn inside(&mut self, bx: LocalBox) -> Result<(bool, bool), Unloaded> {
         let ((x0, x1), (y0, y1), (z0, z1)) = (self.span(bx, 0), self.span(bx, 1), self.span(bx, 2));
+        let both = WET_BIT | INSIDE;
+        let mut found = 0;
         for y in y0..=y1 {
             for x in x0..=x1 {
                 for z in z0..=z1 {
                     let block = self.world([x, y, z]);
                     match self.src.probe(block) {
-                        Probe::Block(state) if self.table.is_wet(state) => return Ok(true),
-                        Probe::Block(_) => {}
+                        Probe::Block(state) => {
+                            found |= self.table.raw_bits(state) & both;
+                            if found == both {
+                                return Ok((true, true));
+                            }
+                        }
                         Probe::Unloaded => return Err(Unloaded { block }),
                     }
                 }
             }
         }
-        Ok(false)
+        Ok((found & WET_BIT != 0, found & INSIDE != 0))
     }
 
     /// The nearest blocking plane of layer `layer` on `axis` within the footprint `b` x `c` (on

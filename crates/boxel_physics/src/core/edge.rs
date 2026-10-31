@@ -39,6 +39,9 @@ pub const EDGE_MARGIN: f64 = 1.0 / 1024.0;
 /// - Then both together: if the box would have no support there (a corner between two
 ///   supports), neither axis moves, as Minecraft's shortening does at walking speeds.
 ///
+/// Blocks whose collision holds only some bodies ([`crate::Hold`], ADR 0047) are no support: a
+/// sneaking body descends through them.
+///
 /// `d.y` is returned as it is. Components of `d` that are not finite count as 0 and each one is
 /// clamped like a sweep.
 ///
@@ -195,6 +198,11 @@ fn gather<S: VoxelSource + ?Sized>(
                     Probe::Unloaded => return Err(Unloaded { block }),
                 };
                 if y < y0 && !table.is_tall(state) {
+                    continue;
+                }
+                // A block that holds only some bodies (ADR 0047) never holds a sneaking one:
+                // it descends through it.
+                if table.has_holds() && table.surface(state).hold.is_some() {
                     continue;
                 }
                 let at = DVec3::new(x as f64, y as f64, z as f64);

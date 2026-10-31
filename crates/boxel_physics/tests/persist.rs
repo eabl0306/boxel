@@ -11,9 +11,10 @@ use boxel_app::App;
 use boxel_ecs::prelude::*;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BODY_CODEC, BodyCodec, BodyPosition, BodySettings, CharacterController, Collider, Contacts,
-    Crouch, Frozen, Interpolated, MoveIntent, OnBlock, Projectile, ReportContacts, RigidBody,
-    Sleeping, SwimIntent, SwimPlugin, SwimSettings, Swimmer, Velocity,
+    BODY_CODEC, BlockSurfaces, BodyCodec, BodyPosition, BodySettings, CharacterController,
+    Collider, Contacts, Crouch, Drag, Frozen, Interpolated, MoveIntent, OnBlock, Projectile,
+    ReportContacts, RigidBody, Sleeping, Surface, SwimIntent, SwimPlugin, SwimSettings, Swimmer,
+    Treads, Velocity,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, ChunkKey, ChunkPos, MAX_BLOCK_COORD, WorldPos};
@@ -43,6 +44,15 @@ fn bases() -> [I64Vec3; 4] {
 /// A settled sim at `base` saving to `backend`; no fixed step runs until the test steps it
 /// (frames of zero length), so the steps after a restart are counted exactly.
 fn start(backend: &Arc<MemoryStore>, base: I64Vec3) -> Sim {
+    start_with(backend, base, |_: &mut App| {})
+}
+
+/// [`start`] with `extra` plugins.
+fn start_with<M>(
+    backend: &Arc<MemoryStore>,
+    base: I64Vec3,
+    extra: impl boxel_app::Plugins<M>,
+) -> Sim {
     let store = WorldStore::open(
         Arc::clone(backend) as Arc<dyn ChunkStore>,
         &boxel_demo::blocks::registry(),
@@ -55,6 +65,7 @@ fn start(backend: &Arc<MemoryStore>, base: I64Vec3) -> Sim {
         (
             SwimPlugin,
             PersistPlugin::new(store).with_executor(Arc::new(InlineExecutor)),
+            extra,
         ),
     );
     sim.app.insert_resource(PersistSettings {
@@ -108,6 +119,7 @@ struct State {
     swimmer: Option<Swimmer>,
     swim_intent: Option<SwimIntent>,
     frozen: bool,
+    treads: Option<Treads>,
 }
 
 fn bits(v: DVec3) -> [u64; 3] {
@@ -150,6 +162,7 @@ fn states(app: &mut App) -> Vec<(SavedId, State)> {
                 swimmer: r.get::<Swimmer>().copied(),
                 swim_intent: r.get::<SwimIntent>().copied(),
                 frozen: r.contains::<Frozen>(),
+                treads: r.get::<Treads>().copied(),
             };
             (id, state)
         })
@@ -780,4 +793,68 @@ fn the_loads_a_pile_came_back_with_do_not_wake_it() {
     );
     sim.steps(20);
     assert_eq!(states(&mut sim.app), before, "asleep where it was");
+}
+
+/// The demo's short grass holds bodies back (ADR 0047).
+fn sticky_grass(app: &mut App) {
+    let mut surfaces = BlockSurfaces::default();
+    surfaces.set(
+        "boxel:short_grass",
+        Surface {
+            inside: Some(Drag {
+                across: 20.0,
+                vertical: 30.0,
+            }),
+            ..Surface::PLAIN
+        },
+    );
+    app.insert_resource(surfaces);
+}
+
+/// A walker with treads walking into short grass that holds it back, then (with `restart`)
+/// the world exits and opens again, then 30 more steps.
+fn run_stuck(base: I64Vec3, restart: bool) -> (Vec<(SavedId, State)>, bool) {
+    let backend = Arc::new(MemoryStore::new());
+    let mut sim = start_with(&backend, base, sticky_grass);
+    let grass = boxel_demo::blocks::registry()
+        .by_name("boxel:short_grass")
+        .expect("short grass");
+    for x in 7..12 {
+        sim.edit(sim.block(x, 4, 6), grass);
+    }
+    calm(&mut sim);
+    let walker = sim.body(
+        sim.pos(6.5, 4.0, 6.5),
+        (
+            Saved::new(),
+            Collider::standing(0.6, 1.8),
+            CharacterController::default(),
+            Treads(3),
+            MoveIntent {
+                wish: Vec2::new(1.0, 0.0),
+                ..MoveIntent::default()
+            },
+        ),
+    );
+    sim.steps(40);
+    let stuck = sim.get::<Contacts>(walker).surface.stuck();
+    if restart {
+        sim.app.shutdown();
+        drop(sim);
+        sim = start_with(&backend, base, sticky_grass);
+    }
+    sim.steps(30);
+    (states(&mut sim.app), stuck)
+}
+
+/// A walker held back by a cell comes back with what the surfaces did in its last step and
+/// its treads: after the restart it goes on exactly as if it had never been saved.
+#[test]
+fn a_walker_held_back_by_a_cell_steps_the_same_after_a_restart() {
+    for base in [bases()[0], bases()[2], bases()[3]] {
+        let (straight, stuck) = run_stuck(base, false);
+        assert!(stuck, "{base:?}: held back");
+        assert_eq!(straight[0].1.treads, Some(Treads(3)));
+        assert_eq!(run_stuck(base, true).0, straight, "{base:?}");
+    }
 }

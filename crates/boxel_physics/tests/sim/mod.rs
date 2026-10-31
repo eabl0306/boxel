@@ -108,6 +108,17 @@ impl Sim {
 
     /// [`Sim::new`] with more plugins, added after `PhysicsPlugin`.
     pub fn with_plugins<M>(base: I64Vec3, frame: Duration, plugins: impl Plugins<M>) -> Self {
+        Self::with_registry(base, frame, boxel_demo::blocks::registry(), plugins)
+    }
+
+    /// [`Sim::with_plugins`] over `registry` (it must have `boxel:stone` and `boxel:grass`, the
+    /// flat world's layers).
+    pub fn with_registry<M>(
+        base: I64Vec3,
+        frame: Duration,
+        registry: BlockRegistry,
+        plugins: impl Plugins<M>,
+    ) -> Self {
         let start = Instant::now();
         let mut app = App::new();
         app.add_plugins((
@@ -121,7 +132,7 @@ impl Sim {
                     base: ChunkPos::containing(BlockPos::from_i64vec3(base)),
                 }),
                 executor: Arc::new(InlineExecutor),
-                registry: Arc::new(boxel_demo::blocks::registry()),
+                registry: Arc::new(registry),
                 ..WorldPlugin::default()
             },
             PhysicsPlugin::default(),

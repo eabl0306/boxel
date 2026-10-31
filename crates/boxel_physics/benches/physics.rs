@@ -14,6 +14,7 @@
 //! | `tick/0` | <= 20 us |
 //! | `tick/100` | <= 0.05 ms |
 //! | `tick/1000` | <= 0.5 ms |
+//! | `tick/1000_surfaces` | no target (block surfaces under and around the bodies, ADR 0047) |
 //! | `frame/1000`, `frame/1000_multi_thread` | no target (per-frame cost, compare the two) |
 //! | `grid/10000` | <= 0.3 ms |
 //! | `grid/1000`, `grid/10000_crowd` | no target (scaling, a dense crowd) |
@@ -78,12 +79,12 @@ use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::MultiThreadedExecutor;
 use boxel_math::{DVec3, I64Vec3, Vec2};
 use boxel_physics::{
-    BlockBounds, BodyPosition, BodySettings, CharacterController, ChunkSource, Collider,
-    CollisionEnded, CollisionLayers, CollisionStarted, CollisionTable, Grid, Interpolated,
-    LocalBox, MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, Projectile, ProjectileHit,
-    RayResult, RigidBody, Sleeping, StepUp, SweepConfig, Teleport, TestWorld, Velocity,
-    VoxelFilter, VoxelImpact, move_box, move_box_stepping, move_box_stepping_unpruned,
-    raycast_voxels,
+    BlockBounds, BlockSurfaces, BodyPosition, BodySettings, CharacterController, ChunkSource,
+    Collider, CollisionEnded, CollisionLayers, CollisionStarted, CollisionTable, Grid,
+    Interpolated, LocalBox, MoveIntent, PhysicsPlugin, PhysicsSettings, PhysicsStats, Projectile,
+    ProjectileHit, RayResult, RigidBody, Sleeping, StepUp, Surface, SweepConfig, Teleport,
+    TestWorld, Velocity, VoxelFilter, VoxelImpact, move_box, move_box_stepping,
+    move_box_stepping_unpruned, raycast_voxels,
 };
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockState, CHUNK_SHIFT, ChunkPos, LocalPos, WorldPos};
@@ -717,6 +718,48 @@ fn tick_benches(c: &mut Criterion) {
         );
         assert_eq!(stats.frozen, 0, "every body is on loaded ground");
     }
+    // The same 1000 bodies with block surfaces (ADR 0047): slippery grass under every body that
+    // stands (a probe of its ground in the controller and the step), and short grass that holds
+    // bodies back (the cells of the bodies in it are scanned). The bodies' paths change.
+    let mut surfaces = BlockSurfaces::default();
+    surfaces
+        .set(
+            "boxel:grass",
+            Surface {
+                friction: -2.0,
+                ..Surface::PLAIN
+            },
+        )
+        .set(
+            "boxel:short_grass",
+            Surface {
+                inside: Some(boxel_physics::Drag {
+                    across: 20.0,
+                    vertical: 30.0,
+                }),
+                ..Surface::PLAIN
+            },
+        );
+    app.insert_resource(surfaces);
+    let mut t = 0u64;
+    for _ in 0..256 {
+        t += 1;
+        if t.is_multiple_of(64) {
+            turn(&mut app, t);
+        }
+        app.world_mut().run_schedule(FixedPostUpdate);
+    }
+    tick.bench_function("1000_surfaces", |b| {
+        b.iter(|| {
+            t += 1;
+            if t.is_multiple_of(64) {
+                turn(&mut app, t);
+            }
+            app.world_mut().run_schedule(FixedPostUpdate);
+        });
+    });
+    app.insert_resource(BlockSurfaces::default());
+    app.world_mut().run_schedule(FixedPostUpdate);
     tick.finish();
 
     // Frames at 144 fps that run no step: the accumulator moves, so alpha (and every

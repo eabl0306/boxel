@@ -8,6 +8,8 @@
 //! - [`edge`]: [`guard_edge`], Minecraft's sneak edge guard (a sneaking character never walks
 //!   off a ledge).
 //! - [`ray`]: [`raycast_voxels`], the exact DDA voxel raycast.
+//! - [`surface`]: [`Surface`], how a block acts on the bodies on it and in it (ADR 0047), and
+//!   [`sense_inside`].
 //! - [`body`]: [`step_body`], one fixed step of a body (gravity, drag, sweep, bounces), and
 //!   [`predict`].
 //! - [`narrow`]: the narrowphase between two shapes ([`shape_contact`]: overlap and the minimum
@@ -22,6 +24,7 @@ pub mod narrow;
 pub mod ray;
 pub mod shape;
 pub mod source;
+pub mod surface;
 pub mod sweep;
 
 pub use body::{
@@ -40,9 +43,13 @@ pub use narrow::{
 pub use ray::{MAX_RAY_DISTANCE, RayResult, VoxelFilter, VoxelHit, raycast_voxels};
 pub use shape::{LocalBox, Shape, ShapeHit};
 pub use source::{CollisionShape, CollisionTable, Probe, TestWorld, VoxelSource};
+pub use surface::{
+    Climb, Drag, HOLD_TOLERANCE, Hold, Inside, SLIDE_ACROSS, SLIDE_CUT_FROM, SLIDE_FROM, Surface,
+    Tread, sense_inside,
+};
 #[doc(hidden)]
 pub use sweep::move_box_stepping_unpruned;
 pub use sweep::{
     MAX_SWEEP_DISTANCE, StepUp, SweepConfig, SweepOut, Unloaded, axis_order, move_box,
-    move_box_stepping,
+    move_box_stepping, move_box_treading,
 };

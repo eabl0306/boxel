@@ -9,13 +9,14 @@
 //! [`CharacterController`] with its [`MoveIntent`] and [`Crouch`] (the standing collider of a
 //! crouched body), the [`Projectile`] (the shooter it ignores
 //! is saved by its saved id, so only a saved shooter is kept), the [`Swimmer`] (with the land
-//! settings it keeps while in a fluid) and its [`SwimIntent`]. Floats are saved bit for bit, so
+//! settings it keeps while in a fluid), its [`SwimIntent`] and its [`Treads`] (ADR 0047, with what
+//! the surfaces did in the latest step: [`crate::SurfaceContacts`]). Floats are saved bit for bit, so
 //! a body that comes back steps exactly as it would have. Not saved: the contacts with other
 //! bodies and the events (they start again).
 use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Crouch, Frozen, Interpolated,
     MoveIntent, OnBlock, OnEntity, PhysicsSync, Projectile, ReportContacts, Response, Restored,
-    RigidBody, Sleeping, Teleport, Vacated, Velocity,
+    RigidBody, Sleeping, SurfaceContacts, Teleport, Treads, Vacated, Velocity,
 };
 use crate::core::{BodySettings, CollisionLayers, Shape};
 use crate::swim::{SwimIntent, SwimSettings, Swimmer};
@@ -67,7 +68,9 @@ const SWIM_INTENT: u16 = 1 << 11;
 const FROZEN: u16 = 1 << 12;
 const PENDING: u16 = 1 << 13;
 const RAN_INTO: u16 = 1 << 14;
-const KNOWN: u16 = (1 << 15) - 1;
+/// Two bytes follow the ground block: the [`SurfaceContacts`] and the [`Treads`] (ADR 0047).
+/// Bodies saved before surfaces have neither.
+const SURFACES: u16 = 1 << 15;
 
 // Bits of a saved controller's state byte.
 const FLYING: u8 = 1;
@@ -325,6 +328,7 @@ impl EntityCodec for BodyCodec {
         let pending = pending_of(&e);
         let collider = e.get::<Collider>().copied();
         let contacts = e.get::<Contacts>().copied().unwrap_or_default();
+        let treads = e.get::<Treads>().map_or(0, |t| t.0);
         let sync = e.get::<PhysicsSync>().copied().unwrap_or_default();
         let interpolated = e.get::<Interpolated>().copied();
         let controller = e.get::<CharacterController>().copied();
@@ -348,6 +352,7 @@ impl EntityCodec for BodyCodec {
             (e.contains::<Frozen>(), FROZEN),
             (pending.is_some(), PENDING),
             (contacts.ran_into, RAN_INTO),
+            (contacts.surface.0 != 0 || treads != 0, SURFACES),
         ] {
             if on {
                 flags |= flag;
@@ -366,6 +371,10 @@ impl EntityCodec for BodyCodec {
         w.u8(contacts.faces);
         if let Some(ground) = contacts.ground_block {
             w.block(ground);
+        }
+        if flags & SURFACES != 0 {
+            w.u8(contacts.surface.0);
+            w.u8(treads);
         }
         w.u32(sync.still);
         if let Some(c) = collider {
@@ -479,15 +488,22 @@ impl EntityCodec for BodyCodec {
             _ => return Err("unknown body kind".to_string()),
         };
         let flags = r.u16()?;
-        if flags & !KNOWN != 0 {
-            return Err("unknown body flags".to_string());
-        }
+        // Every bit of `flags` has a meaning now: a new flag needs a new version.
         let has = |flag: u16| flags & flag != 0;
         let position = r.pos()?;
         let velocity = r.vec()?;
         let settings = r.settings()?;
         let faces = r.u8()?;
         let ground_block = if has(GROUND) { Some(r.block()?) } else { None };
+        let (surface, treads) = if has(SURFACES) {
+            let surface = r.u8()?;
+            if surface & !SurfaceContacts::ALL != 0 {
+                return Err("unknown surface contacts".to_string());
+            }
+            (SurfaceContacts(surface), r.u8()?)
+        } else {
+            (SurfaceContacts::default(), 0)
+        };
         let still = r.u32()?;
         let collider = if has(COLLIDER) {
             Some(r.collider()?)
@@ -614,6 +630,7 @@ impl EntityCodec for BodyCodec {
                 ground_block,
                 in_fluid: has(IN_FLUID),
                 ran_into: has(RAN_INTO),
+                surface,
             },
             PhysicsSync {
                 last_written: placed.then_some(translation),
@@ -625,6 +642,9 @@ impl EntityCodec for BodyCodec {
         ));
         if let Some(collider) = collider {
             e.insert(collider);
+        }
+        if treads != 0 {
+            e.insert(Treads(treads));
         }
         if has(INTERPOLATED) {
             e.insert(Interpolated { prev: previous });

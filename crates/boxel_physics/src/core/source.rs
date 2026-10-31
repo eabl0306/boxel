@@ -2,6 +2,7 @@
 //! [`CollisionTable`] says how each block state collides.
 
 use super::shape::LocalBox;
+use super::surface::Surface;
 use boxel_math::DVec3;
 use boxel_voxel::{
     BlockCollision, BlockPos, BlockRegistry, BlockState, ChunkData, ChunkPos, CollisionBox,
@@ -79,7 +80,10 @@ const OUTLINE_BOXES: u8 = 1 << 4;
 /// `CollisionTable` bit: some collision box of the block reaches into the cell above.
 const TALL: u8 = 1 << 5;
 /// `CollisionTable` bit: the block holds a fluid (a fluid block or a waterlogged one).
-const WET: u8 = 1 << 6;
+pub(crate) const WET: u8 = 1 << 6;
+/// `CollisionTable` bit: the block has a [`Surface`] that acts on the bodies in its cell
+/// ([`Surface::acts_inside`]).
+pub(crate) const INSIDE: u8 = 1 << 7;
 
 /// Per block state, what physics needs to know: its [`CollisionShape`], its picking outline and
 /// whether it is a fluid. Built from a [`BlockRegistry`] (ADR 0016, ADR 0018):
@@ -113,6 +117,14 @@ pub struct CollisionTable {
     reach: f64,
     /// The states with the `TALL` bit.
     tall: StateSet,
+    /// Per state, its entry in `surfaces` (0: plain); empty while no state has a surface.
+    surface_of: Vec<u16>,
+    /// The distinct surfaces of the table, [`Surface::PLAIN`] first.
+    surfaces: Vec<Surface>,
+    /// Some state's surface acts on the ground, acts inside, or has a hold.
+    any_ground: bool,
+    any_inside: bool,
+    any_hold: bool,
 }
 
 impl CollisionTable {
@@ -302,6 +314,95 @@ impl CollisionTable {
     #[inline]
     pub fn has_outline(&self, state: BlockState) -> bool {
         self.bits(state) & OUTLINE != 0
+    }
+
+    /// Gives states their [`Surface`] (ADR 0047): `surface_of` says each state's, `None` for a
+    /// plain one. Replaces the surfaces set before. Values are [`Surface::sanitized`]. At most
+    /// 65,535 distinct surfaces.
+    pub fn set_surfaces(&mut self, mut surface_of: impl FnMut(BlockState) -> Option<Surface>) {
+        self.surface_of.clear();
+        self.surfaces = vec![Surface::PLAIN];
+        self.any_ground = false;
+        self.any_inside = false;
+        self.any_hold = false;
+        let mut of = vec![0u16; self.bits.len()];
+        for (i, bits) in self.bits.iter_mut().enumerate() {
+            *bits &= !INSIDE;
+            let Some(surface) = surface_of(BlockState(i as u16)).map(Surface::sanitized) else {
+                continue;
+            };
+            if surface == Surface::PLAIN {
+                continue;
+            }
+            let index = match self.surfaces.iter().position(|s| *s == surface) {
+                Some(index) => index,
+                None => {
+                    assert!(
+                        self.surfaces.len() < usize::from(u16::MAX),
+                        "too many surfaces"
+                    );
+                    self.surfaces.push(surface);
+                    self.surfaces.len() - 1
+                }
+            };
+            of[i] = index as u16;
+            self.any_ground |= surface.acts_on_ground();
+            self.any_hold |= surface.hold.is_some();
+            if surface.acts_inside() {
+                self.any_inside = true;
+                *bits |= INSIDE;
+            }
+        }
+        if self.surfaces.len() > 1 {
+            self.surface_of = of;
+        } else {
+            self.surfaces.clear();
+        }
+    }
+
+    /// The [`Surface`] of `state` ([`Surface::PLAIN`] when it has none).
+    #[inline]
+    pub fn surface(&self, state: BlockState) -> &Surface {
+        match self.surface_of.get(state.0 as usize) {
+            Some(&i) => &self.surfaces[usize::from(i)],
+            None => &Surface::PLAIN,
+        }
+    }
+
+    /// Some state has a surface that is not plain.
+    #[inline]
+    pub fn has_surfaces(&self) -> bool {
+        !self.surface_of.is_empty()
+    }
+
+    /// Some state's surface acts on the bodies standing on it ([`Surface::acts_on_ground`]).
+    #[inline]
+    pub fn has_ground_surfaces(&self) -> bool {
+        self.any_ground
+    }
+
+    /// Some state's surface acts on the bodies in its cell ([`Surface::acts_inside`]).
+    #[inline]
+    pub fn has_inside_surfaces(&self) -> bool {
+        self.any_inside
+    }
+
+    /// Some state's collision holds only some bodies ([`Surface::hold`]).
+    #[inline]
+    pub fn has_holds(&self) -> bool {
+        self.any_hold
+    }
+
+    /// `state`'s surface acts on the bodies in its cell ([`Surface::acts_inside`]).
+    #[inline]
+    pub fn acts_inside(&self, state: BlockState) -> bool {
+        self.bits(state) & INSIDE != 0
+    }
+
+    /// The raw bits of `state`, for the sweep's scans.
+    #[inline]
+    pub(crate) fn raw_bits(&self, state: BlockState) -> u8 {
+        self.bits(state)
     }
 
     /// Number of states.

@@ -1,7 +1,7 @@
 # ADR 0016: física propia mínima
 
 - Estado: aceptado (fases P0 a P4 hechas; de P4 falta medir con stress en ventana; P5 a pedido,
-  con subir escalones y las formas de bloque hechas)
+  con subir escalones, las formas de bloque y las superficies de bloque hechas, ADR 0047)
 - Fecha: 2026-10-06
 
 ## Contexto

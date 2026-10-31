@@ -339,10 +339,13 @@ pub struct Contacts {
     /// `horizontalCollision && !minorHorizontalCollision`). It ends a sprint, and the next step
     /// does not start one ([`CharacterController::sprinting`]). False for other bodies.
     pub ran_into: bool,
+    /// What block surfaces did to the body in the latest step (ADR 0047).
+    pub surface: SurfaceContacts,
 }
 
 impl Contacts {
-    /// The contacts a sweep reports (it does not tell [`Contacts::ran_into`]: false).
+    /// The contacts a sweep reports (it does not tell [`Contacts::ran_into`], nor what the
+    /// surfaces did in the step: false).
     pub fn from_sweep(out: &SweepOut) -> Self {
         Self {
             faces: out.faces,
@@ -350,6 +353,7 @@ impl Contacts {
             ground_block: out.ground,
             in_fluid: out.in_fluid,
             ran_into: false,
+            surface: SurfaceContacts::default().with(SurfaceContacts::NEAR, out.near_surface),
         }
     }
 
@@ -358,6 +362,57 @@ impl Contacts {
         self.faces & (1 << face.index()) != 0
     }
 }
+
+/// What block surfaces (ADR 0047, [`crate::Surface`]) did to a body in its latest step, and
+/// whether its box ended the step in a cell whose surface acts inside it (then the next step
+/// looks at those cells).
+///
+/// A game resets a fall where Minecraft does: climbing, stuck in a cell and sliding down a side
+/// all end a fall.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SurfaceContacts(pub(crate) u8);
+
+impl SurfaceContacts {
+    pub(crate) const NEAR: u8 = 1;
+    pub(crate) const CLIMBING: u8 = 1 << 1;
+    pub(crate) const STUCK: u8 = 1 << 2;
+    pub(crate) const SLIDING: u8 = 1 << 3;
+    pub(crate) const ALL: u8 = (1 << 4) - 1;
+
+    /// The same with `bit` set to `on`.
+    pub(crate) const fn with(self, bit: u8, on: bool) -> Self {
+        Self(if on { self.0 | bit } else { self.0 & !bit })
+    }
+
+    /// The box ended the step overlapping a cell whose surface acts inside it
+    /// ([`crate::Surface::acts_inside`]).
+    pub const fn near(self) -> bool {
+        self.0 & Self::NEAR != 0
+    }
+
+    /// The body climbed ([`crate::Surface::climb`]: a character with its feet in such a cell).
+    pub const fn climbing(self) -> bool {
+        self.0 & Self::CLIMBING != 0
+    }
+
+    /// A cell's [`crate::Surface::inside`] drag held the body back.
+    pub const fn stuck(self) -> bool {
+        self.0 & Self::STUCK != 0
+    }
+
+    /// The body slid down a side ([`crate::Surface::slide`]).
+    pub const fn sliding(self) -> bool {
+        self.0 & Self::SLIDING != 0
+    }
+}
+
+/// A body's treads (ADR 0047): bits the game gives a meaning to, that some block surfaces ask
+/// for. A block whose collision holds only bodies with a tread ([`crate::Hold::treads`]) holds
+/// this body if it has one of them, and a [`crate::Climb`] with treads lets it climb. The game
+/// sets them from what the body wears (`game:leather_boots` lets a player walk on
+/// `game:powder_snow`). A body without the component has none.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Treads(pub u8);
 
 /// Marker: the latest step of this body needed a block of an unloaded chunk, so it did not move
 /// (position and velocity kept, no gravity). Physics adds it and removes it when the body moves

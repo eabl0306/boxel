@@ -3,12 +3,14 @@
 use crate::components::{
     BodyPosition, CharacterController, Collider, Contacts, Crouch, FLIGHT_VERTICAL_DRAG, Frozen,
     Interpolated, MoveIntent, PhysicsSettings, PhysicsStats, PhysicsSync, Projectile, Restored,
-    RigidBody, Sleeping, Teleport, Vacated, Velocity, VoxelImpact,
+    RigidBody, Sleeping, SurfaceContacts, Teleport, Treads, Vacated, Velocity, VoxelImpact,
 };
 use crate::contacts::{BodyIndex, ObstacleIndex, ObstacleScratch};
+use crate::core::sweep::effective_eps;
 use crate::core::{
-    BodySettings, CollisionTable, LocalBox, MAX_SWEEP_DISTANCE, StepParams, StepUp, SweepOut,
-    guard_edge, integrate_velocity, move_body, move_box,
+    BodySettings, CollisionTable, Inside, LocalBox, MAX_SWEEP_DISTANCE, Probe, SLIDE_ACROSS,
+    SLIDE_CUT_FROM, SLIDE_FROM, StepParams, StepUp, Surface, SweepOut, Tread, VoxelSource,
+    guard_edge, integrate_velocity, move_body, move_box, sense_inside,
 };
 use crate::plugin::PhysicsContent;
 use crate::source::ChunkSource;
@@ -20,7 +22,7 @@ use boxel_ecs::system::SystemChangeTick;
 use boxel_math::{DVec2, DVec3, Vec2};
 use boxel_tasks::{ComputeTaskPool, TaskPool};
 use boxel_transform::Transform;
-use boxel_voxel::{Face, WorldPos};
+use boxel_voxel::{BlockPos, Face, WorldPos};
 use boxel_world::{ChunkMap, WorldSettings};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
@@ -190,6 +192,9 @@ pub(crate) struct AwakeCount {
 pub(crate) fn drive_characters(
     fixed: Res<FixedTime>,
     settings: Res<PhysicsSettings>,
+    map: Res<ChunkMap>,
+    world: Res<WorldSettings>,
+    content: Res<PhysicsContent>,
     mut characters: Query<
         (
             &RigidBody,
@@ -212,7 +217,10 @@ pub(crate) fn drive_characters(
     >,
 ) {
     let dt = timestep(&fixed);
-    let drive = |(kind, mut controller, mut intent, mut velocity, contacts, body, crouch): (
+    let table = &*content.collision;
+    let new_source = || ChunkSource::new(&map, &world);
+    let drive = |source: &mut ChunkSource<'_>,
+                 (kind, mut controller, mut intent, mut velocity, contacts, body, crouch): (
         &RigidBody,
         Mut<CharacterController>,
         Mut<MoveIntent>,
@@ -248,11 +256,18 @@ pub(crate) fn drive_characters(
         } else {
             controller.walk_speed
         };
+        // The surface it stands on (ADR 0047): its friction is made up for (a walker reaches
+        // its speed on a slippery block, slower), its drag is not.
+        let ground = if !flying && contacts.on_ground && table.has_ground_surfaces() {
+            ground_surface(source, table, contacts.ground_block)
+        } else {
+            Surface::PLAIN
+        };
         // A flyer is never on the ground for its drag (it lands and stops flying).
         let (rate, control) = if flying {
             (body.drag_xz, 1.0)
         } else if contacts.on_ground {
-            (body.ground_friction, 1.0)
+            ((body.ground_friction + ground.friction).max(0.0), 1.0)
         } else {
             (body.drag_xz, controller.air_control)
         };
@@ -272,7 +287,7 @@ pub(crate) fn drive_characters(
         } else if intent.jump {
             intent.jump = false;
             if contacts.on_ground {
-                v.y = controller.jump_speed;
+                v.y = controller.jump_speed * ground.jump;
                 // Minecraft's sprint-jump: a push along the facing.
                 if sprinting && let Some(dir) = facing {
                     let boost = controller.sprint_jump_boost;
@@ -285,9 +300,31 @@ pub(crate) fn drive_characters(
     };
     if awake.iter().len() > settings.parallel_threshold {
         ensure_compute_pool();
-        characters.par_iter_mut().for_each(drive);
+        characters.par_iter_mut().for_each_init(new_source, drive);
     } else {
-        characters.iter_mut().for_each(drive);
+        let mut source = new_source();
+        characters
+            .iter_mut()
+            .for_each(|item| drive(&mut source, item));
+    }
+}
+
+/// The face bits of a body's four faces across (a clip across).
+const ACROSS_FACES: u8 = (1 << Face::PosX.index())
+    | (1 << Face::NegX.index())
+    | (1 << Face::PosZ.index())
+    | (1 << Face::NegZ.index());
+
+/// The surface of the block a body stood on (`Contacts::ground_block`; plain without one or in
+/// an unloaded chunk).
+fn ground_surface<S: VoxelSource + ?Sized>(
+    src: &mut S,
+    table: &CollisionTable,
+    ground: Option<BlockPos>,
+) -> Surface {
+    match ground.map(|block| src.probe(block)) {
+        Some(Probe::Block(state)) => *table.surface(state),
+        _ => Surface::PLAIN,
     }
 }
 
@@ -698,6 +735,7 @@ type StepItem<'a> = (
     Option<Mut<'a, CharacterController>>,
     Option<&'a MoveIntent>,
     Option<Mut<'a, Crouch>>,
+    Option<&'a Treads>,
 );
 
 /// One step of one dynamic body (it reads the world and writes only itself).
@@ -715,6 +753,7 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
         mut controller,
         intent,
         mut crouch,
+        treads,
     ) = item;
     if *kind != RigidBody::Dynamic {
         return;
@@ -740,7 +779,75 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
     } else {
         body
     };
-    let mut v = integrate_velocity(velocity.0, contacts.on_ground && !flying, body, params);
+    // Block surfaces (ADR 0047): the ground it stood on and the cells its box ended the latest
+    // step in (a flyer is never on the ground and never climbs).
+    let table = shared.table;
+    let on_ground = contacts.on_ground && !flying;
+    let ground = if on_ground && table.has_ground_surfaces() {
+        ground_surface(&mut stepper.voxels, table, contacts.ground_block)
+    } else {
+        Surface::PLAIN
+    };
+    let treads = treads.map_or(0, |t| t.0);
+    let climber = (controller.is_some() && !flying).then_some(treads);
+    let inside = if contacts.surface.near() {
+        sense_inside(
+            &mut stepper.voxels,
+            table,
+            pos,
+            shape,
+            effective_eps(params.sweep.eps),
+            contacts.on_ground,
+            climber,
+        )
+    } else {
+        Inside::default()
+    };
+    let surfaced;
+    let body = if ground != Surface::PLAIN || inside.drag.is_some() {
+        let mut s = *body;
+        if ground != Surface::PLAIN {
+            s.ground_friction = (s.ground_friction + ground.friction).max(0.0) + ground.drag;
+        }
+        if let Some(drag) = inside.drag {
+            s.ground_friction += drag.across;
+            s.drag_xz += drag.across;
+            s.drag_y += drag.vertical;
+        }
+        surfaced = s;
+        &surfaced
+    } else {
+        body
+    };
+    let mut v = integrate_velocity(velocity.0, on_ground, body, params);
+    let sneaking = intent.is_some_and(|i| i.sneak) && !flying && controller.is_some();
+    // Climbing: speeds held, sneaking holds on, pushing across or holding up climbs.
+    let climbed = inside.climb.inspect(|climb| {
+        let max = climb.max;
+        v.x = v.x.clamp(-max, max);
+        v.z = v.z.clamp(-max, max);
+        v.y = v.y.max(-max);
+        if v.y < 0.0 && sneaking && climb.sneak_holds {
+            v.y = 0.0;
+        }
+        let pushing = contacts.faces & ACROSS_FACES != 0 || intent.is_some_and(|i| i.up);
+        if pushing && v.y < climb.up {
+            v.y = climb.up;
+        }
+    });
+    // Sliding down a side: falling against it, off the ground.
+    let slid = inside
+        .slide
+        .filter(|_| !contacts.on_ground && velocity.0.y < -SLIDE_FROM)
+        .inspect(|&speed| {
+            let fall = -velocity.0.y;
+            if fall > SLIDE_CUT_FROM {
+                let cut = SLIDE_ACROSS / fall;
+                v.x *= cut;
+                v.z *= cut;
+            }
+            v.y = -speed;
+        });
     // Characters step up ledges (projectiles never get here); flyers do not.
     let step = match controller.as_deref() {
         Some(controller) if !flying && controller.step_height > 0.0 => StepUp {
@@ -854,9 +961,30 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             body,
             params,
             step,
+            Tread {
+                descending: sneaking,
+                treads,
+            },
         )
     }) {
         Ok(mut out) => {
+            // A landing on a bouncy block (not sneaking): its restitution instead of the body's.
+            if table.has_ground_surfaces()
+                && v.y < 0.0
+                && !sneaking
+                && out.sweep.touched(Face::NegY)
+                && let Some(block) = out.sweep.blocks[1]
+                && let Probe::Block(state) = stepper.voxels.probe(block)
+                && let Some(restitution) = table.surface(state).bounce
+            {
+                let speed = -v.y;
+                let resting = (params.gravity.y * body.gravity_scale * params.dt).abs();
+                out.vel.y = if speed > body.bounce_min_speed.max(resting) && restitution > 0.0 {
+                    speed * restitution
+                } else {
+                    0.0
+                };
+            }
             for axis in [0, 2] {
                 if guarded[axis] {
                     out.vel[axis] = 0.0;
@@ -872,6 +1000,11 @@ fn step_one(stepper: &mut Stepper<'_>, shared: &StepShared<'_>, item: StepItem<'
             // Running into something ahead ends a sprint, and keeps the key from starting it
             // again in the next step (`Contacts::ran_into`).
             let mut touched = Contacts::from_sweep(&out.sweep);
+            touched.surface = touched
+                .surface
+                .with(SurfaceContacts::CLIMBING, climbed.is_some())
+                .with(SurfaceContacts::STUCK, inside.drag.is_some())
+                .with(SurfaceContacts::SLIDING, slid.is_some());
             if let Some(controller) = controller.as_mut() {
                 touched.ran_into = ran_into(
                     &out.sweep,
@@ -941,6 +1074,7 @@ pub(crate) fn step_dynamic(
             Option<&mut CharacterController>,
             Option<&MoveIntent>,
             Option<&mut Crouch>,
+            Option<&Treads>,
         ),
         (Without<Sleeping>, Without<Projectile>),
     >,

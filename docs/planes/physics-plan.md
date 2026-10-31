@@ -459,7 +459,7 @@ Estimate behind these: 25 to 35 probes at about 1 ns, plus a few 6.5 ns lookups,
   - Step-up (done: ADR 0016, section 9c).
   - Non-full shapes through `BlockDef.collision`.
   - Fluids.
-  - Per-block friction.
+  - Per-block friction (done: block surfaces, ADR 0047).
   - Carrying riders.
   - Exact sphere vs voxels.
   - Simulation distance for mobs.

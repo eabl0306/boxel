@@ -7,7 +7,7 @@ use crate::components::{
 use crate::contacts::{
     BodyIndex, ContactSet, ObstacleIndex, broadphase, build_obstacles, solve, write_collisions,
 };
-use crate::core::CollisionTable;
+use crate::core::{CollisionTable, Surface};
 use crate::persist::BodyCodec;
 use crate::projectile::{PendingHits, step_projectiles, write_hits};
 use crate::sleep::{sleep_bodies, wake_bodies, wake_to_pose};
@@ -20,6 +20,7 @@ use boxel_app::{
 };
 use boxel_ecs::prelude::*;
 use boxel_ecs::schedule::SingleThreadedExecutor;
+use boxel_voxel::{BlockId, BlockRegistry};
 use boxel_world::{BlockChanged, ChunkDataEvent, WorldContent};
 use std::sync::Arc;
 
@@ -31,12 +32,104 @@ pub struct PhysicsContent {
     pub collision: Arc<CollisionTable>,
 }
 
+/// The [`Surface`] of each block that has one (ADR 0047), by block name: slippery ground,
+/// ground that slows walkers, cells that hold bodies back, cells characters climb, sides bodies
+/// slide down, blocks that hold only bodies above them. The game inserts it (any time: the
+/// next fixed step reads a change) and [`PhysicsPlugin`] puts the surfaces in
+/// [`PhysicsContent::collision`] for every state of each block. A block not named here is
+/// plain. Removing the resource leaves the surfaces as they were: insert an empty one instead.
+///
+/// ```ignore
+/// let mut surfaces = BlockSurfaces::default();
+/// surfaces.set("game:ice", Surface { friction: -9.81, ..Surface::PLAIN });
+/// app.insert_resource(surfaces);
+/// ```
+#[derive(Resource, Clone, Debug, Default, PartialEq)]
+pub struct BlockSurfaces {
+    blocks: Vec<(String, Surface)>,
+}
+
+impl BlockSurfaces {
+    /// Gives the block named `block` (`"game:ice"`) its surface, replacing one set before.
+    pub fn set(&mut self, block: impl Into<String>, surface: Surface) -> &mut Self {
+        let block = block.into();
+        match self.blocks.iter_mut().find(|(name, _)| *name == block) {
+            Some(entry) => entry.1 = surface,
+            None => self.blocks.push((block, surface)),
+        }
+        self
+    }
+
+    /// The surface set for the block named `block`.
+    pub fn get(&self, block: &str) -> Option<&Surface> {
+        self.blocks
+            .iter()
+            .find(|(name, _)| name == block)
+            .map(|(_, surface)| surface)
+    }
+
+    /// Every block and its surface, in the order they were first set.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Surface)> {
+        self.blocks
+            .iter()
+            .map(|(name, surface)| (name.as_str(), surface))
+    }
+
+    /// Puts the surfaces in `table`, built from `registry` ([`CollisionTable::set_surfaces`]),
+    /// and returns the names `registry` does not have (they are left out).
+    pub fn apply(&self, registry: &BlockRegistry, table: &mut CollisionTable) -> Vec<String> {
+        let mut unknown = Vec::new();
+        let mut by_block: Vec<Option<Surface>> = Vec::new();
+        for (name, surface) in &self.blocks {
+            let Some(BlockId(id)) = registry.block_by_name(name) else {
+                unknown.push(name.clone());
+                continue;
+            };
+            let id = usize::from(id);
+            if by_block.len() <= id {
+                by_block.resize(id + 1, None);
+            }
+            by_block[id] = Some(*surface);
+        }
+        table.set_surfaces(|state| {
+            registry
+                .block(state)
+                .and_then(|BlockId(id)| by_block.get(usize::from(id)).copied().flatten())
+        });
+        unknown
+    }
+}
+
+/// [`PhysicsSystems::Prepare`], first: a new or changed [`BlockSurfaces`] goes into the
+/// collision table. A name the registry does not have is a warning.
+pub(crate) fn apply_surfaces(
+    surfaces: Option<Res<BlockSurfaces>>,
+    world: Res<WorldContent>,
+    mut content: ResMut<PhysicsContent>,
+) {
+    let Some(surfaces) = surfaces else {
+        return;
+    };
+    if !surfaces.is_changed() {
+        return;
+    }
+    let table = Arc::make_mut(&mut content.collision);
+    for name in surfaces.apply(&world.registry, table) {
+        tracing::warn!(
+            block = name,
+            "BlockSurfaces names a block the registry does not have"
+        );
+    }
+}
+
 /// Adds physics to an app with a voxel world (`WorldPlugin`) and time (`TimePlugin`). Not part
 /// of `DefaultPlugins`: games add it.
 ///
 /// - Bodies ([`crate::RigidBody`] and the other components) move in fixed steps, in
 ///   `FixedPostUpdate`, in the chained [`PhysicsSystems`]; interpolated `Transform`s are written
 ///   after the frame's steps (`RunFixedMainLoopSystems::AfterFixedMainLoop`).
+/// - Block surfaces (ADR 0047): a [`BlockSurfaces`] the game inserts goes into the collision
+///   table before the next step.
 /// - Resources: [`PhysicsSettings`], [`PhysicsStats`] (a `"physics"` line on `DiagnosticsBoard`,
 ///   refreshed in `Last`), [`BodyIndex`] (the bodies for entity queries) and, in
 ///   `Plugin::finish`, [`PhysicsContent`] from the world's registry, which
@@ -145,7 +238,7 @@ impl Plugin for PhysicsPlugin {
             .add_systems(
                 FixedPostUpdate,
                 (
-                    (prepare_bodies, wake_to_pose)
+                    (apply_surfaces, prepare_bodies, wake_to_pose)
                         .chain()
                         .in_set(PhysicsSystems::Prepare),
                     drive_characters.in_set(PhysicsSystems::Controller),
