@@ -1871,7 +1871,8 @@ fn the_lod_moves_the_far_plane_and_keeps_the_fog_layers() {
 
 /// The demo's hazy valley (its haze past the cells) over the LOD terrain: while the LOD draws,
 /// its haze goes on to the horizon, so every texel whose ray meets the band 0.6 to 3 km away
-/// has fog over an empty LOD, and over the forest's LOD those the hills do not hide; without
+/// (but for those behind the near water wall, where the march ends: ADR 0058) has fog over an
+/// empty LOD, and over the forest's LOD those the hills do not hide; without
 /// LOD none lies past the view distance, and neither does the plain valley's with LOD (layers
 /// without haze keep their range).
 #[test]
@@ -1894,6 +1895,20 @@ fn a_hazy_valley_reaches_the_lod_horizon() {
         let dir = basis.dir(ndc[0], ndc[1]);
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         (dir[1] < 0.0).then(|| top / dir[1] * len)
+    };
+    // The texels whose ray meets the water wall of `full_detail` (x 0 to 32, y 96 to 120, its
+    // front at z -40): the march ends there (ADR 0058), so none of them reaches the band.
+    let origin = view.render_origin.as_vec3();
+    let eye = view.eye_rel + origin;
+    let behind_wall = |tx: u32, ty: u32| {
+        let ndc = [
+            (2 * tx + 1) as f32 / WIDTH as f32 * 2.0 - 1.0,
+            1.0 - (2 * ty + 1) as f32 / HEIGHT as f32 * 2.0,
+        ];
+        let dir = basis.dir(ndc[0], ndc[1]);
+        let t = (-40.0 - eye.z) / dir[2];
+        let (x, y) = (eye.x + t * dir[0], eye.y + t * dir[1]);
+        t > 0.0 && (-1.0..33.0).contains(&x) && (95.0..121.0).contains(&y)
     };
     let fog = |layer| FogInput {
         settings: Arc::new(FogSettings::new(vec![layer])),
@@ -1920,7 +1935,8 @@ fn a_hazy_valley_reaches_the_lod_horizon() {
                 let (mut fogged, mut all) = (0, 0);
                 for ty in 0..size.y {
                     for tx in 0..size.x {
-                        if entry(tx, ty).is_some_and(|d| range.contains(&d)) {
+                        if entry(tx, ty).is_some_and(|d| range.contains(&d)) && !behind_wall(tx, ty)
+                        {
                             all += 1;
                             fogged += usize::from(words[(ty * size.x + tx) as usize][1] != 0);
                         }

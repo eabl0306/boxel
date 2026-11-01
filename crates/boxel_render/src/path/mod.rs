@@ -84,11 +84,21 @@ pub(crate) trait TierPath {
     fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32;
 
     /// Records the translucent buckets ([`translucent_draws`], back to front) with the
-    /// translucent pipeline, after [`TierPath::draw_solid`], binding each bucket's page when it
-    /// changes. Something else may have been drawn in between (the block outline, ADR 0026; the
-    /// far LOD, ADR 0031), even in a new pass with only groups 0 and 1 bound: it sets every other
-    /// group, buffer and immediate it uses again. Returns the draw calls recorded.
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32;
+    /// translucent pipeline of `draw`, after [`TierPath::draw_solid`], binding each bucket's page
+    /// when it changes. Something else may have been drawn in between (the block outline, ADR
+    /// 0026; the far LOD, ADR 0031), even in a new pass with only groups 0 and 1 bound: it sets
+    /// every other group, buffer and immediate it uses again. [`TranslucentDraw::FogDepth`]
+    /// records nothing without its pipeline ([`VoxelPipelines::set_fog_depth`]). Returns the draw
+    /// calls recorded.
+    fn draw_translucent(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pages: &PageSet,
+        draw: TranslucentDraw,
+    ) -> u32;
+
+    /// The tier's voxel pipelines (the fog builds and drops its depth pipeline there).
+    fn voxel_mut(&mut self) -> &mut VoxelPipelines;
 
     /// The page changes of this frame's translucent list ([`page_switches`]).
     fn translucent_page_switches(&self) -> u32;
@@ -198,7 +208,8 @@ impl VoxelLayouts {
     }
 }
 
-/// The three voxel pipelines of a tier (ADR 0012, ADR 0018).
+/// The voxel pipelines of a tier (ADR 0012, ADR 0018), and the fog's depth of the translucent
+/// buckets while there is fog (ADR 0058).
 pub(crate) struct VoxelPipelines {
     /// `fs_opaque`, back faces culled, face buckets 0..6.
     pub opaque: wgpu::RenderPipeline,
@@ -207,12 +218,34 @@ pub(crate) struct VoxelPipelines {
     /// `fs_translucent`: alpha blending, depth test without depth write, no face culling (a
     /// water surface or a glass pane shows from both sides), bucket 7.
     pub translucent: wgpu::RenderPipeline,
+    /// `fs_translucent_depth`, only while the fog is on ([`VoxelPipelines::set_fog_depth`]):
+    /// bucket 7 again after its color, writing depth and no color, so the fog march ends at the
+    /// nearest translucent surface (ADR 0058).
+    pub fog_depth: Option<wgpu::RenderPipeline>,
+    /// What builds them.
+    builder: VoxelBuilder,
 }
 
-impl VoxelPipelines {
-    /// Builds the opaque, cutout and translucent pipelines of `tier` (`VoxelPull` on High/Mid,
-    /// `VoxelInstanced` on Low).
-    pub fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
+/// The shared state of a tier's voxel pipelines: its module, layout and vertex input.
+struct VoxelBuilder {
+    tier: Tier,
+    module: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    vertex_entry: &'static str,
+    topology: wgpu::PrimitiveTopology,
+}
+
+/// What a voxel pipeline does with depth and color.
+struct VoxelDraw {
+    fragment_entry: &'static str,
+    cull_mode: Option<wgpu::Face>,
+    blend: Option<wgpu::BlendState>,
+    depth_write: bool,
+    write_mask: wgpu::ColorWrites,
+}
+
+impl VoxelBuilder {
+    fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
         let (module_id, vertex_entry, topology, immediate_size) = match tier {
             Tier::High | Tier::Mid => (
                 ShaderModuleId::VoxelPull,
@@ -241,6 +274,16 @@ impl VoxelPipelines {
             bind_group_layouts: &groups,
             immediate_size,
         });
+        Self {
+            tier,
+            module,
+            layout,
+            vertex_entry,
+            topology,
+        }
+    }
+
+    fn build(&self, device: &wgpu::Device, label: &str, draw: VoxelDraw) -> wgpu::RenderPipeline {
         // High/Mid: DrawRef per draw; Low: the PackedQuad itself (slot 0) and its light palette
         // entry (slot 1, a light page parallel to the page, ADR 0015). All instance-step
         // Uint32x2.
@@ -257,71 +300,125 @@ impl VoxelPipelines {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes,
         };
-        let buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = match tier {
+        let buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = match self.tier {
             Tier::High | Tier::Mid => vec![Some(instance_step(&slot0))],
             Tier::Low => vec![Some(instance_step(&slot0)), Some(instance_step(&slot1))],
         };
-        let build = |label: &str,
-                     fragment_entry: &str,
-                     cull_mode: Option<wgpu::Face>,
-                     blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some(vertex_entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    // Blended quads test depth but do not write it: the ones behind still show.
-                    depth_write_enabled: Some(blend.is_none()),
-                    depth_compare: Some(wgpu::CompareFunction::Greater),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(fragment_entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: MAIN_COLOR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&self.layout),
+            vertex: wgpu::VertexState {
+                module: &self.module,
+                entry_point: Some(self.vertex_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: self.topology,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: draw.cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(draw.depth_write),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &self.module,
+                entry_point: Some(draw.fragment_entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: MAIN_COLOR_FORMAT,
+                    blend: draw.blend,
+                    write_mask: draw.write_mask,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+}
+
+impl VoxelPipelines {
+    /// Builds the opaque, cutout and translucent pipelines of `tier` (`VoxelPull` on High/Mid,
+    /// `VoxelInstanced` on Low). The fog's depth pipeline waits for the fog.
+    pub fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
+        let builder = VoxelBuilder::new(device, tier, layouts);
+        let solid = |fragment_entry, cull_mode| VoxelDraw {
+            fragment_entry,
+            cull_mode,
+            blend: None,
+            depth_write: true,
+            write_mask: wgpu::ColorWrites::ALL,
         };
         Self {
-            opaque: build(
+            opaque: builder.build(
+                device,
                 "boxel voxel opaque",
-                "fs_opaque",
-                Some(wgpu::Face::Back),
-                None,
+                solid("fs_opaque", Some(wgpu::Face::Back)),
             ),
-            cutout: build("boxel voxel cutout", "fs_cutout", None, None),
-            translucent: build(
+            cutout: builder.build(device, "boxel voxel cutout", solid("fs_cutout", None)),
+            // Blended quads test depth but do not write it: the ones behind still show.
+            translucent: builder.build(
+                device,
                 "boxel voxel translucent",
-                "fs_translucent",
-                None,
-                Some(wgpu::BlendState::ALPHA_BLENDING),
+                VoxelDraw {
+                    fragment_entry: "fs_translucent",
+                    cull_mode: None,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    depth_write: false,
+                    write_mask: wgpu::ColorWrites::ALL,
+                },
             ),
+            fog_depth: None,
+            builder,
         }
     }
+
+    /// Builds the fog's depth pipeline (`on`) or drops it. Its draw writes no color, so the
+    /// frame's pixels stay what they were; only the depth the fog reads changes.
+    pub fn set_fog_depth(&mut self, device: &wgpu::Device, on: bool) {
+        if !on {
+            self.fog_depth = None;
+        } else if self.fog_depth.is_none() {
+            self.fog_depth = Some(self.builder.build(
+                device,
+                "boxel voxel fog depth",
+                VoxelDraw {
+                    fragment_entry: "fs_translucent_depth",
+                    cull_mode: None,
+                    blend: None,
+                    depth_write: true,
+                    write_mask: wgpu::ColorWrites::empty(),
+                },
+            ));
+        }
+    }
+
+    /// The pipeline of a draw of the translucent buckets: `None` for the fog's depth without
+    /// fog.
+    pub fn translucent_for(&self, draw: TranslucentDraw) -> Option<&wgpu::RenderPipeline> {
+        match draw {
+            TranslucentDraw::Color => Some(&self.translucent),
+            TranslucentDraw::FogDepth => self.fog_depth.as_ref(),
+        }
+    }
+}
+
+/// What a draw of the translucent buckets records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranslucentDraw {
+    /// Their color, blended, without depth writes.
+    Color,
+    /// After the color, only their depth, for the fog march (ADR 0058).
+    FogDepth,
 }
 
 /// The High tier cull pipeline and its layout.

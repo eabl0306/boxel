@@ -44,3 +44,14 @@ fn fs_translucent(i: VsOut) -> @location(0) vec4<f32> {
   if (albedo.a <= 0.0) { discard; }
   return vec4(shade_fragment(albedo, i, view).rgb, albedo.a);
 }
+
+// The translucent bucket again, after its color, only while there is fog (ADR 0058): its
+// pipeline writes depth and no color (an empty write mask), so the fog march ends at the
+// nearest translucent surface. Texels under 0.1 alpha (the clear inside of glass) let the fog
+// through, like Minecraft's cutout glass.
+@fragment
+fn fs_translucent_depth(i: VsOut) -> @location(0) vec4<f32> {
+  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  if (albedo.a < 0.1) { discard; }
+  return vec4(0.0);
+}

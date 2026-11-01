@@ -13,7 +13,7 @@ use crate::model::{ModelDraw, ModelLayer, ModelPass, ModelStats};
 use crate::outline::{Outline, OutlinePass};
 use crate::path::{
     HighInputs, HighPath, LowPath, MidPath, SlotVisibility, TierPath, TierPipelines,
-    quad_index_buffer,
+    TranslucentDraw, quad_index_buffer,
 };
 use crate::plugin::Resync;
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
@@ -211,6 +211,9 @@ pub struct RenderStats {
     pub fog_passes: u32,
     /// Fog layers the last frame marched.
     pub fog_layers: u32,
+    /// Draws of the translucent buckets' depth for the fog march (ADR 0058), after their color
+    /// and only in a frame that marches fog. Not counted in [`RenderStats::draws`].
+    pub fog_depth_draws: u32,
     /// Far LOD nodes resident in the LOD arena (ADR 0031; 0 without LOD).
     pub lod_nodes: u32,
     /// LOD nodes with an octant left to draw (finer detail draws none of it), in view or not,
@@ -863,10 +866,12 @@ impl VoxelRenderer {
     /// Without fog nothing of it exists and frames are what they were before the fog. With it,
     /// each `render` marches the layers after the main pass and blends them over the main color
     /// (before overlays and the blit), unless the settings are off or no layer is in reach
-    /// ([`RenderStats::fog_passes`]).
+    /// ([`RenderStats::fog_passes`]). The march ends at the nearest water or glass of the
+    /// terrain too: the translucent buckets are drawn again, depth only (ADR 0058).
     pub fn set_fog(&mut self, device: &wgpu::Device, input: Option<FogInput>) {
         let Some(input) = input else {
             if self.fog.take().is_some() {
+                self.path.voxel_mut().set_fog_depth(device, false);
                 self.sample_depth(device);
             }
             return;
@@ -884,8 +889,11 @@ impl VoxelRenderer {
                 self.blit.rebind(device, &self.targets.color_view);
             }
             let mut pass = None;
+            let path = &mut self.path;
             let built = boxel_gfx::run_in_error_scopes(device, || {
                 pass = Some(FogPass::new(device, &self.targets.depth_view));
+                // The march ends at the nearest translucent surface too (ADR 0058).
+                path.voxel_mut().set_fog_depth(device, true);
                 Ok(())
             });
             match (built, pass) {
@@ -896,6 +904,7 @@ impl VoxelRenderer {
                         result.err().unwrap_or_default()
                     );
                     self.fog_failed = true;
+                    self.path.voxel_mut().set_fog_depth(device, false);
                     self.sample_depth(device);
                     return;
                 }
@@ -1037,6 +1046,18 @@ impl VoxelRenderer {
     /// without a LOD pass.
     pub fn take_lod_report(&mut self) -> Option<LodReport> {
         self.lod.as_mut().map(LodPass::report)
+    }
+
+    /// The translucent buckets again after their color, writing only depth, in a frame that
+    /// marches fog: the march ends at the nearest translucent surface, so the fog in front of
+    /// water or glass covers it and the fog behind it does not paint over it (ADR 0058). The
+    /// color is final already, so no pixel changes. Returns the draw calls recorded.
+    fn draw_fog_depth(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        if !self.fog.as_ref().is_some_and(FogPass::marches) {
+            return 0;
+        }
+        self.path
+            .draw_translucent(pass, &self.pages, TranslucentDraw::FogDepth)
     }
 
     /// The horizon while the far LOD draws (a LOD pass whose last input draws), else `None`:
@@ -1583,8 +1604,9 @@ impl VoxelRenderer {
     /// re-sorted for this camera (uploads), clear, (High) cull, opaque buckets with the opaque
     /// pipeline, then the cutout bucket with the cutout pipeline, then the block outline
     /// ([`VoxelRenderer::set_outline`]), then the translucent buckets back to front with the
-    /// translucent pipeline, then the fog march and composite when there is fog
-    /// ([`VoxelRenderer::set_fog`]). Submit `encoder` before the next `render`.
+    /// translucent pipeline (with fog, again writing only their depth, ADR 0058), then the fog
+    /// march and composite when there is fog ([`VoxelRenderer::set_fog`]). Submit `encoder`
+    /// before the next `render`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -1721,6 +1743,7 @@ impl VoxelRenderer {
             lod.prepare(device, queue, encoder, &self.targets, cull_view, sealed);
         }
         self.path.encode_compute(encoder, slot_count);
+        let fog_depth_draws;
         let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {
             // High with LOD to draw: the main pass ends after the opaque and cutout terrain, the
             // LOD is culled against the depth pyramid of what they wrote, and the pass goes on.
@@ -1747,7 +1770,11 @@ impl VoxelRenderer {
             // The far water (one layer, a depth prepass then its color) before the near water,
             // which blends over it where it is in front.
             lod.draw_water(&mut pass);
-            solid + self.path.draw_translucent(&mut pass, &self.pages)
+            let translucent =
+                self.path
+                    .draw_translucent(&mut pass, &self.pages, TranslucentDraw::Color);
+            fog_depth_draws = self.draw_fog_depth(&mut pass);
+            solid + translucent
         } else {
             let mut pass = self.targets.begin_main_pass(encoder, view.clear_color);
             pass.set_bind_group(bindings::GROUP_MATERIALS, &self.materials, &[]);
@@ -1771,8 +1798,13 @@ impl VoxelRenderer {
             if let Some(lod) = &self.lod {
                 lod.draw_water(&mut pass);
             }
-            solid + self.path.draw_translucent(&mut pass, &self.pages)
+            let translucent =
+                self.path
+                    .draw_translucent(&mut pass, &self.pages, TranslucentDraw::Color);
+            fog_depth_draws = self.draw_fog_depth(&mut pass);
+            solid + translucent
         };
+        self.stats.fog_depth_draws = fog_depth_draws;
         (self.stats.fog_passes, self.stats.fog_layers) = match &mut self.fog {
             Some(fog) => {
                 let _span = frame_span!("render.fog");

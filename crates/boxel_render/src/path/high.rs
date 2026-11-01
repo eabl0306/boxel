@@ -1,7 +1,7 @@
 //! High tier: GPU cull + `multi_draw_indexed_indirect_count`, one pair of lists per page.
 use super::{
-    BucketDraw, CullPipeline, SlotVisibility, TierPath, VoxelPipelines, page_switches,
-    translucent_draws,
+    BucketDraw, CullPipeline, SlotVisibility, TierPath, TranslucentDraw, VoxelPipelines,
+    page_switches, translucent_draws,
 };
 use crate::chunk_table::ChunkTable;
 use crate::memory::{ARGS_BYTES, PageSet};
@@ -350,12 +350,20 @@ impl TierPath for HighPath {
         draws
     }
 
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32 {
+    fn draw_translucent(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pages: &PageSet,
+        draw: TranslucentDraw,
+    ) -> u32 {
+        let Some(pipeline) = self.voxel.translucent_for(draw) else {
+            return 0;
+        };
         if self.translucent.is_empty() {
             return 0;
         }
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        pass.set_pipeline(&self.voxel.translucent);
+        pass.set_pipeline(pipeline);
         let written = (self.translucent.len() * size_of::<DrawRef>()) as u64;
         pass.set_vertex_buffer(0, self.translucent_refs.slice(..written));
         // Group 2 is set at the first draw: the pass may be a new one (the far LOD's pyramid ends
@@ -379,6 +387,10 @@ impl TierPath for HighPath {
 
     fn translucent_page_switches(&self) -> u32 {
         self.switches
+    }
+
+    fn voxel_mut(&mut self) -> &mut VoxelPipelines {
+        &mut self.voxel
     }
 
     fn list_pages(&self) -> Option<u32> {

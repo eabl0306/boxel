@@ -1,6 +1,7 @@
 //! Low tier: CPU cull + instanced triangle strips + immediates.
 use super::{
-    BucketDraw, CpuCull, SlotVisibility, TierPath, VoxelPipelines, page_lists, page_switches,
+    BucketDraw, CpuCull, SlotVisibility, TierPath, TranslucentDraw, VoxelPipelines, page_lists,
+    page_switches,
 };
 use crate::chunk_table::ChunkTable;
 use crate::memory::{PageGpu, PageSet};
@@ -66,12 +67,20 @@ impl TierPath for LowPath {
         draws
     }
 
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32 {
+    fn draw_translucent(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pages: &PageSet,
+        draw: TranslucentDraw,
+    ) -> u32 {
+        let Some(pipeline) = self.voxel.translucent_for(draw) else {
+            return 0;
+        };
         let list = &self.cull.translucent;
         if list.is_empty() {
             return 0;
         }
-        pass.set_pipeline(&self.voxel.translucent);
+        pass.set_pipeline(pipeline);
         let mut draws = 0;
         let mut start = 0;
         // One run per page change: its buffers bound, then its draws.
@@ -92,6 +101,10 @@ impl TierPath for LowPath {
 
     fn translucent_page_switches(&self) -> u32 {
         self.switches
+    }
+
+    fn voxel_mut(&mut self) -> &mut VoxelPipelines {
+        &mut self.voxel
     }
 }
 

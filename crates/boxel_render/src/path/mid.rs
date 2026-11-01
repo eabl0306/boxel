@@ -1,6 +1,7 @@
 //! Mid tier: CPU cull + `draw_indexed` per visible bucket with `DrawRef`.
 use super::{
-    BucketDraw, CpuCull, SlotVisibility, TierPath, VoxelPipelines, page_lists, page_switches,
+    BucketDraw, CpuCull, SlotVisibility, TierPath, TranslucentDraw, VoxelPipelines, page_lists,
+    page_switches,
 };
 use crate::chunk_table::ChunkTable;
 use crate::memory::PageSet;
@@ -122,13 +123,21 @@ impl TierPath for MidPath {
         draws
     }
 
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, pages: &PageSet) -> u32 {
+    fn draw_translucent(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pages: &PageSet,
+        draw: TranslucentDraw,
+    ) -> u32 {
+        let Some(pipeline) = self.voxel.translucent_for(draw) else {
+            return 0;
+        };
         let list = &self.cull.translucent;
         if list.is_empty() {
             return 0;
         }
         self.bind_refs(pass);
-        pass.set_pipeline(&self.voxel.translucent);
+        pass.set_pipeline(pipeline);
         // The refs of the translucent buckets come after the opaque and cutout ones.
         let first = self.cull.solid_len() as u32;
         let mut bound = None;
@@ -154,6 +163,10 @@ impl TierPath for MidPath {
 
     fn translucent_page_switches(&self) -> u32 {
         self.switches
+    }
+
+    fn voxel_mut(&mut self) -> &mut VoxelPipelines {
+        &mut self.voxel
     }
 }
 

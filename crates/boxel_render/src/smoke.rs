@@ -123,15 +123,17 @@ fn lod_check(smoke: &RendererSmokeTest, ctx: &SmokeContext<'_>, result: Result<(
 /// Every pipeline of the tier + the blit for the output format; one main pass and one blit.
 /// With the fog check, the fog passes too (in their own scopes).
 fn compile(ctx: &SmokeContext<'_>, smoke: &RendererSmokeTest) -> Result<(), String> {
+    let mut pipelines = TierPipelines::new(ctx.device, ctx.tier);
     if smoke.fog {
         let targets = Targets::new(ctx.device, UVec2::splat(SIZE), true);
         let result = run_in_error_scopes(ctx.device, || {
             drop(crate::fog::FogPass::new(ctx.device, &targets.depth_view));
+            // The translucent buckets' depth for the march (ADR 0058).
+            pipelines.voxel.set_fog_depth(ctx.device, true);
             Ok(())
         });
         fog_check(smoke, ctx, result);
     }
-    let pipelines = TierPipelines::new(ctx.device, ctx.tier);
     if checks_lod(smoke, ctx) {
         let result = run_in_error_scopes(ctx.device, || {
             // High draws it GPU-driven: both of its pipelines are built.

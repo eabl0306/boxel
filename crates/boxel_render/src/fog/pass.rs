@@ -284,6 +284,14 @@ impl FogPass {
         self.input = Some(input);
     }
 
+    /// Whether a frame may march: there is input, it is on and it has layers (the layers may
+    /// still be out of reach; [`FogPass::encode`] decides that).
+    pub fn marches(&self) -> bool {
+        self.input
+            .as_ref()
+            .is_some_and(|i| i.settings.enabled && !i.settings.layers.is_empty())
+    }
+
     /// The march target texture, if a frame created one.
     pub fn target(&self) -> Option<&wgpu::Texture> {
         self.target.as_ref().map(|t| &t.texture)

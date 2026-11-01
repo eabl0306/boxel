@@ -254,6 +254,8 @@ juego):
   vidrio o bajo el agua se pinta encima de esa superficie, y la niebla vista desde abajo del agua
   no toma su color. El valle del ejemplo empieza en y 48, encima del agua del mar (termina en 47),
   así que el mar sale exacto. Una banda que baja bajo el agua o queda detrás de un vidrio no.
+  Desde el ADR 0058 la marcha termina en el agua o el vidrio más cercano: ya no pinta encima de
+  ellos, y la niebla de detrás de ellos no se ve.
 - **Sin mapa del suelo.** Las bandas son planas: la niebla también llena las cuevas y los aleros
   dentro de su banda (el terreno las tapa, salvo en las entradas) y no se junta en los valles que
   quedan arriba de la banda. Un borrador del mapa del suelo, hecho con los techos de cielo de la

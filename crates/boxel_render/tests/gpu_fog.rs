@@ -29,6 +29,10 @@
 //!   16-block cumulus with haze from below at 5 and 15 degrees, inside and above.
 //! - **Origins:** the same camera with render origins a few blocks apart draws the same image,
 //!   with cubic and soft fog and with haze past a ring of cells in view.
+//! - **Translucent terrain:** the march ends at the nearest water or glass (ADR 0058): a water
+//!   wall in front of clouds keeps its fog-free pixels, a glass wall lets the clouds through its
+//!   clear inside only, the view from under a lake is the fog-free one, and over a lake each
+//!   texel is the reference march to the water's surface.
 //! - **Half resolution:** thin posts in front of dense fog look the same at half and full
 //!   resolution (each pixel of a 2x2 block keeps its own depth).
 //! - **Shades:** a slab looks the same from above and below unless the layer asks for face
@@ -68,6 +72,8 @@ const MAX_TIER_DIFF: f64 = 0.001;
 const FLOOR_CHUNKS: i64 = 8;
 /// Top of the floor.
 const FLOOR_TOP: f32 = 2.0;
+/// The surface of the lake: one block of water sources on the floor, 14/16 high.
+const LAKE_TOP: f32 = FLOOR_TOP + boxel_mesh::FLUID_FLAT as f32 / 16.0;
 
 // ---------------------------------------------------------------- adapters
 
@@ -212,6 +218,16 @@ fn mesh_chunk(
     registry: &BlockRegistry,
     block: impl Fn(u32, u32, u32) -> &'static str,
 ) -> ChunkMesh {
+    mesh_chunk_in(registry, block, false)
+}
+
+/// [`mesh_chunk`], with the same chunk all around when `tiled`: a lake of them has no side
+/// faces and no lower corners at the chunk borders.
+fn mesh_chunk_in(
+    registry: &BlockRegistry,
+    block: impl Fn(u32, u32, u32) -> &'static str,
+    tiled: bool,
+) -> ChunkMesh {
     let mut dense = vec![BlockState::AIR; 32 * 32 * 32];
     for x in 0..32 {
         for y in 0..32 {
@@ -226,7 +242,7 @@ fn mesh_chunk(
     let chunk = ChunkData::from_dense(&dense);
     let input = MeshInput {
         center: &chunk,
-        neighbors: [None; 26],
+        neighbors: [tiled.then_some(&chunk); 26],
         light: None,
     };
     Mesher::new().mesh_chunk(
@@ -245,14 +261,54 @@ enum World {
     Posts,
     /// A water pool and a glass box on the floor of chunk (0, 0, 0).
     Pool,
+    /// The floor with a wall of water sources (x 0..32, y 2..32 at z 26) in chunk (0, 0, 0).
+    WaterWall,
+    /// The same wall in glass.
+    GlassWall,
+    /// The floor under one block of water sources (top at [`LAKE_TOP`]), seamless.
+    Lake,
+    /// The floor under 8 blocks of water sources (top at 9 + 14/16), seamless.
+    Deep,
+}
+
+impl World {
+    /// The height of the plane the analytic shots see: the floor's top, or the lake's surface.
+    fn plane(self) -> f32 {
+        match self {
+            World::Lake => LAKE_TOP,
+            _ => FLOOR_TOP,
+        }
+    }
 }
 
 /// The chunks of a world: `(chunk position, mesh)`.
 fn world(registry: &BlockRegistry, kind: World) -> Vec<(I64Vec3, ChunkMesh)> {
-    let floor = mesh_chunk(
-        registry,
-        |_, y, _| if y < 2 { "boxel:stone" } else { "air" },
-    );
+    let water_below = |top: u32| {
+        mesh_chunk_in(
+            registry,
+            move |_, y, _| match y {
+                0..2 => "boxel:stone",
+                y if y < top => "boxel:water",
+                _ => "air",
+            },
+            true,
+        )
+    };
+    let floor = match kind {
+        World::Lake => water_below(3),
+        World::Deep => water_below(10),
+        _ => mesh_chunk(
+            registry,
+            |_, y, _| if y < 2 { "boxel:stone" } else { "air" },
+        ),
+    };
+    let wall = |block: &'static str| {
+        Some(mesh_chunk(registry, move |_, y, z| match (y, z) {
+            (0..2, _) => "boxel:stone",
+            (_, 26) => block,
+            _ => "air",
+        }))
+    };
     let mut out = Vec::new();
     for cx in -FLOOR_CHUNKS / 2..FLOOR_CHUNKS / 2 {
         for cz in -FLOOR_CHUNKS / 2..FLOOR_CHUNKS / 2 {
@@ -276,6 +332,8 @@ fn world(registry: &BlockRegistry, kind: World) -> Vec<(I64Vec3, ChunkMesh)> {
                         "air"
                     }
                 })),
+                World::WaterWall if (cx, cz) == (0, 0) => wall("boxel:water"),
+                World::GlassWall if (cx, cz) == (0, 0) => wall("boxel:glass"),
                 _ => None,
             };
             out.push((
@@ -834,15 +892,22 @@ fn linear_to_srgb(c: f32) -> f32 {
         }
 }
 
-/// The view depth of the floor (or the sky, `INFINITY`) under the ray of pixel center `px`, and
-/// whether it is safely away from the floor's edges.
-fn floor_depth(basis: &RayBasis, eye: Vec3, origin: I64Vec3, px: [f32; 2]) -> (f32, bool) {
+/// The view depth of the floor's plane at `plane` (its top, or the lake's surface; the sky,
+/// `INFINITY`) under the ray of pixel center `px`, and whether it is safely away from the
+/// floor's edges.
+fn floor_depth(
+    basis: &RayBasis,
+    eye: Vec3,
+    origin: I64Vec3,
+    px: [f32; 2],
+    plane: f32,
+) -> (f32, bool) {
     let ndc = [
         px[0] / WIDTH as f32 * 2.0 - 1.0,
         1.0 - px[1] / HEIGHT as f32 * 2.0,
     ];
     let dir = basis.dir(ndc[0], ndc[1]);
-    let top = FLOOR_TOP - origin.y as f32;
+    let top = plane - origin.y as f32;
     if dir[1] >= -1e-6 || eye.y <= top {
         return (f32::INFINITY, true);
     }
@@ -900,7 +965,13 @@ fn check_against_reference(
                     ((2 * tx + (k & 1)) as f32 + 0.5).min(WIDTH as f32 - 0.5),
                     ((2 * ty + (k >> 1)) as f32 + 0.5).min(HEIGHT as f32 - 0.5),
                 ];
-                let (t, ok) = floor_depth(&basis, shot.view.eye_rel, shot.view.render_origin, px);
+                let (t, ok) = floor_depth(
+                    &basis,
+                    shot.view.eye_rel,
+                    shot.view.render_origin,
+                    px,
+                    shot.world.plane(),
+                );
                 depths[k as usize] = t;
                 clean &= ok;
             }
@@ -1509,6 +1580,185 @@ fn every_tier_draws_the_fog_of_the_reference() {
                         MAX_TIER_DIFF,
                     );
                 }
+            }
+        }
+    }
+    report.finish();
+}
+
+/// Translucent terrain ends the march (ADR 0058), on every tier:
+///
+/// - **A water wall in front of clouds:** its pixels keep the fog-free color (no fog lies
+///   between the eye and the wall) where, without the wall, clouds are behind them; before the
+///   translucent depth the clouds were painted over the water.
+/// - **A glass wall:** its frame and streaks end the fog too, its almost clear inside (alpha
+///   under 0.1) lets the clouds through.
+/// - **Underwater:** from inside a lake, the clouds above its surface are not painted over the
+///   surface seen from below: the image is the fog-free one.
+/// - **A lake under clouds and a bank, seen from above:** each texel of the march is the
+///   reference march to the lake's surface (2 + 14/16), not to its bed: the fog in front of the
+///   water covers it, by the water's own distance.
+/// - Without fog no depth is drawn for it; the tiers draw the same images.
+#[test]
+fn translucent_terrain_ends_the_march() {
+    let registry = boxel_demo::blocks::registry();
+    let worlds: Vec<(World, Vec<(I64Vec3, ChunkMesh)>)> = [
+        World::Floor,
+        World::WaterWall,
+        World::GlassWall,
+        World::Deep,
+        World::Lake,
+    ]
+    .into_iter()
+    .map(|w| (w, world(&registry, w)))
+    .collect();
+    let chunks = |w: World| &worlds.iter().find(|(k, _)| *k == w).expect("world").1;
+    // From 6 blocks in front of the water wall, looking up through it at the clouds; from 2.5
+    // in front of the glass wall, near enough that its clear inside is not mipped away (from
+    // farther or at a grazing angle the mips blend the frame in, over 0.1 alpha).
+    let wall_view = |w| match w {
+        World::GlassWall => look(DVec3::new(16.0, 4.5, 23.5), DVec3::new(16.0, 12.2, 40.0)),
+        _ => look(DVec3::new(16.0, 4.5, 20.0), DVec3::new(16.0, 30.0, 60.0)),
+    };
+    // Inside the deep lake (its surface at 9 + 14/16), looking up.
+    let deep_view = look(DVec3::new(0.5, 6.0, 0.5), DVec3::new(30.0, 40.0, 80.0));
+    let lake = Shot {
+        name: "lake",
+        world: World::Lake,
+        view: look(DVec3::new(-5.5, 45.0, -9.5), DVec3::new(40.0, 10.0, 60.0)),
+        layers: vec![clouds(), bank()],
+        tick: 1234,
+        max_steps: boxel_fog::DEFAULT_MAX_STEPS,
+        analytic: true,
+    };
+    let cloud_fog = || fog_input(vec![clouds()], FogResolution::Full, 1234);
+    let mut per_adapter: Vec<(String, Vec<(Tier, Vec<RgbaImage>)>)> = Vec::new();
+    let mut report = for_every_tier(|label, tier, device, queue, _, report| {
+        let mut run = || -> Result<Vec<RgbaImage>, String> {
+            let mut renderer = new_renderer(device, queue, tier, UVec2::new(WIDTH, HEIGHT))?;
+            let name = |what: &str| format!("{label}_{tier}_{what}");
+            // The fog-free and fogged images of a world.
+            let both = |renderer: &mut VoxelRenderer, w: World, view: &ViewParams| {
+                load_world(renderer, chunks(w))?;
+                renderer.set_fog(device, None);
+                let plain = render(device, queue, renderer, view)?;
+                if renderer.stats().fog_depth_draws != 0 {
+                    return Err(format!("{w:?}: a fog depth draw without fog"));
+                }
+                renderer.set_fog(device, Some(cloud_fog()));
+                let fogged = render(device, queue, renderer, view)?;
+                if renderer.stats().fog_passes != 2 {
+                    return Err(format!("{w:?}: no fog passes"));
+                }
+                let depth = renderer.stats().fog_depth_draws;
+                if w != World::Floor && depth == 0 {
+                    return Err(format!("{w:?}: no fog depth draw"));
+                }
+                Ok::<_, String>((plain, fogged))
+            };
+            let px = |img: &RgbaImage, i: usize| [0, 1, 2, 3].map(|c| img.data[4 * i + c]);
+            let mut walls = Vec::new();
+            for w in [World::WaterWall, World::GlassWall] {
+                let (floor_plain, floor_fogged) = both(&mut renderer, World::Floor, &wall_view(w))?;
+                let (plain, fogged) = both(&mut renderer, w, &wall_view(w))?;
+                // Pixels of the wall with clouds behind it, and those the fog changed.
+                let (mut behind, mut painted) = (0usize, 0usize);
+                for i in 0..(WIDTH * HEIGHT) as usize {
+                    let wall = px(&plain, i) != px(&floor_plain, i);
+                    let clouds = px(&floor_fogged, i) != px(&floor_plain, i);
+                    if wall && clouds {
+                        behind += 1;
+                        painted += usize::from(px(&fogged, i) != px(&plain, i));
+                    }
+                }
+                eprintln!(
+                    "gpu_fog: {label} {tier}: {w:?}: {painted} of {behind} pixels with clouds \
+                     behind painted"
+                );
+                let names = [
+                    name("floor_plain"),
+                    name("floor_fogged"),
+                    name(&format!("{w:?}_plain")),
+                    name(&format!("{w:?}_fogged")),
+                ];
+                let images = [
+                    (names[0].as_str(), &floor_plain),
+                    (names[1].as_str(), &floor_fogged),
+                    (names[2].as_str(), &plain),
+                    (names[3].as_str(), &fogged),
+                ];
+                // The clouds cover a good part of the view: the check has teeth.
+                let teeth = behind >= 2000;
+                let ok = match w {
+                    // Texels at the edge of the filtering may still let some fog through.
+                    World::WaterWall => painted * 100 <= behind,
+                    // The frame and the streaks end the fog, the clear inside does not (the
+                    // frame takes more of the view where the mips blend it in, at the top).
+                    _ => painted * 3 >= behind && (behind - painted) * 20 >= behind,
+                };
+                if !(teeth && ok) {
+                    report.fail(
+                        format!(
+                            "{label} {tier}: {w:?}: {painted} of {behind} pixels with clouds \
+                             behind painted"
+                        ),
+                        &images,
+                    );
+                }
+                walls.push(fogged);
+            }
+            // Underwater: the march ends at the surface seen from below.
+            let (deep_plain, deep_fogged) = both(&mut renderer, World::Deep, &deep_view)?;
+            report.check_identical(
+                &format!("{label} {tier}: under the deep lake"),
+                (&name("deep_plain"), &deep_plain),
+                (&name("deep_fogged"), &deep_fogged),
+            );
+            // The lake: the reference march to its surface.
+            load_world(&mut renderer, chunks(World::Lake))?;
+            renderer.set_fog(device, None);
+            let plain = render(device, queue, &mut renderer, &lake.view)?;
+            renderer.set_fog(device, Some(lake.input(FogResolution::Half)));
+            let fogged = render(device, queue, &mut renderer, &lake.view)?;
+            let texels = renderer
+                .fog_texels(device, queue)
+                .ok_or("no fog target")??;
+            check_against_reference(
+                &format!("{label} {tier} lake"),
+                &lake,
+                &texels,
+                &plain,
+                &fogged,
+                report,
+            );
+            if fogged.data == plain.data {
+                report.fail(format!("{label} {tier}: lake: no fog drawn"), &[]);
+            }
+            walls.extend([deep_fogged, fogged]);
+            Ok(walls)
+        };
+        match run() {
+            Ok(images) => match per_adapter.iter_mut().find(|(l, _)| l == label) {
+                Some((_, tiers)) => tiers.push((tier, images)),
+                None => per_adapter.push((label.to_string(), vec![(tier, images)])),
+            },
+            Err(e) => report.fail(format!("{label} {tier}: {e}"), &[]),
+        }
+    });
+    let names = ["water_wall", "glass_wall", "deep", "lake"];
+    for (label, tiers) in &per_adapter {
+        let Some(((best, best_images), rest)) = tiers.split_first() else {
+            continue;
+        };
+        for (tier, images) in rest {
+            for ((what, a), b) in names.iter().zip(best_images).zip(images) {
+                report.check_close(
+                    &format!("{label}: {tier} vs {best} ({what})"),
+                    (&format!("{label}_{best}_{what}"), a),
+                    (&format!("{label}_{tier}_{what}"), b),
+                    2,
+                    MAX_TIER_DIFF,
+                );
             }
         }
     }
