@@ -6,8 +6,9 @@
 //!   `(y << 10) | (x << 5) | z` (z fastest), the same order as binary-greedy-meshing's padded
 //!   linearization.
 //! - [`registry`]: data-driven blocks; runtime `BlockState(u16)` is dense and never persisted raw.
-//!   Each state has an RGB emission and a light opacity (ADR 0015), and the states a game marks
-//!   are drawn full bright (ADR 0036).
+//!   Each state has an RGB emission and a light opacity (ADR 0015), the states a game marks
+//!   are drawn full bright (ADR 0036), and some states may be sky sources ([`SkySourceDef`],
+//!   ADR 0061: a beam of sky light down or up their column).
 //! - [`state`]: block state properties (ADR 0019): `game:log[axis=x]`, one dense id per
 //!   combination of values, contiguous per block.
 //! - [`shapes`]: the boxes of the models made of boxes (ADR 0020: slabs, and the [`BoxModel`]s a
@@ -28,7 +29,8 @@
 //!   quads a block's cells draw from that data ([`CellQuadRule`], ADR 0050: an item in a frame).
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
-//!   filter, emitters; built and cached only when the storage cannot serve them as is), and
+//!   filter, emitters; built and cached only when the storage cannot serve them as is), its sky
+//!   sources ([`ChunkData::sky_sources`], cached with the masks), and
 //!   [`ChunkData::may_contain`], a cached palette scan for a [`StateSet`]. Voxel arrays never
 //!   live inline in ECS components.
 //! - `testing` (with the `testing` feature): a minimal block set with `test:` names for engine
@@ -72,10 +74,11 @@ pub use planes::{
     ModelPlane, PLANE_UNIT, PlaneCorner, PlaneEntry, PlaneKind, QUARTER_FACES, TableEntry,
 };
 pub use registry::{
-    Axis, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry, BlockRegistryBuilder,
-    BlockState, BoxFaceTexture, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures,
-    MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError, RenderShape, SlabHalf, StateFlags, TextureId,
-    TextureImage, TextureSpec, WATERLOGGED, box_face_entries, validate_name,
+    Axis, BeamDir, BlockCollision, BlockDef, BlockId, BlockModel, BlockRegistry,
+    BlockRegistryBuilder, BlockState, BoxFaceTexture, BoxModel, BoxModelId, CollisionBox,
+    FLUID_LEVEL, FaceTextures, MAX_BEAM, MAX_COLLISION_HEIGHT, MAX_STATES, RegistryError,
+    RenderShape, SkySourceDef, SlabHalf, StateFlags, TextureId, TextureImage, TextureSpec,
+    WATERLOGGED, box_face_entries, validate_name,
 };
 pub use shapes::{Facing, MAX_BOX_FACE_LAYERS, MAX_MODEL_BOXES, ModelBox};
 pub use state::{Property, StateName, StateParseError, StateValues};

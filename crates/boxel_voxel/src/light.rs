@@ -15,8 +15,10 @@
 //!   voxel: [`transmit`]`(l - cost, filter)`, with `filter` in fifteenths. Sky light ignores
 //!   filters (it has one channel, so it stays white). A filter never raises a level, so light
 //!   still falls by at least 1 per voxel.
+//! - A sky source (ADR 0061) is a clear state that lights a beam of its column as direct sky
+//!   ([`SkySourceDef`]). The masks list the sources of a chunk; `boxel_light` traces the beams.
 
-use crate::{BlockRegistry, BlockState};
+use crate::{BlockRegistry, BlockState, SkySourceDef};
 
 /// Opacity of a block that stops light (and the highest opacity).
 pub const OPAQUE_OPACITY: u8 = 15;
@@ -123,6 +125,8 @@ pub(crate) const CLASS_PARTIAL: u8 = 1 << 1;
 pub(crate) const CLASS_EMITS: u8 = 1 << 2;
 /// Class bit: filters block light (not opaque, filter other than `[15; 3]`).
 pub(crate) const CLASS_FILTER: u8 = 1 << 3;
+/// Class bit: a sky source (ADR 0061).
+pub(crate) const CLASS_SKY_SOURCE: u8 = 1 << 4;
 
 /// The level `level` of a block channel after a filter that lets `filter` fifteenths of its
 /// brightness through (ADR 0060): the level whose brightness is nearest `filter / 15` times
@@ -178,10 +182,13 @@ pub struct LightTables {
     emission: Vec<LightValue>,
     /// Light filter of each state (`[15; 3]`: none).
     filter: Vec<[u8; 3]>,
+    /// Sky source of each state (ADR 0061).
+    sky_source: Vec<Option<SkySourceDef>>,
     class: Vec<u8>,
     max_partial: u8,
     any_emitter: bool,
     any_filter: bool,
+    any_sky_source: bool,
     id: u64,
 }
 
@@ -193,6 +200,8 @@ impl LightTables {
         let opacity: Vec<u8> = states.clone().map(|s| registry.light_opacity(s)).collect();
         let emission: Vec<LightValue> = states.clone().map(|s| registry.emission(s)).collect();
         let filter: Vec<[u8; 3]> = states.clone().map(|s| registry.light_filter(s)).collect();
+        let sky_source: Vec<Option<SkySourceDef>> =
+            states.clone().map(|s| registry.sky_source(s)).collect();
         let class: Vec<u8> = states
             .map(|s| {
                 let i = s.0 as usize;
@@ -208,6 +217,9 @@ impl LightTables {
                 if opacity[i] < OPAQUE_OPACITY && filter[i] != [MAX_LIGHT; 3] {
                     c |= CLASS_FILTER;
                 }
+                if sky_source[i].is_some() {
+                    c |= CLASS_SKY_SOURCE;
+                }
                 c
             })
             .collect();
@@ -219,6 +231,7 @@ impl LightTables {
             .unwrap_or(0);
         let any_emitter = emission.iter().any(|e| !e.is_dark());
         let any_filter = class.iter().any(|c| c & CLASS_FILTER != 0);
+        let any_sky_source = class.iter().any(|c| c & CLASS_SKY_SOURCE != 0);
         // A fingerprint of the content, so a cache built from other tables can be detected.
         let id = {
             use std::hash::{BuildHasher, Hasher};
@@ -231,16 +244,26 @@ impl LightTables {
             for f in &filter {
                 h.write(f);
             }
+            // Only the sources, so tables without any keep the id they had before sources.
+            for (i, d) in sky_source.iter().enumerate() {
+                if let Some(d) = d {
+                    h.write_usize(i);
+                    h.write_u8(d.dir as u8);
+                    h.write_u16(d.range);
+                }
+            }
             h.finish()
         };
         Self {
             opacity,
             emission,
             filter,
+            sky_source,
             class,
             max_partial,
             any_emitter,
             any_filter,
+            any_sky_source,
             id,
         }
     }
@@ -281,6 +304,20 @@ impl LightTables {
     /// True if some state filters block light.
     pub fn any_filter(&self) -> bool {
         self.any_filter
+    }
+    /// The sky source `s` is (ADR 0061), if it is one.
+    #[inline]
+    pub fn sky_source(&self, s: BlockState) -> Option<SkySourceDef> {
+        self.sky_source.get(s.0 as usize).copied().flatten()
+    }
+    /// True if `s` is a sky source.
+    #[inline]
+    pub fn is_sky_source(&self, s: BlockState) -> bool {
+        self.class(s) & CLASS_SKY_SOURCE != 0
+    }
+    /// True if some state is a sky source.
+    pub fn any_sky_source(&self) -> bool {
+        self.any_sky_source
     }
     /// True if `s` stops direct sky (opacity above 0): the sky top of a column is its highest
     /// such voxel.

@@ -3,7 +3,8 @@
 //! table. The flag that keeps flowing fluids out ([`StateFlags::KEEPS_FLUIDS_OUT`], #110): on
 //! every waterloggable state, and on every state of a declared block. On the `test:` blocks
 //! ([`crate::testing`]) and a few more after them. The name rule every registry shares. Light
-//! filters (ADR 0060): none by default, set on every state of a block.
+//! filters (ADR 0060): none by default, set on every state of a block. Sky sources (ADR 0061):
+//! set per state, on invisible clear states only.
 use super::*;
 use crate::testing;
 
@@ -263,6 +264,138 @@ fn a_light_filter_is_set_on_every_state_and_checked() {
     assert!(tables.any_filter() && tables.filters(by(&r, "test:glass")));
     assert_eq!(tables.light_filter(by(&r, "test:glass")), [4, 15, 9]);
     assert_ne!(tables.id(), crate::LightTables::from_registry(&plain).id());
+}
+
+#[test]
+fn a_sky_source_is_set_per_state_and_checked() {
+    let plain = builder().build();
+    assert!(states(&plain).all(|s| plain.sky_source(s).is_none()));
+    assert!(!crate::LightTables::from_registry(&plain).any_sky_source());
+
+    // `test:sky_source`: every state is the source its properties say.
+    let mut b = builder();
+    let source = testing::add_sky_source(&mut b).expect("test:sky_source");
+    let r = b.build();
+    assert_eq!(
+        r.state_name(source).to_string(),
+        "test:sky_source[dir=down,range=16]"
+    );
+    let tables = crate::LightTables::from_registry(&r);
+    assert!(tables.any_sky_source());
+    let mut seen = 0;
+    for s in states(&r) {
+        let Some(def) = r.sky_source(s) else {
+            assert!(!tables.is_sky_source(s), "{}", r.state_name(s));
+            continue;
+        };
+        seen += 1;
+        let dir = match r.property(s, "dir") {
+            Some("down") => BeamDir::Down,
+            Some("up") => BeamDir::Up,
+            other => panic!("dir {other:?}"),
+        };
+        let range: u16 = r
+            .property(s, "range")
+            .expect("range")
+            .parse()
+            .expect("number");
+        assert_eq!(def, SkySourceDef { dir, range });
+        assert_eq!(tables.sky_source(s), Some(def));
+        assert!(tables.is_sky_source(s) && !tables.blocks_sky(s) && !tables.emits(s));
+        assert!(r.flags(s).contains(StateFlags::KEEPS_FLUIDS_OUT));
+        assert!(!r.flags(s).contains(StateFlags::SOLID));
+        assert_eq!(r.shape(s), RenderShape::None);
+    }
+    assert_eq!(seen, 2 * testing::SKY_SOURCE_RANGES.len());
+    assert_eq!(r.sky_source(BlockState(u16::MAX)), None);
+    assert_eq!(tables.sky_source(BlockState(u16::MAX)), None);
+    assert_ne!(tables.id(), crate::LightTables::from_registry(&plain).id());
+
+    // A clear, invisible block to mark, and one state of each thing a source cannot be.
+    let mut b = builder();
+    let clear = BlockDef {
+        name: "test:clear".to_string(),
+        shape: RenderShape::None,
+        model: BlockModel::CUBE,
+        collision: BlockCollision::None,
+        emission: [0; 3],
+        light_opacity: 0,
+        textures: FaceTextures::all(TextureId(0)),
+    };
+    let ok = b.add_block(clear.clone()).expect("test:clear");
+    let mut bad = Vec::new();
+    for (name, change) in [
+        (
+            "test:drawn",
+            (|d: &mut BlockDef| d.shape = RenderShape::Cutout) as fn(&mut BlockDef),
+        ),
+        ("test:dim", |d| d.light_opacity = 1),
+        ("test:dark", |d| d.light_opacity = 15),
+        ("test:glow", |d| d.emission = [0, 0, 1]),
+        ("test:solid_air", |d| d.collision = BlockCollision::Full),
+        ("test:liquid", |d| d.model = BlockModel::Fluid),
+    ] {
+        let mut def = BlockDef {
+            name: name.to_string(),
+            ..clear.clone()
+        };
+        change(&mut def);
+        bad.push((name, b.add_block(def).expect(name)));
+    }
+    let wet = b
+        .add_block_with_states(
+            BlockDef {
+                name: "test:wet_source".to_string(),
+                ..clear.clone()
+            },
+            vec![Property::boolean(WATERLOGGED)],
+            |_, _| {},
+        )
+        .expect("test:wet_source");
+    bad.push(("test:wet_source", wet));
+    let down = |range| SkySourceDef {
+        dir: BeamDir::Down,
+        range,
+    };
+    for (name, s) in bad {
+        assert_eq!(
+            b.set_sky_source(s, down(16)),
+            Err(RegistryError::InvalidSkySource(name.to_string())),
+            "{name}"
+        );
+    }
+    for range in [0, MAX_BEAM + 1, u16::MAX] {
+        assert_eq!(
+            b.set_sky_source(ok, down(range)),
+            Err(RegistryError::InvalidSkySource("test:clear".into())),
+            "range {range}"
+        );
+    }
+    let unknown = BlockState(b.states.len() as u16);
+    assert_eq!(
+        b.set_sky_source(unknown, down(1)),
+        Err(RegistryError::InvalidSkySource(format!(
+            "state {}",
+            unknown.0
+        )))
+    );
+    assert!(b.sky_sources.is_empty(), "the failed calls set nothing");
+    // Both ends of the range are fine, and a later call replaces an earlier one; a failed call
+    // keeps what was set.
+    b.set_sky_source(ok, down(1)).expect("range 1");
+    b.set_sky_source(ok, down(MAX_BEAM)).expect("range 256");
+    let up = SkySourceDef {
+        dir: BeamDir::Up,
+        range: 7,
+    };
+    b.set_sky_source(ok, up).expect("up");
+    assert!(b.set_sky_source(ok, down(0)).is_err());
+    let r = b.build();
+    assert_eq!(r.sky_source(ok), Some(up));
+    assert_eq!(states(&r).filter(|&s| r.sky_source(s).is_some()).count(), 1);
+    // Marking a source moves no other per-state datum.
+    assert_eq!(r.flags(ok), plain.flags(BlockState::AIR));
+    assert_eq!(r.light_opacity(ok), 0);
 }
 
 #[test]

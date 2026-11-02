@@ -1,7 +1,7 @@
 use crate::block_data::CellData;
 use crate::{
     BlockData, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_VOLUME, LightMasks, LightTables,
-    LocalPos, Occupancy, OwnedLightMasks, Paletted,
+    LocalPos, Occupancy, OwnedLightMasks, Paletted, SkySourceDef,
 };
 use std::num::NonZeroU64;
 use std::sync::OnceLock;
@@ -280,10 +280,10 @@ impl ChunkData {
     }
     /// The light masks of this chunk ([`LightMasks`]).
     ///
-    /// Uniform and 1-bit chunks without emission are served from their storage (static words,
-    /// or the packed words kept or flipped by the palette order): no build, no memory. Any
-    /// other chunk builds its masks on first use ([`OwnedLightMasks::compute`]) and caches them
-    /// until the blocks change.
+    /// Uniform and 1-bit chunks without emission or sky source are served from their storage
+    /// (static words, or the packed words kept or flipped by the palette order): no build, no
+    /// memory. Any other chunk builds its masks on first use ([`OwnedLightMasks::compute`]) and
+    /// caches them until the blocks change.
     ///
     /// The cache belongs to one set of tables (one registry per world): asking with other
     /// tables is a bug, checked in debug builds.
@@ -301,6 +301,26 @@ impl ChunkData {
         );
         masks.view()
     }
+    /// Every sky source of this chunk (ADR 0061), in increasing [`LocalPos`] index order, with
+    /// what it emits. Empty without a build when [`ChunkData::may_source`] says no; otherwise
+    /// read from the cached masks, which a chunk with a source palette entry always builds
+    /// (its [`ChunkData::light_masks`] are never served from its storage).
+    ///
+    /// The same one set of tables as [`ChunkData::light_masks`] (checked in debug builds).
+    pub fn sky_sources(&self, tables: &LightTables) -> &[(LocalPos, SkySourceDef)] {
+        if !self.may_source(tables) {
+            return &[];
+        }
+        let masks = self
+            .masks
+            .0
+            .get_or_init(|| OwnedLightMasks::compute(self, tables));
+        debug_assert!(
+            masks.built_with(tables),
+            "ChunkData::sky_sources called with other light tables than the cached masks"
+        );
+        masks.sky_sources()
+    }
     /// True if built light masks are cached (for tests and memory reports).
     pub fn has_cached_light_masks(&self) -> bool {
         self.masks.0.get().is_some()
@@ -315,6 +335,20 @@ impl ChunkData {
         match &self.blocks {
             Paletted::Uniform(s) => tables.emits(*s),
             Paletted::Packed { palette, .. } => palette.iter().any(|&s| tables.emits(s)),
+            Paletted::Direct(_) => true,
+        }
+    }
+    /// True if some voxel may be a sky source per `tables` (ADR 0061): a palette scan like
+    /// [`ChunkData::may_emit`], so it may answer yes for a chunk whose source palette entries are
+    /// no longer used, but never no for a chunk with a source. `Direct` storage answers
+    /// [`LightTables::any_sky_source`].
+    pub fn may_source(&self, tables: &LightTables) -> bool {
+        if !tables.any_sky_source() {
+            return false;
+        }
+        match &self.blocks {
+            Paletted::Uniform(s) => tables.is_sky_source(*s),
+            Paletted::Packed { palette, .. } => palette.iter().any(|&s| tables.is_sky_source(s)),
             Paletted::Direct(_) => true,
         }
     }

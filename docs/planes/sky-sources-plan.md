@@ -8,7 +8,10 @@ design document: nothing here is built. Paths are relative to the repo root. Num
 recorded as decisions in sec. 9, and per-realm face shading was added to Option A (sec. 3 and
 lane 4).
 
-**Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039).
+**Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039) and 1 (source states
+in `boxel_voxel`). Lane 1 keeps the source list beside the masks (`ChunkData::sky_sources`,
+`OwnedLightMasks::sky_sources`) instead of in the `LightMasks` view: in the view it cost 8 % on
+`masks/cave_1bit`, and only the beam tiles read it.
 
 **Verdict.** Build Option A: sky sources write the existing sky channel, and each realm gets its
 own sky color, intensity, daylight curve, ambient color and face shading, applied in the shader

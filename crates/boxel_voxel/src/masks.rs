@@ -1,15 +1,16 @@
 //! [`LightMasks`]: per-chunk bit masks for the light computation, built from the blocks and the
 //! [`LightTables`] and read through a borrowed view.
 //!
-//! Most chunks never build anything: a uniform chunk without emission reads static words, and
-//! a 1-bit chunk without emission (the overworld's caves, nearly every chunk underground) reads
-//! its own packed words, kept or flipped by the palette order. The other chunks build their
-//! masks once ([`OwnedLightMasks`]: 4 KiB, 4 KiB more for each of partial and filter only when
-//! some voxel is one, plus the emitters) and cache them on the [`ChunkData`].
-use crate::light::{CLASS_EMITS, CLASS_FILTER, CLASS_OPAQUE, CLASS_PARTIAL};
+//! Most chunks never build anything: a uniform chunk without emission or sky source reads static
+//! words, and a 1-bit chunk without either (the overworld's caves, nearly every chunk
+//! underground) reads its own packed words, kept or flipped by the palette order. The other
+//! chunks build their masks once ([`OwnedLightMasks`]: 4 KiB, 4 KiB more for each of partial and
+//! filter only when some voxel is one, plus the emitters and the sky sources) and cache them on
+//! the [`ChunkData`].
+use crate::light::{CLASS_EMITS, CLASS_FILTER, CLASS_OPAQUE, CLASS_PARTIAL, CLASS_SKY_SOURCE};
 use crate::{
     BlockState, CHUNK_AREA, CHUNK_VOLUME, ChunkData, LightTables, LightValue, LocalPos, Occupancy,
-    Paletted,
+    Paletted, SkySourceDef,
 };
 
 /// Words of one mask: word `k` holds [`Occupancy`] rows `2k` (low half) and `2k + 1` (high
@@ -126,9 +127,15 @@ impl LightMasks<'static> {
     };
 }
 
+/// The classes that make a chunk build its masks whatever its storage: they come as lists. A
+/// chunk with a sky source keeps its list ([`OwnedLightMasks::sky_sources`]) next to its masks,
+/// not in the [`LightMasks`] view, which every light box reads 27 times and which only the
+/// beam tiles of `boxel_light` need.
+const CLASS_LISTED: u8 = CLASS_EMITS | CLASS_SKY_SOURCE;
+
 impl<'a> LightMasks<'a> {
     /// The masks of `blocks` when they need no build: uniform or 1-bit storage without
-    /// emission. `None` for every other chunk.
+    /// emission or sky source. `None` for every other chunk.
     pub(crate) fn borrowed(blocks: &'a Paletted, tables: &LightTables) -> Option<Self> {
         let bit = |c: u8, b: u8| c & b != 0;
         match blocks {
@@ -141,7 +148,7 @@ impl<'a> LightMasks<'a> {
                         MaskRows::EMPTY
                     }
                 };
-                (!bit(c, CLASS_EMITS)).then(|| LightMasks {
+                (!bit(c, CLASS_LISTED)).then(|| LightMasks {
                     opaque: fill(CLASS_OPAQUE),
                     partial: fill(CLASS_PARTIAL),
                     filter: fill(CLASS_FILTER),
@@ -155,7 +162,7 @@ impl<'a> LightMasks<'a> {
             } => {
                 let words: &MaskWords = (&**words).try_into().ok()?;
                 let (c0, c1) = one_bit_classes(palette, tables);
-                if bit(c0 | c1, CLASS_EMITS) {
+                if bit(c0 | c1, CLASS_LISTED) {
                     return None;
                 }
                 let mask = |b| MaskRows::one_bit(words, bit(c0, b), bit(c1, b));
@@ -179,8 +186,8 @@ fn one_bit_classes(palette: &[BlockState], tables: &LightTables) -> (u8, u8) {
 }
 
 /// Built light masks: what [`ChunkData::light_masks`] caches for the chunks that need a build
-/// (`Packed` with 2 or more bits, `Direct`, and chunks with an emitter), and what
-/// [`OwnedLightMasks::compute`] returns for any chunk.
+/// (`Packed` with 2 or more bits, `Direct`, and chunks with an emitter or a sky source), and
+/// what [`OwnedLightMasks::compute`] returns for any chunk.
 #[derive(Clone)]
 pub struct OwnedLightMasks {
     opaque: MaskWords,
@@ -189,6 +196,7 @@ pub struct OwnedLightMasks {
     /// `None` when no voxel filters.
     filter: Option<Box<MaskWords>>,
     emitters: Vec<(LocalPos, LightValue)>,
+    sky_sources: Vec<(LocalPos, SkySourceDef)>,
     /// [`LightTables::id`] of the tables the masks were built with.
     tables_id: u64,
 }
@@ -275,6 +283,11 @@ impl OwnedLightMasks {
             partial: partial.iter().any(|&w| w != 0).then(|| Box::new(partial)),
             filter: filter_words(chunk, tables),
             emitters,
+            sky_sources: if tables.any_sky_source() {
+                sky_source_list(chunk, tables)
+            } else {
+                Vec::new()
+            },
             tables_id: tables.id(),
         })
     }
@@ -295,12 +308,19 @@ impl OwnedLightMasks {
         }
     }
 
+    /// Every sky source of the chunk (ADR 0061), in increasing [`LocalPos`] index order, with
+    /// what it emits. A source is clear (opacity 0), so it is in no mask.
+    pub fn sky_sources(&self) -> &[(LocalPos, SkySourceDef)] {
+        &self.sky_sources
+    }
+
     /// Heap bytes of these masks once boxed (what a chunk's cache holds).
     pub fn heap_bytes(&self) -> usize {
         size_of::<OwnedLightMasks>()
             + self.partial.as_ref().map_or(0, |_| size_of::<MaskWords>())
             + self.filter.as_ref().map_or(0, |_| size_of::<MaskWords>())
             + self.emitters.capacity() * size_of::<(LocalPos, LightValue)>()
+            + self.sky_sources.capacity() * size_of::<(LocalPos, SkySourceDef)>()
     }
 
     /// True if these masks were built with `tables`.
@@ -449,4 +469,60 @@ fn filter_words(chunk: &ChunkData, tables: &LightTables) -> Option<Box<MaskWords
         }
     }
     out.iter().any(|&w| w != 0).then_some(out)
+}
+
+/// The sky sources of `chunk` (ADR 0061), in index order. A pass of its own, like the filter
+/// mask, so a chunk whose palette holds no source state (nearly all) only pays a palette scan,
+/// and none at all when no state is a source (the caller checks). Words of one repeated index
+/// (runs of air or stone) are skipped whole. Out of line, so the mask build keeps the code it
+/// had.
+#[inline(never)]
+fn sky_source_list(chunk: &ChunkData, tables: &LightTables) -> Vec<(LocalPos, SkySourceDef)> {
+    let mut out = Vec::new();
+    match chunk.blocks() {
+        Paletted::Uniform(s) => {
+            if let Some(d) = tables.sky_source(*s) {
+                out = (0..CHUNK_VOLUME)
+                    .map(|i| (LocalPos::from_index(i), d))
+                    .collect();
+            }
+        }
+        Paletted::Packed {
+            palette,
+            bits,
+            words,
+        } => {
+            let mut lut = [None; 256];
+            for (slot, &s) in lut.iter_mut().zip(palette) {
+                *slot = tables.sky_source(s);
+            }
+            if lut.iter().all(Option::is_none) {
+                return out;
+            }
+            let b = usize::from(*bits);
+            let per_word = 64 / b;
+            let mask = (1u64 << b) - 1;
+            // `idx * repeat` has `idx` in every slot of a word.
+            let repeat = u64::MAX / mask;
+            for (wi, &w) in words.iter().enumerate() {
+                let first = (w & mask) as usize;
+                if w == first as u64 * repeat && lut[first].is_none() {
+                    continue;
+                }
+                for j in 0..per_word {
+                    if let Some(d) = lut[((w >> (j * b)) & mask) as usize] {
+                        out.push((LocalPos::from_index(wi * per_word + j), d));
+                    }
+                }
+            }
+        }
+        Paletted::Direct(states) => {
+            for (i, &s) in states.iter().enumerate() {
+                if let Some(d) = tables.sky_source(s) {
+                    out.push((LocalPos::from_index(i), d));
+                }
+            }
+        }
+    }
+    out
 }

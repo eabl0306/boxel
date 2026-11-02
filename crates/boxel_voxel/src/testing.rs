@@ -14,12 +14,15 @@
 //! | `test:hot` | an opaque fluid that emits light and hardens into `test:solid` beside `test:fluid` |
 //! | `test:cutout` | a cutout full cube (leaves), with the plant's layer |
 //!
+//! [`add_sky_source`] adds `test:sky_source` (ADR 0061) after them, for the tests that need sky
+//! sources; [`builder`] leaves it out, so the other tests keep their registry.
+//!
 //! Every layer is a flat [`TEXTURE_SIZE`]^2 image; the plant's has binary alpha.
 use crate::{
-    BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BoxModel,
-    CollisionBox, FLUID_LEVEL, Face, FaceTextures, FluidHardening, FluidRules, ModelBox,
-    OPAQUE_OPACITY, Property, RenderShape, SlabHalf, TextureId, TextureImage, TextureSpec,
-    WATERLOGGED,
+    BeamDir, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
+    BoxModel, CollisionBox, FLUID_LEVEL, Face, FaceTextures, FluidHardening, FluidRules, ModelBox,
+    OPAQUE_OPACITY, Property, RegistryError, RenderShape, SkySourceDef, SlabHalf, TextureId,
+    TextureImage, TextureSpec, WATERLOGGED,
 };
 
 /// Edge of the test layers.
@@ -184,6 +187,45 @@ pub fn builder() -> BlockRegistryBuilder {
     )
     .expect("test:hot");
     b
+}
+
+/// The values of the `range` property of `test:sky_source` ([`add_sky_source`]).
+pub const SKY_SOURCE_RANGES: [u16; 4] = [1, 16, 64, 256];
+
+/// Adds `test:sky_source` to `b` and returns its default state (`dir=down,range=16`): an
+/// invisible block light passes, without collision, with a `dir` property (`down`, `up`) and a
+/// `range` property ([`SKY_SOURCE_RANGES`]). Every state is a sky source with its direction and
+/// range ([`BlockRegistryBuilder::set_sky_source`]) and keeps flowing fluids out, as a game's
+/// source block would.
+pub fn add_sky_source(b: &mut BlockRegistryBuilder) -> Result<BlockState, RegistryError> {
+    let ranges = SKY_SOURCE_RANGES.map(|r| r.to_string());
+    let default = b.add_block_with_states(
+        BlockDef {
+            name: "test:sky_source".to_string(),
+            shape: RenderShape::None,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        },
+        vec![
+            Property::new("dir", ["down", "up"]),
+            Property::new("range", ranges).with_default("16"),
+        ],
+        |_, _| {},
+    )?;
+    let block = b.block_by_name("test:sky_source").expect("just added");
+    b.set_keeps_fluids_out(block)?;
+    // `dir` then `range` (sorted by name), the last varying fastest; the default is `down`.
+    let first = default.0 - SKY_SOURCE_RANGES.iter().position(|&r| r == 16).expect("16") as u16;
+    for (d, dir) in [BeamDir::Down, BeamDir::Up].into_iter().enumerate() {
+        for (r, &range) in SKY_SOURCE_RANGES.iter().enumerate() {
+            let state = BlockState(first + (d * SKY_SOURCE_RANGES.len() + r) as u16);
+            b.set_sky_source(state, SkySourceDef { dir, range })?;
+        }
+    }
+    Ok(default)
 }
 
 /// The frozen test registry.

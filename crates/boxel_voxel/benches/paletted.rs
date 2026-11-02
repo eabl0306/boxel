@@ -1,8 +1,10 @@
 //! Paletted container benchmarks: encode/decode/get/set on a terrain-like chunk, and the light
-//! masks (`LightMasks`) of a cave chunk and of that terrain chunk.
+//! masks (`LightMasks`) of a cave chunk, of that cave chunk with sky sources under its roofs,
+//! and of the terrain chunk.
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, LightTables, LocalPos, Occupancy,
-    OwnedLightMasks, Paletted,
+    BeamDir, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_VOLUME,
+    ChunkData, FaceTextures, LightTables, LocalPos, Occupancy, OwnedLightMasks, Paletted,
+    RenderShape, SkySourceDef, TextureId,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -125,7 +127,52 @@ fn bench(c: &mut Criterion) {
     g.bench_function("surface_packed", |b| {
         b.iter(|| OwnedLightMasks::compute(black_box(&chunk), &tables));
     });
+    // The cave with a sky source in the first air cell under stone of every column (ADR 0061):
+    // 2 bits, so it builds its masks and its source list once.
+    let (lit, lit_tables) = cave_with_sources(&cave);
+    assert_eq!(lit.blocks().bits_per_voxel(), 2);
+    assert_eq!(lit.sky_sources(&lit_tables).len(), 434);
+    g.bench_function("cave_with_sources", |b| {
+        b.iter(|| OwnedLightMasks::compute(black_box(&lit), &lit_tables));
+    });
     g.finish();
+}
+
+/// `cave` with a down sky source (`test:sky_source`, range 64) in the first air cell under
+/// stone of every column that has one, and the tables of its registry (the demo blocks plus the
+/// source; the stone keeps its state).
+fn cave_with_sources(cave: &ChunkData) -> (ChunkData, LightTables) {
+    let mut b = boxel_demo::blocks::builder();
+    let source = b
+        .add_block(BlockDef {
+            name: "test:sky_source".to_string(),
+            shape: RenderShape::None,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("test:sky_source");
+    let def = SkySourceDef {
+        dir: BeamDir::Down,
+        range: 64,
+    };
+    b.set_sky_source(source, def).expect("a sky source");
+    let tables = LightTables::from_registry(&b.build());
+    let mut lit = cave.clone();
+    for x in 0..32 {
+        for z in 0..32 {
+            let roof = (1..32u32).rev().find(|&y| {
+                let at = |y| cave.get(LocalPos::new(x, y, z));
+                at(y) != BlockState::AIR && at(y - 1) == BlockState::AIR
+            });
+            if let Some(y) = roof {
+                lit.set(LocalPos::new(x, y - 1, z), source);
+            }
+        }
+    }
+    (lit, tables)
 }
 
 /// A stone chunk with about 10% air in blobs, as the overworld's 1-bit cave chunks.

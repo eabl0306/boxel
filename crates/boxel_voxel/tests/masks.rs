@@ -1,7 +1,8 @@
 //! Light fields of the registry, `LightTables`, and the chunk light masks: masks equal a brute
 //! force in every storage representation, uniform and 1-bit chunks without emission are served
 //! from their storage (nothing cached), the cache resets on every change, and `may_emit` never
-//! misses an emitter. Filters (ADR 0060) get a mask of their own.
+//! misses an emitter. Filters (ADR 0060) get a mask of their own, and sky sources (ADR 0061) a
+//! list, like emitters.
 use boxel_demo::blocks::{LAMPS, LAVA_EMISSION};
 use boxel_voxel::*;
 use proptest::prelude::*;
@@ -27,7 +28,9 @@ const STATES: u16 = 320;
 
 /// A registry whose states cycle through every light class: opacity 0, 1, 7 and 15, solid or
 /// not (no effect on the light masks), every 5th state emits a color of its own, and every 3rd
-/// state has a light filter (which an opaque state ignores).
+/// state has a light filter (which an opaque state ignores). Every 7th state is instead a sky
+/// source (invisible, clear, dark, not solid), down or up with a range of its own; some of them
+/// filter too.
 fn light_registry() -> BlockRegistry {
     let mut b = BlockRegistryBuilder::new();
     let t = b
@@ -49,7 +52,7 @@ fn light_registry() -> BlockRegistry {
         } else {
             [0; 3]
         };
-        b.add_block(BlockDef {
+        let def = BlockDef {
             name: format!("test:b{i}"),
             shape,
             model: BlockModel::CUBE,
@@ -61,8 +64,24 @@ fn light_registry() -> BlockRegistry {
             emission,
             light_opacity: opacity,
             textures: FaceTextures::all(t),
-        })
-        .unwrap();
+        };
+        if i % 7 == 0 {
+            let source = b
+                .add_block(BlockDef {
+                    shape: RenderShape::None,
+                    collision: BlockCollision::None,
+                    emission: [0; 3],
+                    light_opacity: 0,
+                    ..def
+                })
+                .unwrap();
+            let dir = [BeamDir::Down, BeamDir::Up][usize::from(i % 2)];
+            let range = 1 + i % MAX_BEAM;
+            b.set_sky_source(source, SkySourceDef { dir, range })
+                .unwrap();
+        } else {
+            b.add_block(def).unwrap();
+        }
         if i % 3 == 0 {
             let block = b.block_by_name(&format!("test:b{i}")).unwrap();
             let filter = [(i % 16) as u8, 15, (i / 3 % 16) as u8];
@@ -79,10 +98,11 @@ struct Plain {
     partial: Box<Occupancy>,
     filter: Box<Occupancy>,
     emitters: Vec<(LocalPos, LightValue)>,
+    sky_sources: Vec<(LocalPos, SkySourceDef)>,
 }
 
 impl Plain {
-    fn of(m: LightMasks<'_>) -> Self {
+    fn of(m: LightMasks<'_>, sky_sources: &[(LocalPos, SkySourceDef)]) -> Self {
         // An empty mask is the constant one, which the light reads without a word.
         assert_eq!(m.filter.is_empty(), m.filter.count() == 0);
         assert_eq!(m.partial.is_empty(), m.partial.count() == 0);
@@ -91,6 +111,7 @@ impl Plain {
             partial: m.partial.to_occupancy(),
             filter: m.filter.to_occupancy(),
             emitters: m.emitters.to_vec(),
+            sky_sources: sky_sources.to_vec(),
         }
     }
 }
@@ -101,6 +122,7 @@ fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
     let mut partial = Box::new([0u32; 1024]);
     let mut filter = Box::new([0u32; 1024]);
     let mut emitters = Vec::new();
+    let mut sky_sources = Vec::new();
     for i in 0..CHUNK_VOLUME {
         let p = LocalPos::from_index(i);
         let s = chunk.get(p);
@@ -116,27 +138,37 @@ fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
         if !tables.emission(s).is_dark() {
             emitters.push((p, tables.emission(s)));
         }
+        if let Some(d) = tables.sky_source(s) {
+            sky_sources.push((p, d));
+        }
     }
     Plain {
         opaque,
         partial,
         filter,
         emitters,
+        sky_sources,
     }
 }
 
-fn assert_masks_eq(got: LightMasks<'_>, want: &Plain, what: &str) {
-    let got = Plain::of(got);
+fn assert_masks_eq(
+    got: LightMasks<'_>,
+    sky_sources: &[(LocalPos, SkySourceDef)],
+    want: &Plain,
+    what: &str,
+) {
+    let got = Plain::of(got, sky_sources);
     assert!(got.opaque == want.opaque, "{what}: opaque");
     assert!(got.partial == want.partial, "{what}: partial");
     assert!(got.filter == want.filter, "{what}: filter");
     assert_eq!(got.emitters, want.emitters, "{what}: emitters");
+    assert_eq!(got.sky_sources, want.sky_sources, "{what}: sky sources");
 }
 
-/// True if `chunk` is served from its storage: uniform or 1-bit, with no emitting palette entry
-/// (a palette scan, as `may_emit`).
+/// True if `chunk` is served from its storage: uniform or 1-bit, with no emitting or source
+/// palette entry (a palette scan, as `may_emit` and `may_source`).
 fn served_from_storage(chunk: &ChunkData, tables: &LightTables) -> bool {
-    chunk.blocks().bits_per_voxel() <= 1 && !chunk.may_emit(tables)
+    chunk.blocks().bits_per_voxel() <= 1 && !chunk.may_emit(tables) && !chunk.may_source(tables)
 }
 
 /// A dense chunk with `k` distinct states below `STATES` in runs of up to `run`.
@@ -183,12 +215,16 @@ proptest! {
             chunk.set(p, BlockState(rng.below(u64::from(STATES)) as u16));
         }
         let want = brute_force(&chunk, &tables);
-        assert_masks_eq(OwnedLightMasks::compute(&chunk, &tables).view(), &want, "compute");
-        assert_masks_eq(chunk.light_masks(&tables), &want, "chunk");
+        let owned = OwnedLightMasks::compute(&chunk, &tables);
+        assert_masks_eq(owned.view(), owned.sky_sources(), &want, "compute");
+        assert_masks_eq(chunk.light_masks(&tables), chunk.sky_sources(&tables), &want, "chunk");
         prop_assert_eq!(chunk.has_cached_light_masks(), !served_from_storage(&chunk, &tables));
-        // `may_emit` never misses an emitter.
+        // `may_emit` never misses an emitter, `may_source` never a sky source.
         if !want.emitters.is_empty() {
             prop_assert!(chunk.may_emit(&tables));
+        }
+        if !want.sky_sources.is_empty() {
+            prop_assert!(chunk.may_source(&tables));
         }
     }
 }
@@ -199,7 +235,8 @@ fn masks_of_every_representation() {
     let tables = LightTables::from_registry(&registry);
     let mut rng = Rng(5);
     let mut chunks = Vec::new();
-    for s in [0, 1, 2, 3, 4, 5, 15, STATES - 1, STATES + 7] {
+    // 7 and 14 are sky sources.
+    for s in [0, 1, 2, 3, 4, 5, 7, 15, STATES - 1, STATES + 7] {
         chunks.push(ChunkData::uniform(BlockState(s)));
     }
     for (k, run) in [
@@ -222,6 +259,8 @@ fn masks_of_every_representation() {
         (BlockState(3), BlockState(0)),
         (BlockState(0), BlockState(5)),
         (BlockState(10), BlockState(9)),
+        (BlockState(14), BlockState(0)),
+        (BlockState(3), BlockState(7)),
     ] {
         chunks.push(ChunkData::from_occupancy(&mask, set, clear));
     }
@@ -232,14 +271,17 @@ fn masks_of_every_representation() {
     for (n, chunk) in chunks.iter().enumerate() {
         seen.insert(chunk.blocks().bits_per_voxel());
         let want = brute_force(chunk, &tables);
+        let owned = OwnedLightMasks::compute(chunk, &tables);
         assert_masks_eq(
-            OwnedLightMasks::compute(chunk, &tables).view(),
+            owned.view(),
+            owned.sky_sources(),
             &want,
             &format!("chunk {n}"),
         );
         let heap = chunk.heap_bytes();
         assert_masks_eq(
             chunk.light_masks(&tables),
+            chunk.sky_sources(&tables),
             &want,
             &format!("chunk {n} view"),
         );
@@ -248,6 +290,10 @@ fn masks_of_every_representation() {
         assert_eq!(chunk.heap_bytes() == heap, borrowed, "chunk {n}");
         assert!(
             chunk.may_emit(&tables) || want.emitters.is_empty(),
+            "chunk {n}"
+        );
+        assert!(
+            chunk.may_source(&tables) || want.sky_sources.is_empty(),
             "chunk {n}"
         );
     }

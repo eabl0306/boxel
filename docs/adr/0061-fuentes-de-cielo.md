@@ -3,7 +3,8 @@
 - Estado: aceptado (issue #140, que reemplaza a #130). El dueño aprobó el plan
   (`docs/planes/sky-sources-plan.md`) el 2026-11-02, con la opción A y sus respuestas a las
   preguntas abiertas (sección 9 del plan). Se construye por carriles (sección 8 del plan). Cada
-  carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR).
+  carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR) y
+  el 1 (los estados de fuente en `boxel_voxel`).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -60,12 +61,19 @@ BlockRegistryBuilder::set_sky_source(state: BlockState, def: SkySourceDef) -> Re
 - El juego registra un bloque (por ejemplo `game:sky_source`, con estados de dirección y algunos
   alcances) y marca cada estado. El motor nunca lo nombra; los tests usan `test:sky_source`.
 - Validación (`RegistryError::InvalidSkySource`): forma `RenderShape::None`, opacidad de luz 0,
-  emisión 0, sin colisión y `1 <= range <= MAX_BEAM`.
+  emisión 0, sin colisión y `1 <= range <= MAX_BEAM`. Tampoco un fluido ni un bloque con la
+  propiedad `waterlogged`: la fuente comparte su celda solo con aire.
 - El juego marca el bloque con `set_keeps_fluids_out` (decisión del dueño): el agua no se lleva una
   fuente que puso la generación.
-- `LightTables::sky_source` y `any_sky_source`, una clase de luz propia, `LightMasks::sky_sources`
-  (la lista de fuentes del chunk, como la de emisores) y `ChunkData::may_source` (un escaneo de
-  paleta, como `may_emit`).
+- `BlockRegistry::sky_source`, `LightTables::sky_source`, `is_sky_source` y `any_sky_source` (una
+  clase de luz propia), `ChunkData::sky_sources` (la lista de fuentes del chunk en orden, guardada
+  con sus máscaras) y `ChunkData::may_source` (un escaneo de paleta, como `may_emit`).
+- La lista no va en la vista `LightMasks`, que cada caja de luz lee 27 veces y que no la
+  necesita: solo la leen los tiles de rayos. Con la lista dentro, la vista crecía 16 bytes y
+  `masks/cave_1bit` subía un 8 %. Un chunk con una fuente en su paleta nunca se sirve desde sus
+  palabras, como uno con un emisor, así que su lista y sus máscaras se construyen juntas una vez.
+- `boxel_voxel::testing::add_sky_source` suma `test:sky_source` (dirección abajo o arriba,
+  alcances 1, 16, 64 y 256) para los tests de los otros crates.
 
 Así todo lo demás ya funciona: ediciones, `BlockChanged`, lotes atómicos, la versión del chunk, el
 guardado por nombre, el streaming y la generación privada. Un chunk con una fuente deja de ser
@@ -141,6 +149,13 @@ un techo y convierte un chunk de aire gratis en uno real. Las alturas extremas l
 Una zona con su propia curva dentro de un reino (una caverna de la superficie que no se oscurece
 de noche) no la pide la decisión. Si algún día hace falta, va como "fuentes constantes", que
 escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer canal de luz (XL).
+
+## Medidas
+
+- Carril 1, criterion `masks`, una corrida por lado contra a9a0abf, una detrás de la otra:
+  `cave_1bit` 4,52 a 4,50 ns (sin cambio), `surface_packed` 12,09 a 12,21 µs (+0,9 %, dentro del
+  ruido). Nuevo: `cave_with_sources` (la cueva de 1 bit con 434 fuentes bajo sus techos, 2 bits)
+  16,8 µs para construir máscaras y lista.
 
 ## El juego
 

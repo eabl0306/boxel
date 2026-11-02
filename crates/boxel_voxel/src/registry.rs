@@ -21,6 +21,33 @@ pub const FLUID_LEVEL: &str = "level";
 /// or `true`; ADR 0025): the states with `true` have [`StateFlags::WATERLOGGED`].
 pub const WATERLOGGED: &str = "waterlogged";
 
+/// Longest beam of a sky source in voxels, its own cell included (ADR 0061): 8 chunk layers. It
+/// bounds how far a source reaches and so how much one edit can relight.
+pub const MAX_BEAM: u16 = 256;
+
+/// Which way the beam of a sky source goes (ADR 0061).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BeamDir {
+    /// Toward lower y (a source under a cavern roof).
+    #[default]
+    Down,
+    /// Toward higher y.
+    Up,
+}
+
+/// What a sky source state emits ([`BlockRegistryBuilder::set_sky_source`], ADR 0061): sky light
+/// 15 along a straight beam in its column, from its own cell through the next ones in `dir`
+/// while they let direct sky through (light opacity 0), at most `range` cells and never past
+/// the plane of its realm. Beam cells are direct sky, so the light spreads from them as from the
+/// open sky; leaves and water end the beam as they end direct sky.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SkySourceDef {
+    /// Which way the beam goes.
+    pub dir: BeamDir,
+    /// Cells the beam may cover, the source included: `1..=MAX_BEAM`.
+    pub range: u16,
+}
+
 /// Most states a registry holds: `2^16`, every `u16` id. The mesher's material id is the state
 /// id; it marks fluid surface cells in a mask of their own, not in the id (ADR 0043).
 pub const MAX_STATES: usize = 1 << 16;
@@ -810,6 +837,12 @@ pub enum RegistryError {
     /// edge differs from the layers registered before it.
     #[error("invalid texture size of {0}")]
     TextureSize(String),
+    /// A sky source ([`BlockRegistryBuilder::set_sky_source`]) on a state that is drawn
+    /// (shape other than `RenderShape::None`), stops or emits light, collides, is a fluid or
+    /// could hold one, or with a range outside `1..=MAX_BEAM`; or on a state that is not
+    /// registered (`state N`).
+    #[error("invalid sky source {0}")]
+    InvalidSkySource(String),
 }
 
 /// Index of a block (not of a state) in its registry, in registration order (`0` = air).
@@ -878,6 +911,8 @@ pub struct BlockRegistryBuilder {
     full_bright: Vec<bool>,
     /// The light filter of each block (by [`BlockId`]; missing at the end: none).
     light_filters: Vec<Option<[u8; 3]>>,
+    /// The sky source of each state (by state id; missing at the end: none).
+    sky_sources: Vec<Option<SkySourceDef>>,
     /// The support shape of each state (by state id; `None` or missing at the end: its
     /// collision).
     support: Vec<Option<BlockCollision>>,
@@ -1106,6 +1141,44 @@ impl BlockRegistryBuilder {
             self.light_filters.resize(i + 1, None);
         }
         self.light_filters[i] = filter;
+        Ok(())
+    }
+
+    /// Makes `state` a sky source (ADR 0061): it emits sky light 15 along a beam in its column,
+    /// as `def` says ([`SkySourceDef`]). A later call replaces an earlier one. A game registers
+    /// a block with states for the direction and a few ranges, marks each state, and usually
+    /// declares the block [`BlockRegistryBuilder::set_keeps_fluids_out`] so flowing water does
+    /// not wash a generated source away.
+    ///
+    /// A source shares its cell with air only and must be invisible to everything but the
+    /// light: shape `RenderShape::None`, light opacity 0 (it does not move the sky top), no
+    /// emission, no collision, not a fluid and no [`WATERLOGGED`] property. Fails with
+    /// [`RegistryError::InvalidSkySource`] (nothing set) otherwise, when `def.range` is outside
+    /// `1..=MAX_BEAM`, or when `state` is not registered.
+    pub fn set_sky_source(
+        &mut self,
+        state: BlockState,
+        def: SkySourceDef,
+    ) -> Result<(), RegistryError> {
+        let i = usize::from(state.0);
+        let unknown = || RegistryError::InvalidSkySource(format!("state {}", state.0));
+        let s = self.states.get(i).ok_or_else(unknown)?;
+        let block = self
+            .blocks
+            .iter()
+            .find(|b| b.range().contains(&i))
+            .ok_or_else(unknown)?;
+        let valid = s.shape == RenderShape::None
+            && s.light_opacity == 0
+            && s.emission == [0; 3]
+            && s.collision.is_none()
+            && s.model != BlockModel::Fluid
+            && !block.properties.iter().any(|p| p.name() == WATERLOGGED)
+            && (1..=MAX_BEAM).contains(&def.range);
+        if !valid {
+            return Err(RegistryError::InvalidSkySource(s.name.clone()));
+        }
+        set_slot(&mut self.sky_sources, i, def);
         Ok(())
     }
 
@@ -1465,6 +1538,11 @@ impl BlockRegistryBuilder {
             })
             .collect();
         BlockRegistry {
+            sky_sources: {
+                let mut sources = self.sky_sources;
+                sources.resize(states.len(), None);
+                sources
+            },
             neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
             use_rules: per_block(self.use_rules, self.blocks.len()),
             place_rules: per_block(self.place_rules, self.blocks.len()),
@@ -1567,6 +1645,8 @@ pub struct BlockRegistry {
     opacity: Vec<u8>,
     /// The light filter of each state ([`BlockRegistry::light_filter`]).
     light_filter: Vec<[u8; 3]>,
+    /// The sky source of each state ([`BlockRegistry::sky_source`]).
+    sky_sources: Vec<Option<SkySourceDef>>,
     /// The states drawn full bright ([`BlockRegistry::is_full_bright`]).
     full_bright: Vec<bool>,
     faces: Vec<FaceTextures>,
@@ -1882,6 +1962,11 @@ impl BlockRegistry {
             .get(s.0 as usize)
             .copied()
             .unwrap_or([crate::MAX_LIGHT; 3])
+    }
+    /// The sky source `s` is ([`BlockRegistryBuilder::set_sky_source`], ADR 0061; `None` for
+    /// every other state and out of range).
+    pub fn sky_source(&self, s: BlockState) -> Option<SkySourceDef> {
+        self.sky_sources.get(usize::from(s.0)).copied().flatten()
     }
     /// Texture layer of `face` of `s` (for a turned cube, the end texture is on the faces
     /// across its axis).
