@@ -130,6 +130,7 @@ impl<'w> Reference<'w> {
             origin: pos,
             chunks: std::array::from_fn(|i| chunks[i].as_deref()),
             sky: SkyInput::Tiles(std::array::from_fn(|i| &*tiles[i])),
+            beams: [None; 9],
             tables: &self.content.light_tables,
         };
         let mut out = PaddedLight::default();

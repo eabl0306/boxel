@@ -9,6 +9,8 @@
 //!   0 in the world content (generator plus edits), found by walking each chunk column down
 //!   ([`sky_tile::walk`]). A voxel above `T` is direct sky (15). `T` never depends on what is
 //!   loaded, so streaming never relights anything.
+//! - [`beam_tile`]: the beams of the sky sources (ADR 0061) of each column that can reach a
+//!   window of y, found from the world content like `T`. Beam cells are direct sky too.
 //! - [`box_light`]: the exact light of the padded chunk (local `-1..=32`). Any light that
 //!   reaches it comes from at most 14 voxels away, so a breadth-first flood over the box chunk
 //!   +-16 (64^3) gives the global solution bit for bit, with fast paths for dark and open
@@ -24,6 +26,7 @@
 //! of order, thread count and position (every absolute comparison is made relative to the box
 //! in `i64`).
 
+pub mod beam_tile;
 pub mod box_light;
 mod chunk_light;
 #[cfg(any(test, feature = "oracle"))]
@@ -31,6 +34,7 @@ pub mod oracle;
 mod padded;
 pub mod sky_tile;
 
+pub use beam_tile::{Beam, BeamTile, Retrace};
 pub use box_light::{LightInput, LightPath, LightScratch, SkyInput, compute, compute_full};
 pub use chunk_light::ChunkLight;
 pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedLight};

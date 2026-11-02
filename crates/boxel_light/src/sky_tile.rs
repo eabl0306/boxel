@@ -59,7 +59,7 @@ pub enum LayerData<'a> {
 
 impl LayerData<'_> {
     /// The chunk, if the layer has blocks.
-    fn chunk(&self) -> Option<&ChunkData> {
+    pub(crate) fn chunk(&self) -> Option<&ChunkData> {
         match self {
             LayerData::Air | LayerData::AirUntil(_) | LayerData::Void => None,
             LayerData::Ref(c) => Some(c),

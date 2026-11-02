@@ -17,6 +17,8 @@ boxel_voxel.workspace = true
 [dev-dependencies]
 # The example content (#48), for tests, benches and examples only.
 boxel_demo.workspace = true
+# `testing::add_sky_source` (`test:sky_source`, ADR 0061) for the beam tests.
+boxel_voxel = { workspace = true, features = ["testing"] }
 # Enables `oracle` for the integration tests (the crate itself).
 boxel_light = { workspace = true, features = ["oracle"] }
 # The sky walk tests and the benches use the real generators.

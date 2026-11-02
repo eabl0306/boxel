@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #140, que reemplaza a #130). El dueño aprobó el plan
   (`docs/planes/sky-sources-plan.md`) el 2026-11-02, con la opción A y sus respuestas a las
   preguntas abiertas (sección 9 del plan). Se construye por carriles (sección 8 del plan). Cada
-  carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR) y
-  el 1 (los estados de fuente en `boxel_voxel`).
+  carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR), el 1
+  (los estados de fuente en `boxel_voxel`) y el 2 (los rayos en `boxel_light`).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -96,6 +96,35 @@ respuesta:
   filas de cielo directo. Si algún rayo cruza la caja, `FastDark` no vale. `FastOpen` no cambia. La
   caja sigue siendo exacta: las celdas del rayo son fuentes de nivel 15 como el cielo directo.
 - `ChunkLight`, `PaddedLight` y el mesher no cambian.
+
+Lo que construyó el carril 2 (`boxel_light`):
+
+- `beam_tile::build(ventana, planos, tablas, capa)`. Los planos de reino van como un slice simple
+  y ascendente, el de `RealmStack::planes`: el plano `p` es la primera celda del reino de arriba.
+  Un rayo hacia abajo para en el plano más alto que está en su fuente o debajo, y uno hacia arriba,
+  justo antes del primer plano que está arriba de su fuente (`beam_tile::beam_limit`). No se usa
+  una closure porque el generador ya da los planos así. El recorte no necesita planos alineados a
+  chunks. No hay argumento de columna: la closure `capa` ya sabe qué columna lee, como en
+  `sky_tile::walk`.
+- El tile guarda cada fuente que alcanza la ventana por su alcance (`beam_tile::reaches`) con su
+  rayo entero. Así una edición se retraza en el lugar: `BeamTile::edit(x, z, y, estado, planos,
+  tablas, capa)` da `Retrace::Changed { lo, hi }` (las celdas de rayo que cambiaron), `Unchanged` o
+  `Unresolved` (le faltó una capa y el tile no cambió). El resultado es igual a un `build` del
+  contenido editado. Cortar un rayo no lee ninguna capa; solo crecerlo o poner una fuente.
+- El índice por columna es `u32` (4 KiB), no `u16`: una columna puede tener más de 65 535 rayos
+  al alcance (fuentes apiladas) y un `u16` se desbordaría. Un tile sin rayos no guarda índice
+  (0 B). Cada rayo son 8 B, en offsets de 16 bits desde `w_lo - 256`, así que una ventana tiene a
+  lo sumo `MAX_WINDOW` = 65 024 filas. `flags` guarda `range - 1` (bits 0 a 7) y la dirección
+  (bit 8); los bits 9 a 15 quedan libres para rayos de color y fuentes constantes.
+- `LightInput::beams: [Option<&BeamTile>; 9]`. Cada tile debe cubrir las filas de la caja (se
+  revisa en debug). `build_direct` suma los rayos por columna de la caja: los junta en tramos
+  disjuntos, marca el comienzo y el final de cada tramo y hace un barrido XOR hacia arriba, sobre
+  las filas `closed` que la inundación del cielo pisa después.
+- El oráculo traza los rayos celda por celda (`OracleWorld::sources`, `planes`, `beam_cells`).
+- Los filtros de luz (ADR 0060): un rayo es cielo directo y queda blanco. Un filtro de opacidad 0
+  (vidrio de color) lo deja pasar; uno de opacidad 1 o más lo termina, como a cualquier bloqueador.
+- Los otros crates que arman un `LightInput` (`boxel_world`, dos tests de GPU de `boxel_render`)
+  solo agregan `beams: [None; 9]`, sin otro cambio. El carril 3 los conecta.
 
 ### 4. Costo cero sin fuentes
 
@@ -189,6 +218,21 @@ escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer 
   16,8 µs para construir máscaras y lista.
 - Carril 4, `just perf-smoke surface cave-static` (RTX, radio 16, sin tope) contra a9a0abf:
   superficie 2020 a 2058 fps (+1,9 %), cueva quieta 2474 a 2463 (-0,4 %), p99 igual. Ok.
+- Carril 2, criterion `light`, una corrida por lado contra 641774b, una detrás de la otra. Sin
+  rayos (`beams: [None; 9]`) nada empeora: `box_cave_dark` 41,7 a 41,5 ns (sin cambio),
+  `walk_generate` 130,9 a 129,7 µs y `walk_loaded` 16,5 a 16,2 µs. Las cajas con inundación
+  salieron entre 8 y 15 % más rápidas (`box_surface` 47,6 a 40,3 µs), que es ruido de la máquina:
+  el cambio no toca la inundación.
+- Nuevos, sin lado base:
+
+| Bench | Tiempo | Qué mide |
+|---|---|---|
+| `light/box_cavern_ceiling` | 36,2 µs | caverna de 64 de alto, una fuente bajo el techo en cada columna, dos pilares (9 198 rayos en los 9 tiles). Meta: 100 µs o menos |
+| `light/box_cavern_ledge` | 167,6 µs | la misma con un alero de lado a lado: 26 390 celdas en su sombra. Es el costo de inundar esa sombra, como cualquier caja con mucho cielo esparcido |
+| `light/box_sunbeam` | 25,2 µs | una cueva generada con un rayo de sol |
+| `beam_tile/build_loaded` | 31,1 µs | la columna de esa cueva, 19 capas cargadas con sus máscaras, 5 132 fuentes bajo los techos de cueva, 1 412 rayos guardados (15 KiB) |
+| `beam_tile/build_loaded_cold_masks` | 375,7 µs | lo mismo sin máscaras: cada capa con una fuente las construye (unos 17 µs, carril 1). Las cajas de luz las reusan después |
+| `beam_tile/build_generate` | 3,16 ms | cada capa generada y decorada en la closure: 166 µs por capa, casi todo generación |
 
 ## El juego
 
@@ -206,8 +250,8 @@ escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer 
   Una cuadrícula rala de fuentes lo baja. El carril 3 lo mide.
 - Una caja con un rayo cerca toma el camino completo (unos 56 µs, como la superficie) en vez de
   `FastDark` (0,04 µs). Las cajas sin rayos no cambian.
-- Un tile de rayos cuesta 2 KiB más 8 B por fuente. Un techo lleno de fuentes en toda la vista
-  son unos 11 MiB a r16.
+- Un tile de rayos cuesta 4 KiB más 8 B por fuente (0 B si no tiene rayos). Un techo lleno de
+  fuentes en toda la vista son unos 13 MiB a r16.
 - Sin formato de guardado nuevo: las fuentes son bloques guardados por nombre, los tiles no se
   guardan y `RealmLighting` es del juego.
 - `RealmSky::Under` desaparece: #129 quita la variante y el reino del techo pasa a `Closed` con

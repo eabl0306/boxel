@@ -2,8 +2,9 @@
 //! and 15, RGB emitters opaque and clear, sky tops from the blocks, roofs far above, caps over
 //! air inside the world, tops below the world and `i64::MIN`), every chunk of the inner 3x3x3
 //! gets the padded light of the scalar global solver, bit for bit, with and without the fast
-//! paths, with and without light filters (ADR 0060). End to end on generated content: tiles from
-//! the walk feed the box and match the oracle with brute-force tops capped at the walk floor.
+//! paths, with and without light filters (ADR 0060), with and without sky sources and realm
+//! planes (ADR 0061). End to end on generated content: tiles from the walk feed the box and match
+//! the oracle with brute-force tops capped at the walk floor.
 mod common;
 
 use boxel_demo::worldgen::OverworldGenerator;
@@ -11,13 +12,14 @@ use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::oracle::OracleWorld;
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
 use boxel_light::{
-    LayerData, LightInput, LightPath, LightScratch, PaddedLight, SkyInput, SkyTile, compute,
-    compute_full,
+    BeamTile, LayerData, LightInput, LightPath, LightScratch, PaddedLight, SkyInput, SkyTile,
+    beam_tile, compute, compute_full,
 };
-use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos};
+use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos, SkySourceDef};
 use boxel_worldgen::WorldGenerator;
 use common::{
-    Blocks, CYAN_FILTER, RED_FILTER, World, random_world, test_registry, test_registry_with,
+    Blocks, CYAN_FILTER, RED_FILTER, Rng, World, random_world, test_registry, test_registry_full,
+    test_registry_with,
 };
 use proptest::prelude::*;
 
@@ -40,8 +42,23 @@ fn first_mismatch(got: &PaddedLight, want: &[LightValue]) -> Option<String> {
 
 /// Checks every inner chunk of `world` against the oracle; returns the paths taken.
 fn check_world(world: &World, tables: &LightTables) -> Vec<LightPath> {
-    let oracle =
+    check_world_with(world, tables, &[], &[])
+}
+
+/// [`check_world`] with the beam tiles `beams` (by `cx * n + cz`, empty for none) built with
+/// the realm planes `planes`.
+fn check_world_with(
+    world: &World,
+    tables: &LightTables,
+    beams: &[BeamTile],
+    planes: &[i64],
+) -> Vec<LightPath> {
+    let mut oracle =
         OracleWorld::from_chunks(world.min, [N; 3], &world.chunks, tables, world.tops.clone());
+    if beams.is_empty() {
+        oracle.sources.clear();
+    }
+    oracle.planes = planes.to_vec();
     let solution = oracle.solve();
     let tiles = world.tiles();
     let mut scratch = LightScratch::new();
@@ -50,7 +67,7 @@ fn check_world(world: &World, tables: &LightTables) -> Vec<LightPath> {
     for cy in 1..N - 1 {
         for cx in 1..N - 1 {
             for cz in 1..N - 1 {
-                let input = world.input(&tiles, tables, (cx, cy, cz));
+                let input = world.input_with(&tiles, beams, tables, (cx, cy, cz));
                 let want = oracle.padded(&solution, input.origin);
                 let path = compute(&input, &mut scratch, &mut out);
                 if let Some(m) = first_mismatch(&out, &want) {
@@ -85,6 +102,71 @@ proptest! {
         let world = random_world(seed, N, min, &blocks, &tables);
         check_world(&world, &tables);
     }
+}
+
+/// A world of [`random_world`] with sky sources ([`World::add_sources`]) and 0 to 2 realm planes
+/// inside it (any row: the clip does not need them chunk aligned), its beam tiles and planes.
+fn world_with_sources(
+    seed: u64,
+    min: ChunkPos,
+    blocks: &Blocks,
+    tables: &LightTables,
+) -> (World, Vec<BeamTile>, Vec<i64>) {
+    let mut world = random_world(seed, N, min, blocks, tables);
+    let mut rng = Rng::new(seed ^ 0x5eed_50c3);
+    world.add_sources(&mut rng, blocks, tables);
+    let y0 = min.origin().y;
+    let mut planes: Vec<i64> = (0..rng.below(3))
+        .map(|_| y0 + rng.below((N * 32) as u64) as i64)
+        .collect();
+    planes.sort_unstable();
+    planes.dedup();
+    let beams = world.beam_tiles(tables, &planes);
+    (world, beams, planes)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
+
+    #[test]
+    fn box_with_beams_equals_global_solution(seed in any::<u64>(), heavy in any::<bool>(),
+                                             filters in any::<bool>(), far in 0usize..4) {
+        let (registry, blocks) = test_registry_full(heavy, filters, true);
+        let tables = LightTables::from_registry(&registry);
+        let min = [
+            ChunkPos::new(-2, -2, -2),
+            ChunkPos::new(1 << 26, -3, -(1 << 26)),
+            ChunkPos::new(-(1 << 35), 1 << 35, 7),
+            ChunkPos::new(5, -(1 << 50), 1 << 50),
+        ][far];
+        let (world, beams, planes) = world_with_sources(seed, min, &blocks, &tables);
+        check_world_with(&world, &tables, &beams, &planes);
+    }
+}
+
+/// Fixed worlds with sky sources, in every registry, also under a roof far above every column,
+/// where only the beams give sky light to boxes the tops leave dark.
+#[test]
+fn fixed_worlds_with_sources_match_and_light_dark_boxes() {
+    let mut beam_lit = 0;
+    for (seed, heavy, filters) in [(41, false, false), (42, true, false), (43, true, true)] {
+        let (registry, blocks) = test_registry_full(heavy, filters, true);
+        let tables = LightTables::from_registry(&registry);
+        let (mut world, beams, planes) =
+            world_with_sources(seed, ChunkPos::new(-2, -2, -2), &blocks, &tables);
+        check_world_with(&world, &tables, &beams, &planes);
+        // A roof far above every column: only beams light anything.
+        let roof = world.min.origin().y + 1000;
+        world.tops.iter_mut().for_each(|t| *t = (*t).max(roof));
+        let roofed = check_world_with(&world, &tables, &beams, &planes);
+        let dark = check_world(&world, &tables);
+        let sky = |p: &LightPath| matches!(p, LightPath::Full { sky_pops, .. } if *sky_pops > 0);
+        for (with, without) in roofed.iter().zip(&dark) {
+            assert!(!sky(without));
+            beam_lit += usize::from(sky(with));
+        }
+    }
+    assert!(beam_lit > 0, "no dark box lit by a beam");
 }
 
 /// A fixed world per registry, so the regular run covers both every time.
@@ -153,6 +235,7 @@ fn light_of(
         origin: ChunkPos::new(0, 0, 0),
         chunks: refs,
         sky: SkyInput::Tiles(tiles),
+        beams: [None; 9],
         tables,
     };
     let mut out = PaddedLight::default();
@@ -306,6 +389,97 @@ fn a_filter_scales_each_block_channel_and_leaves_sky_alone() {
     assert_eq!(light.get(17, 0, 16), LightValue::new(14, 0, 0, 0));
 }
 
+/// A cavern 64 high under a roof far from the sky, lit by a down source of range 64 in the
+/// first air cell under the roof of every column, with a ledge across it: the cavern is all 15
+/// but under the ledge, which gets spread light from the beams beside it; the same with the
+/// sky tops and below the floor. Without beams the box is dark.
+#[test]
+fn a_cavern_roof_of_sources_lights_it_like_daylight() {
+    let (registry, b) = test_registry_full(false, false, true);
+    let tables = LightTables::from_registry(&registry);
+    let source = b
+        .sources
+        .iter()
+        .copied()
+        .find(|&s| {
+            tables.sky_source(s)
+                == Some(SkySourceDef {
+                    dir: boxel_voxel::BeamDir::Down,
+                    range: 64,
+                })
+        })
+        .unwrap();
+    // World voxels -32..64: the cavern y in -20..=43, the ledge y = 10, x in -8..8.
+    let chunks = scene(&b, |x, y, z| match (x, y, z) {
+        (_, 43, _) => source,
+        (-8..8, 10, _) => b.stone,
+        (_, -20..=42, _) => b.air,
+        _ => b.stone,
+    });
+    let window = -16..=47;
+    let beams: Vec<BeamTile> = (0..9)
+        .map(|i| {
+            let (dx, dz) = (i as i64 / 3 - 1, i as i64 % 3 - 1);
+            beam_tile::build(window.clone(), &[], &tables, |cy| {
+                if (-1..=1).contains(&cy) {
+                    let ci = ((cy + 1) * 9 + (dx + 1) * 3 + dz + 1) as usize;
+                    LayerData::Ref(&chunks[ci])
+                } else {
+                    LayerData::Air
+                }
+            })
+        })
+        .collect();
+    let refs: [Option<&ChunkData>; 27] = std::array::from_fn(|i| Some(&chunks[i]));
+    let roof = SkyTile::uniform(1000, i64::MIN);
+    let mut input = LightInput {
+        origin: ChunkPos::new(0, 0, 0),
+        chunks: refs,
+        sky: SkyInput::Tiles([&roof; 9]),
+        beams: [None; 9],
+        tables: &tables,
+    };
+    let mut scratch = LightScratch::new();
+    let mut out = PaddedLight::default();
+    assert_eq!(compute(&input, &mut scratch, &mut out), LightPath::FastDark);
+    input.beams = std::array::from_fn(|i| Some(&beams[i]));
+    let path = compute(&input, &mut scratch, &mut out);
+    assert!(
+        matches!(path, LightPath::Full { sky_pops, .. } if sky_pops > 0),
+        "{path:?}"
+    );
+    assert_eq!(out.get(20, 0, 5).sky(), 15);
+    assert_eq!(out.get(20, 32, 5).sky(), 15, "the padded top");
+    assert_eq!(out.get(5, 11, 5).sky(), 15, "on the ledge");
+    assert_eq!(out.get(5, 10, 5).sky(), 0, "the ledge");
+    // Under the ledge: 8 cells from the beam at x = 8 (and 9 from the one at x = -9).
+    assert_eq!(out.get(0, 9, 5).sky(), 15 - 8);
+    assert_eq!(out.get(-1, 9, 5).sky(), 15 - 8, "8 from the beam at x = -9");
+    assert_eq!(out.get(7, 9, 5).sky(), 14);
+    // The oracle agrees, and so do the forced full path and below the floor.
+    let mut oracle = OracleWorld::from_chunks(
+        ChunkPos::new(-1, -1, -1),
+        [3; 3],
+        &chunks,
+        &tables,
+        vec![1000; 96 * 96],
+    );
+    let want = oracle.padded(&oracle.solve(), input.origin);
+    assert_eq!(first_mismatch(&out, &want), None);
+    let mut full = PaddedLight::default();
+    compute_full(&input, &mut scratch, &mut full);
+    assert_eq!(full, out);
+    input.sky = SkyInput::BelowFloor;
+    let below = compute(&input, &mut scratch, &mut full);
+    assert!(matches!(below, LightPath::Full { .. }));
+    assert_eq!(full, out);
+    compute_full(&input, &mut scratch, &mut full);
+    assert_eq!(full, out);
+    // Without the sources the oracle is dark.
+    oracle.sources.clear();
+    assert!(oracle.solve().iter().all(|v| v.sky() == 0));
+}
+
 #[test]
 fn a_shaft_gets_full_sky_at_its_bottom() {
     let (registry, b) = test_registry(false);
@@ -356,7 +530,7 @@ fn fast_paths_equal_the_global_solution() {
     assert!(paths.iter().all(|p| *p == LightPath::FastDark), "{paths:?}");
 
     // Air and glass under open sky (tops below the world or open forever): all open.
-    let mut rng = common::Rng::new(5);
+    let mut rng = Rng::new(5);
     for chunk in &mut world.chunks {
         *chunk = ChunkData::uniform(b.air);
         for _ in 0..rng.below(300) {
@@ -535,6 +709,7 @@ fn walked_tiles_light_generated_content_exactly() {
                 origin: ChunkPos::new(min.x + 1, min.y + cy as i64, min.z + 1),
                 chunks: near,
                 sky: SkyInput::Tiles(refs),
+                beams: [None; 9],
                 tables: &tables,
             };
             let want = oracle.padded(&solution, input.origin);

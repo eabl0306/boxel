@@ -2,7 +2,7 @@
 #![allow(dead_code, reason = "each test binary uses a subset of the helpers")]
 
 use boxel_light::box_light::{chunk_index, tile_index};
-use boxel_light::{LightInput, SkyInput, SkyTile};
+use boxel_light::{BeamTile, LayerData, LightInput, SkyInput, SkyTile, beam_tile};
 use boxel_voxel::{
     BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE,
     CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos, Occupancy, RenderShape,
@@ -51,6 +51,8 @@ pub struct Blocks {
     /// Light filters (ADR 0060), only in a registry with filters: red glass (opacity 0) and
     /// cyan water (opacity 1, its filter after the cost).
     pub filters: Option<[BlockState; 2]>,
+    /// Every state of `test:sky_source` (ADR 0061), only in a registry with sources.
+    pub sources: Vec<BlockState>,
 }
 
 /// Red glass's filter: red through, little green and blue.
@@ -66,6 +68,11 @@ pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
 
 /// [`test_registry`], with two filter blocks when `filters` ([`Blocks::filters`]).
 pub fn test_registry_with(heavy: bool, filters: bool) -> (BlockRegistry, Blocks) {
+    test_registry_full(heavy, filters, false)
+}
+
+/// [`test_registry_with`], with `test:sky_source` when `sources` ([`Blocks::sources`]).
+pub fn test_registry_full(heavy: bool, filters: bool, sources: bool) -> (BlockRegistry, Blocks) {
     let mut b = boxel_demo::blocks::builder();
     let tex = FaceTextures::all(TextureId(0));
     let mut add = |name: &str, shape, solid, emission, light_opacity| {
@@ -106,7 +113,14 @@ pub fn test_registry_with(heavy: bool, filters: bool) -> (BlockRegistry, Blocks)
     } else {
         None
     };
+    if sources {
+        boxel_voxel::testing::add_sky_source(&mut b).unwrap();
+    }
     let r = b.build();
+    let sources = (0..r.len())
+        .map(|i| BlockState(i as u16))
+        .filter(|&s| r.sky_source(s).is_some())
+        .collect();
     let blocks = Blocks {
         air: BlockState::AIR,
         stone: r.by_name("boxel:stone").unwrap(),
@@ -117,6 +131,7 @@ pub fn test_registry_with(heavy: bool, filters: bool) -> (BlockRegistry, Blocks)
         glows,
         smoke,
         filters,
+        sources,
     };
     (r, blocks)
 }
@@ -217,10 +232,22 @@ impl World {
     }
 
     /// The light input of chunk `(cx, cy, cz)` (1..n-1 on each axis), with the tiles `tiles`
-    /// (`n * n`, by `cx * n + cz`).
+    /// (`n * n`, by `cx * n + cz`) and no beams.
     pub fn input<'a>(
         &'a self,
         tiles: &'a [SkyTile],
+        tables: &'a LightTables,
+        at: (usize, usize, usize),
+    ) -> LightInput<'a> {
+        self.input_with(tiles, &[], tables, at)
+    }
+
+    /// [`World::input`] with the beam tiles `beams` (`n * n`, by `cx * n + cz`, or empty for
+    /// none); an empty tile is passed as `None`.
+    pub fn input_with<'a>(
+        &'a self,
+        tiles: &'a [SkyTile],
+        beams: &'a [BeamTile],
         tables: &'a LightTables,
         (cx, cy, cz): (usize, usize, usize),
     ) -> LightInput<'a> {
@@ -238,9 +265,12 @@ impl World {
             &tiles[(cx as i32 + dx) as usize * self.n + (cz as i32 + dz) as usize]
         };
         let mut picked = [tile(0, 0); 9];
+        let mut beamed = [None; 9];
         for dx in -1..=1 {
             for dz in -1..=1 {
                 picked[tile_index(dx, dz)] = tile(dx, dz);
+                let i = (cx as i32 + dx) as usize * self.n + (cz as i32 + dz) as usize;
+                beamed[tile_index(dx, dz)] = beams.get(i).filter(|t| !t.is_empty());
             }
         }
         LightInput {
@@ -251,7 +281,66 @@ impl World {
             ),
             chunks,
             sky: SkyInput::Tiles(picked),
+            beams: beamed,
             tables,
+        }
+    }
+
+    /// The beam tile of every chunk column (by `cx * n + cz`), built over the world's rows with
+    /// the realm planes `planes`; outside the world is air.
+    pub fn beam_tiles(&self, tables: &LightTables, planes: &[i64]) -> Vec<BeamTile> {
+        let y0 = self.min.origin().y;
+        let window = y0..=y0 + (self.n * CHUNK_SIZE as usize) as i64 - 1;
+        (0..self.n * self.n)
+            .map(|i| {
+                let (cx, cz) = (i / self.n, i % self.n);
+                beam_tile::build(window.clone(), planes, tables, |cy| {
+                    let k = cy - self.min.y;
+                    if (0..self.n as i64).contains(&k) {
+                        LayerData::Ref(self.chunk(cx, k as usize, cz))
+                    } else {
+                        LayerData::Air
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Puts sky sources of `b.sources` into air voxels: in some chunks a few at random, in
+    /// others one under every blocker of the chunk (a lit cavern roof), down, with random ranges.
+    /// Sources have opacity 0, so the tops stay right.
+    pub fn add_sources(&mut self, rng: &mut Rng, b: &Blocks, tables: &LightTables) {
+        if b.sources.is_empty() {
+            return;
+        }
+        let down = |s: &BlockState| {
+            tables
+                .sky_source(*s)
+                .is_some_and(|d| d.dir == boxel_voxel::BeamDir::Down)
+        };
+        let downs: Vec<BlockState> = b.sources.iter().copied().filter(down).collect();
+        for chunk in &mut self.chunks {
+            match rng.below(10) {
+                0..=2 => {
+                    for _ in 0..1 + rng.below(20) {
+                        let p = LocalPos::from_index(rng.below(CHUNK_VOLUME as u64) as usize);
+                        if chunk.get(p).is_air() {
+                            chunk.set(p, b.sources[rng.below(b.sources.len() as u64) as usize]);
+                        }
+                    }
+                }
+                3 => {
+                    let source = downs[rng.below(downs.len() as u64) as usize];
+                    for i in 0..CHUNK_VOLUME - CHUNK_AREA {
+                        let p = LocalPos::from_index(i);
+                        let above = LocalPos::from_index(i + CHUNK_AREA);
+                        if chunk.get(p).is_air() && tables.blocks_sky(chunk.get(above)) {
+                            chunk.set(p, source);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

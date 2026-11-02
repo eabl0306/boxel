@@ -80,6 +80,7 @@ fn dump(r: &BlockRegistry) -> String {
         origin: ChunkPos::new(0, 0, 0),
         chunks,
         sky: SkyInput::Tiles(std::array::from_fn(|i| &tiles[i])),
+        beams: [None; 9],
         tables: &t,
     };
     let mut out = PaddedLight::default();

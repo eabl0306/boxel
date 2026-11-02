@@ -213,6 +213,7 @@ fn mesh(registry: &BlockRegistry, wall: Wall) -> ChunkMesh {
         origin: boxel_voxel::ChunkPos::new(0, 0, 0),
         chunks,
         sky: SkyInput::BelowFloor,
+        beams: [None; 9],
         tables: &tables,
     };
     let mut light = PaddedLight::default();

@@ -11,6 +11,12 @@
 //! | `light/box_far` (the surface neighborhood at x = z = 2^40) | 1.15x of `box_surface` or less |
 //! | `sky_tile/walk_generate` (overworld column, generated privately) | 400 us or less |
 //! | `sky_tile/walk_loaded` (the same column loaded, masks not built yet) | 60 us or less |
+//! | `light/box_cavern_ceiling` (ADR 0061: a 64-high cavern under a down source in every roof column, two pillars) | 100 us or less |
+//! | `light/box_cavern_ledge` (the same with a ledge across the box: 30 000 cells in its shadow) | none (the flood of a large shadow) |
+//! | `light/box_sunbeam` (a generated cave with one down source under its roof) | as `box_surface` |
+//! | `beam_tile/build_loaded` (the cave's column, 19 layers loaded with masks, sources under every cave roof) | 20 to 60 us |
+//! | `beam_tile/build_loaded_cold_masks` (the same, masks not built yet: each layer with a source builds them) | none |
+//! | `beam_tile/build_generate` (the same column, every layer generated and decorated) | 22 to 60 us per layer, plus generation |
 //!
 //! The box benches run with the chunk masks cached (each chunk's masks are built once and
 //! shared by the 27 boxes that read it); `light/box_surface_cold_masks` builds them too.
@@ -19,10 +25,13 @@
 mod scenes;
 
 use boxel_demo::worldgen::OverworldGenerator;
-use boxel_light::box_light::tile_index;
+use boxel_light::box_light::{MARGIN, tile_index};
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
-use boxel_light::{LayerData, LightPath, LightScratch, PaddedLight, compute};
-use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables};
+use boxel_light::{BeamTile, LayerData, LightPath, LightScratch, PaddedLight, beam_tile, compute};
+use boxel_voxel::{
+    BeamDir, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, LightTables,
+    LocalPos, SkySourceDef,
+};
 use boxel_worldgen::WorldGenerator;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use scenes::{
@@ -194,5 +203,222 @@ fn bench(c: &mut Criterion) {
     g_sky.finish();
 }
 
-criterion_group!(benches, bench);
+/// The demo blocks plus `test:sky_source` (ADR 0061), and its down state of range `range`.
+fn source_registry(range: u16) -> (BlockRegistry, BlockState) {
+    let mut b = boxel_demo::blocks::builder();
+    boxel_voxel::testing::add_sky_source(&mut b).expect("test:sky_source");
+    let registry = b.build();
+    let want = SkySourceDef {
+        dir: BeamDir::Down,
+        range,
+    };
+    let state = (0..registry.len())
+        .map(|i| BlockState(i as u16))
+        .find(|&s| registry.sky_source(s) == Some(want))
+        .expect("a source state");
+    (registry, state)
+}
+
+/// Puts `source` in every air voxel of `chunk` right under a blocker (a lit cavern roof, as a
+/// game's generator would): returns how many.
+fn roof_sources(chunk: &mut ChunkData, tables: &LightTables, source: BlockState) -> usize {
+    let mut placed = 0;
+    for i in 0..CHUNK_VOLUME - 1024 {
+        let p = LocalPos::from_index(i);
+        if chunk.get(p).is_air() && tables.blocks_sky(chunk.get(LocalPos::from_index(i + 1024))) {
+            chunk.set(p, source);
+            placed += 1;
+        }
+    }
+    placed
+}
+
+/// The beam tiles of a neighborhood's 9 columns (by `tile_index`) for its box rows, from its 27
+/// chunks (every other layer air).
+fn neighborhood_beams(n: &Neighborhood, tables: &LightTables) -> Vec<BeamTile> {
+    let y0 = n.origin.origin().y - MARGIN;
+    (0..9)
+        .map(|i| {
+            let (dx, dz) = (i as i64 / 3 - 1, i as i64 % 3 - 1);
+            beam_tile::build(y0..=y0 + 63, &[], tables, |cy| {
+                let dy = cy - n.origin.y;
+                if (-1..=1).contains(&dy) {
+                    LayerData::Ref(&n.chunks[((dy + 1) * 9 + (dx + 1) * 3 + dz + 1) as usize])
+                } else {
+                    LayerData::Air
+                }
+            })
+        })
+        .collect()
+}
+
+/// Beam scenes: a full cavern ceiling and a single sunbeam, then the beam tile of a cave column.
+fn bench_beams(c: &mut Criterion) {
+    let g = OverworldGenerator::default();
+    let (registry, source) = source_registry(64);
+    let tables = LightTables::from_registry(&registry);
+    let stone = registry.by_name("boxel:stone").expect("stone");
+    let mut scratch = LightScratch::new();
+    let mut out = PaddedLight::default();
+
+    // The deep chunk's tiles (tops far above), its chunks replaced by stone around a cavern 64
+    // high (box rows -20..=43 from the chunk's origin), a source under the roof of every column,
+    // and two 3x3 pillars; with `ledge`, a ledge at 10 across x in -8..8.
+    let deep = Neighborhood::generate(&g, &registry, &tables, ChunkPos::new(0, -40, 0));
+    let origin = deep.origin.origin();
+    let cavern_of = |ledge: bool| {
+        let mut chunks = Vec::with_capacity(27);
+        for i in 0..27i64 {
+            let (dy, dx, dz) = (i / 9 - 1, i / 3 % 3 - 1, i % 3 - 1);
+            let mut chunk = ChunkData::uniform(stone);
+            for v in 0..CHUNK_VOLUME {
+                let p = LocalPos::from_index(v);
+                let (x, y, z) = (
+                    dx * 32 + i64::from(p.x()),
+                    dy * 32 + i64::from(p.y()),
+                    dz * 32 + i64::from(p.z()),
+                );
+                let pillar = |cx: i64, cz: i64| (x - cx).abs() <= 1 && (z - cz).abs() <= 1;
+                let s = match y {
+                    43 if !pillar(20, 20) && !pillar(-5, 25) => source,
+                    10 if ledge && (-8..8).contains(&x) => stone,
+                    -20..=42 if !pillar(20, 20) && !pillar(-5, 25) => BlockState::AIR,
+                    _ => stone,
+                };
+                if s != stone {
+                    chunk.set(p, s);
+                }
+            }
+            chunks.push(chunk);
+        }
+        Neighborhood {
+            origin: deep.origin,
+            chunks,
+            tiles: deep.tiles.clone(),
+        }
+    };
+    let cavern = cavern_of(false);
+    let ledge = cavern_of(true);
+    let cavern_beams = neighborhood_beams(&cavern, &tables);
+    let ledge_beams = neighborhood_beams(&ledge, &tables);
+    eprintln!(
+        "box_cavern_ceiling: chunk {:?} (origin y {}), {} beams in its 9 tiles",
+        cavern.origin,
+        origin.y,
+        cavern_beams.iter().map(BeamTile::len).sum::<usize>()
+    );
+
+    // A generated cave (8% air) with one source under its roof, the nearest to the chunk's
+    // center.
+    let (cave, _) = lamp_cave(&g, &registry, &tables, [stone; 3]);
+    let mut sunbeam = Neighborhood::generate(&g, &registry, &tables, cave.origin);
+    let center = &mut sunbeam.chunks[13];
+    let roof = (0..CHUNK_VOLUME - 1024)
+        .filter(|&i| {
+            let p = LocalPos::from_index(i);
+            center.get(p).is_air() && tables.blocks_sky(center.get(LocalPos::from_index(i + 1024)))
+        })
+        .min_by_key(|&i| {
+            let p = LocalPos::from_index(i);
+            let d = |v: u32| (i64::from(v) - 16).abs();
+            d(p.x()) + d(p.y()) + d(p.z())
+        })
+        .expect("a cave roof in the center chunk");
+    center.set(LocalPos::from_index(roof), source);
+    let sun_beams = neighborhood_beams(&sunbeam, &tables);
+    let beam = sun_beams[tile_index(0, 0)]
+        .iter()
+        .next()
+        .expect("the sunbeam");
+    eprintln!(
+        "box_sunbeam: chunk {:?}, beam {:?} cells {}..={}",
+        sunbeam.origin, beam.2.def, beam.2.lo, beam.2.hi
+    );
+
+    let mut g_light = c.benchmark_group("light");
+    g_light.measurement_time(Duration::from_secs(4));
+    for (name, n, beams) in [
+        ("box_cavern_ceiling", &cavern, &cavern_beams),
+        ("box_cavern_ledge", &ledge, &ledge_beams),
+        ("box_sunbeam", &sunbeam, &sun_beams),
+    ] {
+        let mut input = n.input(&tables);
+        assert_eq!(compute(&input, &mut scratch, &mut out), LightPath::FastDark);
+        input.beams = std::array::from_fn(|i| Some(&beams[i]));
+        let path = compute(&input, &mut scratch, &mut out);
+        assert!(
+            matches!(path, LightPath::Full { .. }),
+            "{name} took {path:?}"
+        );
+        eprintln!("{name}: {path:?}");
+        g_light.bench_function(name, |b| {
+            b.iter(|| compute(black_box(&input), &mut scratch, &mut out));
+        });
+    }
+    g_light.finish();
+
+    // The beam tile of the cave's column for the cave box: every layer it reads (the box rows
+    // plus 255 on each side, 20 layers), with sources under every cave roof.
+    let (cx, cz) = (cave.origin.x, cave.origin.z);
+    let y0 = cave.origin.origin().y - MARGIN;
+    let window = y0..=y0 + 63;
+    let decorated = |cy: i64| {
+        let mut chunk = g.generate(ChunkKey::new(ChunkPos::new(cx, cy, cz)), &registry);
+        let placed = roof_sources(&mut chunk, &tables, source);
+        (chunk, placed)
+    };
+    let layers: Vec<(i64, ChunkData)> = ((y0 - 255) >> 5..=(y0 + 63 + 255) >> 5)
+        .rev()
+        .map(|cy| (cy, decorated(cy).0))
+        .collect();
+    let placed: usize = layers
+        .iter()
+        .map(|(_, c)| c.sky_sources(&tables).len())
+        .sum();
+    let column = |chunks: &[(i64, ChunkData)]| {
+        beam_tile::build(window.clone(), &[], &tables, |cy| {
+            chunks
+                .iter()
+                .find(|(y, _)| *y == cy)
+                .map_or(LayerData::Air, |(_, c)| LayerData::Ref(c))
+        })
+    };
+    let fresh: Vec<(i64, ChunkData)> = layers.iter().map(|(y, c)| (*y, c.clone())).collect();
+    let tile = column(&fresh);
+    eprintln!(
+        "beam_tile column ({cx}, {cz}): {} layers, {placed} sources, {} beams, {} B",
+        layers.len(),
+        tile.len(),
+        tile.heap_bytes()
+    );
+    let mut g_beam = c.benchmark_group("beam_tile");
+    g_beam.measurement_time(Duration::from_secs(4));
+    // The masks were built by the first build, as by the light boxes of a loaded world.
+    g_beam.bench_function("build_loaded", |b| {
+        b.iter(|| column(black_box(&fresh)));
+    });
+    g_beam.bench_function("build_loaded_cold_masks", |b| {
+        b.iter_batched(
+            // A clone starts without masks.
+            || {
+                layers
+                    .iter()
+                    .map(|(y, c)| (*y, c.clone()))
+                    .collect::<Vec<_>>()
+            },
+            |chunks| column(&chunks),
+            BatchSize::LargeInput,
+        );
+    });
+    g_beam.bench_function("build_generate", |b| {
+        b.iter(|| {
+            beam_tile::build(window.clone(), &[], &tables, |cy| {
+                LayerData::Owned(decorated(black_box(cy)).0)
+            })
+        });
+    });
+    g_beam.finish();
+}
+
+criterion_group!(benches, bench, bench_beams);
 criterion_main!(benches);

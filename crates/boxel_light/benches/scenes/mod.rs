@@ -94,6 +94,7 @@ impl Neighborhood {
             origin: self.origin,
             chunks,
             sky: SkyInput::Tiles(tiles),
+            beams: [None; 9],
             tables,
         }
     }

@@ -1097,6 +1097,7 @@ fn lit_scene(shift: I64Vec3, light: bool) -> LitScene {
                     debug_assert_eq!(tile_index(dx as i32, dz as i32), i);
                     &tiles[&(pos.x + dx, pos.z + dz)]
                 })),
+                beams: [None; 9],
                 tables: &tables,
             };
             boxel_light::compute(&input, &mut scratch, &mut padded);

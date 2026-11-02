@@ -14,17 +14,22 @@
 //! monotone (more light in, never less out), so the fixpoint is still unique and the
 //! highest-first floods still pop each voxel at its final level.
 //!
+//! Sky sources (ADR 0061) keep it too: a beam cell is direct sky, a level-15 source like a voxel
+//! above `T`, and the beam set is exact because its tiles are built from the world content
+//! ([`crate::beam_tile`]). A beam passes filters of opacity 0 and stays white, as the sky does.
+//!
 //! **Steps** ([`compute`]):
 //! 1. Emitters inside the box, from the chunks whose palette may emit (the others are skipped
 //!    without reading a voxel). Fast paths, from that and the tiles' bounds alone: no emitter
 //!    and the box under every sky top is uniformly dark ([`LightPath::FastDark`]); no emitter
 //!    and the padded chunk above every sky top is uniformly open sky ([`LightPath::FastOpen`]).
 //!    A lamp that is gone but still in a palette, or one outside the box, does not block them.
+//!    A beam that crosses the box rules out `FastDark`; it never changes `FastOpen`.
 //! 2. Opaque (and, when some state has opacity 2..=14, partial) z-row masks of the box, from
 //!    the 27 chunks' [`LightMasks`].
-//! 3. Sky: the direct voxels (above the top of their column) as row masks, built from the 9
-//!    tiles; seeds are the open non-direct voxels next to a direct one, at `15 - cost`; then a
-//!    flood into open non-direct voxels.
+//! 3. Sky: the direct voxels (above the top of their column, and the beam cells of the sky
+//!    sources, ADR 0061) as row masks, built from the 9 tiles; seeds are the open non-direct
+//!    voxels next to a direct one, at `15 - cost`; then a flood into open non-direct voxels.
 //! 4. Block light: one flood per channel present, seeded by the emitters inside the box. When a
 //!    chunk of the box holds a filter voxel, the floods price the filter voxels (and the partial
 //!    ones) one by one; the sky flood never does.
@@ -38,6 +43,7 @@
 //! (sky tops against the box) are `i64` differences relative to the box, saturated, so the
 //! result is the same at any position up to the world limit.
 use crate::SkyTile;
+use crate::beam_tile::BeamTile;
 use crate::padded::{PADDED, PaddedLight, new_full};
 use boxel_voxel::{
     BlockState, ChunkData, ChunkPos, LightMasks, LightTables, LightValue, LocalPos, MaskRows,
@@ -99,6 +105,11 @@ pub struct LightInput<'a> {
     pub chunks: [Option<&'a ChunkData>; 27],
     /// Sky tops.
     pub sky: SkyInput<'a>,
+    /// Beams of sky sources (ADR 0061) of the 3x3 chunk columns, by [`tile_index`]. A tile must
+    /// cover the box's rows (`origin.y * 32 - 16 ..= origin.y * 32 + 47`, checked in debug
+    /// builds). `None`: no beam reaches this column's part of the box (every world without sky
+    /// sources), at no cost.
+    pub beams: [Option<&'a BeamTile>; 9],
     /// Opacity and emission of each state (built from the registry the chunks use).
     pub tables: &'a LightTables,
 }
@@ -241,19 +252,139 @@ enum Sky {
     Mixed,
 }
 
-fn classify(sky: &SkyInput<'_>, origin_y: i64) -> Sky {
-    let SkyInput::Tiles(tiles) = sky else {
-        return Sky::Dark;
+fn classify(input: &LightInput<'_>, origin_y: i64) -> Sky {
+    let sky = match &input.sky {
+        SkyInput::BelowFloor => Sky::Dark,
+        SkyInput::Tiles(tiles) => {
+            let min = tiles.iter().map(|t| t.min()).min().unwrap_or(i64::MIN);
+            let max = tiles.iter().map(|t| t.max()).max().unwrap_or(i64::MIN);
+            // Box top: origin + 31 + MARGIN. Padded bottom: origin - 1.
+            if origin_y.saturating_add(31 + MARGIN) <= min {
+                Sky::Dark
+            } else if origin_y.saturating_sub(1) > max {
+                Sky::Open
+            } else {
+                Sky::Mixed
+            }
+        }
     };
-    let min = tiles.iter().map(|t| t.min()).min().unwrap_or(i64::MIN);
-    let max = tiles.iter().map(|t| t.max()).max().unwrap_or(i64::MIN);
-    // Box top: origin + 31 + MARGIN. Padded bottom: origin - 1.
-    if origin_y.saturating_add(31 + MARGIN) <= min {
-        Sky::Dark
-    } else if origin_y.saturating_sub(1) > max {
-        Sky::Open
-    } else {
+    // Beams add direct voxels: a dark box with one is mixed. An open one is already all 15.
+    if sky == Sky::Dark && any_beams(&input.beams) && beams_cross(&input.beams, origin_y - MARGIN) {
         Sky::Mixed
+    } else {
+        sky
+    }
+}
+
+/// The box columns (`bx` or `bz`) in the chunk column at tile offset `d + 1` (`d` in `-1..=1`).
+fn box_span(d1: usize) -> std::ops::Range<usize> {
+    match d1 {
+        0 => 0..MARGIN as usize,
+        1 => MARGIN as usize..BOX - MARGIN as usize,
+        _ => BOX - MARGIN as usize..BOX,
+    }
+}
+
+/// True if some column has a beam tile. Branch-free, as the dark fast path asks it of every box.
+#[inline]
+fn any_beams(beams: &[Option<&BeamTile>; 9]) -> bool {
+    beams.iter().fold(false, |any, t| any | t.is_some())
+}
+
+/// True if some beam of `beams` has a cell in the box whose bottom row is `box_y0`.
+#[inline(never)]
+fn beams_cross(beams: &[Option<&BeamTile>; 9], box_y0: i64) -> bool {
+    let top = BOX as i64 - 1;
+    beams.iter().enumerate().any(|(ti, tile)| {
+        debug_assert!(
+            tile.is_none_or(|t| t.covers(box_y0, box_y0 + top)),
+            "a beam tile of window {:?} for the box rows {box_y0}..={}",
+            tile.map(BeamTile::window),
+            box_y0 + top
+        );
+        let Some(tile) = tile.filter(|t| t.may_cross(box_y0, box_y0 + top)) else {
+            return false;
+        };
+        let shift = tile.base() - box_y0;
+        box_span(ti / 3).any(|bx| {
+            box_span(ti % 3).any(|bz| {
+                let col = (split(bx).1 << 5) | split(bz).1;
+                tile.packed(col)
+                    .iter()
+                    .any(|b| i64::from(b.lo) + shift <= top && i64::from(b.hi) + shift >= 0)
+            })
+        })
+    })
+}
+
+/// ORs the beam cells of `beams` in the box (bottom row `box_y0`) into `direct`, through
+/// `toggles` (overwritten): per box column, the beams merged into disjoint runs, each run
+/// toggling its first row and the row past its last, then one XOR sweep upwards.
+fn add_beams(
+    beams: &[Option<&BeamTile>; 9],
+    box_y0: i64,
+    direct: &mut BoxRows,
+    toggles: &mut BoxRows,
+) {
+    let top = BOX as i64 - 1;
+    toggles.fill(0);
+    let mut any = false;
+    for (ti, tile) in beams.iter().enumerate() {
+        debug_assert!(
+            tile.is_none_or(|t| t.covers(box_y0, box_y0 + top)),
+            "a beam tile of window {:?} for the box rows {box_y0}..={}",
+            tile.map(BeamTile::window),
+            box_y0 + top
+        );
+        let Some(tile) = tile.filter(|t| t.may_cross(box_y0, box_y0 + top)) else {
+            continue;
+        };
+        // Box row of a beam offset: exact at any height (a difference of nearby values).
+        let shift = tile.base() - box_y0;
+        for bx in box_span(ti / 3) {
+            for bz in box_span(ti % 3) {
+                let col = (split(bx).1 << 5) | split(bz).1;
+                let mut toggle = |lo: i64, hi: i64| {
+                    toggles[((lo as usize) << 6) | bx] ^= 1 << bz;
+                    if hi < top {
+                        toggles[(((hi + 1) as usize) << 6) | bx] ^= 1 << bz;
+                    }
+                    any = true;
+                };
+                let mut run: Option<(i64, i64)> = None;
+                // Sorted by `lo`, so clipped runs come in order and merge in one pass.
+                for b in tile.packed(col) {
+                    let lo = (i64::from(b.lo) + shift).max(0);
+                    if lo > top {
+                        break;
+                    }
+                    let hi = (i64::from(b.hi) + shift).min(top);
+                    if hi < lo {
+                        continue;
+                    }
+                    match run {
+                        Some((s, e)) if lo <= e + 1 => run = Some((s, e.max(hi))),
+                        _ => {
+                            if let Some((s, e)) = run {
+                                toggle(s, e);
+                            }
+                            run = Some((lo, hi));
+                        }
+                    }
+                }
+                if let Some((s, e)) = run {
+                    toggle(s, e);
+                }
+            }
+        }
+    }
+    if any {
+        for r in BOX..ROWS {
+            toggles[r] ^= toggles[r - BOX];
+        }
+        for (d, &t) in direct.iter_mut().zip(toggles.iter()) {
+            *d |= t;
+        }
     }
 }
 
@@ -264,7 +395,7 @@ fn run(
     force_full: bool,
 ) -> LightPath {
     let origin_y = input.origin.origin().y;
-    let sky = classify(&input.sky, origin_y);
+    let sky = classify(input, origin_y);
     let any_emission = box_emitters(input, &mut scratch.emitters);
     let emits = !scratch.emitters.is_empty();
     if !force_full && !emits {
@@ -306,22 +437,34 @@ fn floods(
         gather_rows(&masks.map(|m| m.partial), &mut scratch.partial);
     }
     let cost_of = |bi: usize| u16::from(tables.opacity(state_at(input, bi)).max(1));
+    let any_beams = any_beams(&input.beams);
     let sky = match (force_full, &input.sky) {
         (true, SkyInput::Tiles(_)) => Sky::Mixed,
+        (true, SkyInput::BelowFloor) if any_beams => Sky::Mixed,
         _ => sky,
     };
     let mut sky_pops = 0;
-    match (sky, &input.sky) {
-        (Sky::Mixed, SkyInput::Tiles(tiles)) => {
-            build_direct(tiles, origin_y - MARGIN, &mut scratch.direct);
+    match sky {
+        Sky::Mixed => {
+            match &input.sky {
+                SkyInput::Tiles(tiles) => {
+                    build_direct(tiles, origin_y - MARGIN, &mut scratch.direct);
+                }
+                SkyInput::BelowFloor => scratch.direct.fill(0),
+            }
+            if any_beams {
+                // `closed` is free until the sky flood sets it.
+                let LightScratch { direct, closed, .. } = scratch;
+                add_beams(&input.beams, origin_y - MARGIN, direct, closed);
+            }
             sky_pops = if heavy {
                 sky_flood::<true>(scratch, &cost_of)
             } else {
                 sky_flood::<false>(scratch, &cost_of)
             };
         }
-        (Sky::Open, _) => scratch.direct.fill(u64::MAX),
-        _ => scratch.direct.fill(0),
+        Sky::Open => scratch.direct.fill(u64::MAX),
+        Sky::Dark => scratch.direct.fill(0),
     }
     let filters = emits && tables.any_filter() && masks.iter().any(|m| !m.filter.is_empty());
     if filters {
@@ -701,6 +844,7 @@ mod tests {
             origin: ChunkPos::new(0, 0, 0),
             chunks: [Some(air); 27],
             sky: SkyInput::Tiles([tile; 9]),
+            beams: [None; 9],
             tables,
         }
     }

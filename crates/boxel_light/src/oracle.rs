@@ -1,17 +1,18 @@
 //! The reference the tests compare [`compute`](crate::compute) against: a scalar global light
 //! solver over an explicit voxel world, one channel at a time, with a plain FIFO queue (no
 //! buckets, no masks, no box), and sky tops found by brute force. Light filters (ADR 0060) apply
-//! to the block channels only.
+//! to the block channels only. Sky sources (ADR 0061) light their beams, traced cell by cell,
+//! as direct sky.
 //!
 //! Only with the `oracle` feature (and in this crate's unit tests).
 use boxel_voxel::{
-    BlockState, CHUNK_SIZE, ChunkData, ChunkPos, LightTables, LightValue, LocalPos, MAX_LIGHT,
-    transmit,
+    BeamDir, BlockState, CHUNK_SIZE, ChunkData, ChunkPos, LightTables, LightValue, LocalPos,
+    MAX_LIGHT, SkySourceDef, transmit,
 };
 use std::collections::VecDeque;
 
 /// An explicit world: `dims` chunks per axis from chunk `min`, with each voxel's opacity,
-/// emission and light filter, and the sky top of each column.
+/// emission and light filter, its sky sources, the realm planes and the sky top of each column.
 ///
 /// Voxels are indexed `(y * size_x + x) * size_z + z` and columns `x * size_z + z`, in voxels
 /// from the world's min corner. Light never leaves the world (there is nothing outside it).
@@ -29,6 +30,11 @@ pub struct OracleWorld {
     pub filter: Vec<[u8; 3]>,
     /// Sky top per column (absolute y; `i64::MIN` for open forever).
     pub tops: Vec<i64>,
+    /// Every sky source: voxel index and what it emits.
+    pub sources: Vec<(usize, SkySourceDef)>,
+    /// Realm planes (absolute y, ascending; plane `p` is the bottom of the realm above it). A
+    /// beam never leaves its source's realm. Empty from [`OracleWorld::from_chunks`].
+    pub planes: Vec<i64>,
 }
 
 impl OracleWorld {
@@ -49,6 +55,7 @@ impl OracleWorld {
         let mut opacity = vec![0u8; volume];
         let mut emission = vec![LightValue::DARK; volume];
         let mut filter = vec![[MAX_LIGHT; 3]; volume];
+        let mut sources = Vec::new();
         for (ci, chunk) in chunks.iter().enumerate() {
             let (cy, cx, cz) = (
                 ci / (dims[0] * dims[2]),
@@ -67,6 +74,9 @@ impl OracleWorld {
                 opacity[v] = tables.opacity(state);
                 emission[v] = tables.emission(state);
                 filter[v] = tables.light_filter(state);
+                if let Some(def) = tables.sky_source(state) {
+                    sources.push((v, def));
+                }
             }
         }
         Self {
@@ -76,6 +86,8 @@ impl OracleWorld {
             emission,
             filter,
             tops,
+            sources,
+            planes: Vec::new(),
         }
     }
 
@@ -103,16 +115,45 @@ impl OracleWorld {
         tops
     }
 
+    /// The beam cells of the sky sources: from each source, cell by cell in its direction, while
+    /// the cell has opacity 0, at most `range` cells, inside the world and the source's realm.
+    pub fn beam_cells(&self) -> Vec<bool> {
+        let [sx, sy, sz] = self.size();
+        let y0 = self.min.origin().y;
+        let realm = |y: i64| self.planes.partition_point(|&p| p <= y);
+        let mut beam = vec![false; sx * sy * sz];
+        for &(v, def) in &self.sources {
+            let (y, column) = (v / (sx * sz), v % (sx * sz));
+            let home = realm(y0 + y as i64);
+            for k in 0..i64::from(def.range) {
+                let cy = match def.dir {
+                    BeamDir::Down => y as i64 - k,
+                    BeamDir::Up => y as i64 + k,
+                };
+                if !(0..sy as i64).contains(&cy) || realm(y0 + cy) != home {
+                    break;
+                }
+                let c = cy as usize * sx * sz + column;
+                if self.opacity[c] > 0 {
+                    break;
+                }
+                beam[c] = true;
+            }
+        }
+        beam
+    }
+
     /// The global light of every voxel.
     pub fn solve(&self) -> Vec<LightValue> {
         let [sx, sy, sz] = self.size();
         let y0 = self.min.origin().y;
         let volume = sx * sy * sz;
         let mut out = vec![0u16; volume];
-        // Direct sky: above the top of the column.
+        let beam = self.beam_cells();
+        // Direct sky: above the top of the column, or in a beam.
         let direct = |v: usize| {
             let (y, x, z) = (v / (sx * sz), v / sz % sx, v % sz);
-            y0 + y as i64 > self.tops[x * sz + z]
+            beam[v] || y0 + y as i64 > self.tops[x * sz + z]
         };
         // Each channel with the index of its filter (`None`: sky, never filtered).
         for (shift, k) in [

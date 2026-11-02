@@ -8,10 +8,14 @@ design document: nothing here is built. Paths are relative to the repo root. Num
 recorded as decisions in sec. 9, and per-realm face shading was added to Option A (sec. 3 and
 lane 4).
 
-**Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039) and 1 (source states
-in `boxel_voxel`). Lane 1 keeps the source list beside the masks (`ChunkData::sky_sources`,
-`OwnedLightMasks::sky_sources`) instead of in the `LightMasks` view: in the view it cost 8 % on
-`masks/cave_1bit`, and only the beam tiles read it.
+**Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039), 1 (source states
+in `boxel_voxel`) and 2 (beams in `boxel_light`). Lane 1 keeps the source list beside the masks
+(`ChunkData::sky_sources`, `OwnedLightMasks::sky_sources`) instead of in the `LightMasks` view:
+in the view it cost 8 % on `masks/cave_1bit`, and only the beam tiles read it. Lane 2 differs
+from sec. 2.3 in four small ways (ADR 0061 sec. 3 has the detail): the index is `u32` (4 KiB,
+none for an empty tile), since a column can hold more than 65 535 beams in reach; a window is
+at most `MAX_WINDOW` (65 024) rows; `build` takes the realm planes as a plain ascending slice and
+no column argument; and it adds `BeamTile::edit`, the in-place retrace lane 3 calls on edits.
 
 **Verdict.** Build Option A: sky sources write the existing sky channel, and each realm gets its
 own sky color, intensity, daylight curve, ambient color and face shading, applied in the shader
@@ -169,10 +173,12 @@ window of voxels `[w_lo, w_hi]`:
 - `sources`: every source of the column that can reach the window (a down source with
   `w_lo <= y <= w_hi + R - 1`, an up source with `w_lo - R + 1 <= y <= w_hi`), each with its full,
   unclipped beam `[lo, hi]`. Kept per (x, z) column, sorted by `lo`.
-- Layout: `index: Box<[u16; 1025]>` (offsets per column) and `beams: Vec<Beam>`, with
+- Layout: `index: Box<[u32]>` (offsets per column, 1025 entries, empty without beams; built as
+  `u32` because a column can hold more than 65 535 beams in reach) and `beams: Vec<Beam>`, with
   `Beam { y: u16, lo: u16, hi: u16, flags: u16 }` as offsets from `w_lo - MAX_BEAM`. A window is
-  at most the loaded vertical extent plus `2 * MAX_BEAM` (about 1 100 voxels at a vertical radius
-  of 8), so 16-bit offsets are exact at any height (ADR 0014). 8 B per source plus 2 KiB.
+  at most `MAX_WINDOW` (65 024) rows, far above the loaded vertical extent plus `2 * MAX_BEAM`
+  (about 1 100 voxels at a vertical radius of 8), so 16-bit offsets are exact at any height
+  (ADR 0014). 8 B per source plus 4 KiB.
 - `version`, like `SkyTile`.
 
 **`beam_tile::build(window, column, realm planes, tables, layer)`** walks the column from
@@ -446,10 +452,10 @@ table and the realm lookup). Not touched: frame pacing, physics, `boxel_gfx`, `v
 - A chunk with no source in reach: 0 B. A world without sources: 0 B everywhere.
 - A chunk that holds sources: one palette entry; a 1-bit cave chunk becomes 2-bit (+4 KiB of
   voxels) and builds its masks (+4 KiB, +4 KiB more if partial voxels, + 4 B per source).
-- A chunk column with a beam tile: 2 KiB plus 8 B per source in reach. A full ceiling (1024
-  sources) is about 10 KiB per column: about 11 MiB at r16 and 42 MiB at r32 if the whole view is
-  under such a ceiling (a cavern realm), against 7.4 and 27.7 MiB of sky tiles measured. A source
-  every second column divides it by 4.
+- A chunk column with a beam tile: 4 KiB plus 8 B per source in reach (0 B with none). A full
+  ceiling (1024 sources) is about 12 KiB per column: about 13 MiB at r16 and 50 MiB at r32 if the
+  whole view is under such a ceiling (a cavern realm), against 7.4 and 27.7 MiB of sky tiles
+  measured. A source every second column along x and z halves it.
 - `ChunkLight` (gameplay cache, r8): a lit cavern chunk is `SkyOnly` (16 KiB) instead of
   `Uniform` (0 B), like a surface chunk.
 

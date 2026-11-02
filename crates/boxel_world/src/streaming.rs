@@ -338,6 +338,7 @@ fn with_light<R>(
             origin: pos,
             chunks,
             sky: tiles.map_or(SkyInput::BelowFloor, SkyInput::Tiles),
+            beams: [None; 9],
             tables: &job.tables,
         };
         let path = boxel_light::compute(&input, scratch, padded);
