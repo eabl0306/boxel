@@ -2,8 +2,8 @@
 //! Runs on any machine (no GPU): WGSL front end, validator, and every backend wgpu uses on
 //! desktop: GLSL (GL tiers), MSL (Metal), HLSL SM 5.1 (FXC) and SM 6.0 (DXC), SPIR-V (Vulkan).
 use boxel_shaders::gpu::{
-    ChunkGpu, ChunkImmediate, DrawIndexedIndirect, FogHeader, FogLayerGpu, LodImmediate,
-    RealmEnvGpu, ViewUniform,
+    ChunkGpu, ChunkImmediate, DrawIndexedIndirect, DynamicLightGpu, FogHeader, FogLayerGpu,
+    LodImmediate, RealmEnvGpu, ViewUniform,
 };
 use boxel_shaders::{ShaderModuleId, Stage};
 use naga::back::{glsl, hlsl, msl, spv};
@@ -372,6 +372,22 @@ fn wgsl_realm_bits_match_the_mirrors() {
         // The AO byte (bits 0..8) and the 4 flags (8..12) come first.
         assert_eq!(const_u32(&module, "AO_REALM_SHIFT"), 12, "{id:?}");
     }
+    // The dynamic lights' bits (ADR 0062) follow the realm, one per light, in the 16 bits left.
+    use boxel_shaders::gpu::MAX_DYNAMIC_LIGHTS;
+    for id in [
+        ShaderModuleId::VoxelPull,
+        ShaderModuleId::VoxelInstanced,
+        ShaderModuleId::Cell,
+    ] {
+        let (module, _) = load(id);
+        assert_eq!(const_u32(&module, "AO_DYNAMIC_SHIFT"), 16, "{id:?}");
+        assert_eq!(
+            const_u32(&module, "MAX_DYNAMIC_LIGHTS") as usize,
+            MAX_DYNAMIC_LIGHTS,
+            "{id:?}"
+        );
+    }
+    const { assert!(16 + MAX_DYNAMIC_LIGHTS <= 32) };
     let (module, _) = load(ShaderModuleId::Model);
     assert_eq!(const_u32(&module, "MODEL_REALM_SHIFT"), model::REALM_SHIFT);
     // The shade's 8 bits end where the realm starts, and 4 bits fit in the word.
@@ -504,17 +520,18 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     let (pull, _) = load(ShaderModuleId::VoxelPull);
     let (size, offsets) = struct_layout(&pull, "View");
     // The per-frame part, then the model box table (ADR 0020). The realm planes and entries
-    // (2 + 27 vec4) take it from 352 to 816 bytes: 9,008 with the table, one uniform block on
-    // Low, well under the 16 KiB GL ES 3.0 guarantees.
+    // (2 + 27 vec4) take it from 352 to 816 bytes, the dynamic lights (1 + 32 vec4, ADR 0062)
+    // to 1,344: 9,536 with the table, one uniform block on Low, well under the 16 KiB GL ES 3.0
+    // guarantees.
     assert_eq!(u64::from(size), boxel_shaders::gpu::VIEW_BUFFER_SIZE);
-    assert_eq!(size, 816 + 8192);
+    assert_eq!(size, 1344 + 8192);
     assert!(size <= 16384);
     assert_eq!(
-        u64::from(offsets[13]),
+        u64::from(offsets[15]),
         boxel_shaders::gpu::VIEW_BOXES_OFFSET
     );
-    assert_eq!(size_of::<ViewUniform>(), 816);
-    let offsets = offsets[..13].to_vec();
+    assert_eq!(size_of::<ViewUniform>(), 1344);
+    let offsets = offsets[..15].to_vec();
     let rust = [
         offset_of!(ViewUniform, view_proj),
         offset_of!(ViewUniform, frustum),
@@ -529,9 +546,21 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
         offset_of!(ViewUniform, viewport),
         offset_of!(ViewUniform, realm_planes),
         offset_of!(ViewUniform, realm_env),
+        offset_of!(ViewUniform, dynamic_count),
+        offset_of!(ViewUniform, dynamic_lights),
     ];
     assert_eq!(offsets, rust.map(|o| o as u32));
-    assert_eq!(offsets[7..], [240, 256, 272, 336, 352, 384]);
+    assert_eq!(offsets[7..], [240, 256, 272, 336, 352, 384, 816, 832]);
+    let (size, offsets) = struct_layout(&pull, "DynamicLight");
+    assert_eq!((size, size_of::<DynamicLightGpu>()), (32, 32));
+    assert_eq!(
+        offsets,
+        [
+            offset_of!(DynamicLightGpu, pos),
+            offset_of!(DynamicLightGpu, level)
+        ]
+        .map(|o| o as u32)
+    );
     let (size, offsets) = struct_layout(&pull, "RealmEnv");
     assert_eq!((size, size_of::<RealmEnvGpu>()), (48, 48));
     assert_eq!(

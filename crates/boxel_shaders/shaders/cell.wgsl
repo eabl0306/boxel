@@ -14,8 +14,8 @@
 //            cell's LightValue << 16
 //   data.y = tint, sRGB 0xRRGGBB | opacity (8 bits, translucent quads only) << 24
 // fs_cell is a cutout terrain fragment: alpha test, then shade_fragment with the quad's face,
-// its cell's light at the 4 corners, AO open and its chunk's realm (realm planes are chunk
-// aligned, so the chunk's realm is its cell's). fs_cell_translucent (ADR 0055, its pipeline
+// its cell's light at the 4 corners, AO open, its chunk's realm (realm planes are chunk
+// aligned, so the chunk's realm is its cell's) and the dynamic lights near it (ADR 0062). fs_cell_translucent (ADR 0055, its pipeline
 // blends and writes depth) shades the same way and gives the image's alpha times the opacity,
 // dropping texels of alpha under a tenth as Minecraft's translucent item shader does.
 //
@@ -41,8 +41,13 @@ struct CellOut {
   @location(0) uv: vec2<f32>,
   @location(1) @interpolate(flat) data: vec2<u32>,
   @location(2) view_dist: f32,
-  @location(3) @interpolate(flat) realm: u32,      // the realm of the quad's chunk (realm_at)
+  @location(3) @interpolate(flat) realm: u32,      // the realm of the quad's chunk (realm_at), then the dynamic lights that may reach it from bit 16 (AO_DYNAMIC_SHIFT)
+  @location(4) pos: vec3<f32>,                     // the point relative to render_origin (dynamic lights)
 };
+
+// A cell quad's corners are within about a block of each other, so the dynamic lights within
+// this many blocks of the reach of one corner hold every light of the quad.
+const CELL_DYNAMIC_MARGIN: f32 = 2.0;
 
 // The corner `pos` of a quad of the chunk at `origin`, relative to the render origin.
 fn cell_rel(origin: vec3<i32>, pos: vec3<f32>) -> vec3<f32> {
@@ -64,6 +69,11 @@ fn vs_cell(
   o.data = data;
   o.view_dist = length(rel - view.camera_rel.xyz);
   o.realm = realm_at(origin.y - view.render_origin.y);
+  if (view.dynamic_count.x != 0u) {
+    let lights = dynamic_mask(rel - vec3(CELL_DYNAMIC_MARGIN), rel + vec3(CELL_DYNAMIC_MARGIN));
+    o.realm = o.realm | (lights << AO_DYNAMIC_SHIFT);
+  }
+  o.pos = rel;
   return o;
 }
 
@@ -116,6 +126,7 @@ fn vs_cell_pattern(
   o.data = data;
   o.view_dist = length(rel - view.camera_rel.xyz);
   o.realm = 0u;
+  o.pos = rel;
   return o;
 }
 
@@ -146,7 +157,9 @@ fn cell_shade(albedo: vec4<f32>, i: CellOut) -> vec4<f32> {
   v.view_dist = i.view_dist;
   v.st = vec2(0.0);
   v.light = vec2(corners, corners);
-  v.ao = 0xFFu | select(0u, FLAG_EMISSIVE << 8u, (i.data.x & CELL_BRIGHT_BIT) != 0u) | (i.realm << AO_REALM_SHIFT);
+  v.ao = 0xFFu | select(0u, FLAG_EMISSIVE << 8u, (i.data.x & CELL_BRIGHT_BIT) != 0u)
+    | ((i.realm & 15u) << AO_REALM_SHIFT) | ((i.realm >> AO_DYNAMIC_SHIFT) << AO_DYNAMIC_SHIFT);
+  v.pos = i.pos;
   return shade_fragment(vec4(albedo.rgb * cell_linear(tint), albedo.a), v, view);
 }
 

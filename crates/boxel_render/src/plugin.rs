@@ -17,7 +17,7 @@ use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     AllocProbeReport, BlockTextureData, ChunkMemorySettings, ChunkMemoryStats, ChunkOp,
-    DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RealmShading, RendererConfig,
+    DEFAULT_SKY_COLOR, DistanceFog, DynamicLights, FLUID_TIME_PERIOD, RealmShading, RendererConfig,
     RendererSmokeTest, SceneLight, SceneRealms, TextureReport, TextureSource, TranslucentSort,
     ViewParams, VoxelRenderer, generate_block_textures, light_curve, load_block_textures,
     texture_tick,
@@ -34,7 +34,7 @@ use boxel_gfx::{
     build_fingerprint, configure_surface, create_gl_instance, create_instance,
     install_lkg_panic_hook, read_texture_rgba8, select_gpu,
 };
-use boxel_math::{Quat, UVec2};
+use boxel_math::{DVec3, Quat, UVec2};
 use boxel_mesh::MaterialTable;
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, BlockRegistry, BlockRegistryBuilder, ChunkPos, LightValue};
@@ -446,11 +446,15 @@ impl Plugin for RenderPlugin {
             Render,
             (
                 setup.in_set(RenderSystems::Setup),
-                (extract, extract_visibility)
+                (
+                    extract,
+                    crate::dynamic_light::extract_dynamic_lights,
+                    extract_visibility,
+                )
                     .chain()
                     .in_set(RenderSystems::Extract),
                 crate::model::extract_models
-                    .after(extract)
+                    .after(crate::dynamic_light::extract_dynamic_lights)
                     .in_set(RenderSystems::Extract),
                 extract_moving_cells.in_set(RenderSystems::Extract),
                 prepare.in_set(RenderSystems::Prepare),
@@ -810,6 +814,13 @@ pub(crate) struct ExtractedFrame {
     presented: bool,
     /// The presentation gate was used (presented or skipped): `Cleanup` closes it.
     gate_used: bool,
+}
+
+impl ExtractedFrame {
+    /// The active camera's eye this frame (after `extract`), `None` without one.
+    pub(crate) fn camera_eye(&self) -> Option<DVec3> {
+        self.camera.map(|(_, transform)| transform.translation)
+    }
 }
 
 /// What to do after a frame (see [`RejectedFrames::record`]).
@@ -1485,6 +1496,7 @@ fn scene_light(
         block_gain: settings.block_light_gain,
         curve: light_curve(settings.light_gamma),
         realms,
+        dynamic: DynamicLights::default(),
     };
     (
         daylight.map_or(settings.clear_color, |d| d.sky_color),

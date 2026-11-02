@@ -35,6 +35,7 @@ macro_rules! frame_span {
 pub(crate) struct NoSpan;
 
 mod distance_fog;
+mod dynamic_light;
 pub mod fog;
 mod light;
 pub mod lod;
@@ -63,6 +64,7 @@ mod upload;
 
 pub use cells::{CellStats, MovingCellQuad};
 pub use distance_fog::{DistanceFog, DistanceFogError};
+pub use dynamic_light::{DynamicLight, DynamicLights, MAX_DYNAMIC_LIGHTS, PointLight};
 pub use light::{LIGHT_LEVELS, RealmShading, SceneLight, SceneRealms, light_curve};
 pub use memory::{
     ChunkMemoryError, ChunkMemorySettings, ChunkMemoryStats, DEFAULT_PAGE_QUADS, MIN_PAGE_QUADS,
@@ -108,7 +110,7 @@ pub mod prelude {
     pub use crate::lod::{LodPlugin, LodSettings};
     pub use crate::model::{ModelInstance, ModelLayer, ModelTexture};
     pub use crate::{
-        BlockOutline, DistanceFog, PresentSettings, RenderInfo, RenderPlugin, RenderSettings,
-        RequestScreenshot, ScreenshotSaved,
+        BlockOutline, DistanceFog, DynamicLight, PresentSettings, RenderInfo, RenderPlugin,
+        RenderSettings, RequestScreenshot, ScreenshotSaved,
     };
 }

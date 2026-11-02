@@ -1678,6 +1678,7 @@ impl VoxelRenderer {
         light_params[2] = pattern_phase(view.texture_tick);
         let (realm_planes, realm_env) =
             view.light.realms.uniform(&view.light, view.render_origin.y);
+        let (dynamic_count, dynamic_lights) = view.light.dynamic.uniform(view.render_origin);
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: cull_view.frustum.to_array(),
@@ -1709,6 +1710,8 @@ impl VoxelRenderer {
             ],
             realm_planes,
             realm_env,
+            dynamic_count,
+            dynamic_lights,
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         self.view_uniform = uniform;

@@ -200,6 +200,11 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
+  --ao MODE           ambient occlusion baked into the meshes: off, baked (every face, what a
+                      world with dynamic lights meshes with, ADR 0062) or lit-only (faces with
+                      some light; the world's default)
+  --held-light R,G,B  a dynamic light at the camera with this emission per channel (0 to 15, a
+                      torch is 14,11,6; ADR 0062), as a held torch
   --cave-culling on|off  skip the chunks the camera cannot see through open space (default on;
                       --no-cave-culling is off)
   --idle-work on|off  the world's work between frames under --fps-limit (default on, ADR 0023);
@@ -333,6 +338,10 @@ struct Options {
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
     light: bool,
+    /// `--ao`: the world's AO policy (`None`: the world's default).
+    ao: Option<AoPolicy>,
+    /// `--held-light`: a dynamic light at the camera with this emission (ADR 0062).
+    held_light: Option<[u8; 3]>,
     /// `--cave-culling`: on (the default) or off.
     cave_culling: bool,
     /// `--idle-work`: the world's work between frames on (the default) or off.
@@ -416,6 +425,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         edits: false,
         time: 12.0,
         light: true,
+        ao: None,
+        held_light: None,
         cave_culling: true,
         idle_work: true,
         no_distance_fog: false,
@@ -622,6 +633,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--light" => o.light = on_off(flag, &value()?)?,
+            "--ao" => o.ao = Some(ao_policy(flag, &value()?)?),
+            "--held-light" => o.held_light = Some(emission(flag, &value()?)?),
             "--cave-culling" => o.cave_culling = on_off(flag, &value()?)?,
             "--no-cave-culling" => o.cave_culling = false,
             "--cave" => o.cave = true,
@@ -1055,7 +1068,7 @@ impl Recorder {
 
 fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
     let o = &bench.options;
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera {
             // 32 blocks a chunk of radius, not where the meshed disc is complete as in the
             // other examples (`ChunkViewer::mesh_reach`): the far plane culls as it always did,
@@ -1070,6 +1083,12 @@ fn spawn_camera(mut commands: Commands, bench: Res<Bench>) {
             o.vertical_radius
         }),
     ));
+    if let Some(emission) = o.held_light {
+        camera.insert(DynamicLight {
+            emission,
+            offset: Vec3::ZERO,
+        });
+    }
 }
 
 /// `PreUpdate`, after `record`: what chunk memory did in each measured frame, kept in the
@@ -1615,11 +1634,34 @@ fn world_settings(
         idle_work: options.idle_work,
         ..WorldSettings::default()
     };
+    if let Some(ao) = options.ao {
+        settings.ao_policy = ao;
+    }
     if !options.light {
         settings.light = false;
         settings.ao_policy = AoPolicy::Off;
     }
     settings
+}
+
+/// `--ao`'s value.
+fn ao_policy(flag: &str, v: &str) -> Result<AoPolicy, String> {
+    match v {
+        "off" => Ok(AoPolicy::Off),
+        "baked" => Ok(AoPolicy::Baked),
+        "lit-only" => Ok(AoPolicy::BakedLitOnly),
+        _ => Err(format!("{flag}: {v:?} is not off, baked or lit-only")),
+    }
+}
+
+/// `--held-light`'s value: three levels `0..=15`.
+fn emission(flag: &str, v: &str) -> Result<[u8; 3], String> {
+    let levels: Vec<u8> = v
+        .split(',')
+        .map(|c| c.trim().parse::<u8>().ok().filter(|&l| l <= 15))
+        .collect::<Option<_>>()
+        .ok_or_else(|| format!("{flag}: {v:?} is not R,G,B levels 0 to 15"))?;
+    <[u8; 3]>::try_from(levels).map_err(|_| format!("{flag}: {v:?} is not R,G,B levels 0 to 15"))
 }
 
 /// What the summary says about the run before it starts: the options, the present mode, the
@@ -2115,6 +2157,25 @@ mod tests {
             Some(first),
             "never goes back"
         );
+    }
+
+    /// `--ao` sets the world's AO policy (`--light off` still turns it off), `--held-light` takes
+    /// three levels up to 15.
+    #[test]
+    fn ao_and_held_light_parse() {
+        let o = options(&["--ao", "baked", "--held-light", "14,11,6"]);
+        assert_eq!(world_settings(&o, None).ao_policy, AoPolicy::Baked);
+        assert_eq!(o.held_light, Some([14, 11, 6]));
+        assert_eq!(options(&[]).held_light, None);
+        let off = options(&["--ao", "baked", "--light", "off"]);
+        assert_eq!(world_settings(&off, None).ao_policy, AoPolicy::Off);
+        for bad in [
+            &["--ao", "on"][..],
+            &["--held-light", "16,0,0"],
+            &["--held-light", "1,2"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -147,7 +147,8 @@ pub struct WorldSettings {
     /// Which faces the mesher bakes ambient occlusion into (ADR 0015). The default,
     /// `BakedLitOnly`, skips faces whose 4 corners are dark (most cave faces). A change applies
     /// to the meshes built after it. With `light` off every face counts as lit, so every face
-    /// gets AO unless this is `AoPolicy::Off`.
+    /// gets AO unless this is `AoPolicy::Off`. An app with dynamic lights (ADR 0062) sets
+    /// `Baked`: they light dark faces too.
     pub ao_policy: AoPolicy,
     /// Voxel light (ADR 0015): sky light from per-column sky tops plus RGB block light, baked
     /// into each mesh by its job. Off: meshes see open sky everywhere and no sky tops are

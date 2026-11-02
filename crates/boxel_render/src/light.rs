@@ -6,6 +6,7 @@
 //! ambient floor and face shade. The shaders find a voxel's realm from the planes in the same
 //! uniform, so a realm costs no per-chunk data.
 
+use crate::DynamicLights;
 use boxel_shaders::gpu::{REALM_ENVS, REALM_PLANES, RealmEnvGpu};
 use boxel_world::DEFAULT_FACE_SHADE;
 
@@ -131,6 +132,9 @@ pub struct SceneLight {
     /// The realms (ADR 0039): where they meet and each one's sky light, ambient floor and face
     /// shade. [`SceneRealms::default`]: one realm, lit by `sky` and `ambient`.
     pub realms: SceneRealms,
+    /// The dynamic point lights of the frame (ADR 0062): block light that moves, added in the
+    /// shaders by the brightest per channel. Empty by default.
+    pub dynamic: DynamicLights,
 }
 
 impl SceneLight {
@@ -150,6 +154,7 @@ impl SceneLight {
             block_gain: 1.0,
             curve: light_curve(Self::DEFAULT_GAMMA),
             realms: SceneRealms::default(),
+            dynamic: DynamicLights::default(),
         }
     }
 

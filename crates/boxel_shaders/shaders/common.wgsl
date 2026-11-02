@@ -116,6 +116,11 @@ const CHUNK_SIZE: f32 = 32.0;
 const AO_REALM_SHIFT: u32 = 12u;
 // The last realm entry of View::realm_env (boxel_shaders::gpu::REALM_ENVS - 1).
 const REALM_LAST: u32 = 8u;
+// Dynamic point lights (ADR 0062): View::dynamic_lights holds at most MAX_DYNAMIC_LIGHTS
+// (boxel_shaders::gpu::MAX_DYNAMIC_LIGHTS), and VsOut::ao keeps one bit per light that may
+// reach the quad from AO_DYNAMIC_SHIFT (16 bits).
+const MAX_DYNAMIC_LIGHTS: u32 = 16u;
+const AO_DYNAMIC_SHIFT: u32 = 16u;
 
 // One realm's light (ADR 0015 and 0039; boxel_shaders::gpu::RealmEnvGpu): its sky light (rgb),
 // its ambient floor (rgb) and its 6 face shade factors, in the w of the first two and in the
@@ -124,6 +129,12 @@ struct RealmEnv {
   sky: vec4<f32>,                  // rgb = sky light color times the daylight intensity (linear), w = shade of +Y faces
   ambient: vec4<f32>,              // rgb = ambient floor (linear), w = shade of -Y faces
   shade: vec4<f32>,                // shade of +X, -X, +Z, -Z faces
+};
+
+// One dynamic point light (ADR 0062; boxel_shaders::gpu::DynamicLightGpu).
+struct DynamicLight {
+  pos: vec4<f32>,                  // xyz = position relative to render_origin, w = reach (its brightest level)
+  level: vec4<f32>,                // rgb = its block light level per channel (0..15)
 };
 
 struct View {
@@ -140,6 +151,8 @@ struct View {
   viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = still flow textures (bit 0 water, bit 1 lava; ADR 0028)
   realm_planes: array<vec4<i32>, 2>, // the planes between realms relative to render_origin.y, clamped to i32, ascending (plane 4k + j at [k][j]); unused ones i32::MAX
   realm_env: array<RealmEnv, 9>,   // each realm's light, bottom realm first (realm_at)
+  dynamic_count: vec4<u32>,        // x = dynamic lights in use (0: none, the shaders skip them)
+  dynamic_lights: array<DynamicLight, 16>, // ADR 0062, the first dynamic_count.x in use
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
   // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
   boxes: array<vec4<u32>, 512>,
@@ -163,7 +176,8 @@ struct VsOut {
   @location(3) view_dist: f32,
   @location(4) st: vec2<f32>,                       // quad-local (s, t): corner k sits at (k & 1, k >> 1)
   @location(5) @interpolate(flat) light: vec2<u32>, // the quad's light palette entry (4 corner lights)
-  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE), then its realm (bits 12..16, AO_REALM_SHIFT)
+  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE), then its realm (bits 12..16, AO_REALM_SHIFT), then the dynamic lights that may reach it (bit 16 + k for light k, AO_DYNAMIC_SHIFT)
+  @location(7) pos: vec3<f32>,                      // the point relative to render_origin, before edge growth (dynamic lights)
 };
 
 struct Decoded {
@@ -177,6 +191,8 @@ struct Decoded {
   flags: u32,
   grow: vec2<f32>,                 // the corner's outward direction along u and v (-1 or 1)
   front_y: i32,                    // chunk-local y of the voxel whose light the quad shows (-1..=32): its realm's light lights it
+  cell: vec3<f32>,                 // chunk-local min corner of the quad's first cell
+  span: vec2<f32>,                 // the cells the quad spans along u and v (1 for a box face, a cross or a plane)
 };
 
 fn face_normal(f: u32) -> vec3<f32> {
@@ -254,6 +270,10 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.ao = select((mat >> MAT_AO_SHIFT) & 0xFFu, 0xFFu, sloped);
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
+  // The cells the quad lies in, for the dynamic lights (dynamic_mask): its extent bits hold a
+  // table index on a box face or a plane.
+  o.cell = p;
+  o.span = select(vec2(w, h), vec2(1.0), boxed || shape == SHAPE_CROSS);
   // The voxel whose light the face shows: the one in front of it (as the mesher reads it). An
   // edge wall, a cross and a plane show the light of their own cell (below). A box face inside
   // its cell with an opaque cube in front takes its own cell's light too (boxel_mesh's
@@ -492,6 +512,23 @@ fn edge_growth(clip: vec4<f32>, axis_u: vec4<f32>, axis_v: vec4<f32>, half_px: v
   return select(vec2(0.0), t, clip.w > 0.0);
 }
 
+// The dynamic lights (their bits, light k at bit k) that may light some point of the box `lo`
+// to `hi` (relative to render_origin): those less than their reach from it in Manhattan
+// distance. Only a hint for the fragment (dynamic_levels), so a box may be larger than what it
+// holds; with no light in use it is 0 and the fragment does what it did before dynamic lights.
+fn dynamic_mask(lo: vec3<f32>, hi: vec3<f32>) -> u32 {
+  var mask = 0u;
+  let lights = min(view.dynamic_count.x, MAX_DYNAMIC_LIGHTS);
+  for (var k = 0u; k < lights; k++) {
+    let l = view.dynamic_lights[k];
+    let d = max(max(lo - l.pos.xyz, l.pos.xyz - hi), vec3(0.0));
+    if (d.x + d.y + d.z < l.pos.w) {
+      mask = mask | (1u << k);
+    }
+  }
+  return mask;
+}
+
 fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   // wrapping i32 subtraction first: exact for any world position (see the top), then small floats
   let rel = vec3<f32>(chunk_origin - view.render_origin.xyz) + d.local;
@@ -532,7 +569,17 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   // under a plane shows the light of the cell above it, so it takes the upper realm's light.
   // Integers before any growth, and flat per quad.
   let realm = realm_at(chunk_origin.y - view.render_origin.y + d.front_y);
-  o.ao = d.ao | (d.flags << 8u) | (realm << AO_REALM_SHIFT);
+  // The dynamic lights that may reach the quad (ADR 0062): from the box of its cells, the same
+  // at its 4 corners, two more blocks on every side (a model box reaches up to 31/16 of a block
+  // from its cell's corner, and the fragment reads the light half a block in front of the face).
+  var lights = 0u;
+  if (view.dynamic_count.x != 0u) {
+    let base = vec3<f32>(chunk_origin - view.render_origin.xyz) + d.cell;
+    let far = face_u(d.face) * (d.span.x - 1.0) + face_v(d.face) * (d.span.y - 1.0);
+    lights = dynamic_mask(base - vec3(2.0), base + far + vec3(3.0));
+  }
+  o.ao = d.ao | (d.flags << 8u) | (realm << AO_REALM_SHIFT) | (lights << AO_DYNAMIC_SHIFT);
+  o.pos = rel;
   return o;
 }
 
@@ -571,11 +618,37 @@ fn out_realm(i: VsOut) -> u32 {
   return (i.ao >> AO_REALM_SHIFT) & 15u;
 }
 
-// The light reaching a fragment: the 4 corner lights interpolated per channel at (s, t), each
-// channel through the brightness curve, then the brightest of sky light (times its realm's sky
-// color), block light (times its gain) and its realm's ambient floor.
+// The block light levels (red, green, blue) the dynamic lights give fragment `i` (ADR 0062),
+// the brightest per channel: a light of level L gives L - d at Manhattan distance d, as a
+// block emitter's light falls off in open air, measured from the point half a block in front of
+// the face (the center of the voxel the mesher reads a face's light from). A face never takes
+// light from behind its plane: a wall does not light the room past it. A cross (plants) has no
+// side: it takes the light at its own point. Only the lights in the quad's bits are read.
+fn dynamic_levels(i: VsOut) -> vec3<f32> {
+  let mask = i.ao >> AO_DYNAMIC_SHIFT;
+  let cross = ((i.ao >> 9u) & GEO_SHAPE_MASK) == SHAPE_CROSS;
+  let n = select(face_normal(i.face), vec3(0.0), cross);
+  let front = i.pos + 0.5 * n;
+  var level = vec3(0.0);
+  for (var k = 0u; (mask >> k) != 0u; k++) {
+    if (((mask >> k) & 1u) == 0u) { continue; }
+    let l = view.dynamic_lights[k];
+    if (!cross && dot(l.pos.xyz - i.pos, n) <= 0.0) { continue; }
+    let d = abs(l.pos.xyz - front);
+    level = max(level, l.level.rgb - vec3(d.x + d.y + d.z));
+  }
+  return level;
+}
+
+// The light reaching a fragment: the 4 corner lights interpolated per channel at (s, t), the
+// block channels raised to the dynamic lights' levels (the brightest per channel, as block light
+// mixes), each channel through the brightness curve, then the brightest of sky light (times its
+// realm's sky color), block light (times its gain) and its realm's ambient floor.
 fn voxel_light(i: VsOut, view: View) -> vec3<f32> {
-  let l = bilinear(corner_light(i.light, 0u), corner_light(i.light, 1u), corner_light(i.light, 2u), corner_light(i.light, 3u), i.st);
+  var l = bilinear(corner_light(i.light, 0u), corner_light(i.light, 1u), corner_light(i.light, 2u), corner_light(i.light, 3u), i.st);
+  if ((i.ao >> AO_DYNAMIC_SHIFT) != 0u) {
+    l = vec4(l.x, max(l.yzw, dynamic_levels(i)));
+  }
   let env = realm_env(out_realm(i));
   let sky = level_curve(l.x) * env.sky.rgb;
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;

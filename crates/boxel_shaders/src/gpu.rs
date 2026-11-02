@@ -10,6 +10,8 @@ pub const VIEW_BOXES_OFFSET: u64 = size_of::<ViewUniform>() as u64;
 /// Bytes of the whole `View` uniform buffer: the per-frame [`ViewUniform`] (written every frame)
 /// and the model box table (written when the blocks change).
 pub const VIEW_BUFFER_SIZE: u64 = VIEW_BOXES_OFFSET + 8 * VIEW_BOX_CAPACITY as u64;
+// One uniform block on Low: GL ES 3.0 guarantees 16 KiB.
+const _: () = assert!(VIEW_BUFFER_SIZE <= 16384);
 
 /// Realm planes the `View` uniform holds (`boxel_worldgen::realm::MAX_REALM_PLANES`).
 pub const REALM_PLANES: usize = 8;
@@ -30,7 +32,24 @@ pub struct RealmEnvGpu {
     pub shade: [f32; 4],
 }
 
-/// The per-frame part of the uniform `View` (816 bytes, std140-compatible: only vec4/mat4
+/// Dynamic point lights the `View` uniform holds (ADR 0062): the renderer keeps the ones
+/// nearest the camera. A quad keeps one bit per light in the free high bits of its flat AO word
+/// (`VsOut::ao`), so this is at most 16.
+pub const MAX_DYNAMIC_LIGHTS: usize = 16;
+
+/// One dynamic point light in the `View` uniform (`DynamicLight` in `common.wgsl`, 32 bytes,
+/// std140, ADR 0062).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct DynamicLightGpu {
+    /// xyz = position relative to the render origin (blocks), w = its reach: the level of its
+    /// brightest channel (no light at that Manhattan distance or farther).
+    pub pos: [f32; 4],
+    /// rgb = its level per block light channel (red, green, blue; `0..=15`), w = 0.
+    pub level: [f32; 4],
+}
+
+/// The per-frame part of the uniform `View` (1344 bytes, std140-compatible: only vec4/mat4
 /// members and arrays of them). The buffer continues with the model box table
 /// ([`VIEW_BOXES_OFFSET`]).
 #[repr(C)]
@@ -78,6 +97,11 @@ pub struct ViewUniform {
     pub realm_planes: [[i32; 4]; 2],
     /// Each realm's sky light, ambient floor and face shade, bottom realm first.
     pub realm_env: [RealmEnvGpu; REALM_ENVS],
+    /// x = dynamic lights in use (at most [`MAX_DYNAMIC_LIGHTS`]; 0: the shaders skip them),
+    /// yzw = 0.
+    pub dynamic_count: [u32; 4],
+    /// The dynamic lights, the first `dynamic_count.x` in use (ADR 0062).
+    pub dynamic_lights: [DynamicLightGpu; MAX_DYNAMIC_LIGHTS],
 }
 
 /// Layers the fog uniform holds (`boxel_fog::MAX_FOG_LAYERS`).
