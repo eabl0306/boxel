@@ -438,7 +438,7 @@ Run section 7, then take the AO policy and cave-culling ordering decisions.
 
 - GPU-occupancy AO on High and Mid, if G1 or P7 asks for it, or when held lights arrive.
 - Sun shadow cascades on High: geometry-only depth from the same arena, a second cull dispatch, and the sky level as the outdoor mask.
-- Dynamic held and entity lights in the shader.
+- Dynamic held and entity lights in the shader: done, up to 16 point lights in the `View`, max per channel with the baked light; worlds with them mesh with `AoPolicy::Baked` (ADR 0062).
 - Tinted glass filters: done, per-channel filters that scale block light brightness, sky stays white (ADR 0060).
 - Drop the CPU mesh copies and remesh on resync.
 - `ChunkLight` on demand for entities in chunks without a mesh.

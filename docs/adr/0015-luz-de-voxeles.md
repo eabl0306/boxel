@@ -1,7 +1,8 @@
 # ADR 0015: luz de vóxeles
 
 - Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
-  medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060).
+  medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060, y las
+  luces dinámicas: ADR 0062).
   Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061)
 - Fecha: 2026-10-06
 
@@ -220,7 +221,7 @@ streaming tampoco los cambia.
 - **AO omitido en caras oscuras**: una cara con sus 4 esquinas en 0 lleva AO "abierto" en su
   clave. Casi toda la geometría de cuevas está a oscuras, así que se fusiona como hoy. Es
   invisible con el piso de ambiente por defecto. Política `AoPolicy::BakedLitOnly` por defecto
-  (`Off` y `Baked` también existen); hay que revisarla cuando lleguen luces en la mano.
+  (`Off` y `Baked` también existen). Un mundo con luces dinámicas malla con `Baked` (ADR 0062).
 - Clave del merge: (material, byte de AO, índice de paleta), llevada a un id `u32` denso. Hace
   falta un fork en el repo de `binary-greedy-meshing` 0.5.2 (aviso MIT incluido) que fusione por
   clave de cara en lugar del `u16` del vóxel. El crate queda como dependencia de desarrollo para
