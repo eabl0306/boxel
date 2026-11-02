@@ -28,7 +28,7 @@
 //!   quads a block's cells draw from that data ([`CellQuadRule`], ADR 0050: an item in a frame).
 //! - [`ChunkData`]: one chunk's immutable snapshot payload (shared as `Arc<ChunkData>`; edits use
 //!   `Arc::make_mut` copy-on-write), with its light masks ([`LightMasks`]: opaque, partial,
-//!   emitters; built and cached only when the storage cannot serve them as is), and
+//!   filter, emitters; built and cached only when the storage cannot serve them as is), and
 //!   [`ChunkData::may_contain`], a cached palette scan for a [`StateSet`]. Voxel arrays never
 //!   live inline in ECS components.
 //! - `testing` (with the `testing` feature): a minimal block set with `test:` names for engine
@@ -65,7 +65,7 @@ pub use coords::{
 };
 pub use faces::{ALL_LINKS, ChunkFaceInfo, link_bit};
 pub use fluid::{FluidHardening, FluidId, FluidReplace, FluidRules, FluidType, MAX_FLUIDS};
-pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY};
+pub use light::{LightTables, LightValue, MAX_LIGHT, OPAQUE_OPACITY, transmit};
 pub use lod::{CellPartial, LodClass, LodClasses};
 pub use masks::{LightMasks, MaskRows, MaskWords, OwnedLightMasks};
 pub use planes::{

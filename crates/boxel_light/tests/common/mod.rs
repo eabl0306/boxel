@@ -48,11 +48,24 @@ pub struct Blocks {
     pub glows: [BlockState; 2],
     /// Opacity 5, only in the heavy registry.
     pub smoke: Option<BlockState>,
+    /// Light filters (ADR 0060), only in a registry with filters: red glass (opacity 0) and
+    /// cyan water (opacity 1, its filter after the cost).
+    pub filters: Option<[BlockState; 2]>,
 }
+
+/// Red glass's filter: red through, little green and blue.
+pub const RED_FILTER: [u8; 3] = [15, 3, 2];
+/// Cyan water's filter.
+pub const CYAN_FILTER: [u8; 3] = [4, 12, 15];
 
 /// The built-in blocks plus glass, three opaque lamps, two clear emitters and (with `heavy`)
 /// smoke of opacity 5.
 pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
+    test_registry_with(heavy, false)
+}
+
+/// [`test_registry`], with two filter blocks when `filters` ([`Blocks::filters`]).
+pub fn test_registry_with(heavy: bool, filters: bool) -> (BlockRegistry, Blocks) {
     let mut b = boxel_demo::blocks::builder();
     let tex = FaceTextures::all(TextureId(0));
     let mut add = |name: &str, shape, solid, emission, light_opacity| {
@@ -82,6 +95,17 @@ pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
         add("lantern", RenderShape::Cutout, true, [12, 12, 12], 1),
     ];
     let smoke = heavy.then(|| add("smoke", RenderShape::Translucent, false, [0; 3], 5));
+    let filters = if filters {
+        let red = add("red_glass", RenderShape::Translucent, true, [0; 3], 0);
+        let cyan = add("cyan_water", RenderShape::Translucent, false, [0; 3], 1);
+        for (name, filter) in [("red_glass", RED_FILTER), ("cyan_water", CYAN_FILTER)] {
+            let block = b.block_by_name(&format!("test:{name}")).unwrap();
+            b.set_light_filter(block, filter).unwrap();
+        }
+        Some([red, cyan])
+    } else {
+        None
+    };
     let r = b.build();
     let blocks = Blocks {
         air: BlockState::AIR,
@@ -92,6 +116,7 @@ pub fn test_registry(heavy: bool) -> (BlockRegistry, Blocks) {
         lamps,
         glows,
         smoke,
+        filters,
     };
     (r, blocks)
 }
@@ -148,6 +173,9 @@ pub fn random_chunk(rng: &mut Rng, b: &Blocks, airy: bool) -> ChunkData {
                     b.stone
                 } else if u < emit + stone + partial {
                     match (rng.below(4), b.smoke) {
+                        (k, _) if b.filters.is_some() && rng.chance(0.4) => {
+                            b.filters.unwrap_or_default()[usize::from(k % 2 == 1)]
+                        }
                         (0, _) => b.leaves,
                         (1, _) => b.water,
                         (2, Some(smoke)) => smoke,
@@ -251,7 +279,11 @@ pub fn random_world(seed: u64, n: usize, min: ChunkPos, b: &Blocks, tables: &Lig
                         let mut c = ChunkData::uniform(b.air);
                         for _ in 0..rng.below(200) {
                             let p = LocalPos::from_index(rng.below(CHUNK_VOLUME as u64) as usize);
-                            c.set(p, b.glass);
+                            let glass = match b.filters {
+                                Some([red, _]) if rng.chance(0.5) => red,
+                                _ => b.glass,
+                            };
+                            c.set(p, glass);
                         }
                         c
                     } else {

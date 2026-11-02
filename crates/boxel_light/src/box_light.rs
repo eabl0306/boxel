@@ -8,6 +8,12 @@
 //! for bit. The box lies inside the 27 chunks around the chunk, which the mesh job already
 //! holds, so no chunk ever reads another chunk's light.
 //!
+//! Light filters (ADR 0060, colored glass) keep the argument: a filter voxel scales the block
+//! light entering it after its cost ([`boxel_voxel::transmit`]), which never raises a level, so
+//! light still falls by at least 1 per voxel and still starts at 15 at most. The rule stays
+//! monotone (more light in, never less out), so the fixpoint is still unique and the
+//! highest-first floods still pop each voxel at its final level.
+//!
 //! **Steps** ([`compute`]):
 //! 1. Emitters inside the box, from the chunks whose palette may emit (the others are skipped
 //!    without reading a voxel). Fast paths, from that and the tiles' bounds alone: no emitter
@@ -19,7 +25,9 @@
 //! 3. Sky: the direct voxels (above the top of their column) as row masks, built from the 9
 //!    tiles; seeds are the open non-direct voxels next to a direct one, at `15 - cost`; then a
 //!    flood into open non-direct voxels.
-//! 4. Block light: one flood per channel present, seeded by the emitters inside the box.
+//! 4. Block light: one flood per channel present, seeded by the emitters inside the box. When a
+//!    chunk of the box holds a filter voxel, the floods price the filter voxels (and the partial
+//!    ones) one by one; the sky flood never does.
 //! 5. The padded region is copied out of the box (direct voxels get sky 15), and the rows the
 //!    floods wrote are reset (no 512 KiB clear).
 //!
@@ -31,7 +39,10 @@
 //! result is the same at any position up to the world limit.
 use crate::SkyTile;
 use crate::padded::{PADDED, PaddedLight, new_full};
-use boxel_voxel::{ChunkData, ChunkPos, LightMasks, LightTables, LightValue, LocalPos, MaskRows};
+use boxel_voxel::{
+    BlockState, ChunkData, ChunkPos, LightMasks, LightTables, LightValue, LocalPos, MaskRows,
+    transmit,
+};
 
 /// Box edge in voxels: the chunk plus [`MARGIN`] on each side.
 pub const BOX: usize = 64;
@@ -121,6 +132,9 @@ pub struct LightScratch {
     direct: Box<BoxRows>,
     /// Voxels the sky flood may not enter (opaque or direct).
     closed: Box<BoxRows>,
+    /// Voxels the block floods price one by one when the box holds a filter: filter voxels,
+    /// and partial ones when some state has opacity 2..=14.
+    special: Box<BoxRows>,
     /// Rows with a non-zero light value (to reset them).
     touched: [u64; ROW_WORDS],
     /// Flood queue: voxels raised to level `l` (2 or more) wait in bucket `l`.
@@ -167,6 +181,7 @@ impl LightScratch {
             partial: zeroed(),
             direct: zeroed(),
             closed: zeroed(),
+            special: zeroed(),
             touched: [0; ROW_WORDS],
             buckets: Default::default(),
             emitters: Vec::new(),
@@ -249,7 +264,6 @@ fn run(
     force_full: bool,
 ) -> LightPath {
     let origin_y = input.origin.origin().y;
-    let tables = input.tables;
     let sky = classify(&input.sky, origin_y);
     let any_emission = box_emitters(input, &mut scratch.emitters);
     let emits = !scratch.emitters.is_empty();
@@ -266,6 +280,23 @@ fn run(
             Sky::Mixed => {}
         }
     }
+    floods(input, scratch, out, force_full, sky, any_emission)
+}
+
+/// The floods of [`run`] when no fast path applies. Kept out of line, so the fast paths stay a
+/// small function with a small stack frame (no 27 chunks' masks).
+#[inline(never)]
+fn floods(
+    input: &LightInput<'_>,
+    scratch: &mut LightScratch,
+    out: &mut PaddedLight,
+    force_full: bool,
+    sky: Sky,
+    any_emission: u16,
+) -> LightPath {
+    let origin_y = input.origin.origin().y;
+    let tables = input.tables;
+    let emits = !scratch.emitters.is_empty();
     let masks: [LightMasks<'_>; 27] = std::array::from_fn(|i| {
         input.chunks[i].map_or(LightMasks::EMPTY, |c| c.light_masks(tables))
     });
@@ -274,7 +305,7 @@ fn run(
     if heavy {
         gather_rows(&masks.map(|m| m.partial), &mut scratch.partial);
     }
-    let cost_of = |bi: usize| opacity_cost(input, bi);
+    let cost_of = |bi: usize| u16::from(tables.opacity(state_at(input, bi)).max(1));
     let sky = match (force_full, &input.sky) {
         (true, SkyInput::Tiles(_)) => Sky::Mixed,
         _ => sky,
@@ -292,10 +323,25 @@ fn run(
         (Sky::Open, _) => scratch.direct.fill(u64::MAX),
         _ => scratch.direct.fill(0),
     }
-    let block_pops = match (emits, heavy) {
-        (false, _) => 0,
-        (true, true) => block_flood::<true>(any_emission, scratch, &cost_of),
-        (true, false) => block_flood::<false>(any_emission, scratch, &cost_of),
+    let filters = emits && tables.any_filter() && masks.iter().any(|m| !m.filter.is_empty());
+    if filters {
+        gather_rows(&masks.map(|m| m.filter), &mut scratch.special);
+        if heavy {
+            let LightScratch {
+                special, partial, ..
+            } = scratch;
+            for (s, &p) in special.iter_mut().zip(partial.iter()) {
+                *s |= p;
+            }
+        }
+    }
+    let block_pops = match (emits, filters, heavy) {
+        (false, _, _) => 0,
+        (true, true, _) => block_flood::<true>(any_emission, scratch, Special::Filter(input)),
+        (true, false, true) => block_flood::<true>(any_emission, scratch, Special::Partial(input)),
+        (true, false, false) => {
+            block_flood::<false>(any_emission, scratch, Special::Partial(input))
+        }
     };
     extract(scratch, out);
     // Reset the touched rows.
@@ -390,18 +436,25 @@ fn build_direct(tiles: &[&SkyTile; 9], box_y0: i64, direct: &mut BoxRows) {
     }
 }
 
-/// `max(1, opacity)` of box voxel `bi` (only asked for partial voxels when some state has
-/// opacity 2..=14).
-fn opacity_cost(input: &LightInput<'_>, bi: usize) -> u16 {
+/// The state of box voxel `bi` (air in a missing chunk). Only asked for the voxels the floods
+/// price one by one.
+fn state_at(input: &LightInput<'_>, bi: usize) -> BlockState {
     let (dy, ly) = split(bi >> 12);
     let (dx, lx) = split((bi >> 6) & 63);
     let (dz, lz) = split(bi & 63);
-    let opacity = input.chunks[chunk_index(dx, dy, dz)].map_or(0, |c| {
-        input
-            .tables
-            .opacity(c.get(LocalPos::new(lx as u32, ly as u32, lz as u32)))
-    });
-    u16::from(opacity.max(1))
+    input.chunks[chunk_index(dx, dy, dz)].map_or(BlockState::AIR, |c| {
+        c.get(LocalPos::new(lx as u32, ly as u32, lz as u32))
+    })
+}
+
+/// Which voxels the block floods price one by one, and how.
+#[derive(Clone, Copy)]
+enum Special<'a, 'b> {
+    /// The partial voxels: `max(1, opacity)` (when some state has opacity 2..=14).
+    Partial(&'a LightInput<'b>),
+    /// The filter voxels, and the partial ones when some state has opacity 2..=14: the filter
+    /// after the cost.
+    Filter(&'a LightInput<'b>),
 }
 
 /// Writes `value` at nibble `shift` of voxel `n` (non-zero), marks its row and queues it if it
@@ -429,6 +482,7 @@ fn sky_flood<const HEAVY: bool>(
     scratch: &mut LightScratch,
     cost_of: &impl Fn(usize) -> u16,
 ) -> u32 {
+    let step = |n: usize, level: u16| level.saturating_sub(cost_of(n));
     let LightScratch {
         light,
         opaque,
@@ -486,28 +540,30 @@ fn sky_flood<const HEAVY: bool>(
         closed,
         partial,
         LightValue::SKY_SHIFT,
-        cost_of,
+        &step,
     )
 }
 
 /// Seeds the emitters inside the box (collected by [`box_emitters`]; `any` is the OR of their
-/// emissions) and floods each channel present.
-fn block_flood<const HEAVY: bool>(
+/// emissions) and floods each channel present. With `SPECIAL`, the voxels of `special` are
+/// priced one by one.
+fn block_flood<const SPECIAL: bool>(
     any: u16,
     scratch: &mut LightScratch,
-    cost_of: &impl Fn(usize) -> u16,
+    special: Special<'_, '_>,
 ) -> u32 {
     let LightScratch {
         light,
         opaque,
         partial,
+        special: filter_rows,
         touched,
         buckets,
         emitters,
         ..
     } = scratch;
     let mut pops = 0;
-    for shift in LightValue::BLOCK_SHIFTS {
+    for (k, shift) in LightValue::BLOCK_SHIFTS.into_iter().enumerate() {
         if (any >> shift) & 15 == 0 {
             continue;
         }
@@ -517,22 +573,39 @@ fn block_flood<const HEAVY: bool>(
                 raise(light, touched, buckets, bi as usize, shift, level);
             }
         }
-        pops += flood::<HEAVY>(light, buckets, touched, opaque, partial, shift, cost_of);
+        pops += match special {
+            Special::Partial(input) => {
+                let step = |n: usize, level: u16| {
+                    let opacity = input.tables.opacity(state_at(input, n));
+                    level.saturating_sub(u16::from(opacity.max(1)))
+                };
+                flood::<SPECIAL>(light, buckets, touched, opaque, partial, shift, &step)
+            }
+            Special::Filter(input) => {
+                let step = |n: usize, level: u16| {
+                    let s = state_at(input, n);
+                    let cost = u16::from(input.tables.opacity(s).max(1));
+                    transmit(level.saturating_sub(cost), input.tables.light_filter(s)[k])
+                };
+                flood::<SPECIAL>(light, buckets, touched, opaque, filter_rows, shift, &step)
+            }
+        };
     }
     pops
 }
 
 /// Floods one channel (`shift`) from the queued voxels, highest level first. `closed` voxels
-/// are never entered (they may still be sources). Entering a voxel costs 1, or (`HEAVY`)
-/// `cost_of` for the voxels of `partial`. Returns the voxels popped.
-fn flood<const HEAVY: bool>(
+/// are never entered (they may still be sources). Entering a voxel from one at `level` gives it
+/// `level - 1`, or (`SPECIAL`) `step(voxel, level)` for the voxels of `special`; `step` must
+/// give less than `level` and never less for a higher `level`. Returns the voxels popped.
+fn flood<const SPECIAL: bool>(
     light: &mut BoxLight,
     buckets: &mut [Vec<u32>; 16],
     touched: &mut [u64; ROW_WORDS],
     closed: &BoxRows,
-    partial: &BoxRows,
+    special: &BoxRows,
     shift: u32,
-    cost_of: &impl Fn(usize) -> u16,
+    step: &impl Fn(usize, u16) -> u16,
 ) -> u32 {
     let mut pops = 0;
     for level in (2..16u16).rev() {
@@ -550,13 +623,13 @@ fn flood<const HEAVY: bool>(
                 if (closed[row] >> bit) & 1 != 0 {
                     return;
                 }
-                let cost = if HEAVY && (partial[row] >> bit) & 1 != 0 {
-                    cost_of(n)
+                let value = if SPECIAL && (special[row] >> bit) & 1 != 0 {
+                    step(n, level)
                 } else {
-                    1
+                    level - 1
                 };
-                if level > cost && (light[n] >> shift) & 15 < level - cost {
-                    raise(light, touched, buckets, n, shift, level - cost);
+                if (light[n] >> shift) & 15 < value {
+                    raise(light, touched, buckets, n, shift, value);
                 }
             };
             let (bz, bx, by) = (bi & 63, (bi >> 6) & 63, bi >> 12);
@@ -622,7 +695,6 @@ fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boxel_voxel::BlockState;
 
     fn input<'a>(air: &'a ChunkData, tile: &'a SkyTile, tables: &'a LightTables) -> LightInput<'a> {
         LightInput {

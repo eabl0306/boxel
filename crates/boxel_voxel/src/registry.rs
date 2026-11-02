@@ -876,6 +876,8 @@ pub struct BlockRegistryBuilder {
     keeps_fluids_out: Vec<bool>,
     /// The states drawn full bright (by state id; missing at the end: not).
     full_bright: Vec<bool>,
+    /// The light filter of each block (by [`BlockId`]; missing at the end: none).
+    light_filters: Vec<Option<[u8; 3]>>,
     /// The support shape of each state (by state id; `None` or missing at the end: its
     /// collision).
     support: Vec<Option<BlockCollision>>,
@@ -1077,6 +1079,33 @@ impl BlockRegistryBuilder {
             self.full_bright.resize(range.end, false);
         }
         self.full_bright[range].copy_from_slice(&marks);
+        Ok(())
+    }
+
+    /// Sets the light filter of every state of `block` (ADR 0060): the fraction of each block
+    /// light channel `[red, green, blue]`, in fifteenths (`0..=15`), that passes into one of its
+    /// voxels. Light entering the voxel at level `l` per channel becomes
+    /// `transmit(l - max(1, opacity), filter)` ([`crate::light::transmit`]) instead of
+    /// `l - max(1, opacity)`: a `game:red_glass` with `[15, 3, 2]` turns white lamp light red.
+    /// `[15, 15, 15]` is no filter. Sky light never goes through a filter: it stays white
+    /// (it has one channel). A later call replaces an earlier one.
+    ///
+    /// Fails with [`RegistryError::UnknownBlock`], or with [`RegistryError::InvalidLight`]
+    /// (nothing set) when a channel is above 15.
+    pub fn set_light_filter(
+        &mut self,
+        block: BlockId,
+        filter: [u8; 3],
+    ) -> Result<(), RegistryError> {
+        let i = self.block_index(block)?;
+        if filter.iter().any(|&c| c > crate::MAX_LIGHT) {
+            return Err(RegistryError::InvalidLight(self.blocks[i].name.clone()));
+        }
+        let filter = (filter != [crate::MAX_LIGHT; 3]).then_some(filter);
+        if self.light_filters.len() <= i {
+            self.light_filters.resize(i + 1, None);
+        }
+        self.light_filters[i] = filter;
         Ok(())
     }
 
@@ -1428,6 +1457,13 @@ impl BlockRegistryBuilder {
                 }
             }
         }
+        let light_filter = state_block
+            .iter()
+            .map(|&block| {
+                let filter = self.light_filters.get(usize::from(block)).copied();
+                filter.flatten().unwrap_or([crate::MAX_LIGHT; 3])
+            })
+            .collect();
         BlockRegistry {
             neighbor_rules: per_block(self.neighbor_rules, self.blocks.len()),
             use_rules: per_block(self.use_rules, self.blocks.len()),
@@ -1452,6 +1488,7 @@ impl BlockRegistryBuilder {
                 .map(|b| LightValue::from_rgb(b.emission))
                 .collect(),
             opacity: states.iter().map(|b| b.light_opacity).collect(),
+            light_filter,
             // A fluid glows exactly when it emits: in the shaders the same quad bit also picks
             // its flow speed and animation (ADR 0036).
             full_bright: states
@@ -1528,6 +1565,8 @@ pub struct BlockRegistry {
     flags: Vec<StateFlags>,
     emission: Vec<LightValue>,
     opacity: Vec<u8>,
+    /// The light filter of each state ([`BlockRegistry::light_filter`]).
+    light_filter: Vec<[u8; 3]>,
     /// The states drawn full bright ([`BlockRegistry::is_full_bright`]).
     full_bright: Vec<bool>,
     faces: Vec<FaceTextures>,
@@ -1835,6 +1874,14 @@ impl BlockRegistry {
     /// Light opacity `0..=15` (out of range -> 0).
     pub fn light_opacity(&self, s: BlockState) -> u8 {
         self.opacity.get(s.0 as usize).copied().unwrap_or(0)
+    }
+    /// Light filter `[red, green, blue]` in fifteenths
+    /// ([`BlockRegistryBuilder::set_light_filter`]; no filter and out of range -> `[15; 3]`).
+    pub fn light_filter(&self, s: BlockState) -> [u8; 3] {
+        self.light_filter
+            .get(s.0 as usize)
+            .copied()
+            .unwrap_or([crate::MAX_LIGHT; 3])
     }
     /// Texture layer of `face` of `s` (for a turned cube, the end texture is on the faces
     /// across its axis).

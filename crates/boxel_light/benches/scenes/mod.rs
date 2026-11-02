@@ -1,6 +1,7 @@
 //! Bench scenes shared by the light benches and the mesher's (`boxel_mesh/benches/mesh.rs`
 //! includes this file): neighborhoods of 27 overworld chunks and 9 sky tiles, the surface chunk
-//! near the origin with trees and a cave entrance, and a cave lit by colored lamps.
+//! near the origin with trees and a cave entrance, and a cave lit by colored lamps (also with
+//! each lamp in glass, colored or clear).
 #![allow(dead_code, reason = "each bench uses a subset of the scenes")]
 
 use boxel_demo::worldgen::OverworldGenerator;
@@ -243,5 +244,83 @@ pub fn lamp_cave(
             }
         }
     }
+    (n, placed)
+}
+
+/// [`lamp_registry`] plus glass that filters light (ADR 0060) in the lamps' colors, orange, red
+/// and blue, and clear glass: `(registry, lamps, filter glass, clear glass)`.
+pub fn glass_registry() -> (BlockRegistry, [BlockState; 3], [BlockState; 3], BlockState) {
+    let (lamps_only, lamps) = lamp_registry();
+    let mut b = boxel_demo::blocks::builder();
+    let mut add = |name: &str, emission, light_opacity, shape| {
+        b.add_block(BlockDef {
+            name: format!("bench:{name}"),
+            shape,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
+            emission,
+            light_opacity,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("block")
+    };
+    let lamps_again = [
+        add("lamp_orange", [14, 11, 6], 15, RenderShape::Opaque),
+        add("lamp_red", [14, 3, 3], 15, RenderShape::Opaque),
+        add("lamp_blue", [4, 6, 14], 15, RenderShape::Opaque),
+    ];
+    assert_eq!(lamps_again, lamps, "the lamps keep their states");
+    let names = ["glass_orange", "glass_red", "glass_blue"];
+    let glass = names.map(|name| add(name, [0; 3], 0, RenderShape::Translucent));
+    let clear = add("glass", [0; 3], 0, RenderShape::Translucent);
+    for (name, filter) in names.into_iter().zip([[15, 8, 2], [15, 3, 2], [4, 6, 15]]) {
+        let block = b.block_by_name(&format!("bench:{name}")).expect("glass");
+        b.set_light_filter(block, filter).expect("filter");
+    }
+    let registry = b.build();
+    assert_eq!(registry.len(), lamps_only.len() + 4);
+    (registry, lamps, glass, clear)
+}
+
+/// `cave` (from [`lamp_cave`]) with every lamp in glass: the air beside each lamp, in its
+/// chunk, becomes `glass[i]` for `lamps[i]`. Returns the glass voxels placed.
+pub fn glass_cave(
+    cave: &Neighborhood,
+    lamps: [BlockState; 3],
+    glass: [BlockState; 3],
+) -> (Neighborhood, usize) {
+    let mut chunks = cave.chunks.clone();
+    let mut placed = 0;
+    for chunk in &mut chunks {
+        for i in 0..CHUNK_VOLUME {
+            let p = LocalPos::from_index(i);
+            let Some(k) = lamps.iter().position(|&l| l == chunk.get(p)) else {
+                continue;
+            };
+            let (x, y, z) = (p.x() as i32, p.y() as i32, p.z() as i32);
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                if [nx, ny, nz].iter().all(|v| (0..32).contains(v)) {
+                    let n = LocalPos::new(nx as u32, ny as u32, nz as u32);
+                    if chunk.get(n).is_air() {
+                        chunk.set(n, glass[k]);
+                        placed += 1;
+                    }
+                }
+            }
+        }
+    }
+    let n = Neighborhood {
+        origin: cave.origin,
+        chunks,
+        tiles: cave.tiles.clone(),
+    };
     (n, placed)
 }

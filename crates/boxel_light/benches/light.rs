@@ -5,6 +5,9 @@
 //! | `light/box_cave_dark` (deep overworld chunk, fast path) | 5 us or less |
 //! | `light/box_surface` (overworld surface near the origin, trees and an entrance) | 150 us or less (median) |
 //! | `light/box_cave_lamps_rgb` (cave, lamps on 1.5% of the floor, 3 colors) | 500 us or less |
+//! | `light/box_cave_lamps_glass_filter` (the same cave, each lamp in glass of its color, ADR 0060) | 1.25x of `box_cave_lamps_glass_clear` or less |
+//! | `light/box_cave_lamps_glass_clear` (the same glass voxels, clear) | as `box_cave_lamps_rgb` |
+//! | `light/box_surface_cold_masks_filters` (`box_surface_cold_masks`, a registry with filters) | 1.05x of `box_surface_cold_masks` or less |
 //! | `light/box_far` (the surface neighborhood at x = z = 2^40) | 1.15x of `box_surface` or less |
 //! | `sky_tile/walk_generate` (overworld column, generated privately) | 400 us or less |
 //! | `sky_tile/walk_loaded` (the same column loaded, masks not built yet) | 60 us or less |
@@ -23,7 +26,8 @@ use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables};
 use boxel_worldgen::WorldGenerator;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use scenes::{
-    Neighborhood, generated_tile, lamp_cave, lamp_registry, surface_origin, trees_and_entrance,
+    Neighborhood, generated_tile, glass_cave, glass_registry, lamp_cave, lamp_registry,
+    surface_origin, trees_and_entrance,
 };
 use std::hint::black_box;
 use std::sync::Arc;
@@ -76,6 +80,23 @@ fn bench(c: &mut Criterion) {
         "box_cave_lamps_rgb took {lamps_path:?}"
     );
     eprintln!("box_cave_lamps_rgb: {placed} lamps");
+    // The lamps in glass, colored and clear, read with the tables of a registry that has both.
+    let (glass_blocks, glass_lamps, filter_glass, clear_glass) = glass_registry();
+    let glass_tables = LightTables::from_registry(&glass_blocks);
+    assert_eq!(glass_lamps, lamps);
+    let (filtered, glass_placed) = glass_cave(&cave, lamps, filter_glass);
+    let (clear, _) = glass_cave(&cave, lamps, [clear_glass; 3]);
+    for (name, n) in [
+        ("box_cave_lamps_glass_filter", &filtered),
+        ("box_cave_lamps_glass_clear", &clear),
+    ] {
+        let path = compute(&n.input(&glass_tables), &mut scratch, &mut out);
+        assert!(
+            matches!(path, LightPath::Full { block_pops, .. } if block_pops > 0),
+            "{name} took {path:?}"
+        );
+        eprintln!("{name}: {glass_placed} glass voxels, {path:?}");
+    }
 
     let mut g_light = c.benchmark_group("light");
     g_light.measurement_time(Duration::from_secs(4));
@@ -90,6 +111,15 @@ fn bench(c: &mut Criterion) {
             b.iter(|| compute(black_box(&input), &mut scratch, &mut out));
         });
     }
+    for (name, n) in [
+        ("box_cave_lamps_glass_filter", &filtered),
+        ("box_cave_lamps_glass_clear", &clear),
+    ] {
+        let input = n.input(&glass_tables);
+        g_light.bench_function(name, |b| {
+            b.iter(|| compute(black_box(&input), &mut scratch, &mut out));
+        });
+    }
     g_light.bench_function("box_surface_cold_masks", |b| {
         b.iter_batched(
             // A clone starts without masks.
@@ -99,6 +129,19 @@ fn bench(c: &mut Criterion) {
                 tiles: surface.tiles.clone(),
             },
             |n| compute(&n.input(&tables), &mut scratch, &mut out),
+            BatchSize::LargeInput,
+        );
+    });
+    // The same with the tables of a registry that has filters (as a game with colored glass):
+    // the masks also scan each palette for a filter state.
+    g_light.bench_function("box_surface_cold_masks_filters", |b| {
+        b.iter_batched(
+            || Neighborhood {
+                origin: surface.origin,
+                chunks: surface.chunks.clone(),
+                tiles: surface.tiles.clone(),
+            },
+            |n| compute(&n.input(&glass_tables), &mut scratch, &mut out),
             BatchSize::LargeInput,
         );
     });

@@ -1,13 +1,17 @@
 //! The reference the tests compare [`compute`](crate::compute) against: a scalar global light
 //! solver over an explicit voxel world, one channel at a time, with a plain FIFO queue (no
-//! buckets, no masks, no box), and sky tops found by brute force.
+//! buckets, no masks, no box), and sky tops found by brute force. Light filters (ADR 0060) apply
+//! to the block channels only.
 //!
 //! Only with the `oracle` feature (and in this crate's unit tests).
-use boxel_voxel::{BlockState, CHUNK_SIZE, ChunkData, ChunkPos, LightTables, LightValue, LocalPos};
+use boxel_voxel::{
+    BlockState, CHUNK_SIZE, ChunkData, ChunkPos, LightTables, LightValue, LocalPos, MAX_LIGHT,
+    transmit,
+};
 use std::collections::VecDeque;
 
-/// An explicit world: `dims` chunks per axis from chunk `min`, with each voxel's opacity and
-/// emission, and the sky top of each column.
+/// An explicit world: `dims` chunks per axis from chunk `min`, with each voxel's opacity,
+/// emission and light filter, and the sky top of each column.
 ///
 /// Voxels are indexed `(y * size_x + x) * size_z + z` and columns `x * size_z + z`, in voxels
 /// from the world's min corner. Light never leaves the world (there is nothing outside it).
@@ -21,6 +25,8 @@ pub struct OracleWorld {
     pub opacity: Vec<u8>,
     /// Emission per voxel.
     pub emission: Vec<LightValue>,
+    /// Light filter per voxel (`[15; 3]`: none).
+    pub filter: Vec<[u8; 3]>,
     /// Sky top per column (absolute y; `i64::MIN` for open forever).
     pub tops: Vec<i64>,
 }
@@ -42,6 +48,7 @@ impl OracleWorld {
         let volume = size[0] * size[1] * size[2];
         let mut opacity = vec![0u8; volume];
         let mut emission = vec![LightValue::DARK; volume];
+        let mut filter = vec![[MAX_LIGHT; 3]; volume];
         for (ci, chunk) in chunks.iter().enumerate() {
             let (cy, cx, cz) = (
                 ci / (dims[0] * dims[2]),
@@ -59,6 +66,7 @@ impl OracleWorld {
                 let v = (y * size[0] + x) * size[2] + z;
                 opacity[v] = tables.opacity(state);
                 emission[v] = tables.emission(state);
+                filter[v] = tables.light_filter(state);
             }
         }
         Self {
@@ -66,6 +74,7 @@ impl OracleWorld {
             dims,
             opacity,
             emission,
+            filter,
             tops,
         }
     }
@@ -105,11 +114,12 @@ impl OracleWorld {
             let (y, x, z) = (v / (sx * sz), v / sz % sx, v % sz);
             y0 + y as i64 > self.tops[x * sz + z]
         };
-        for shift in [
-            LightValue::SKY_SHIFT,
-            LightValue::RED_SHIFT,
-            LightValue::GREEN_SHIFT,
-            LightValue::BLUE_SHIFT,
+        // Each channel with the index of its filter (`None`: sky, never filtered).
+        for (shift, k) in [
+            (LightValue::SKY_SHIFT, None),
+            (LightValue::RED_SHIFT, Some(0)),
+            (LightValue::GREEN_SHIFT, Some(1)),
+            (LightValue::BLUE_SHIFT, Some(2)),
         ] {
             let mut level = vec![0u8; volume];
             let mut queue = VecDeque::new();
@@ -150,7 +160,10 @@ impl OracleWorld {
                     if opacity >= 15 {
                         continue;
                     }
-                    let value = level[v].saturating_sub(opacity.max(1));
+                    let mut value = level[v].saturating_sub(opacity.max(1));
+                    if let Some(k) = k {
+                        value = transmit(u16::from(value), self.filter[n][k]) as u8;
+                    }
                     if value > level[n] {
                         level[n] = value;
                         queue.push_back(n);

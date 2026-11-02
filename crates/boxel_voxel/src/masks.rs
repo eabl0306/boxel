@@ -4,9 +4,9 @@
 //! Most chunks never build anything: a uniform chunk without emission reads static words, and
 //! a 1-bit chunk without emission (the overworld's caves, nearly every chunk underground) reads
 //! its own packed words, kept or flipped by the palette order. The other chunks build their
-//! masks once ([`OwnedLightMasks`]: 4 KiB, 4 KiB more only when some voxel is partial, plus the
-//! emitters) and cache them on the [`ChunkData`].
-use crate::light::{CLASS_EMITS, CLASS_OPAQUE, CLASS_PARTIAL};
+//! masks once ([`OwnedLightMasks`]: 4 KiB, 4 KiB more for each of partial and filter only when
+//! some voxel is one, plus the emitters) and cache them on the [`ChunkData`].
+use crate::light::{CLASS_EMITS, CLASS_FILTER, CLASS_OPAQUE, CLASS_PARTIAL};
 use crate::{
     BlockState, CHUNK_AREA, CHUNK_VOLUME, ChunkData, LightTables, LightValue, LocalPos, Occupancy,
     Paletted,
@@ -78,6 +78,13 @@ impl<'a> MaskRows<'a> {
     pub fn to_occupancy(self) -> Box<Occupancy> {
         Box::new(std::array::from_fn(|i| self.row(i)))
     }
+    /// True for the constant empty mask: no voxel set, known without reading a word. The masks
+    /// of [`ChunkData::light_masks`] and [`OwnedLightMasks::view`] are always this one when they
+    /// have no voxel set.
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.keep == 0 && self.flip == 0
+    }
     /// Voxels set.
     pub fn count(self) -> u32 {
         self.words
@@ -102,6 +109,8 @@ pub struct LightMasks<'a> {
     pub opaque: MaskRows<'a>,
     /// Voxels with light opacity 1..=14 (leaves, water).
     pub partial: MaskRows<'a>,
+    /// Voxels that filter block light ([`LightTables::filters`], ADR 0060: colored glass).
+    pub filter: MaskRows<'a>,
     /// Every voxel that emits light, in increasing [`LocalPos`] index order, with its emission
     /// (sky 0).
     pub emitters: &'a [(LocalPos, LightValue)],
@@ -112,6 +121,7 @@ impl LightMasks<'static> {
     pub const EMPTY: Self = Self {
         opaque: MaskRows::EMPTY,
         partial: MaskRows::EMPTY,
+        filter: MaskRows::EMPTY,
         emitters: &[],
     };
 }
@@ -134,6 +144,7 @@ impl<'a> LightMasks<'a> {
                 (!bit(c, CLASS_EMITS)).then(|| LightMasks {
                     opaque: fill(CLASS_OPAQUE),
                     partial: fill(CLASS_PARTIAL),
+                    filter: fill(CLASS_FILTER),
                     emitters: &[],
                 })
             }
@@ -151,6 +162,7 @@ impl<'a> LightMasks<'a> {
                 Some(LightMasks {
                     opaque: mask(CLASS_OPAQUE),
                     partial: mask(CLASS_PARTIAL),
+                    filter: mask(CLASS_FILTER),
                     emitters: &[],
                 })
             }
@@ -174,6 +186,8 @@ pub struct OwnedLightMasks {
     opaque: MaskWords,
     /// `None` when no voxel is partial.
     partial: Option<Box<MaskWords>>,
+    /// `None` when no voxel filters.
+    filter: Option<Box<MaskWords>>,
     emitters: Vec<(LocalPos, LightValue)>,
     /// [`LightTables::id`] of the tables the masks were built with.
     tables_id: u64,
@@ -259,6 +273,7 @@ impl OwnedLightMasks {
         Box::new(OwnedLightMasks {
             opaque,
             partial: partial.iter().any(|&w| w != 0).then(|| Box::new(partial)),
+            filter: filter_words(chunk, tables),
             emitters,
             tables_id: tables.id(),
         })
@@ -272,6 +287,10 @@ impl OwnedLightMasks {
                 .partial
                 .as_deref()
                 .map_or(MaskRows::EMPTY, MaskRows::from_words),
+            filter: self
+                .filter
+                .as_deref()
+                .map_or(MaskRows::EMPTY, MaskRows::from_words),
             emitters: &self.emitters,
         }
     }
@@ -280,6 +299,7 @@ impl OwnedLightMasks {
     pub fn heap_bytes(&self) -> usize {
         size_of::<OwnedLightMasks>()
             + self.partial.as_ref().map_or(0, |_| size_of::<MaskWords>())
+            + self.filter.as_ref().map_or(0, |_| size_of::<MaskWords>())
             + self.emitters.capacity() * size_of::<(LocalPos, LightValue)>()
     }
 
@@ -379,4 +399,54 @@ fn packed(
             }
         }
     }
+}
+
+/// The filter mask of `chunk` (ADR 0060), `None` when no voxel filters. A pass of its own, after
+/// the other masks, so a chunk whose palette holds no filter state (nearly all) only pays a
+/// palette scan, and none at all when no state filters.
+fn filter_words(chunk: &ChunkData, tables: &LightTables) -> Option<Box<MaskWords>> {
+    if !tables.any_filter() {
+        return None;
+    }
+    let mut out: Box<MaskWords> = Box::new([0; CHUNK_AREA / 2]);
+    match chunk.blocks() {
+        Paletted::Uniform(s) => {
+            if !tables.filters(*s) {
+                return None;
+            }
+            out.fill(u64::MAX);
+        }
+        Paletted::Packed {
+            palette,
+            bits,
+            words,
+        } => {
+            let mut lut = [false; 256];
+            for (slot, &s) in lut.iter_mut().zip(palette) {
+                *slot = tables.filters(s);
+            }
+            if !lut.contains(&true) {
+                return None;
+            }
+            let b = usize::from(*bits);
+            let per_word = 64 / b;
+            let mask = (1u64 << b) - 1;
+            for (wi, &w) in words.iter().enumerate() {
+                for j in 0..per_word {
+                    if lut[((w >> (j * b)) & mask) as usize] {
+                        let i = wi * per_word + j;
+                        out[i >> 6] |= 1 << (i & 63);
+                    }
+                }
+            }
+        }
+        Paletted::Direct(states) => {
+            for (i, &s) in states.iter().enumerate() {
+                if tables.filters(s) {
+                    out[i >> 6] |= 1 << (i & 63);
+                }
+            }
+        }
+    }
+    out.iter().any(|&w| w != 0).then_some(out)
 }

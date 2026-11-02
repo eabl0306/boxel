@@ -2,8 +2,8 @@
 //! and 15, RGB emitters opaque and clear, sky tops from the blocks, roofs far above, caps over
 //! air inside the world, tops below the world and `i64::MIN`), every chunk of the inner 3x3x3
 //! gets the padded light of the scalar global solver, bit for bit, with and without the fast
-//! paths. End to end on generated content: tiles from the walk feed the box and match the
-//! oracle with brute-force tops capped at the walk floor.
+//! paths, with and without light filters (ADR 0060). End to end on generated content: tiles from
+//! the walk feed the box and match the oracle with brute-force tops capped at the walk floor.
 mod common;
 
 use boxel_demo::worldgen::OverworldGenerator;
@@ -16,7 +16,9 @@ use boxel_light::{
 };
 use boxel_voxel::{ChunkData, ChunkKey, ChunkPos, LightTables, LightValue, LocalPos};
 use boxel_worldgen::WorldGenerator;
-use common::{Blocks, World, random_world, test_registry};
+use common::{
+    Blocks, CYAN_FILTER, RED_FILTER, World, random_world, test_registry, test_registry_with,
+};
 use proptest::prelude::*;
 
 /// Chunks per axis of the test worlds.
@@ -71,8 +73,8 @@ proptest! {
 
     #[test]
     fn box_equals_global_solution(seed in any::<u64>(), heavy in any::<bool>(),
-                                  far in 0usize..4) {
-        let (registry, blocks) = test_registry(heavy);
+                                  filters in any::<bool>(), far in 0usize..4) {
+        let (registry, blocks) = test_registry_with(heavy, filters);
         let tables = LightTables::from_registry(&registry);
         let min = [
             ChunkPos::new(-2, -2, -2),
@@ -89,8 +91,15 @@ proptest! {
 #[test]
 fn fixed_worlds_cover_every_path() {
     let mut all = Vec::new();
-    for (seed, heavy) in [(1, false), (2, true), (3, false), (4, true)] {
-        let (registry, blocks) = test_registry(heavy);
+    for (seed, heavy, filters) in [
+        (1, false, false),
+        (2, true, false),
+        (3, false, false),
+        (4, true, false),
+        (5, false, true),
+        (6, true, true),
+    ] {
+        let (registry, blocks) = test_registry_with(heavy, filters);
         let tables = LightTables::from_registry(&registry);
         let world = random_world(seed, N, ChunkPos::new(-2, -2, -2), &blocks, &tables);
         all.extend(check_world(&world, &tables));
@@ -225,6 +234,76 @@ fn a_double_slab_stops_light_and_a_slab_does_not() {
             registry.state_name(slab)
         );
     }
+}
+
+/// ADR 0060: a white lamp behind a red glass wall lights the far side red, each channel scaled
+/// after the cost of the glass and then falling by 1 per voxel; sky light ignores the filter.
+#[test]
+fn a_filter_scales_each_block_channel_and_leaves_sky_alone() {
+    use boxel_voxel::transmit;
+    for heavy in [false, true] {
+        let (registry, b) = test_registry_with(heavy, true);
+        let tables = LightTables::from_registry(&registry);
+        let [red, cyan] = b.filters.unwrap();
+        let white = b.glows[1]; // The lantern: (12, 12, 12), opacity 1.
+        // A sealed room x, y, z in 5..27 with a white lantern at x = 10 and a wall at x = 14 of
+        // red glass, then one of cyan water at x = 20.
+        let chunks = scene(&b, |x, y, z| {
+            let inside = |v: i64| (5..27).contains(&v);
+            match (x, y, z) {
+                (10, 16, 16) => white,
+                _ if !(inside(x) && inside(y) && inside(z)) => b.stone,
+                (14, _, _) => red,
+                (20, _, _) => cyan,
+                _ => b.air,
+            }
+        });
+        let roof = SkyTile::uniform(1000, i64::MIN);
+        let (light, path) = light_of(&chunks, [&roof; 9], &tables);
+        assert!(matches!(path, LightPath::Full { sky_pops: 0, .. }));
+        let scaled = |l: u16, f: [u8; 3]| f.map(|c| transmit(l, c) as u8);
+        assert_eq!(light.get(13, 16, 16), LightValue::from_rgb([9; 3]));
+        // Into the glass: 9 - 1 = 8, then scaled.
+        let glass = scaled(8, RED_FILTER);
+        assert_eq!(light.get(14, 16, 16), LightValue::from_rgb(glass));
+        let after = glass.map(|c| c.saturating_sub(5));
+        assert_eq!(light.get(19, 16, 16), LightValue::from_rgb(after));
+        // Into the water: its cost (1), then its filter.
+        let water = [0, 1, 2]
+            .map(|k| transmit(u16::from(after[k]).saturating_sub(1), CYAN_FILTER[k]) as u8);
+        assert_eq!(light.get(20, 16, 16), LightValue::from_rgb(water));
+        // The same room without the walls: white.
+        let open = scene(&b, |x, y, z| {
+            let inside = |v: i64| (5..27).contains(&v);
+            match (x, y, z) {
+                (10, 16, 16) => white,
+                _ if inside(x) && inside(y) && inside(z) => b.air,
+                _ => b.stone,
+            }
+        });
+        let (light, _) = light_of(&open, [&roof; 9], &tables);
+        assert_eq!(light.get(14, 16, 16), LightValue::from_rgb([8; 3]));
+    }
+    // Sky through a red glass roof over a shaft stays white: glass does not stop direct sky,
+    // and a filter never tints it.
+    let (registry, b) = test_registry_with(false, true);
+    let tables = LightTables::from_registry(&registry);
+    let [red, _] = b.filters.unwrap();
+    let chunks = scene(&b, |x, y, z| match (x, y, z) {
+        (16, 41, 16) => red,
+        (16, 0..=41, 16) | (8..24, 0..4, 8..24) => b.air,
+        _ if y > 41 => b.air,
+        _ => b.stone,
+    });
+    let tops: Box<[i64; 1024]> =
+        std::array::from_fn(|i| if i == (16 << 5) | 16 { -1 } else { 41 }).into();
+    let tile = SkyTile::from_tops(tops, i64::MIN);
+    let stone_top = SkyTile::uniform(41, i64::MIN);
+    let mut tiles = [&stone_top; 9];
+    tiles[4] = &tile;
+    let (light, _) = light_of(&chunks, tiles, &tables);
+    assert_eq!(light.get(16, 0, 16), LightValue::FULL_SKY);
+    assert_eq!(light.get(17, 0, 16), LightValue::new(14, 0, 0, 0));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Light fields of the registry, `LightTables`, and the chunk light masks: masks equal a brute
 //! force in every storage representation, uniform and 1-bit chunks without emission are served
 //! from their storage (nothing cached), the cache resets on every change, and `may_emit` never
-//! misses an emitter.
+//! misses an emitter. Filters (ADR 0060) get a mask of their own.
 use boxel_demo::blocks::{LAMPS, LAVA_EMISSION};
 use boxel_voxel::*;
 use proptest::prelude::*;
@@ -26,7 +26,8 @@ impl Rng {
 const STATES: u16 = 320;
 
 /// A registry whose states cycle through every light class: opacity 0, 1, 7 and 15, solid or
-/// not (no effect on the light masks), and every 5th state emits a color of its own.
+/// not (no effect on the light masks), every 5th state emits a color of its own, and every 3rd
+/// state has a light filter (which an opaque state ignores).
 fn light_registry() -> BlockRegistry {
     let mut b = BlockRegistryBuilder::new();
     let t = b
@@ -62,6 +63,11 @@ fn light_registry() -> BlockRegistry {
             textures: FaceTextures::all(t),
         })
         .unwrap();
+        if i % 3 == 0 {
+            let block = b.block_by_name(&format!("test:b{i}")).unwrap();
+            let filter = [(i % 16) as u8, 15, (i / 3 % 16) as u8];
+            b.set_light_filter(block, filter).unwrap();
+        }
     }
     b.build()
 }
@@ -71,14 +77,19 @@ fn light_registry() -> BlockRegistry {
 struct Plain {
     opaque: Box<Occupancy>,
     partial: Box<Occupancy>,
+    filter: Box<Occupancy>,
     emitters: Vec<(LocalPos, LightValue)>,
 }
 
 impl Plain {
     fn of(m: LightMasks<'_>) -> Self {
+        // An empty mask is the constant one, which the light reads without a word.
+        assert_eq!(m.filter.is_empty(), m.filter.count() == 0);
+        assert_eq!(m.partial.is_empty(), m.partial.count() == 0);
         Self {
             opaque: m.opaque.to_occupancy(),
             partial: m.partial.to_occupancy(),
+            filter: m.filter.to_occupancy(),
             emitters: m.emitters.to_vec(),
         }
     }
@@ -88,6 +99,7 @@ impl Plain {
 fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
     let mut opaque = Box::new([0u32; 1024]);
     let mut partial = Box::new([0u32; 1024]);
+    let mut filter = Box::new([0u32; 1024]);
     let mut emitters = Vec::new();
     for i in 0..CHUNK_VOLUME {
         let p = LocalPos::from_index(i);
@@ -98,6 +110,9 @@ fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
             15 => opaque[word] |= bit,
             _ => partial[word] |= bit,
         }
+        if tables.opacity(s) < 15 && tables.light_filter(s) != [15; 3] {
+            filter[word] |= bit;
+        }
         if !tables.emission(s).is_dark() {
             emitters.push((p, tables.emission(s)));
         }
@@ -105,6 +120,7 @@ fn brute_force(chunk: &ChunkData, tables: &LightTables) -> Plain {
     Plain {
         opaque,
         partial,
+        filter,
         emitters,
     }
 }
@@ -113,6 +129,7 @@ fn assert_masks_eq(got: LightMasks<'_>, want: &Plain, what: &str) {
     let got = Plain::of(got);
     assert!(got.opaque == want.opaque, "{what}: opaque");
     assert!(got.partial == want.partial, "{what}: partial");
+    assert!(got.filter == want.filter, "{what}: filter");
     assert_eq!(got.emitters, want.emitters, "{what}: emitters");
 }
 

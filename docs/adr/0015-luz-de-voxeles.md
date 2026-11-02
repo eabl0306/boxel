@@ -1,7 +1,7 @@
 # ADR 0015: luz de vóxeles
 
 - Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
-  medir con la máquina libre, y P8, pendientes)
+  medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060)
 - Fecha: 2026-10-06
 
 ## Contexto

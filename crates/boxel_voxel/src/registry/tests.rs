@@ -2,7 +2,8 @@
 //! set per state, fixed for fluids by their emission, and kept out of every other per-state
 //! table. The flag that keeps flowing fluids out ([`StateFlags::KEEPS_FLUIDS_OUT`], #110): on
 //! every waterloggable state, and on every state of a declared block. On the `test:` blocks
-//! ([`crate::testing`]) and a few more after them. The name rule every registry shares.
+//! ([`crate::testing`]) and a few more after them. The name rule every registry shares. Light
+//! filters (ADR 0060): none by default, set on every state of a block.
 use super::*;
 use crate::testing;
 
@@ -215,6 +216,53 @@ fn a_declared_block_keeps_fluids_out_in_every_state() {
         assert!(marked.keeps_fluids_out(by(&marked, name)), "{name}");
     }
     assert!(!marked.blocks_motion(by(&marked, "test:plant")));
+}
+
+#[test]
+fn a_light_filter_is_set_on_every_state_and_checked() {
+    let plain = builder().build();
+    assert!(states(&plain).all(|s| plain.light_filter(s) == [15; 3]));
+    let mut b = builder();
+    let ore = block(&b, "test:ember_ore");
+    b.set_light_filter(ore, [15, 3, 2]).expect("filter");
+    // Out of range: refused, nothing set.
+    let paint = block(&b, "test:paint");
+    assert_eq!(
+        b.set_light_filter(paint, [16, 0, 0]),
+        Err(RegistryError::InvalidLight("test:paint".into()))
+    );
+    let unknown = BlockId(b.blocks.len() as u16);
+    assert_eq!(
+        b.set_light_filter(unknown, [0; 3]),
+        Err(RegistryError::UnknownBlock(unknown.0))
+    );
+    let r = b.build();
+    for s in states(&r) {
+        let want = if r.name(s) == "test:ember_ore" {
+            [15, 3, 2]
+        } else {
+            [15; 3]
+        };
+        assert_eq!(r.light_filter(s), want, "{}", r.state_name(s));
+        assert_eq!(r.flags(s), plain.flags(s));
+    }
+    assert_eq!(r.light_filter(BlockState(u16::MAX)), [15; 3]);
+    // An opaque state ignores its filter; `[15; 3]` is none.
+    let tables = crate::LightTables::from_registry(&r);
+    assert!(!tables.filters(by(&r, "test:ember_ore[lit=true]")));
+    assert!(tables.any_filter() == states(&r).any(|s| tables.filters(s)));
+    let mut b = builder();
+    let glass = block(&b, "test:glass");
+    b.set_light_filter(glass, [15; 3]).expect("none");
+    assert!(!crate::LightTables::from_registry(&b.build()).any_filter());
+    let mut b = builder();
+    let glass = block(&b, "test:glass");
+    b.set_light_filter(glass, [4, 15, 9]).expect("filter");
+    let r = b.build();
+    let tables = crate::LightTables::from_registry(&r);
+    assert!(tables.any_filter() && tables.filters(by(&r, "test:glass")));
+    assert_eq!(tables.light_filter(by(&r, "test:glass")), [4, 15, 9]);
+    assert_ne!(tables.id(), crate::LightTables::from_registry(&plain).id());
 }
 
 #[test]
