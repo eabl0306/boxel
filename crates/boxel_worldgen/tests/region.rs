@@ -1019,8 +1019,9 @@ fn the_twin_equals_a_one_kind_map() {
 
 // ---- Realms -----------------------------------------------------------------------------------
 
-/// A realm generator that fills every chunk with one state.
-struct Fill(BlockState, RangeLayers);
+/// A realm generator that fills every chunk with one state, and declares the sky source band
+/// of its third field (it places none: only the band is checked).
+struct Fill(BlockState, RangeLayers, RangeLayers);
 type RangeLayers = std::ops::RangeInclusive<i64>;
 
 impl WorldGenerator for Fill {
@@ -1029,6 +1030,9 @@ impl WorldGenerator for Fill {
     }
     fn vertical_chunks(&self) -> RangeLayers {
         self.1.clone()
+    }
+    fn sky_source_layers(&self) -> RangeLayers {
+        self.2.clone()
     }
     fn name(&self) -> &str {
         "fill"
@@ -1097,9 +1101,9 @@ fn a_dimension_dispatches_each_chunk_to_its_realm() {
         id("test:overworld"),
         stack,
         vec![
-            Box::new(Fill(deep, i64::MIN..=i64::MAX)),
+            Box::new(Fill(deep, i64::MIN..=i64::MAX, -200..=-100)),
             Box::new(surface),
-            Box::new(Fill(sky, RangeLayers::new(1, 0))),
+            Box::new(Fill(sky, RangeLayers::new(1, 0), 380..=400)),
         ],
         &digest.finish(),
     );
@@ -1121,6 +1125,8 @@ fn a_dimension_dispatches_each_chunk_to_its_realm() {
     }
     assert_eq!(dim.vertical_chunks().start(), &i64::MIN);
     assert!(*dim.vertical_chunks().end() < 383);
+    // The sky source bands, each clipped to its realm (layers up to -129, from 384): their hull.
+    assert_eq!(dim.sky_source_layers(), -200..=400);
     // The two realms whose generators bring no line get one each (their generator's version and
     // name), so the dimension's version follows them too.
     let lines: Vec<(&str, &str)> = dim
@@ -1199,7 +1205,9 @@ fn a_dimension_refuses_a_realm_generator_in_another_realms_place() {
     let surface = || -> Box<dyn WorldGenerator> {
         Box::new(generator(&world, SEED, RegionSettings::default()))
     };
-    let deep = || -> Box<dyn WorldGenerator> { Box::new(Fill(BlockState(2), i64::MIN..=-129)) };
+    let deep = || -> Box<dyn WorldGenerator> {
+        Box::new(Fill(BlockState(2), i64::MIN..=-129, RangeLayers::new(1, 0)))
+    };
     let digest = DigestBuilder::new().finish();
     let message = panic_of(|| {
         drop(DimensionGenerator::new(

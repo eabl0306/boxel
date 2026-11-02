@@ -61,6 +61,15 @@ pub trait WorldGenerator: Send + Sync + 'static {
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
         i64::MIN..=i64::MAX
     }
+    /// Chunk-y range where [`WorldGenerator::generate`] may place a sky source state (ADR 0061):
+    /// every chunk outside it holds none. The world builds the beams of a column only when a
+    /// mesh is within reach of a layer that may hold a source, so a generator that places
+    /// sources must declare every layer it may place them in (a cavern's roof band, the
+    /// underside of a ceiling realm). The default, empty, places none: such a world never
+    /// builds a beam tile unless an edit places a source.
+    fn sky_source_layers(&self) -> RangeInclusive<i64> {
+        RangeInclusive::new(1, 0)
+    }
     /// Far level of detail (ADR 0031): this generator's coarse source, `None` (the default) if
     /// it has none. A generator that has one usually implements [`LodSource`] itself and returns
     /// `Some(self)`, so the source reads its current settings.

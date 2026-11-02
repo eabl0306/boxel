@@ -586,3 +586,76 @@ fn the_default_world_is_empty_and_new_takes_the_content() {
     assert!(Arc::ptr_eq(&plugin.registry, &registry));
     assert_eq!(plugin.generator.name(), generator.name());
 }
+
+/// Stone at chunk layer 0 and -3, air between, and one sky source under the roof at
+/// `(3, -1, 3)` (ADR 0061: `test:sky_source`, down, range 16), declared in layer -1.
+struct SunbeamHall;
+
+impl WorldGenerator for SunbeamHall {
+    fn generate(
+        &self,
+        key: ChunkKey,
+        registry: &boxel_voxel::BlockRegistry,
+    ) -> boxel_voxel::ChunkData {
+        let stone = registry.by_name("boxel:stone").expect("stone");
+        match key.pos.y {
+            0 | -3 => boxel_voxel::ChunkData::uniform(stone),
+            -1 if (key.pos.x, key.pos.z) == (0, 0) => {
+                let mut chunk = boxel_voxel::ChunkData::uniform(BlockState::AIR);
+                let source = registry.by_name("test:sky_source").expect("source");
+                chunk.set(LocalPos::new(3, 31, 3), source);
+                chunk
+            }
+            _ => boxel_voxel::ChunkData::uniform(BlockState::AIR),
+        }
+    }
+    fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+        -3..=0
+    }
+    fn sky_source_layers(&self) -> std::ops::RangeInclusive<i64> {
+        -1..=-1
+    }
+    fn name(&self) -> &str {
+        "sunbeam hall"
+    }
+}
+
+/// A sky source lights its beam as direct sky through the public API: the cached light, the
+/// column's beam tile and the world's counters.
+#[test]
+fn a_sky_source_lights_its_beam() {
+    let mut b = boxel_demo::blocks::builder();
+    boxel_voxel::testing::add_sky_source(&mut b).expect("sources");
+    let mut app = App::new();
+    app.add_plugins(WorldPlugin {
+        generator: Arc::new(SunbeamHall),
+        registry: Arc::new(b.build()),
+        settings: WorldSettings::default(),
+        executor: Arc::new(InlineExecutor),
+    });
+    app.world_mut().spawn((
+        Transform::from_translation(DVec3::new(16.0, -40.0, 16.0)),
+        ChunkViewer {
+            radius: 1,
+            vertical_radius: 2,
+        },
+    ));
+    settle(&mut app);
+    let map = app.world().resource::<ChunkMap>();
+    // The source's cell and 15 below it, then spread light.
+    for (y, sky) in [(-1, 15), (-16, 15), (-17, 14), (-30, 1)] {
+        let light = map.light_at(BlockPos::new(3, y, 3)).expect("cached");
+        assert_eq!(light.sky(), sky, "y {y}");
+    }
+    let tile = app
+        .world()
+        .resource::<SkyMap>()
+        .beam_tile(0, 0)
+        .expect("built");
+    let beams: Vec<_> = tile.column(3, 3).collect();
+    assert_eq!(beams.len(), 1);
+    assert_eq!((beams[0].lo, beams[0].hi), (-16, -1));
+    let stats = *app.world().resource::<WorldStats>();
+    assert!(stats.beam_tiles > 0 && stats.beam_jobs > 0 && stats.light_beam_boxes > 0);
+    assert_eq!(stats.waiting_beams, 0);
+}

@@ -15,6 +15,8 @@ pub enum JobKind {
     SkyTile,
     /// Compute a chunk's light for the light cache, without a mesh (ADR 0015).
     Light,
+    /// Build a chunk column's beam tile: the beams of its sky sources (ADR 0061).
+    BeamTile,
 }
 
 impl JobKind {
@@ -25,6 +27,7 @@ impl JobKind {
             JobKind::Mesh => 1,
             JobKind::SkyTile => 2,
             JobKind::Light => 3,
+            JobKind::BeamTile => 4,
         }
     }
     const fn from_code(code: u8) -> Self {
@@ -32,12 +35,13 @@ impl JobKind {
             0 => JobKind::Generate,
             1 => JobKind::Mesh,
             2 => JobKind::SkyTile,
-            _ => JobKind::Light,
+            3 => JobKind::Light,
+            _ => JobKind::BeamTile,
         }
     }
 }
 
-/// What a job works on: a chunk slot (generation, meshing) or a chunk column (sky tops).
+/// What a job works on: a chunk slot (generation, meshing) or a chunk column (sky tops, beams).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum JobId {
     /// A chunk slot of the `ChunkMap`.

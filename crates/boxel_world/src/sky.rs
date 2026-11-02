@@ -10,10 +10,11 @@
 //! (`SkyTile::raise`, `SkyTile::rescan_column`) or send the column back to `Pending` for a new
 //! walk; a walk result whose column changed meanwhile (its `version`) is discarded.
 use crate::ChunkId;
+use crate::beams::SourceColumn;
 use crate::persist::WorldStore;
 use boxel_ecs::prelude::*;
 use boxel_light::sky_tile::{GeneratorTop, walk, walk_floor};
-use boxel_light::{LayerData, SkyTile};
+use boxel_light::{BeamTile, LayerData, SkyTile};
 use boxel_voxel::{
     CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, DimensionId, LightTables, MAX_CHUNK_COORD,
 };
@@ -147,8 +148,11 @@ pub(crate) struct SkyColumn {
     /// The edit batch that sent the column back to `Pending`: the chunks the new tile remeshes
     /// join it.
     pub(crate) batch: Option<u32>,
-    /// Set when the column is dropped (a running walk stops).
+    /// Set when the column is dropped (a running walk or beam build stops).
     pub(crate) cancel: Arc<AtomicBool>,
+    /// The column's sky sources and beam tile (ADR 0061), created when a mesh needs the tile or
+    /// a loaded chunk may hold a source (none in a world without sources).
+    pub(crate) beams: Option<Box<SourceColumn>>,
 }
 
 impl SkyColumn {
@@ -169,6 +173,17 @@ impl SkyColumn {
     pub(crate) fn hi(&self) -> i64 {
         self.layers.last().copied().unwrap_or(i64::MIN)
     }
+}
+
+/// What [`SkyMap::beam_stats`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamStats {
+    /// Columns with a beam tile.
+    pub tiles: usize,
+    /// Beams in those tiles.
+    pub beams: usize,
+    /// Heap bytes of the tiles and of the columns' source layer lists.
+    pub heap_bytes: usize,
 }
 
 /// Sky tops of the loaded chunk columns (ADR 0015): one entry per chunk column with a loaded
@@ -271,6 +286,30 @@ impl SkyMap {
             + self.columns.capacity() * size_of::<SkyColumn>()
             + self.index.capacity() * size_of::<((i64, i64), ColumnId)>()
     }
+    /// The beam tile of chunk column `(cx, cz)` (ADR 0061), if loaded and a mesh needed one: exact
+    /// for its window ([`BeamTile::window`]).
+    pub fn beam_tile(&self, cx: i64, cz: i64) -> Option<&Arc<BeamTile>> {
+        self.columns
+            .get(self.id_at(cx, cz)?)?
+            .beams
+            .as_ref()?
+            .tile
+            .as_ref()
+    }
+    /// The beam tiles of the loaded columns (ADR 0061), counted.
+    pub fn beam_stats(&self) -> BeamStats {
+        self.columns
+            .values()
+            .filter_map(|c| c.beams.as_deref())
+            .fold(BeamStats::default(), |mut stats, b| {
+                if let Some(tile) = &b.tile {
+                    stats.tiles += 1;
+                    stats.beams += tile.len();
+                }
+                stats.heap_bytes += size_of::<SourceColumn>() + b.heap_bytes();
+                stats
+            })
+    }
     /// The column at `(cx, cz)`.
     pub(crate) fn id_at(&self, cx: i64, cz: i64) -> Option<ColumnId> {
         self.index.get(&(cx, cz)).copied()
@@ -298,6 +337,7 @@ impl SkyMap {
             waiting_for: None,
             batch: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            beams: None,
         });
         self.index.insert((pos.x, pos.z), id);
         id

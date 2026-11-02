@@ -16,7 +16,12 @@
 //! walked=N walks=N private_generations=N cache_mib=X sky_mib=X`: the light boxes that ran the floods or took a
 //! fast path (dark, open sky or under the walk floor), the chunk columns with a sky tile slot
 //! and with a walked tile, the walks run and the chunks they generated because they were not
-//! loaded, and the memory of the gameplay light cache and of the sky tiles. Compare `quads=`
+//! loaded, and the memory of the gameplay light cache and of the sky tiles; and `beams: tiles=N
+//! beams=N jobs=N private_generations=N waiting=N boxes=N beam_mib=X`: the chunk columns with
+//! a beam tile (ADR 0061), the beams in them, the builds run and the chunks they generated, the
+//! jobs still waiting for one, the light boxes that had beams, and the memory of the tiles.
+//! `--sky-sources` lights the caves near the viewer for it (a measurement harness, not a demo):
+//! a down sky source of range 64 in every other column under each cave roof. Compare `quads=`
 //! across `--light on|off` and `--ao off|baked|lit-only` for the cost of AO: with `--light off`
 //! every face counts as lit (a worst case for `lit-only`).
 //! With `--cave` (overworld), a `cave: eye=X,Y,Z depth=N clearance=N path=N voxels, N chunk
@@ -147,6 +152,8 @@ usage: headless_world [options]
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --spans              after each report, the busiest spans of its slowest update (needs
                        --features trace)
+  --sky-sources        light the caves within 24 layers of the viewer with sky sources: a down
+                       source of range 64 in every other column under each roof (ADR 0061)
   --help               this text";
 
 /// The whole help: [`USAGE`], `--lod` and the world options.
@@ -199,6 +206,8 @@ struct Options {
     spans: bool,
     /// `--reopen`.
     reopen: bool,
+    /// `--sky-sources`.
+    sky_sources: bool,
 }
 
 /// `Ok(None)` for `--help`.
@@ -224,6 +233,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         lod: LodPreset::Off,
         spans: false,
         reopen: false,
+        sky_sources: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -275,6 +285,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--cave" => o.cave = true,
             "--spans" => o.spans = true,
             "--reopen" => o.reopen = true,
+            "--sky-sources" => o.sky_sources = true,
             "--camera" => {
                 let v = value()?;
                 let parts: Vec<f64> = v
@@ -559,7 +570,7 @@ fn main() -> AppExit {
         }
     };
     let seed = boxel_demo::worldgen::DEFAULT_SEED;
-    let generator = options.world.generator(seed);
+    let mut generator = options.world.generator(seed);
     if options.cave {
         match find_cave(&mut options, generator.as_ref(), seed) {
             Ok(line) => println!("{line}"),
@@ -604,7 +615,16 @@ fn main() -> AppExit {
         None
     };
     let lod_settings = options.lod.settings();
-    let registry = Arc::new(boxel_demo::blocks::registry());
+    let registry = if options.sky_sources {
+        let layer = (options.viewer_y.floor() as i64) >> 5;
+        generator = Arc::new(CaveSources {
+            inner: generator,
+            layers: layer - 24..=layer + 24,
+        });
+        Arc::new(source_registry())
+    } else {
+        Arc::new(boxel_demo::blocks::registry())
+    };
     // `--reopen`: the world is saved in memory from the start (no autosave: the close writes it).
     let reopen = if options.reopen {
         let backend = Arc::new(MemoryStore::new());
@@ -941,6 +961,107 @@ fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
     )
 }
 
+/// The block `--sky-sources` places (only in this harness).
+const SOURCE_BLOCK: &str = "example:sky_source";
+
+/// The demo blocks plus [`SOURCE_BLOCK`]: invisible, no collision, a down sky source of range 64
+/// that keeps fluids out.
+fn source_registry() -> BlockRegistry {
+    use boxel::voxel::{BeamDir, BlockCollision, BlockDef, BlockModel, FaceTextures, RenderShape};
+    use boxel::voxel::{SkySourceDef, TextureId};
+    let mut b = boxel_demo::blocks::builder();
+    let state = b
+        .add_block(BlockDef {
+            name: SOURCE_BLOCK.to_string(),
+            shape: RenderShape::None,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::None,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("a new block");
+    let block = b.block_by_name(SOURCE_BLOCK).expect("just added");
+    b.set_keeps_fluids_out(block).expect("a block");
+    b.set_sky_source(
+        state,
+        SkySourceDef {
+            dir: BeamDir::Down,
+            range: 64,
+        },
+    )
+    .expect("a valid source");
+    b.build()
+}
+
+/// `--sky-sources`: `inner` with a sky source in the first air cell under every roof (an
+/// opaque block over air, inside one chunk) of the columns with `x + z` even, in `layers`.
+struct CaveSources {
+    inner: Arc<dyn WorldGenerator>,
+    layers: RangeInclusive<i64>,
+}
+
+impl WorldGenerator for CaveSources {
+    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+        let mut chunk = self.inner.generate(key, registry);
+        if !self.layers.contains(&key.pos.y) || chunk.as_uniform().is_some() {
+            return chunk;
+        }
+        let source = registry
+            .by_name(SOURCE_BLOCK)
+            .expect("the harness registry");
+        let o = key.pos.origin();
+        for x in 0..32u32 {
+            for z in 0..32u32 {
+                if (o.x + i64::from(x) + o.z + i64::from(z)).rem_euclid(2) != 0 {
+                    continue;
+                }
+                for y in (0..31u32).rev() {
+                    let (here, above) = (LocalPos::new(x, y, z), LocalPos::new(x, y + 1, z));
+                    if chunk.get(here).is_air() && registry.occludes(chunk.get(above)) {
+                        chunk.set(here, source);
+                    }
+                }
+            }
+        }
+        chunk
+    }
+    fn vertical_chunks(&self) -> RangeInclusive<i64> {
+        self.inner.vertical_chunks()
+    }
+    fn sky_source_layers(&self) -> RangeInclusive<i64> {
+        self.layers.clone()
+    }
+    fn lod(&self) -> Option<&dyn boxel::worldgen::LodSource> {
+        self.inner.lod()
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn version(&self) -> u32 {
+        self.inner.version()
+    }
+    fn realms(&self) -> &boxel::worldgen::RealmStack {
+        self.inner.realms()
+    }
+}
+
+/// The `beams:` line: the beam tiles of the sky sources (ADR 0061).
+fn beams_line(sky: &SkyMap, stats: &WorldStats) -> String {
+    let b = sky.beam_stats();
+    format!(
+        "beams: tiles={} beams={} jobs={} private_generations={} waiting={} boxes={} \
+         beam_mib={:.1}",
+        b.tiles,
+        b.beams,
+        stats.beam_jobs,
+        stats.beam_private_generations,
+        stats.waiting_beams,
+        stats.light_beam_boxes,
+        b.heap_bytes as f64 / f64::from(1 << 20),
+    )
+}
+
 /// The `sky:` line: light paths, sky walks and the memory of the light caches.
 fn sky_line(map: &ChunkMap, sky: &SkyMap, stats: &WorldStats, light: bool) -> String {
     let cache: usize = map
@@ -1032,6 +1153,7 @@ fn drive(
             println!("{}", world_line(&map));
             println!("{}", light_line(&map, settings.ao_policy));
             println!("{}", sky_line(&map, &sky, &stats, settings.light));
+            println!("{}", beams_line(&sky, &stats));
             if run.options.cull
                 && let Some((transform, viewer)) = viewers.iter().next()
             {

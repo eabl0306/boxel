@@ -158,6 +158,99 @@ pub(crate) mod support {
             self.jobs.lock().expect("lock").push(job);
         }
     }
+
+    /// The states of `test:sky_source` (ADR 0061), by direction and range
+    /// ([`SKY_SOURCE_RANGES`](boxel_voxel::testing::SKY_SOURCE_RANGES): 1, 16, 64, 256).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Sources {
+        pub(crate) down: [BlockState; 4],
+        pub(crate) up: [BlockState; 4],
+    }
+
+    impl Sources {
+        /// The sources of `registry` (which holds `test:sky_source`).
+        pub(crate) fn of(registry: &BlockRegistry) -> Self {
+            // The default is `dir=down,range=16`, the second state; `dir` then `range`.
+            let first = registry.by_name("test:sky_source").expect("sources").0 - 1;
+            Self {
+                down: std::array::from_fn(|i| BlockState(first + i as u16)),
+                up: std::array::from_fn(|i| BlockState(first + 4 + i as u16)),
+            }
+        }
+    }
+
+    /// The demo blocks plus `test:sky_source`.
+    pub(crate) fn source_registry() -> (Arc<BlockRegistry>, Sources) {
+        let mut b = boxel_demo::blocks::builder();
+        boxel_voxel::testing::add_sky_source(&mut b).expect("sky sources");
+        let registry = b.build();
+        let sources = Sources::of(&registry);
+        (Arc::new(registry), sources)
+    }
+
+    /// A lit cavern (ADR 0061) under a stone roof: stone from y = -192 to -1, with a cavern from
+    /// y = -150 to -60 holding stone pillars (3x3 every 40 blocks) and a ledge (y = -100 to -98)
+    /// that shadows the floor under it. Every other cell under the roof (y = -60) is a down
+    /// source of range 256, and a few cells of the floor (y = -150) are up sources of range 16.
+    /// Open sky above y = 0. Sources are declared in layers -5 to -2.
+    pub(crate) struct LitCavern;
+
+    impl LitCavern {
+        /// The block at `(x, y, z)`.
+        pub(crate) fn at(x: i64, y: i64, z: i64, stone: BlockState, s: Sources) -> BlockState {
+            if !(-192..0).contains(&y) {
+                return BlockState::AIR;
+            }
+            let pillar = x.rem_euclid(40) < 3 && z.rem_euclid(40) < 3;
+            if !(-150..=-60).contains(&y) || pillar {
+                return stone;
+            }
+            if (-100..=-98).contains(&y) && (20..44).contains(&x.rem_euclid(64)) {
+                return stone;
+            }
+            if y == -60 && (x + z).rem_euclid(2) == 0 {
+                return s.down[3];
+            }
+            if y == -150 && x.rem_euclid(9) == 0 && z.rem_euclid(7) == 0 {
+                return s.up[1];
+            }
+            BlockState::AIR
+        }
+    }
+
+    impl WorldGenerator for LitCavern {
+        fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+            let stone = registry.by_name("boxel:stone").expect("stone");
+            let o = key.pos.origin();
+            if !(-6..=-1).contains(&key.pos.y) {
+                return ChunkData::uniform(BlockState::AIR);
+            }
+            if key.pos.y == -1 || key.pos.y == -6 {
+                return ChunkData::uniform(stone);
+            }
+            let s = Sources::of(registry);
+            let mut dense = vec![BlockState::AIR; CHUNK_VOLUME];
+            for (i, cell) in dense.iter_mut().enumerate() {
+                let p = boxel_voxel::LocalPos::from_index(i);
+                let (x, y, z) = (
+                    o.x + i64::from(p.x()),
+                    o.y + i64::from(p.y()),
+                    o.z + i64::from(p.z()),
+                );
+                *cell = Self::at(x, y, z, stone, s);
+            }
+            ChunkData::from_dense(&dense)
+        }
+        fn vertical_chunks(&self) -> RangeInclusive<i64> {
+            -6..=-1
+        }
+        fn sky_source_layers(&self) -> RangeInclusive<i64> {
+            -5..=-2
+        }
+        fn name(&self) -> &str {
+            "lit cavern"
+        }
+    }
 }
 
 fn settings(max_jobs_in_flight: usize) -> WorldSettings {
@@ -453,6 +546,11 @@ fn plugin_streams_settles_and_uses_fast_paths() {
             sky_walks: 21,
             sky_private_generations: 0,
             waiting_sky: 0,
+            beam_tiles: 0,
+            beam_jobs: 0,
+            beam_private_generations: 0,
+            waiting_beams: 0,
+            light_beam_boxes: 0,
             edit_batches_held: 0,
             edit_batches_split: 0,
             light_fanout: 0,

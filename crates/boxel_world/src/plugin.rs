@@ -692,6 +692,7 @@ fn teardown_streaming(
     if let Some(mut board) = board {
         board.remove("world");
         board.remove("light");
+        board.remove("beams");
     }
 }
 
@@ -892,12 +893,13 @@ fn publish_meshes(
 }
 
 /// Refreshes `WorldStats` (slot counts, scheduler counts, interest backlog) and the `"world"`
-/// and `"light"` board lines (no `"light"` with light off). The slot counts are kept by the map
-/// (no walk); debug builds check them against a walk of every slot in the frames that changed
-/// the map.
+/// and `"light"` board lines (no `"light"` with light off), and the `"beams"` line in a world
+/// whose registry has sky sources. The slot counts are kept by the map (no walk); debug builds
+/// check them against a walk of every slot in the frames that changed the map.
 fn publish_stats(
     map: Res<ChunkMap>,
     sky: Res<SkyMap>,
+    content: Res<WorldContent>,
     jobs: Res<WorldJobs>,
     mut stats: ResMut<WorldStats>,
     mut failed: Local<Option<usize>>,
@@ -914,6 +916,15 @@ fn publish_stats(
     now.interest_backlog = jobs.interest_backlog();
     jobs.light_stats(&mut now);
     now.sky_columns = sky.len();
+    // Only a registry with sky sources has beam tiles (a walk of the columns).
+    let beams = content.light_tables.any_sky_source() && sky.rule != SkyRule::Off;
+    let beam_bytes = if beams {
+        let b = sky.beam_stats();
+        now.beam_tiles = b.tiles;
+        b.heap_bytes
+    } else {
+        0
+    };
     let changed = *stats != now || *failed != Some(jobs.failed);
     stats.set_if_neq(now);
     *failed = Some(jobs.failed);
@@ -954,6 +965,22 @@ fn publish_stats(
         } else {
             // A world with light off after one with light on.
             board.remove("light");
+        }
+        if beams {
+            board.set(
+                "beams",
+                format!(
+                    "tiles={} jobs={} private={} waiting={} boxes={} mib={:.1}",
+                    now.beam_tiles,
+                    now.beam_jobs,
+                    now.beam_private_generations,
+                    now.waiting_beams,
+                    now.light_beam_boxes,
+                    beam_bytes as f64 / f64::from(1 << 20)
+                ),
+            );
+        } else {
+            board.remove("beams");
         }
     }
 }

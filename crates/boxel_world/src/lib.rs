@@ -73,6 +73,7 @@ macro_rules! frame_span {
 #[cfg(not(feature = "trace"))]
 pub(crate) struct NoSpan;
 
+mod beams;
 mod daylight;
 pub mod fluid;
 mod interest;
@@ -108,7 +109,7 @@ pub use plugin::{
     BlockChanged, BlockEdit, ChunkDataEvent, ChunkMeshEvent, ChunkMeshResync, ChunkViewer,
     DataEdit, EditQueue, WorldContent, WorldPlugin, WorldSettings, WorldSystems,
 };
-pub use sky::{ColumnId, SkyMap};
+pub use sky::{BeamStats, ColumnId, SkyMap};
 pub use ticks::{
     BlockTickSettings, BlockTickStats, BlockTicks, BlockTicksPlugin, GAME_TICKS_PER_SECOND,
     RandomTickHandler, TickContext, TickHandler, TickLight, curve_sky_darken,

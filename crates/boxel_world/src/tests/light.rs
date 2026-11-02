@@ -30,6 +30,12 @@ use std::time::{Duration, Instant};
 
 /// The default blocks plus two opaque lamps (orange, blue).
 fn lamp_registry() -> (Arc<BlockRegistry>, [BlockState; 2]) {
+    let (b, lamps) = lamp_builder();
+    (Arc::new(b.build()), lamps)
+}
+
+/// [`lamp_registry`], still open for more blocks.
+fn lamp_builder() -> (boxel_voxel::BlockRegistryBuilder, [BlockState; 2]) {
     let mut b = boxel_demo::blocks::builder();
     let mut lamp = |name: &str, emission| {
         b.add_block(BlockDef {
@@ -47,7 +53,7 @@ fn lamp_registry() -> (Arc<BlockRegistry>, [BlockState; 2]) {
         lamp("lamp_orange", [14, 11, 6]),
         lamp("lamp_blue", [4, 6, 14]),
     ];
-    (Arc::new(b.build()), lamps)
+    (b, lamps)
 }
 
 const STONE: BlockState = BlockState(1);
@@ -247,10 +253,16 @@ impl<G: WorldGenerator> WorldGenerator for Offset<G> {
         let r = self.inner.vertical_chunks();
         r.start().saturating_add(self.offset.y)..=r.end().saturating_add(self.offset.y)
     }
+    fn sky_source_layers(&self) -> RangeInclusive<i64> {
+        let r = self.inner.sky_source_layers();
+        r.start().saturating_add(self.offset.y)..=r.end().saturating_add(self.offset.y)
+    }
     fn name(&self) -> &str {
         "offset"
     }
 }
+
+mod beams;
 
 fn overworld() -> OverworldGenerator {
     OverworldGenerator::default()

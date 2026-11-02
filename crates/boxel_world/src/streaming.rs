@@ -22,6 +22,7 @@
 //! - Once the interest backlog is empty, every slot's interest is what the viewers want
 //!   ([`Planner::level`]), every wanted position has a slot, and every unwanted unpinned slot is
 //!   inside some viewer's keep region with data that was at least started.
+use crate::beams::{self, BeamJob, GATE_LAYERS, box_rows, edit_layer, source_rows, widen};
 use crate::interest::{Level, Planner, Viewer};
 use crate::jobs::JobExecutor;
 use crate::persist::Persist;
@@ -36,8 +37,8 @@ use crate::{
 use boxel_app::IdleWork;
 use boxel_ecs::prelude::*;
 use boxel_light::{
-    ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight, Rescan, SkyInput,
-    SkyTile,
+    BeamTile, ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight, Rescan,
+    Retrace, SkyInput, SkyTile,
 };
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
@@ -158,6 +159,8 @@ pub(crate) enum JobMessage {
         path: Option<LightPath>,
         /// The center's face info, when the slot had none (after an edit).
         faces: Option<ChunkFaceInfo>,
+        /// The light box had a beam tile with beams.
+        beams: bool,
     },
     /// A light job finished.
     Lit {
@@ -172,6 +175,17 @@ pub(crate) enum JobMessage {
         /// The column version the walk read.
         version: u32,
         tile: SkyTile,
+        /// Chunks it generated privately.
+        generated: u32,
+    },
+    /// A beam tile build finished.
+    Beamed {
+        column: ColumnId,
+        /// The column version the build read.
+        version: u32,
+        /// The rows it built.
+        window: (i64, i64),
+        tile: BeamTile,
         /// Chunks it generated privately.
         generated: u32,
     },
@@ -254,6 +268,14 @@ impl HoldClock {
     }
 }
 
+/// The beam tiles of a light box ([`WorldJobs::beams_for`]), by
+/// `boxel_light::box_light::tile_index`: `None` where no beam can reach the box.
+enum BeamsFor {
+    Ready([Option<Arc<BeamTile>>; 9]),
+    /// A tile the box needs is not built, or does not cover the box: the slot waits for it.
+    Waiting,
+}
+
 /// The sky of a light box ([`WorldJobs::sky_for`]).
 enum SkyFor {
     /// The 9 tiles around the chunk, or `None` when the box needs none (under the walk floor,
@@ -309,6 +331,8 @@ struct LightJob {
     /// The 9 tiles around the chunk (by `boxel_light::box_light::tile_index`), or `None` when
     /// the box is under the walk floor.
     tiles: Option<[Arc<SkyTile>; 9]>,
+    /// The 9 beam tiles around the chunk, `None` where no beam can reach the box (ADR 0061).
+    beams: [Option<Arc<BeamTile>>; 9],
     /// Keep the chunk's light for gameplay.
     keep: bool,
 }
@@ -338,7 +362,7 @@ fn with_light<R>(
             origin: pos,
             chunks,
             sky: tiles.map_or(SkyInput::BelowFloor, SkyInput::Tiles),
-            beams: [None; 9],
+            beams: std::array::from_fn(|i| job.beams[i].as_deref()),
             tables: &job.tables,
         };
         let path = boxel_light::compute(&input, scratch, padded);
@@ -497,6 +521,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) content: &'a WorldContent,
     pub(crate) events: &'a mut Vec<ChunkMeshEvent>,
     generator_layers: Option<RangeInclusive<i64>>,
+    source_layers: Option<RangeInclusive<i64>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -512,7 +537,15 @@ impl<'a> Ctx<'a> {
             content,
             events,
             generator_layers: None,
+            source_layers: None,
         }
+    }
+
+    /// The layers where the generator may place a sky source (queried once per run).
+    fn source_band(&mut self) -> RangeInclusive<i64> {
+        self.source_layers
+            .get_or_insert_with(|| self.content.generator.sky_source_layers())
+            .clone()
     }
 
     /// True if the generator declares layer `y` all air (outside its `vertical_chunks()`, queried
@@ -795,6 +828,10 @@ impl WorldJobs {
         stats.sky_walks = c.sky_walks;
         stats.sky_private_generations = c.sky_private_generations;
         stats.waiting_sky = c.waiting_sky;
+        stats.beam_jobs = c.beam_jobs;
+        stats.beam_private_generations = c.beam_private_generations;
+        stats.waiting_beams = c.waiting_beams;
+        stats.light_beam_boxes = c.light_beam_boxes;
         stats.edit_batches_held = c.edit_batches_held;
         stats.edit_batches_split = c.edit_batches_split;
         stats.light_fanout = c.light_fanout;
@@ -1275,7 +1312,7 @@ impl WorldJobs {
     /// neighbors instead: their bit stays set and the ones with mesh interest are remeshed.
     pub(crate) fn unload(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
         self.leave_batch(cx, id);
-        self.set_waits_sky(cx, id, false);
+        self.stop_waiting(cx, id);
         let Some(slot) = cx.map.remove(id) else {
             return;
         };
@@ -1338,11 +1375,12 @@ impl WorldJobs {
 
     /// For a slot in `MeshState::Queued` that wants a mesh: resolves the empty fast paths that
     /// need no neighbors (`Missing` data, uniform air), or queues a mesh job once its data is
-    /// `Ready`, all 26 neighbors are ready and, when its light box may hold direct sky, the sky
-    /// tiles of its 3x3 columns are walked. Otherwise it waits (it is scheduled again when the
-    /// last neighbor becomes ready, or when the tile lands).
+    /// `Ready`, all 26 neighbors are ready, the sky tiles of its 3x3 columns are walked when its
+    /// light box may hold direct sky, and their beam tiles are built when a sky source may light
+    /// it. Otherwise it waits (it is scheduled again when the last neighbor becomes ready, or
+    /// when the tile lands).
     fn schedule_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId, priority: u32) {
-        self.set_waits_sky(cx, id, false);
+        self.stop_waiting(cx, id);
         let slot = &cx.map.slots[id];
         if !matches!(slot.mesh(), MeshState::Queued) || !slot.interest.contains(Interest::MESH) {
             return;
@@ -1353,7 +1391,10 @@ impl WorldJobs {
                 self.set_mesh_empty(cx, id, true);
             }
             DataState::Ready(_) if slot.neighbors_ready == ALL_NEIGHBORS => {
-                if matches!(self.sky_for(cx, id, false), SkyFor::Ready(_)) {
+                // Both are asked for at once, so their jobs run side by side.
+                let sky = matches!(self.sky_for(cx, id, false), SkyFor::Ready(_));
+                let beams = matches!(self.beams_for(cx, id, false), BeamsFor::Ready(_));
+                if sky && beams {
                     self.scheduler.push(id, JobKind::Mesh, priority);
                 }
             }
@@ -1418,6 +1459,128 @@ impl WorldJobs {
         }
     }
 
+    /// The beam tiles of the light box of slot `id` (ADR 0061; without `collect`, only whether
+    /// they are ready). A column the box needs ([`WorldJobs::beams_needed`]) whose tile is not
+    /// built, or does not cover the box's rows, gets a build of a window that does and the slot
+    /// waits for it ([`BeamsFor::Waiting`]). A tile without beams is passed as `None`, which
+    /// gives the same light. A registry without sources, or a world without sky tops, never looks.
+    fn beams_for(&mut self, cx: &mut Ctx<'_>, id: ChunkId, collect: bool) -> BeamsFor {
+        if !cx.content.light_tables.any_sky_source() || !matches!(cx.sky.rule, SkyRule::Walk(_)) {
+            return BeamsFor::Ready(Default::default());
+        }
+        let pos = cx.map.slots[id].pos;
+        let rows = box_rows(pos.y);
+        let mut beams: [Option<Arc<BeamTile>>; 9] = Default::default();
+        let mut waiting = false;
+        for (i, out) in (0i64..).zip(beams.iter_mut()) {
+            // `boxel_light::box_light::tile_index`: (dx + 1) * 3 + (dz + 1).
+            let (dx, dz) = (i / 3 - 1, i % 3 - 1);
+            let Some(col) = cx.sky.id_at(pos.x + dx, pos.z + dz) else {
+                debug_assert!(false, "no sky column next to {pos:?}");
+                continue;
+            };
+            if !self.beams_needed(cx, col, pos.y) {
+                continue;
+            }
+            let c = &mut cx.sky.columns[col];
+            let b = c.beams.get_or_insert_default();
+            if let Some(tile) = b.tile.as_ref().filter(|t| t.covers(rows.0, rows.1)) {
+                if collect && !tile.is_empty() {
+                    *out = Some(Arc::clone(tile));
+                }
+                continue;
+            }
+            waiting = true;
+            if !b.waiters.contains(&id) {
+                b.waiters.push(id);
+            }
+            // The next build keeps the rows of the tile and of any build before it (their meshes
+            // stay covered), unless that is too tall.
+            b.want = Some(widen(b.window(), rows));
+            let priority = match b.batch {
+                Some(_) => 0,
+                None => self.planner.column_priority(c.x, c.z),
+            };
+            self.request_beams(cx.sky, col, priority);
+        }
+        if waiting {
+            self.set_waits_beams(cx, id, true);
+            return BeamsFor::Waiting;
+        }
+        BeamsFor::Ready(beams)
+    }
+
+    /// True if the light box of a chunk at layer `cy` needs the beam tile of column `col`: a
+    /// layer of the column within [`GATE_LAYERS`] may hold a sky source.
+    fn beams_needed(&self, cx: &mut Ctx<'_>, col: ColumnId, cy: i64) -> bool {
+        self.may_hold_source(
+            cx,
+            col,
+            cy.saturating_sub(GATE_LAYERS),
+            cy.saturating_add(GATE_LAYERS),
+        )
+    }
+
+    /// True if some layer in `lo..=hi` of column `col` may hold a sky source: the generator may
+    /// place one there, a loaded chunk's palette holds one, or a saved chunk that is not readable
+    /// yet is there (its record may hold one).
+    fn may_hold_source(&self, cx: &mut Ctx<'_>, col: ColumnId, lo: i64, hi: i64) -> bool {
+        if lo > hi {
+            return false;
+        }
+        let band = cx.source_band();
+        if !band.is_empty() && *band.start() <= hi && lo <= *band.end() {
+            return true;
+        }
+        let c = &cx.sky.columns[col];
+        if c.beams.as_ref().is_some_and(|b| b.has_layer_in(lo, hi)) {
+            return true;
+        }
+        let Some(p) = &self.persist else {
+            return false;
+        };
+        let saved = p.layers(c.dim, c.x, c.z);
+        let start = saved.partition_point(|&y| y < lo);
+        saved[start..].iter().take_while(|&&y| y <= hi).any(|&y| {
+            cx.map
+                .id_at(ChunkPos::new(c.x, y, c.z))
+                .is_none_or(|id| !cx.map.slots[id].data().is_readable())
+        })
+    }
+
+    /// Queues the beam build of column `col` if one is wanted, none is queued or running, and
+    /// it does not wait for data.
+    fn request_beams(&mut self, sky: &mut SkyMap, col: ColumnId, priority: u32) {
+        let Some(b) = sky
+            .columns
+            .get_mut(col)
+            .and_then(|c| c.beams.as_deref_mut())
+        else {
+            return;
+        };
+        if b.want.is_some() && !b.queued && b.in_flight.is_none() && b.waiting_for.is_none() {
+            b.queued = true;
+            self.scheduler.push(col, JobKind::BeamTile, priority);
+        }
+    }
+
+    /// Slot `id` no longer waits for a sky or beam tile.
+    fn stop_waiting(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
+        self.set_waits_sky(cx, id, false);
+        self.set_waits_beams(cx, id, false);
+    }
+
+    /// Marks whether slot `id` waits for a beam tile ([`WorldStats::waiting_beams`]).
+    fn set_waits_beams(&mut self, cx: &mut Ctx<'_>, id: ChunkId, waits: bool) {
+        if let Some(slot) = cx.map.slots.get_mut(id)
+            && slot.waits_beams() != waits
+        {
+            slot.set_waits_beams(waits);
+            let gauge = &mut self.light_counts.waiting_beams;
+            *gauge = if waits { *gauge + 1 } else { *gauge - 1 };
+        }
+    }
+
     /// Marks whether slot `id` waits for a sky tile ([`WorldStats::waiting_sky`]).
     fn set_waits_sky(&mut self, cx: &mut Ctx<'_>, id: ChunkId, waits: bool) {
         if let Some(slot) = cx.map.slots.get_mut(id)
@@ -1429,16 +1592,23 @@ impl WorldJobs {
         }
     }
 
-    /// The data of slot `id` arrived (or the slot is gone): a walk of its column that waited for
-    /// it is queued again.
+    /// The data of slot `id` arrived (or the slot is gone): a walk or a beam build of its column
+    /// that waited for it is queued again.
     fn walk_data_arrived(&mut self, cx: &mut Ctx<'_>, col: ColumnId, id: ChunkId) {
         let Some(c) = cx.sky.columns.get_mut(col) else {
             return;
         };
+        let priority = self.planner.column_priority(c.x, c.z);
         if c.waiting_for == Some(id) {
             c.waiting_for = None;
-            let priority = self.planner.column_priority(c.x, c.z);
             self.request_walk(cx.sky, col, priority);
+        }
+        if let Some(b) = cx.sky.columns[col].beams.as_deref_mut()
+            && b.waiting_for == Some(id)
+        {
+            b.waiting_for = None;
+            let priority = if b.batch.is_some() { 0 } else { priority };
+            self.request_beams(cx.sky, col, priority);
         }
     }
 
@@ -1449,7 +1619,21 @@ impl WorldJobs {
     fn column_lost_slot(&mut self, cx: &mut Ctx<'_>, slot: &ChunkSlot, id: ChunkId) {
         let col = slot.column;
         self.walk_data_arrived(cx, col, id);
-        if cx.sky.detach(col, slot.pos.y) || !slot.sky_edited() || self.persist.is_some() {
+        if let Some(b) = cx
+            .sky
+            .columns
+            .get_mut(col)
+            .and_then(|c| c.beams.as_deref_mut())
+        {
+            b.remove_layer(slot.pos.y);
+        }
+        if cx.sky.detach(col, slot.pos.y) {
+            return;
+        }
+        if slot.beam_edited() && self.persist.is_none() {
+            self.beams_lost(cx, col);
+        }
+        if !slot.sky_edited() || self.persist.is_some() {
             return;
         }
         let c = &mut cx.sky.columns[col];
@@ -1461,6 +1645,39 @@ impl WorldJobs {
         }
         let priority = self.planner.column_priority(c.x, c.z);
         self.request_walk(cx.sky, col, priority);
+    }
+
+    /// A chunk of column `col` whose edits moved beams unloaded without persistence: the edits
+    /// are lost, so the beams are built again from the content, for the rows of the meshes that
+    /// may still use the tile (around the column's loaded layers). What changed is remeshed when
+    /// the new tile lands.
+    fn beams_lost(&mut self, cx: &mut Ctx<'_>, col: ColumnId) {
+        let c = &mut cx.sky.columns[col];
+        let (lo, hi) = (c.layers[0], c.hi());
+        let (x, z) = (c.x, c.z);
+        let Some(b) = c.beams.as_deref_mut() else {
+            // No source was ever near: no mesh had beams from this column.
+            return;
+        };
+        b.version = b.version.wrapping_add(1);
+        let Some(window) = b.window() else {
+            // Never built: no mesh had beams from this column.
+            return;
+        };
+        let window = (
+            window.0.max(box_rows(lo - 1).0),
+            window.1.min(box_rows(hi + 1).1),
+        );
+        let tile = b.tile.take();
+        if window.0 > window.1 {
+            // No loaded mesh can use it any more.
+            (b.old, b.want) = (None, None);
+            return;
+        }
+        b.old = b.old.take().or(tile);
+        b.want = Some(window);
+        let priority = self.planner.column_priority(x, z);
+        self.request_beams(cx.sky, col, priority);
     }
 
     // ---- Edit batches ------------------------------------------------------------------------
@@ -1694,7 +1911,7 @@ impl WorldJobs {
     /// `shown`: the chunk really has nothing to show ([`ChunkSlot::shown`]); not after a failed
     /// mesh job, whose blocks the renderer then does not show.
     fn set_mesh_empty(&mut self, cx: &mut Ctx<'_>, id: ChunkId, shown: bool) {
-        self.set_waits_sky(cx, id, false);
+        self.stop_waiting(cx, id);
         // The empty fast paths (missing data, uniform chunks) need no job to know their faces.
         let slot = &cx.map.slots[id];
         if slot.face_links().is_none() {
@@ -1717,7 +1934,7 @@ impl WorldJobs {
 
     /// `MeshState::None`, and `Remove` if a mesh was published (nothing is shown).
     fn drop_mesh(&mut self, cx: &mut Ctx<'_>, id: ChunkId) {
-        self.set_waits_sky(cx, id, false);
+        self.stop_waiting(cx, id);
         cx.map.set_mesh_shown(id, MeshState::None, false);
         self.unpublish(cx, id);
         self.leave_batch(cx, id);
@@ -1892,7 +2109,7 @@ impl WorldJobs {
         changed.retain(|(_, change)| change.old != change.new);
         // Each position once: the orders are distinct.
         changed.sort_unstable_by_key(|&(order, _)| order);
-        let changed = changed.into_iter().map(|(_, change)| change).collect();
+        let changed: Vec<BlockChanged> = changed.into_iter().map(|(_, change)| change).collect();
         if changes.is_empty() {
             return changed;
         }
@@ -1961,6 +2178,19 @@ impl WorldJobs {
             cx.map.slots[id].set_sky_edited();
             if let Some(band) = self.sky_edit(cx, p, placed, batch) {
                 band_chunks(cx.map, cx.sky, &band, &mut remesh);
+            }
+        }
+        // 3b. The beams of the sky sources (ADR 0061), from the new data: one retrace per
+        // position, with its final state.
+        if walked && tables.any_sky_source() {
+            for change in &changed {
+                let (old, new) = (change.old, change.new);
+                if tables.is_sky_source(old)
+                    || tables.is_sky_source(new)
+                    || tables.blocks_sky(old) != tables.blocks_sky(new)
+                {
+                    self.beam_edit(cx, change.pos, new, batch, &mut remesh);
+                }
             }
         }
         // 4. The remeshes.
@@ -2051,6 +2281,140 @@ impl WorldJobs {
                 self.request_walk(cx.sky, col, 0);
                 None
             }
+        }
+    }
+
+    /// The voxel at `p` became `state` (after every edit of the call is in the data), a change
+    /// that may move a beam of its column: a source placed or removed, a sky blocker placed or
+    /// removed (ADR 0061). The column's tile is retraced in place and the chunks whose light the
+    /// changed cells reach join `remesh`. When the tile cannot be retraced from loaded data, or
+    /// a new source may light meshes the tile does not cover (they were built without one, as
+    /// nothing could light them), the column gets a new build, compared with what the meshes had
+    /// when it lands, whose remeshes join `batch`.
+    fn beam_edit(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        p: BlockPos,
+        state: BlockState,
+        batch: u32,
+        remesh: &mut BTreeSet<ChunkPos>,
+    ) {
+        let SkyRule::Walk(rule) = &cx.sky.rule else {
+            return;
+        };
+        let layers = rule.layers.clone();
+        let (chunk, local) = p.split();
+        let Some(id) = cx.map.id_at(chunk) else {
+            return;
+        };
+        cx.map.slots[id].set_beam_edited();
+        let col = cx.map.slots[id].column;
+        let content = cx.content;
+        let (tables, planes) = (&*content.light_tables, content.generator.realms().planes());
+        let source = tables.sky_source(state);
+        let c = &mut cx.sky.columns[col];
+        let (x, z, dim) = (c.x, c.z, c.dim);
+        // The rows of the meshes that may use the tile: around the column's loaded layers.
+        let loaded = (box_rows(c.layers[0] - 1).0, box_rows(c.hi() + 1).1);
+        // The boxes a new source may relight, among those.
+        let relit = source
+            .map(|def| {
+                let (lo, hi) = source_rows(def, p.y);
+                let chunks = padded_chunks(lo, hi);
+                (
+                    box_rows(*chunks.start()).0.max(loaded.0),
+                    box_rows(*chunks.end()).1.min(loaded.1),
+                )
+            })
+            .filter(|(lo, hi)| lo <= hi);
+        let b = c.beams.get_or_insert_default();
+        if source.is_some() {
+            b.add_layer(chunk.y);
+        }
+        // A running build read the old content.
+        b.version = b.version.wrapping_add(1);
+        // After a window was replaced, a mesh outside the window may hold an earlier tile: the
+        // light this edit can reach is remeshed around it.
+        let far = b.replaced
+            && b.tile
+                .as_ref()
+                .is_none_or(|t| !t.covers(p.y - beams::REACH - 14, p.y + beams::REACH + 14));
+        let saved = self
+            .persist
+            .as_ref()
+            .map_or(&[][..], |persist| persist.layers(dim, x, z));
+        let map = &*cx.map;
+        let retrace = match &mut b.tile {
+            Some(tile)
+                if p.y >= tile.window().start() - beams::REACH
+                    && p.y <= tile.window().end() + beams::REACH =>
+            {
+                Some(Arc::make_mut(tile).edit(
+                    local.x(),
+                    local.z(),
+                    p.y,
+                    state,
+                    planes,
+                    tables,
+                    |cy| edit_layer(map, (x, z), cy, saved, &layers),
+                ))
+            }
+            _ => None,
+        };
+        let mut changed = None;
+        let mut build = false;
+        match retrace {
+            Some(Retrace::Unchanged) => {}
+            Some(Retrace::Changed { lo, hi }) => changed = Some((lo, hi)),
+            Some(Retrace::Unresolved) => {
+                let window = b.window();
+                let tile = b.tile.take();
+                b.old = b.old.take().or(tile);
+                b.want = window.map(|w| relit.map_or(w, |r| widen(Some(w), r)));
+                build = true;
+            }
+            // No beam cell of the tile's window moves; a new source may light meshes outside it.
+            None if b.tile.is_some() => {
+                if let Some(r) = relit {
+                    let window = b.window();
+                    b.old = b.tile.take();
+                    b.want = Some(widen(window, r));
+                    build = true;
+                }
+            }
+            // No tile yet: a wanted or running build is compared with what the meshes had
+            // (nothing: they were built without a tile), and a new source gets one.
+            None => {
+                if let Some(w) = b.window() {
+                    if b.old.is_none() {
+                        b.old = Some(Arc::new(BeamTile::empty(w.0..=w.1)));
+                    }
+                    b.want = Some(relit.map_or(w, |r| widen(Some(w), r)));
+                    build = true;
+                } else if let Some(r) = relit {
+                    b.old = Some(Arc::new(BeamTile::empty(r.0..=r.1)));
+                    b.want = Some(r);
+                    build = true;
+                }
+            }
+        }
+        if build {
+            b.batch = Some(batch);
+        }
+        if let Some((lo, hi)) = changed {
+            let band = [reach(p.x, p.x), reach(lo, hi), reach(p.z, p.z)];
+            band_chunks(cx.map, cx.sky, &band, remesh);
+        }
+        if far {
+            let band = [
+                reach(p.x, p.x),
+                reach(p.y - beams::REACH, p.y + beams::REACH),
+                reach(p.z, p.z),
+            ];
+            band_chunks(cx.map, cx.sky, &band, remesh);
+        }
+        if build {
+            self.request_beams(cx.sky, col, 0);
         }
     }
 
@@ -2206,6 +2570,7 @@ impl WorldJobs {
                     (JobKind::Generate, JobId::Chunk(id)) => self.start_generate(cx, id),
                     (JobKind::Mesh, JobId::Chunk(id)) => self.start_mesh(cx, id),
                     (JobKind::SkyTile, JobId::Column(col)) => self.start_walk(cx, col),
+                    (JobKind::BeamTile, JobId::Column(col)) => self.start_beams(cx, col),
                     (JobKind::Light, JobId::Chunk(id)) => self.start_light(cx, id),
                     _ => false,
                 };
@@ -2335,16 +2700,25 @@ impl WorldJobs {
             .face_links()
             .is_none()
             .then(|| Arc::clone(&cx.content.registry));
-        // The tiles were walked when the job was queued, but an edit may have sent one back.
+        // The tiles were ready when the job was queued, but an edit may have sent one back.
         let light = match self.sky_for(cx, id, true) {
             SkyFor::Waiting => return false,
             SkyFor::Ready(_) if cx.sky.rule == SkyRule::Off => None,
-            SkyFor::Ready(tiles) => Some(LightJob {
-                tables: Arc::clone(&cx.content.light_tables),
-                tiles,
-                keep: self.planner.priority(pos) <= self.light_cache_sq,
-            }),
+            SkyFor::Ready(tiles) => {
+                let BeamsFor::Ready(beams) = self.beams_for(cx, id, true) else {
+                    return false;
+                };
+                Some(LightJob {
+                    tables: Arc::clone(&cx.content.light_tables),
+                    tiles,
+                    beams,
+                    keep: self.planner.priority(pos) <= self.light_cache_sq,
+                })
+            }
         };
+        let has_beams = light
+            .as_ref()
+            .is_some_and(|l| l.beams.iter().any(Option::is_some));
         cx.map.set_mesh_and_pending(
             id,
             MeshState::InFlight {
@@ -2384,6 +2758,7 @@ impl WorldJobs {
                         light: None,
                         path: None,
                         faces,
+                        beams: false,
                     };
                 };
                 // The 27 chunks in `boxel_light::box_light::chunk_index` order: the
@@ -2408,6 +2783,7 @@ impl WorldJobs {
                         light: light.keep.then(|| ChunkLight::from_padded(padded)),
                         path: Some(path),
                         faces,
+                        beams: has_beams,
                     }
                 })
             },
@@ -2621,6 +2997,9 @@ impl WorldJobs {
             SkyFor::Waiting => return false,
             SkyFor::Ready(tiles) => tiles,
         };
+        let BeamsFor::Ready(beams) = self.beams_for(cx, id, true) else {
+            return false;
+        };
         let map = &*cx.map;
         let slot = &map.slots[id];
         let DataState::Ready(center) = slot.data() else {
@@ -2636,6 +3015,7 @@ impl WorldJobs {
         let light = LightJob {
             tables: Arc::clone(&cx.content.light_tables),
             tiles,
+            beams,
             keep: true,
         };
         cx.map.slots[id].set_light_job(true);
@@ -2729,6 +3109,220 @@ impl WorldJobs {
         }
     }
 
+    /// Starts the beam build of column `col` if one is wanted (ADR 0061): first waits for the
+    /// data of the loaded layers it reads, so it generates as few layers as it can; then
+    /// captures them and spawns the build. Layers on a side of the window where no source can
+    /// be (the gate's test) and that are not loaded read as air: they change no beam cell of the
+    /// window.
+    fn start_beams(&mut self, cx: &mut Ctx<'_>, col: ColumnId) -> bool {
+        let SkyRule::Walk(rule) = &cx.sky.rule else {
+            return false;
+        };
+        let layers = rule.layers.clone();
+        let Some(b) = cx
+            .sky
+            .columns
+            .get_mut(col)
+            .and_then(|c| c.beams.as_deref_mut())
+        else {
+            return false;
+        };
+        b.queued = false;
+        let Some(window) = b.want.filter(|_| b.in_flight.is_none()) else {
+            return false;
+        };
+        let (bottom, top) = BeamJob::read_range(window);
+        let (w_bottom, w_top) = (window.0 >> CHUNK_SHIFT, window.1 >> CHUNK_SHIFT);
+        let air_above = if self.may_hold_source(cx, col, w_top + 1, top) {
+            i64::MAX
+        } else {
+            w_top
+        };
+        let air_below = if self.may_hold_source(cx, col, bottom, w_bottom - 1) {
+            i64::MIN
+        } else {
+            w_bottom
+        };
+        let (lo, hi) = (bottom.max(air_below), top.min(air_above));
+        let map = &*cx.map;
+        let c = &mut cx.sky.columns[col];
+        let (x, z) = (c.x, c.z);
+        let slot_at = |cy| map.id_at(ChunkPos::new(x, cy, z));
+        let waiting = c.layers_in(lo, hi).iter().rev().find_map(|&cy| {
+            slot_at(cy).filter(|&id| {
+                matches!(
+                    map.slots[id].data(),
+                    DataState::Queued | DataState::Generating
+                )
+            })
+        });
+        if let Some(id) = waiting {
+            c.beams.as_deref_mut().expect("checked above").waiting_for = Some(id);
+            return false;
+        }
+        let captured: Vec<(i64, Option<Arc<ChunkData>>)> = c
+            .layers_in(bottom, top)
+            .iter()
+            .rev()
+            .filter_map(|&cy| match map.slots[slot_at(cy)?].data() {
+                DataState::Ready(data) => Some((cy, Some(Arc::clone(data)))),
+                DataState::Missing => Some((cy, None)),
+                DataState::Queued | DataState::Generating => None,
+            })
+            .collect();
+        // The saved layers that are not readable: the job reads them from the store.
+        let saved: Vec<i64> = self
+            .persist
+            .as_ref()
+            .map(|p| {
+                p.layers(c.dim, x, z)
+                    .iter()
+                    .copied()
+                    .filter(|&cy| {
+                        (lo..=hi).contains(&cy)
+                            && slot_at(cy).is_none_or(|id| !map.slots[id].data().is_readable())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let store = self
+            .persist
+            .as_ref()
+            .filter(|_| !saved.is_empty())
+            .map(|p| p.store.clone());
+        let b = c.beams.as_deref_mut().expect("checked above");
+        let version = b.version;
+        b.in_flight = Some((version, window));
+        b.want = None;
+        let job = BeamJob {
+            x,
+            z,
+            dim: c.dim,
+            window,
+            planes: cx.content.generator.realms().planes().to_vec(),
+            layers,
+            captured,
+            air_above,
+            air_below,
+            saved,
+            store,
+        };
+        let cancel = Arc::clone(&c.cancel);
+        let generator = Arc::clone(&cx.content.generator);
+        let registry = Arc::clone(&cx.content.registry);
+        let tables = Arc::clone(&cx.content.light_tables);
+        spawn_job(
+            self.executor.as_ref(),
+            &self.tx,
+            JobId::Column(col),
+            JobKind::BeamTile,
+            cancel,
+            move || {
+                let (tile, generated) = job.run(generator.as_ref(), &registry, &tables);
+                JobMessage::Beamed {
+                    column: col,
+                    version,
+                    window,
+                    tile,
+                    generated,
+                }
+            },
+        );
+        true
+    }
+
+    /// A beam build of column `col` (its `version` and `window`) finished: the tile becomes the
+    /// column's, unless the content changed meanwhile (then it is built again).
+    fn on_beamed(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        col: ColumnId,
+        version: u32,
+        window: (i64, i64),
+        tile: BeamTile,
+    ) {
+        let Some(c) = cx.sky.columns.get_mut(col) else {
+            return;
+        };
+        let (x, z) = (c.x, c.z);
+        let Some(b) = c.beams.as_deref_mut() else {
+            return;
+        };
+        if b.in_flight != Some((version, window)) {
+            return;
+        }
+        b.in_flight = None;
+        if b.version != version {
+            b.want = Some(widen(b.want, window));
+            let priority = match b.batch {
+                Some(_) => 0,
+                None => self.planner.column_priority(x, z),
+            };
+            self.request_beams(cx.sky, col, priority);
+            return;
+        }
+        self.land_beams(cx, col, Arc::new(tile));
+    }
+
+    /// Column `col` gets beam tile `tile`: when the content changed since the meshes were built
+    /// (`SourceColumn::old`), every loaded chunk whose light the changed beams reach is remeshed
+    /// (one edit batch: the column's, or a new one); then the meshes that waited for it are
+    /// scheduled, and a build wanted meanwhile is queued.
+    fn land_beams(&mut self, cx: &mut Ctx<'_>, col: ColumnId, tile: Arc<BeamTile>) {
+        let c = &mut cx.sky.columns[col];
+        let (x, z) = (c.x, c.z);
+        let b = c.beams.get_or_insert_default();
+        let old = b.old.take();
+        let previous = b.tile.replace(Arc::clone(&tile));
+        let batch = b.batch.take();
+        let waiters = std::mem::take(&mut b.waiters);
+        let uncovered = |t: &BeamTile| {
+            let (lo, hi) = t.window().into_inner();
+            !tile.covers(lo, hi)
+        };
+        // A window replaced by one that does not hold it (too tall together).
+        if previous.as_deref().is_some_and(uncovered) || old.as_deref().is_some_and(uncovered) {
+            b.replaced = true;
+        }
+        let mut chunks = BTreeSet::new();
+        if let Some(old) = old {
+            if let Some(band) = beams::changed_band(&old, &tile, x, z) {
+                band_chunks(cx.map, cx.sky, &band, &mut chunks);
+            }
+            if uncovered(&old) {
+                // Rows the new tile does not hold: their meshes are remeshed (and wait for it).
+                let (lo, hi) = old.window().into_inner();
+                let (x0, z0) = (x << CHUNK_SHIFT, z << CHUNK_SHIFT);
+                let band = [reach(x0, x0 + 31), reach(lo, hi), reach(z0, z0 + 31)];
+                band_chunks(cx.map, cx.sky, &band, &mut chunks);
+            }
+        }
+        if !chunks.is_empty() {
+            let b = batch.unwrap_or_else(|| self.new_batch());
+            self.light_counts.light_fanout += chunks.len();
+            for pos in chunks {
+                if let Some(id) = cx.map.id_at(pos) {
+                    self.remesh_for_edit(cx, id, b);
+                }
+            }
+            self.close_if_empty(cx, b);
+        }
+        for w in waiters {
+            if let Some(slot) = cx.map.get(w) {
+                let priority = self.priority(slot.pos);
+                self.schedule_mesh(cx, w, priority);
+                // A light job that waited for the tile.
+                self.want_light(cx, w);
+            }
+        }
+        if let Some(c) = cx.sky.columns.get(col)
+            && c.beams.as_ref().is_some_and(|b| b.want.is_some())
+        {
+            let priority = self.planner.column_priority(x, z);
+            self.request_beams(cx.sky, col, priority);
+        }
+    }
+
     /// Batch `b` closes if no member joined it.
     fn close_if_empty(&mut self, cx: &mut Ctx<'_>, b: u32) {
         if self
@@ -2776,8 +3370,10 @@ impl WorldJobs {
                     light,
                     path,
                     faces,
+                    beams,
                 } => {
                     self.auto_cap.observe_job(busy);
+                    self.light_counts.light_beam_boxes += usize::from(beams);
                     match path {
                         Some(LightPath::Full { .. }) => self.light_counts.light_full += 1,
                         Some(LightPath::FastDark | LightPath::FastOpen) => {
@@ -2819,6 +3415,18 @@ impl WorldJobs {
                     self.light_counts.sky_walks += 1;
                     self.light_counts.sky_private_generations += generated as usize;
                     self.on_walked(cx, column, version, tile);
+                }
+                JobMessage::Beamed {
+                    column,
+                    version,
+                    window,
+                    tile,
+                    generated,
+                } => {
+                    self.auto_cap.observe_job(busy);
+                    self.light_counts.beam_jobs += 1;
+                    self.light_counts.beam_private_generations += generated as usize;
+                    self.on_beamed(cx, column, version, window, tile);
                 }
                 JobMessage::Cancelled { id, kind } => {
                     tracing::trace!(?id, ?kind, "job cancelled (slot or column unloaded)");
@@ -2884,10 +3492,15 @@ impl WorldJobs {
             p.entities.arrived.push((slot.key(), entities));
         }
         let data = self.snapshot(data);
+        let (col, y) = (slot.column, slot.pos.y);
+        if data.may_source(&cx.content.light_tables)
+            && let Some(c) = cx.sky.columns.get_mut(col)
+        {
+            c.beams.get_or_insert_default().add_layer(y);
+        }
         cx.map.set_data(id, DataState::Ready(data));
         cx.map.set_faces(id, Some(faces));
         self.data_available(cx, id);
-        let col = cx.map.slots[id].column;
         self.walk_data_arrived(cx, col, id);
     }
 
@@ -2914,6 +3527,20 @@ impl WorldJobs {
         self.failed += 1;
         let id = match id {
             JobId::Chunk(id) => id,
+            JobId::Column(col) if kind == JobKind::BeamTile => {
+                // A build that panics would panic again: the column gets no beams rather than
+                // blocking its meshes.
+                let Some(c) = cx.sky.columns.get_mut(col) else {
+                    return;
+                };
+                tracing::error!(column = ?(c.x, c.z), "beam tile build failed: {panic}");
+                let Some((_, window)) = c.beams.as_deref_mut().and_then(|b| b.in_flight.take())
+                else {
+                    return;
+                };
+                self.land_beams(cx, col, Arc::new(BeamTile::empty(window.0..=window.1)));
+                return;
+            }
             JobId::Column(col) => {
                 // A walk that panics (private generations that panic read as air already)
                 // would panic again: the column gets open sky rather than blocking its meshes.
@@ -2948,7 +3575,7 @@ impl WorldJobs {
                     self.walk_data_arrived(cx, col, id);
                 }
             }
-            JobKind::SkyTile => {}
+            JobKind::SkyTile | JobKind::BeamTile => {}
             JobKind::Light => {
                 // Not retried: it would fail again. The chunk's next mesh job keeps its light.
                 cx.map.slots[id].set_light_job(false);
@@ -3096,6 +3723,16 @@ fn current_priority(
 ) -> Option<u32> {
     let id = match id {
         JobId::Chunk(id) => id,
+        JobId::Column(col) if kind == JobKind::BeamTile => {
+            let c = sky.columns.get(col)?;
+            let b = c.beams.as_deref()?;
+            // A build an edit asked for runs first, like the edit's remeshes.
+            let priority = match b.batch {
+                Some(_) => 0,
+                None => planner.column_priority(c.x, c.z),
+            };
+            return b.queued.then_some(priority);
+        }
         JobId::Column(col) => {
             let c = sky.columns.get(col)?;
             // A walk an edit sent the column back to runs first, like the edit's remeshes.
@@ -3118,7 +3755,7 @@ fn current_priority(
         JobKind::Light => slot
             .light_job()
             .then(|| light_priority(planner.priority(slot.pos))),
-        JobKind::SkyTile => None,
+        JobKind::SkyTile | JobKind::BeamTile => None,
     }
 }
 

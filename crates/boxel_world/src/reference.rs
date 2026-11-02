@@ -1,13 +1,15 @@
 //! From-scratch references of what the streamed world publishes, for tests and debugging.
 //!
-//! [`Reference`] recomputes sky tiles, light and meshes from the loaded chunk data (which holds
-//! the edits) and the generator alone: no cached tile, light or mask, no incremental update, no
-//! fast path of the world (every box gets its 9 tiles, even under the walk floor). A settled
-//! world's meshes must equal these. Slow: every tile is a fresh walk.
+//! [`Reference`] recomputes sky tiles, beam tiles, light and meshes from the loaded chunk data
+//! (which holds the edits) and the generator alone: no cached tile, light or mask, no
+//! incremental update, no fast path of the world (every box gets its 9 tiles, even under the
+//! walk floor, and its 9 beam tiles, without the gate). A settled world's meshes must equal
+//! these. Slow: every tile is a fresh walk, every beam tile a fresh build for one box.
+use crate::beams::box_rows;
 use crate::sky::{SkyRule, may_block};
-use crate::{ChunkMap, DataState, SkyMap, WorldContent};
+use crate::{ChunkMap, ChunkSlot, DataState, SkyMap, WorldContent};
 use boxel_light::sky_tile::walk;
-use boxel_light::{LayerData, LightInput, LightScratch, PaddedLight, SkyInput, SkyTile};
+use boxel_light::{BeamTile, LayerData, LightInput, LightScratch, PaddedLight, SkyInput, SkyTile};
 use boxel_mesh::{ChunkMesh, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, LocalPos, NEIGHBOR_OFFSETS};
 use std::collections::{BTreeMap, HashMap};
@@ -20,6 +22,8 @@ pub struct Reference<'w> {
     sky: &'w SkyMap,
     content: &'w WorldContent,
     tiles: HashMap<(i64, i64), Arc<SkyTile>>,
+    beams: HashMap<ChunkPos, Arc<BeamTile>>,
+    generated: HashMap<ChunkPos, Arc<ChunkData>>,
     mesher: Mesher,
     scratch: LightScratch,
 }
@@ -32,6 +36,8 @@ impl<'w> Reference<'w> {
             sky,
             content,
             tiles: HashMap::new(),
+            beams: HashMap::new(),
+            generated: HashMap::new(),
             mesher: Mesher::new(),
             scratch: LightScratch::new(),
         }
@@ -113,9 +119,59 @@ impl<'w> Reference<'w> {
         Some(tile)
     }
 
+    /// The beam tile of chunk column `(pos.x, pos.z)` for the light box of the chunk layer
+    /// `pos.y` (ADR 0061), built from scratch: the loaded chunks as they are (`Ready` data; a
+    /// `Missing` chunk is air), the generator where none is loaded. `None` when the world has no
+    /// sky tops (light off, or every column open: beams add nothing).
+    pub fn beam_tile(&mut self, pos: ChunkPos) -> Option<Arc<BeamTile>> {
+        let SkyRule::Walk(rule) = &self.sky.rule else {
+            return None;
+        };
+        if let Some(tile) = self.beams.get(&pos) {
+            return Some(Arc::clone(tile));
+        }
+        let (lo, hi) = box_rows(pos.y);
+        let content = self.content;
+        let (map, layers, generated) = (self.map, &rule.layers, &mut self.generated);
+        // Every layer the build reads, first: the closure only borrows.
+        let (bottom, top) = crate::beams::BeamJob::read_range((lo, hi));
+        let mut chunks: HashMap<i64, Option<Arc<ChunkData>>> = HashMap::new();
+        if content.light_tables.any_sky_source() {
+            for cy in bottom..=top {
+                let at = ChunkPos::new(pos.x, cy, pos.z);
+                let data = match map
+                    .id_at(at)
+                    .and_then(|id| map.get(id))
+                    .map(ChunkSlot::data)
+                {
+                    Some(DataState::Ready(d)) => Some(Arc::clone(d)),
+                    Some(DataState::Missing) => None,
+                    _ if layers.contains(&cy) => {
+                        Some(Arc::clone(generated.entry(at).or_insert_with(|| {
+                            let key = ChunkKey::new(at);
+                            Arc::new(content.generator.generate(key, &content.registry))
+                        })))
+                    }
+                    _ => None,
+                };
+                chunks.insert(cy, data);
+            }
+        }
+        let planes = content.generator.realms().planes();
+        let tile = boxel_light::beam_tile::build(lo..=hi, planes, &content.light_tables, |cy| {
+            chunks
+                .get(&cy)
+                .and_then(Option::as_ref)
+                .map_or(LayerData::Air, |d| LayerData::Shared(Arc::clone(d)))
+        });
+        let tile = Arc::new(tile);
+        self.beams.insert(pos, Arc::clone(&tile));
+        Some(tile)
+    }
+
     /// The light of the padded chunk at `pos`, from its 27 chunks as loaded (`Ready` data; any
-    /// other chunk is air, as the world meshes it) and its 9 tiles from scratch. `None` with
-    /// light off.
+    /// other chunk is air, as the world meshes it), its 9 tiles and 9 beam tiles from scratch.
+    /// `None` with light off.
     pub fn light(&mut self, pos: ChunkPos) -> Option<PaddedLight> {
         if self.sky.rule == SkyRule::Off {
             return None;
@@ -125,12 +181,16 @@ impl<'w> Reference<'w> {
             self.tile(pos.x + dx, pos.z + dz)
                 .unwrap_or_else(|| Arc::clone(&self.sky.open))
         });
+        let beams: [Option<Arc<BeamTile>>; 9] = std::array::from_fn(|i| {
+            let (dx, dz) = (i as i64 / 3 - 1, i as i64 % 3 - 1);
+            self.beam_tile(ChunkPos::new(pos.x + dx, pos.y, pos.z + dz))
+        });
         let chunks = self.chunks(pos);
         let input = LightInput {
             origin: pos,
             chunks: std::array::from_fn(|i| chunks[i].as_deref()),
             sky: SkyInput::Tiles(std::array::from_fn(|i| &*tiles[i])),
-            beams: [None; 9],
+            beams: std::array::from_fn(|i| beams[i].as_deref()),
             tables: &self.content.light_tables,
         };
         let mut out = PaddedLight::default();

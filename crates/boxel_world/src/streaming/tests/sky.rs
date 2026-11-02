@@ -2,8 +2,11 @@
 //! generating it, a walk that read content an edit changed is discarded, an edited chunk that
 //! unloads sends its column back to a walk (its edits are lost) unless the world is saved (then
 //! walks and rescans read the saved chunk), and generators without a top or without content.
+//! Beam tiles (ADR 0061): built only within reach of a layer that may hold a source, waiting for
+//! the data they read, and built again when an edit changed what a running build read.
 use super::*;
 use crate::sky::SkyRule;
+use crate::tests::support::{LitCavern, source_registry};
 
 fn one(center: ChunkPos, radius: u32, vertical: u32) -> [(u64, Viewer); 1] {
     [(0, Viewer::new(center, radius, vertical))]
@@ -258,5 +261,106 @@ fn columns_with_layers_far_apart_settle_at_once() {
             .columns
             .values()
             .all(|c| c.layers.is_sorted() && c.layers.len() <= 15)
+    );
+}
+
+/// The lit cavern, lit, with `test:sky_source` in the registry.
+fn cavern(executor: Arc<dyn JobExecutor>) -> Harness {
+    let mut h = Harness::new(LitCavern, executor, 256).tall();
+    let (registry, _) = source_registry();
+    h.content = WorldContent::new(Arc::clone(&h.content.generator), registry);
+    h.lit()
+}
+
+/// A viewer far above the cavern's source layers needs no beam tile: no build, no wait. One in
+/// the cavern gets a tile for every column around it, built from loaded data only (each build
+/// waits for the layers it reads).
+#[test]
+fn beam_tiles_are_built_only_near_sources_and_wait_for_their_data() {
+    let mut h = cavern(Arc::new(InlineExecutor));
+    h.viewers(&one(ChunkPos::new(0, 30, 0), 1, 1));
+    h.settle(40);
+    let counts = light_counts(&h);
+    assert_eq!((counts.beam_jobs, counts.waiting_beams), (0, 0));
+    assert_eq!(h.sky.beam_stats().tiles, 0);
+
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = cavern(hold.clone());
+    h.viewers(&one(ChunkPos::new(0, -3, 0), 1, 3));
+    for _ in 0..200 {
+        h.dispatch();
+        if hold.held() == 0 {
+            break;
+        }
+        hold.run_all();
+        h.collect();
+    }
+    h.settle(40);
+    let counts = light_counts(&h);
+    assert!(counts.beam_jobs > 0);
+    assert_eq!(counts.waiting_beams, 0);
+    // Every column around a mesh has one.
+    assert_eq!(h.sky.beam_stats().tiles, h.sky.len());
+    let tile = h.sky.beam_tile(0, 0).expect("built");
+    assert!(!tile.is_empty());
+    assert_eq!(tile.column(10, 4).len(), 1, "the roof source of (10, 4)");
+    assert_eq!(tile.column(11, 4).len(), 0);
+}
+
+/// An edit in a column whose build is running: its result is discarded, the column is built
+/// again with the edit, and the edit's new beam is in the tile.
+#[test]
+fn a_beam_build_that_read_edited_content_is_built_again() {
+    let hold = Arc::new(HoldExecutor::default());
+    let mut h = cavern(hold.clone());
+    let sources = crate::tests::support::Sources::of(&h.content.registry);
+    h.viewers(&one(ChunkPos::new(0, -3, 0), 0, 1));
+    let center = h.sky.id_at(0, 0).expect("column");
+    loop {
+        h.dispatch();
+        if h.sky.columns[center]
+            .beams
+            .as_ref()
+            .is_some_and(|b| b.in_flight.is_some())
+        {
+            break;
+        }
+        assert!(hold.held() > 0, "no build started");
+        hold.run_all();
+        h.collect();
+    }
+    let version = h.sky.columns[center].beams.as_ref().expect("beams").version;
+    // Under the ledge, a column without a roof source.
+    h.edit(BlockPos::new(31, -101, 4), sources.down[1]);
+    assert_eq!(
+        h.sky.columns[center].beams.as_ref().expect("beams").version,
+        version + 1
+    );
+    hold.run_all();
+    h.collect();
+    assert!(
+        h.sky.columns[center]
+            .beams
+            .as_ref()
+            .expect("beams")
+            .tile
+            .is_none(),
+        "the stale build was discarded"
+    );
+    loop {
+        h.dispatch();
+        if hold.held() == 0 {
+            break;
+        }
+        hold.run_all();
+        h.collect();
+    }
+    h.settle(40);
+    let tile = h.sky.beam_tile(0, 0).expect("built");
+    let beams: Vec<_> = tile.column(31, 4).collect();
+    assert_eq!(beams.len(), 1);
+    assert_eq!(
+        (beams[0].source, beams[0].lo, beams[0].hi),
+        (-101, -116, -101)
     );
 }
