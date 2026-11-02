@@ -51,6 +51,7 @@ CAVE_FLAG = r'^\s*--cave\s'
 PATH_SCENARIO = r'--scenario \S*\bpath\b'
 RADIUS_STEPS = r'^\s*--radius-steps\s'
 SWITCH_SCENARIO = r'--scenario \S*\bswitch\b'
+SKY_SOURCES_FLAG = r'^\s*--sky-sources\s'
 # A binary whose --help has this grows chunk memory (ADR 0035); older ones had a fixed arena.
 GROWS = r'^\s*--chunk-memory\s'
 
@@ -77,6 +78,12 @@ SCENARIOS = {
                           'cueva abierta, ruta a 8', (CAVE_FLAG, PATH_SCENARIO)),
     'cave-static': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA),
                             'cueva abierta, quieta', (CAVE_FLAG,)),
+    # The same cave lit by sky sources (ADR 0061): a source in every other column under each cave
+    # roof within 24 layers, so every box near the eye takes the full light path and the lit
+    # faces lose the AO elision of the dark ones. Compare it with cave-static.
+    'lit-cavern': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--sky-sources'),
+                           'cueva iluminada por fuentes de cielo, quieta',
+                           (CAVE_FLAG, SKY_SOURCES_FLAG)),
     # Chunk memory growing (ADR 0035): settled at radius 8, radius 32 one second into the
     # measurement, from the default floor like every case.
     'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),

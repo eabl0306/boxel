@@ -358,6 +358,23 @@ class CaseTest(unittest.TestCase):
             grows = fake_binary(d, 'grows', HELP + '  --chunk-memory fixed|grow  grows\n')
             self.assertTrue(runs.grows(grows))
 
+    def test_the_lit_cavern_is_the_still_cave_with_sky_sources(self):
+        case = runs.parse_case('rtx/lit-cavern/r16')
+        args = case.args(10)
+        cave = runs.parse_case('rtx/cave-static/r16').args(10)
+        self.assertEqual(args[args.index('--scenario') + 1], 'static')
+        self.assertIn('--sky-sources', args)
+        # the same camera and world as cave-static, plus the sources
+        self.assertEqual([a for a in args if a != '--sky-sources'], cave)
+        self.assertEqual(case.label, 'cueva iluminada por fuentes de cielo, quieta, sin tope')
+        with tempfile.TemporaryDirectory() as d:
+            # a binary from before the sources lacks the case; one with --sky-sources has it
+            self.assertFalse(runs.supports(fake_binary(d, 'old', HELP),
+                                           Case(scenario='lit-cavern')))
+            lit = fake_binary(d, 'lit', HELP + '  --sky-sources       light the caves\n')
+            self.assertTrue(runs.supports(lit, Case(scenario='lit-cavern')))
+            self.assertTrue(runs.supports(lit, Case(scenario='cave-static')))
+
     def test_the_switch_case_flies_the_surface_and_changes_worlds(self):
         case = runs.parse_case('780m/switch/r16')
         args = case.args(10)
