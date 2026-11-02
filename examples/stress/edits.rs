@@ -1,7 +1,9 @@
 //! `--edits`: scripted block edits during the measurement, and how long the world takes to
 //! publish them. Every [`EDIT_PERIOD`] the script applies the next step of a cycle around the
 //! start position: place a lamp on the ground, remove it, dig a shaft down from the ground, cap
-//! it with stone. Each step that starts on a settled world is timed until the world settles
+//! it with stone. With sky sources in the registry (`--sky-sources`, ADR 0061) the cycle goes on:
+//! place a source over the ground, block its beam halfway down with stone, open it again, remove
+//! the source. Each step that starts on a settled world is timed until the world settles
 //! again (every remesh of the edit batch published); the summary gives those latencies and the
 //! edit batches the world held or had to split (`WorldStats`).
 
@@ -18,12 +20,21 @@ pub const SHAFT_DEPTH: i64 = 24;
 /// Offsets (x, z) in blocks from the start column of the lamp and of the shaft.
 pub const LAMP_OFFSET: (i64, i64) = (6, 6);
 pub const SHAFT_OFFSET: (i64, i64) = (-6, 6);
+/// Offset (x, z) of the sky source's column.
+pub const SOURCE_OFFSET: (i64, i64) = (0, -6);
+/// Highest cell of the source over the ground: the top of the air there, at most this high.
+pub const SOURCE_HEIGHT: i64 = 8;
+/// Fewest air cells over the ground for the source steps: the source, the blocker and a cell
+/// of beam between them and the ground.
+const SOURCE_ROOM: i64 = 3;
 /// How far below the start the ground is searched.
 const GROUND_DEPTH: i64 = 512;
 /// The lamp the script places.
 const LAMP: &str = "boxel:lamp_orange";
-/// What caps the shaft.
+/// What caps the shaft and blocks the beam.
 const CAP: &str = "boxel:stone";
+/// The source the script places (down, range 64).
+const SOURCE: &str = boxel_demo::blocks::SKY_SOURCE;
 
 /// One scripted edit, in cycle order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +48,32 @@ pub enum EditStep {
     DigShaft,
     /// Stone on top of the shaft: dark again.
     CapShaft,
+    /// A sky source over the ground: its beam lights down to the ground.
+    PlaceSource,
+    /// Stone halfway down the beam: it ends there.
+    BlockBeam,
+    /// The stone removed: the beam reaches the ground again.
+    OpenBeam,
+    /// The source removed (the world is as before).
+    RemoveSource,
+}
+
+/// Where the script edits: the ground blocks of the lamp and shaft columns, and the source's
+/// cell with the cell that blocks its beam (`None`: no source steps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spots {
+    pub lamp: BlockPos,
+    pub shaft: BlockPos,
+    pub beam: Option<(BlockPos, BlockPos)>,
+}
+
+/// What the script places: the lamp, the stone that caps the shaft and blocks the beam, and
+/// the source (`None` without sources in the registry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Blocks {
+    pub lamp: BlockState,
+    pub cap: BlockState,
+    pub source: Option<BlockState>,
 }
 
 impl EditStep {
@@ -48,27 +85,63 @@ impl EditStep {
         EditStep::CapShaft,
     ];
 
-    /// The block changes of this step, given the ground blocks of the lamp and shaft columns.
-    pub fn edits(
-        self,
-        lamp_ground: BlockPos,
-        shaft_ground: BlockPos,
-        lamp: BlockState,
-        cap: BlockState,
-    ) -> Vec<(BlockPos, BlockState)> {
+    /// The cycle with sky sources: [`EditStep::CYCLE`], then the source's steps.
+    pub const SOURCE_CYCLE: [EditStep; 8] = [
+        EditStep::PlaceLamp,
+        EditStep::RemoveLamp,
+        EditStep::DigShaft,
+        EditStep::CapShaft,
+        EditStep::PlaceSource,
+        EditStep::BlockBeam,
+        EditStep::OpenBeam,
+        EditStep::RemoveSource,
+    ];
+
+    /// The block changes of this step at `spots`; none for a source step without a source or
+    /// a beam spot.
+    pub fn edits(self, spots: &Spots, blocks: Blocks) -> Vec<(BlockPos, BlockState)> {
         let above = |p: BlockPos| BlockPos::new(p.x, p.y + 1, p.z);
+        let beam = blocks.source.zip(spots.beam);
         match self {
-            EditStep::PlaceLamp => vec![(above(lamp_ground), lamp)],
-            EditStep::RemoveLamp => vec![(above(lamp_ground), BlockState::AIR)],
+            EditStep::PlaceLamp => vec![(above(spots.lamp), blocks.lamp)],
+            EditStep::RemoveLamp => vec![(above(spots.lamp), BlockState::AIR)],
             EditStep::DigShaft => (0..SHAFT_DEPTH)
                 .map(|d| {
-                    let p = BlockPos::new(shaft_ground.x, shaft_ground.y - d, shaft_ground.z);
+                    let p = BlockPos::new(spots.shaft.x, spots.shaft.y - d, spots.shaft.z);
                     (p, BlockState::AIR)
                 })
                 .collect(),
-            EditStep::CapShaft => vec![(shaft_ground, cap)],
+            EditStep::CapShaft => vec![(spots.shaft, blocks.cap)],
+            EditStep::PlaceSource => beam.map(|(s, (at, _))| (at, s)).into_iter().collect(),
+            EditStep::BlockBeam => beam
+                .map(|(_, (_, b))| (b, blocks.cap))
+                .into_iter()
+                .collect(),
+            EditStep::OpenBeam => beam
+                .map(|(_, (_, b))| (b, BlockState::AIR))
+                .into_iter()
+                .collect(),
+            EditStep::RemoveSource => beam
+                .map(|(_, (at, _))| (at, BlockState::AIR))
+                .into_iter()
+                .collect(),
         }
     }
+}
+
+/// The source's cell and the blocker's over `ground`: the source at the top of the air over
+/// the ground (at most [`SOURCE_HEIGHT`] up), the blocker halfway between it and the ground.
+/// `None` while a block on the way is not loaded, `Some(None)` with fewer than 3 air cells.
+pub fn beam_spot(
+    ground: BlockPos,
+    block_at: impl Fn(BlockPos) -> Option<BlockState>,
+) -> Option<Option<(BlockPos, BlockPos)>> {
+    let at = |dy: i64| BlockPos::new(ground.x, ground.y + dy, ground.z);
+    let mut room = 0;
+    while room < SOURCE_HEIGHT && block_at(at(room + 1))?.is_air() {
+        room += 1;
+    }
+    Some((room >= SOURCE_ROOM).then(|| (at(room), at(1 + (room - 1) / 2))))
 }
 
 /// The first non-air block at or under `top` in column `(x, z)`, within [`GROUND_DEPTH`]. `None`
@@ -93,8 +166,8 @@ pub fn ground(
 pub struct EditScript {
     /// Start position: the columns are offsets from it.
     start: DVec3,
-    /// Ground blocks of the lamp and the shaft columns, found before the first step.
-    columns: Option<(BlockPos, BlockPos)>,
+    /// Where the steps go, found before the first step.
+    spots: Option<Spots>,
     /// Next step of [`EditStep::CYCLE`].
     next: usize,
     /// When the last step was applied.
@@ -113,7 +186,7 @@ impl EditScript {
     pub fn new(start: DVec3) -> Self {
         Self {
             start,
-            columns: None,
+            spots: None,
             next: 0,
             last: None,
             timing: None,
@@ -150,8 +223,19 @@ impl EditScript {
         {
             return;
         }
-        let columns = match self.columns {
-            Some(columns) => columns,
+        let (Some(lamp), Some(cap)) = (
+            content.registry.by_name(LAMP),
+            content.registry.by_name(CAP),
+        ) else {
+            return;
+        };
+        let blocks = Blocks {
+            lamp,
+            cap,
+            source: content.registry.by_name(SOURCE),
+        };
+        let spots = match self.spots {
+            Some(spots) => spots,
             None => {
                 let top = self.start.y.floor() as i64;
                 let (bx, bz) = (self.start.x.floor() as i64, self.start.z.floor() as i64);
@@ -164,22 +248,38 @@ impl EditScript {
                     self.last = Some(now);
                     return;
                 };
-                *self.columns.insert((lamp, shaft))
+                let beam = match blocks.source.map(|_| find(SOURCE_OFFSET)) {
+                    Some(None) => return, // not loaded yet
+                    Some(Some(Some(ground))) => {
+                        let Some(spot) = beam_spot(ground, &block_at) else {
+                            return;
+                        };
+                        spot
+                    }
+                    // No source, or no ground in reach of its column.
+                    None | Some(Some(None)) => None,
+                };
+                *self.spots.insert(Spots { lamp, shaft, beam })
             }
         };
-        let (Some(lamp), Some(cap)) = (
-            content.registry.by_name(LAMP),
-            content.registry.by_name(CAP),
-        ) else {
-            return;
+        let cycle: &[EditStep] = if blocks.source.is_some() {
+            &EditStep::SOURCE_CYCLE
+        } else {
+            &EditStep::CYCLE
         };
-        let step = EditStep::CYCLE[self.next % EditStep::CYCLE.len()];
-        for (pos, state) in step.edits(columns.0, columns.1, lamp, cap) {
+        let step = cycle[self.next % cycle.len()];
+        let changes = step.edits(&spots, blocks);
+        self.next += 1;
+        self.last = Some(now);
+        if changes.is_empty() {
+            // A source step without room for a beam.
+            self.skipped += 1;
+            return;
+        }
+        for (pos, state) in changes {
             edit(pos, state);
         }
-        self.next += 1;
         self.steps += 1;
-        self.last = Some(now);
         // Only a step that starts on a settled world can be timed to its end (a step still
         // being timed keeps its timing).
         if self.timing.is_none() && settled {
@@ -231,24 +331,98 @@ mod tests {
     #[test]
     fn the_cycle_places_and_removes_a_lamp_then_digs_and_caps_a_shaft() {
         let (lamp, cap) = (BlockState(29), BlockState(1));
-        let lg = BlockPos::new(6, 63, 6);
         let sg = BlockPos::new(-6, 60, 6);
+        let spots = Spots {
+            lamp: BlockPos::new(6, 63, 6),
+            shaft: sg,
+            beam: None,
+        };
+        let blocks = Blocks {
+            lamp,
+            cap,
+            source: None,
+        };
         assert_eq!(
-            EditStep::PlaceLamp.edits(lg, sg, lamp, cap),
+            EditStep::PlaceLamp.edits(&spots, blocks),
             [(BlockPos::new(6, 64, 6), lamp)]
         );
         assert_eq!(
-            EditStep::RemoveLamp.edits(lg, sg, lamp, cap),
+            EditStep::RemoveLamp.edits(&spots, blocks),
             [(BlockPos::new(6, 64, 6), BlockState::AIR)]
         );
-        let dig = EditStep::DigShaft.edits(lg, sg, lamp, cap);
+        let dig = EditStep::DigShaft.edits(&spots, blocks);
         assert_eq!(dig.len(), SHAFT_DEPTH as usize);
         assert_eq!(dig[0], (sg, BlockState::AIR));
         assert_eq!(
             dig.last().unwrap().0,
             BlockPos::new(-6, 60 - SHAFT_DEPTH + 1, 6)
         );
-        assert_eq!(EditStep::CapShaft.edits(lg, sg, lamp, cap), [(sg, cap)]);
+        assert_eq!(EditStep::CapShaft.edits(&spots, blocks), [(sg, cap)]);
+        // Without a source, its steps change nothing.
+        assert!(EditStep::PlaceSource.edits(&spots, blocks).is_empty());
+    }
+
+    #[test]
+    fn with_sources_the_cycle_places_a_source_blocks_its_beam_and_removes_it() {
+        let registry = boxel_demo::blocks::registry_with_sky_source();
+        let content = WorldContent::new(Arc::new(TerrainGenerator::default()), Arc::new(registry));
+        let source = content.registry.by_name(SOURCE).expect("the source");
+        let stone = content.registry.by_name(CAP).expect("stone");
+        let t0 = Instant::now();
+        // Ground at y = 63, air over it; the source column has a roof at y = 69.
+        let world = |p: BlockPos| {
+            let roof = (p.x, p.z) == SOURCE_OFFSET && p.y == 69;
+            Some(if p.y <= 63 || roof {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        // Five cells of air: the source at the top, the blocker at 64 + 2.
+        assert_eq!(
+            beam_spot(BlockPos::new(0, 63, -6), world),
+            Some(Some((BlockPos::new(0, 68, -6), BlockPos::new(0, 66, -6))))
+        );
+        // Open sky: the source at 63 + SOURCE_HEIGHT; a low roof leaves no room.
+        let open = beam_spot(BlockPos::new(0, 63, 0), |p| {
+            Some(if p.y <= 63 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        });
+        assert_eq!(open.unwrap().unwrap().0.y, 63 + SOURCE_HEIGHT);
+        let low = |p: BlockPos| {
+            Some(if p.y == 65 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        assert_eq!(beam_spot(BlockPos::new(0, 63, 0), low), Some(None));
+        assert_eq!(beam_spot(BlockPos::new(0, 63, 0), |_| None), None);
+
+        // Started under the roof, as in a cave.
+        let mut script = EditScript::new(DVec3::new(0.5, 66.0, 0.5));
+        let mut applied = Vec::new();
+        for i in 0..EditStep::SOURCE_CYCLE.len() as u64 {
+            let at = t0 + EDIT_PERIOD * u32::try_from(i).unwrap();
+            let before = applied.len();
+            script.frame(at, true, &content, world, |p, s| applied.push((p, s)));
+            assert!(applied.len() > before, "step {i} edits");
+        }
+        let (at, blocker) = (BlockPos::new(0, 68, -6), BlockPos::new(0, 66, -6));
+        let n = applied.len();
+        assert_eq!(
+            applied[n - 4..],
+            [
+                (at, source),
+                (blocker, stone),
+                (blocker, BlockState::AIR),
+                (at, BlockState::AIR),
+            ]
+        );
+        assert_eq!((script.steps, script.skipped), (8, 0));
     }
 
     #[test]

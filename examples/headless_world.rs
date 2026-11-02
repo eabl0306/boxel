@@ -20,8 +20,9 @@
 //! beams=N jobs=N private_generations=N waiting=N boxes=N beam_mib=X`: the chunk columns with
 //! a beam tile (ADR 0061), the beams in them, the builds run and the chunks they generated, the
 //! jobs still waiting for one, the light boxes that had beams, and the memory of the tiles.
-//! `--sky-sources` lights the caves near the viewer for it (a measurement harness, not a demo):
-//! a down sky source of range 64 in every other column under each cave roof. Compare `quads=`
+//! `--sky-sources` lights the caves near the viewer for it with the demo's lit cavern
+//! (`boxel_demo::worldgen::LitCaves`, as stress's `lit-cavern` case): a down sky source of range
+//! 64 in every other column under each cave roof, within 24 chunk layers of the viewer. Compare `quads=`
 //! across `--light on|off` and `--ao off|baked|lit-only` for the cost of AO: with `--light off`
 //! every face counts as lit (a worst case for `lit-only`).
 //! With `--cave` (overworld), a `cave: eye=X,Y,Z depth=N clearance=N path=N voxels, N chunk
@@ -112,7 +113,7 @@ use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
 };
-use boxel_demo::worldgen::OverworldGenerator;
+use boxel_demo::worldgen::{LitCaves, OverworldGenerator};
 use lod::LodPreset;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -152,8 +153,9 @@ usage: headless_world [options]
   --timeout S          wall-clock limit in seconds (default 60), exit 4 past it
   --spans              after each report, the busiest spans of its slowest update (needs
                        --features trace)
-  --sky-sources        light the caves within 24 layers of the viewer with sky sources: a down
-                       source of range 64 in every other column under each roof (ADR 0061)
+  --sky-sources        light the caves within 24 layers of the viewer with sky sources, the
+                       demo's lit cavern: a down source of range 64 in every other column under
+                       each roof (ADR 0061)
   --help               this text";
 
 /// The whole help: [`USAGE`], `--lod` and the world options.
@@ -617,11 +619,8 @@ fn main() -> AppExit {
     let lod_settings = options.lod.settings();
     let registry = if options.sky_sources {
         let layer = (options.viewer_y.floor() as i64) >> 5;
-        generator = Arc::new(CaveSources {
-            inner: generator,
-            layers: layer - 24..=layer + 24,
-        });
-        Arc::new(source_registry())
+        generator = Arc::new(LitCaves::around(generator, layer, 24));
+        Arc::new(boxel_demo::blocks::registry_with_sky_source())
     } else {
         Arc::new(boxel_demo::blocks::registry())
     };
@@ -959,91 +958,6 @@ fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
         at(99),
         entries.last().copied().unwrap_or(0),
     )
-}
-
-/// The block `--sky-sources` places (only in this harness).
-const SOURCE_BLOCK: &str = "example:sky_source";
-
-/// The demo blocks plus [`SOURCE_BLOCK`]: invisible, no collision, a down sky source of range 64
-/// that keeps fluids out.
-fn source_registry() -> BlockRegistry {
-    use boxel::voxel::{BeamDir, BlockCollision, BlockDef, BlockModel, FaceTextures, RenderShape};
-    use boxel::voxel::{SkySourceDef, TextureId};
-    let mut b = boxel_demo::blocks::builder();
-    let state = b
-        .add_block(BlockDef {
-            name: SOURCE_BLOCK.to_string(),
-            shape: RenderShape::None,
-            model: BlockModel::CUBE,
-            collision: BlockCollision::None,
-            emission: [0; 3],
-            light_opacity: 0,
-            textures: FaceTextures::all(TextureId(0)),
-        })
-        .expect("a new block");
-    let block = b.block_by_name(SOURCE_BLOCK).expect("just added");
-    b.set_keeps_fluids_out(block).expect("a block");
-    b.set_sky_source(
-        state,
-        SkySourceDef {
-            dir: BeamDir::Down,
-            range: 64,
-        },
-    )
-    .expect("a valid source");
-    b.build()
-}
-
-/// `--sky-sources`: `inner` with a sky source in the first air cell under every roof (an
-/// opaque block over air, inside one chunk) of the columns with `x + z` even, in `layers`.
-struct CaveSources {
-    inner: Arc<dyn WorldGenerator>,
-    layers: RangeInclusive<i64>,
-}
-
-impl WorldGenerator for CaveSources {
-    fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
-        let mut chunk = self.inner.generate(key, registry);
-        if !self.layers.contains(&key.pos.y) || chunk.as_uniform().is_some() {
-            return chunk;
-        }
-        let source = registry
-            .by_name(SOURCE_BLOCK)
-            .expect("the harness registry");
-        let o = key.pos.origin();
-        for x in 0..32u32 {
-            for z in 0..32u32 {
-                if (o.x + i64::from(x) + o.z + i64::from(z)).rem_euclid(2) != 0 {
-                    continue;
-                }
-                for y in (0..31u32).rev() {
-                    let (here, above) = (LocalPos::new(x, y, z), LocalPos::new(x, y + 1, z));
-                    if chunk.get(here).is_air() && registry.occludes(chunk.get(above)) {
-                        chunk.set(here, source);
-                    }
-                }
-            }
-        }
-        chunk
-    }
-    fn vertical_chunks(&self) -> RangeInclusive<i64> {
-        self.inner.vertical_chunks()
-    }
-    fn sky_source_layers(&self) -> RangeInclusive<i64> {
-        self.layers.clone()
-    }
-    fn lod(&self) -> Option<&dyn boxel::worldgen::LodSource> {
-        self.inner.lod()
-    }
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-    fn version(&self) -> u32 {
-        self.inner.version()
-    }
-    fn realms(&self) -> &boxel::worldgen::RealmStack {
-        self.inner.realms()
-    }
 }
 
 /// The `beams:` line: the beam tiles of the sky sources (ADR 0061).

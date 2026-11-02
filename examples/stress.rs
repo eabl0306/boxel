@@ -27,6 +27,11 @@
 //! shaft dug and capped, one per second near the start) and reports how many frames the world
 //! takes to publish each one. The world clock stays still at `--time` (noon by default).
 //!
+//! `--sky-sources` lights the caves within 24 chunk layers of the start with sky sources (ADR
+//! 0061, the demo's `LitCaves`: a down source of range 64 in every other column under each cave
+//! roof), the `lit-cavern` case of `tools/perf`. With `--edits` the script also places a source
+//! over the ground, blocks its beam, opens it again and removes it.
+//!
 //! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
 //! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
 //!
@@ -128,6 +133,7 @@ use boxel::world::{
     ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
 };
 use boxel::worldgen::lod::LodSource;
+use boxel_demo::worldgen::LitCaves;
 use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
@@ -197,6 +203,10 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
   --edits             scripted edits during the measurement, one per second near the start: a
                       lamp placed and removed, a shaft dug and capped; the summary gives the
                       frames each one took to publish (meant for --scenario static)
+  --sky-sources       light the caves within 24 chunk layers of the start with sky sources (a
+                      down source of range 64 in every other column under each cave roof); with
+                      --edits the script also places a source, blocks its beam and removes it;
+                      the summary's world gets +sky-sources
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
@@ -334,6 +344,8 @@ struct Options {
     screenshot_yaw: Option<f64>,
     /// `--edits`.
     edits: bool,
+    /// `--sky-sources`.
+    sky_sources: bool,
     /// `--time`, clock hours.
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
@@ -423,6 +435,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         screenshot: None,
         screenshot_yaw: None,
         edits: false,
+        sky_sources: false,
         time: 12.0,
         light: true,
         ao: None,
@@ -613,6 +626,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                 );
             }
             "--edits" => o.edits = true,
+            "--sky-sources" => o.sky_sources = true,
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--sort" => {
@@ -716,6 +730,9 @@ fn seconds(flag: &str, value: &str) -> Result<Duration, String> {
 // ---------------------------------------------------------------------------------------------
 // Counting wrappers (exact world counters without touching boxel_world)
 
+/// `--sky-sources`: the chunk layers around the start that get sources.
+const SKY_SOURCE_LAYERS: i64 = 24;
+
 /// Counts finished generator calls.
 struct CountingGenerator {
     inner: Arc<dyn WorldGenerator>,
@@ -731,6 +748,11 @@ impl WorldGenerator for CountingGenerator {
 
     fn vertical_chunks(&self) -> RangeInclusive<i64> {
         self.inner.vertical_chunks()
+    }
+
+    /// The inner world's sources (`--sky-sources`): without them no beam is built ahead.
+    fn sky_source_layers(&self) -> RangeInclusive<i64> {
+        self.inner.sky_source_layers()
     }
 
     fn name(&self) -> &str {
@@ -1683,10 +1705,18 @@ fn run_info(options: &Options, present: String) -> RunInfo {
             0.0
         },
         seed: options.seed,
-        world: match options.water {
-            Some(level) => format!("{}+water{level}", options.world.label()),
-            None => options.world.label(),
-        },
+        world: format!(
+            "{}{}",
+            match options.water {
+                Some(level) => format!("{}+water{level}", options.world.label()),
+                None => options.world.label(),
+            },
+            if options.sky_sources {
+                "+sky-sources"
+            } else {
+                ""
+            }
+        ),
         trees: options.world.has_trees(),
         light: if options.light { "on" } else { "off" }.to_string(),
         cave_culling: if options.cave_culling { "on" } else { "off" }.to_string(),
@@ -1896,6 +1926,13 @@ fn main() -> AppExit {
     } else {
         String::new()
     };
+    // `--sky-sources`: after the cave search, which looks for air the sources would fill.
+    let inner: Arc<dyn WorldGenerator> = if options.sky_sources {
+        let layer = (options.camera[1].floor() as i64) >> 5;
+        Arc::new(LitCaves::around(inner, layer, SKY_SOURCE_LAYERS))
+    } else {
+        inner
+    };
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let first: Arc<dyn WorldGenerator> = Arc::new(CountingGenerator {
         inner,
@@ -1950,7 +1987,11 @@ fn main() -> AppExit {
                 last: Arc::clone(&job_clock),
             }),
             settings: world_settings(&options, fixed_bounds),
-            registry: Arc::new(boxel_demo::blocks::registry()),
+            registry: Arc::new(if options.sky_sources {
+                boxel_demo::blocks::registry_with_sky_source()
+            } else {
+                boxel_demo::blocks::registry()
+            }),
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {

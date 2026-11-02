@@ -43,6 +43,12 @@
 //! T pauses it and F runs it 60 times faster; `--time HH:MM` sets the start (noon by default).
 //! `--lamps` places the colored lamps and some lava around the start and begins at night.
 //!
+//! `--sky-sources` builds a cavern lit by sky sources on the ground around the start (ADR 0061,
+//! `shared/cavern.rs`) and starts the camera inside it, unless `--camera` or `--walk` says
+//! otherwise: a closed room that the sources under its roof light like the open sky, following
+//! the day. F3 shows the source whose beam lights the face under the crosshair and the realm at
+//! the eye, and B toggles the markers of the sources and their beams (`SkySourceMarkers`).
+//!
 //! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
 //! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
 //! on, nothing rendered while hidden); the last summary line gives the update and presented
@@ -79,6 +85,8 @@
 //! `--no-distance-fog` starts without it (a hard edge) and F10 toggles it.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
+#[path = "shared/cavern.rs"]
+mod cavern;
 #[path = "shared/clock.rs"]
 mod clock;
 #[path = "shared/crates.rs"]
@@ -96,7 +104,7 @@ mod world;
 
 use boxel::app::{TaskPoolOptions, TaskPoolThreadAssignmentPolicy};
 use boxel::camera::FlyCameraSystems;
-use boxel::debug_overlay::{Crosshair, CrosshairTarget, OverlayLines};
+use boxel::debug_overlay::{Crosshair, CrosshairTarget, OverlayLines, SkySourceMarkers};
 use boxel::gfx::wgpu::PresentMode;
 use boxel::gfx::{CLI_HELP, DeviceClass, RgbaImage};
 use boxel::physics::{PhysicsPlugin, Probe as VoxelProbe, SwimPlugin};
@@ -164,6 +172,9 @@ usage: voxel_world [GPU options] [options]
                           a day lasts 20 minutes); default 12:00, 21:00 with --lamps. Scripted
                           runs (--frames) keep the clock still
   --lamps                 demo: colored lamps and lava on the ground around the start
+  --sky-sources           demo: a cavern lit by sky sources on the ground around the start,
+                          with the camera inside (unless --camera or --walk); B toggles the
+                          markers of the sources and their beams
   --pack DIR              block textures from a Minecraft Java resource pack (the directory
                           with pack.mcmeta; default: procedural textures)
   --world-dir DIR         save the world in DIR on exit and load it from there on start (made
@@ -257,6 +268,8 @@ struct Options {
     /// `--time`, clock hours.
     time: Option<f64>,
     lamps: bool,
+    /// `--sky-sources`.
+    sky_sources: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--fog`.
@@ -334,6 +347,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         vsync_test: false,
         time: None,
         lamps: false,
+        sky_sources: false,
         textures: TextureSource::Procedural,
         fog: fog::FogPreset::Off,
         fog_res: boxel::render::fog::FogResolution::Half,
@@ -482,6 +496,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--vsync-test" => o.vsync_test = true,
             "--time" => o.time = Some(clock::parse_clock(flag, &value()?)?),
             "--lamps" => o.lamps = true,
+            "--sky-sources" => o.sky_sources = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -1818,6 +1833,115 @@ impl Plugin for DayNightPlugin {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The sky sources demo (ADR 0061)
+
+/// The key that toggles the [`SkySourceMarkers`].
+const MARKERS_KEY: KeyCode = KeyCode::KeyB;
+
+/// `--sky-sources`: where the cavern goes until it is built, and the camera to move in.
+#[derive(Resource, Debug)]
+struct CavernDemo {
+    /// `None` once built.
+    start: Option<DVec3>,
+    /// Move the fly camera inside once built, keeping its input on or off (`None`: it stays,
+    /// with `--camera` or `--walk`).
+    camera: Option<bool>,
+}
+
+/// `--sky-sources`: builds the [`cavern::Cavern`] once its columns are loaded, and moves the
+/// fly camera in. The ground is any opaque cube but a log, so the cavern goes under a tree.
+fn build_cavern(
+    mut demo: ResMut<CavernDemo>,
+    map: Res<ChunkMap>,
+    content: Res<WorldContent>,
+    mut edits: ResMut<EditQueue>,
+    cameras: Query<Entity, With<FlyCamera>>,
+    mut commands: Commands,
+) {
+    let Some(start) = demo.start else {
+        return;
+    };
+    let registry = &content.registry;
+    let logs: Vec<BlockState> = registry
+        .block_by_name("boxel:log")
+        .map(|log| registry.states(log).collect())
+        .unwrap_or_default();
+    let is_ground = |s: BlockState| registry.occludes(s) && !logs.contains(&s);
+    let Some(found) = cavern::Cavern::around(start, |p| map.block_at(p), is_ground) else {
+        return;
+    };
+    demo.start = None;
+    let Some(cavern) = found else {
+        println!("boxel: --sky-sources found no ground under the start");
+        return;
+    };
+    let mut placed = 0;
+    for &(pos, name) in &cavern.cells {
+        if let Some(state) = registry.by_name(name) {
+            edits.set_block(pos, state);
+            placed += 1;
+        }
+    }
+    let f = cavern.floor;
+    println!(
+        "boxel: --sky-sources built a cavern of {placed} blocks, floor at {} {} {}",
+        f.x, f.y, f.z
+    );
+    if let Some(enabled) = demo.camera {
+        let (eye, yaw, pitch) = cavern.camera();
+        for camera in &cameras {
+            commands.entity(camera).insert((
+                Transform::from_yaw_pitch(eye, yaw, pitch),
+                FlyCamera {
+                    enabled,
+                    yaw,
+                    pitch,
+                    ..FlyCamera::default()
+                },
+            ));
+        }
+    }
+}
+
+/// B: the sky source markers on or off.
+fn toggle_sky_markers(keys: Res<ButtonInput<KeyCode>>, markers: Option<ResMut<SkySourceMarkers>>) {
+    if keys.just_pressed(MARKERS_KEY)
+        && let Some(mut markers) = markers
+    {
+        markers.visible = !markers.visible;
+        println!(
+            "boxel: sky source markers {}",
+            if markers.visible { "on" } else { "off" }
+        );
+    }
+}
+
+/// `--sky-sources`: inserts the [`CavernDemo`] and adds [`build_cavern`] (after the lamps: both
+/// write the edit queue, and before the world's systems) and [`toggle_sky_markers`].
+struct SkySourcesPlugin {
+    start: DVec3,
+    camera: Option<bool>,
+}
+
+impl Plugin for SkySourcesPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(CavernDemo {
+            start: Some(self.start),
+            camera: self.camera,
+        })
+        .add_systems(
+            Update,
+            (
+                build_cavern
+                    .after(place_demo_lamps)
+                    .before(WorldSystems::Interest),
+                toggle_sky_markers,
+            ),
+        );
+    }
+}
+
 /// Metadata of a saved world: the world options and seed it was made with.
 const WORLD_META: &str = "voxel_world:world";
 /// Metadata of a saved world: the camera on exit, as `x,y,z,yaw,pitch` (degrees).
@@ -2049,7 +2173,12 @@ fn main() -> AppExit {
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
     let generator = options.world.generator(options.seed);
-    let registry = Arc::new(boxel_demo::blocks::registry());
+    // `--sky-sources`: the demo blocks and the source after them (every other id stays).
+    let registry = Arc::new(if options.sky_sources {
+        boxel_demo::blocks::registry_with_sky_source()
+    } else {
+        boxel_demo::blocks::registry()
+    });
     let store = match options.world_dir.clone() {
         Some(dir) => match open_world(&dir, &registry, generator.name(), &mut options) {
             Ok(store) => Some(store),
@@ -2128,6 +2257,14 @@ fn main() -> AppExit {
     // Flowing water (after `WorldPlugin`, in `DefaultPlugins`).
     app.add_plugins(plugins)
         .add_plugins((day_night, FluidPlugin));
+    if options.sky_sources {
+        let [x, y, z, ..] = options.camera;
+        let move_in = !options.camera_given && !options.walk;
+        app.add_plugins(SkySourcesPlugin {
+            start: DVec3::new(x, y, z),
+            camera: move_in.then_some(!options.automation()),
+        });
+    }
     // `--fog`: the plugin only when asked (off adds nothing at all); F7 cycles the presets,
     // Shift+F7 the haze factor, and the far presets follow the LOD's horizon (F8).
     if let Some(settings) = options.fog.settings(
@@ -2508,11 +2645,12 @@ mod tests {
     /// ordered against the fly camera's grab (both use `CursorOptions`), and walking against the
     /// camera's moves. Every update is one fixed step (a synthetic clock).
     fn picking_app() -> App {
-        picking_app_with(None)
+        picking_app_with(None, None)
     }
 
-    /// [`picking_app`], with the `--lamps` demo around `lamps`.
-    fn picking_app_with(lamps: Option<DVec3>) -> App {
+    /// [`picking_app`], with the `--lamps` demo around `lamps` and the `--sky-sources` cavern
+    /// around `cavern` (the camera moves in, its input off).
+    fn picking_app_with(lamps: Option<DVec3>, cavern: Option<DVec3>) -> App {
         use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         use boxel::world::jobs::InlineExecutor;
         use boxel::worldgen::FlatGenerator;
@@ -2527,7 +2665,11 @@ mod tests {
                     ("boxel:grass".to_string(), 1),
                 ])),
                 executor: Arc::new(InlineExecutor),
-                registry: Arc::new(boxel_demo::blocks::registry()),
+                registry: Arc::new(if cavern.is_some() {
+                    boxel_demo::blocks::registry_with_sky_source()
+                } else {
+                    boxel_demo::blocks::registry()
+                }),
                 ..WorldPlugin::default()
             },
             FluidPlugin,
@@ -2548,12 +2690,20 @@ mod tests {
         .init_resource::<CrosshairTarget>()
         // As `RenderPlugin` does: picking sets its block.
         .init_resource::<BlockOutline>()
+        // As `DebugOverlayPlugin` does: B toggles it.
+        .init_resource::<SkySourceMarkers>()
         .edit_schedule(Update, |schedule| {
             schedule.set_build_settings(ScheduleBuildSettings {
                 ambiguity_detection: LogLevel::Error,
                 ..ScheduleBuildSettings::default()
             });
         });
+        if let Some(start) = cavern {
+            app.add_plugins(SkySourcesPlugin {
+                start,
+                camera: Some(false),
+            });
+        }
         player::clock::fixed_frames(&mut app, player::clock::STEP);
         let pitch = -std::f32::consts::FRAC_PI_2;
         app.world_mut().spawn((
@@ -3721,7 +3871,7 @@ mod tests {
     #[test]
     fn lamps_demo_places_its_blocks_once_the_ground_is_loaded() {
         let start = DVec3::new(0.5, 6.0, 0.5);
-        let app = picking_app_with(Some(start));
+        let app = picking_app_with(Some(start), None);
         assert_eq!(app.world().resource::<LampsDemo>().start, None, "placed");
         // On the grass (top at y = 3) of the flat world.
         let ground = |p: BlockPos| {
@@ -3742,6 +3892,67 @@ mod tests {
                 "{pos:?} {name}"
             );
         }
+    }
+
+    #[test]
+    fn sky_sources_demo_builds_its_cavern_on_the_ground() {
+        use boxel::debug_overlay::SourceProbe;
+        use boxel::world::SkyMap;
+        assert!(parse(&["--sky-sources"]).sky_sources);
+        assert!(usage().contains("--sky-sources"));
+        let start = DVec3::new(0.5, 6.0, 0.5);
+        let mut app = picking_app_with(None, Some(start));
+        assert_eq!(app.world().resource::<CavernDemo>().start, None, "built");
+        // On the grass (top at y = 3) of the flat world.
+        let ground = |p: BlockPos| {
+            Some(if p.y <= 3 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        let cavern = cavern::Cavern::around(start, ground, |s| s != BlockState::AIR)
+            .expect("loaded")
+            .expect("ground");
+        assert_eq!(cavern.floor, BlockPos::new(0, 3, 0));
+        let registry = boxel_demo::blocks::registry_with_sky_source();
+        for &(pos, name) in &cavern.cells {
+            assert_eq!(
+                block_at(&app, pos),
+                registry.by_name(name),
+                "{pos:?} {name}"
+            );
+        }
+        // The camera moved in.
+        let (eye, ..) = cavern.camera();
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&Transform, With<FlyCamera>>();
+        let camera = cameras.single(app.world()).expect("one camera");
+        assert_eq!(camera.translation, eye);
+        // Settled again: the room is lit by the beams like the open sky, and the ledge shades.
+        let begin = Instant::now();
+        loop {
+            app.update();
+            let stats = *app.world().resource::<WorldStats>();
+            if stats.is_settled() {
+                break;
+            }
+            assert!(begin.elapsed() < Duration::from_secs(60), "{stats:?}");
+        }
+        let top = 3 + cavern::HEIGHT;
+        let probe = SourceProbe::at(app.world().resource::<SkyMap>(), BlockPos::new(0, 5, 0));
+        let SourceProbe::Beam(source, beam) = probe else {
+            panic!("a beam through the room: {probe:?}");
+        };
+        assert_eq!(
+            (source, beam.lo, beam.hi),
+            (BlockPos::new(0, top, 0), 4, top)
+        );
+        let map = app.world().resource::<ChunkMap>();
+        let sky = |x, y, z| map.light_at(BlockPos::new(x, y, z)).expect("cached").sky();
+        assert_eq!(sky(0, 4, 0), 15, "on the floor");
+        assert!(sky(-cavern::HALF, 4, 0) < 15, "under the ledge");
     }
 
     #[test]
