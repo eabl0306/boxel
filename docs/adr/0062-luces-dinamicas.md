@@ -83,7 +83,9 @@ entidad, así que sin saber dónde están las luces son todas.
 | cuevas (y = -1000) | 9,05 M quads | 16,76 M (+85 %) |
 
   Las paletas no cambian. Bajo tierra el arena por defecto (8 Mi entradas) ya no alcanza y crece
-  (ADR 0035).
+  (ADR 0035). En la GPU (RTX, `stress --ao baked` contra el mismo binario): cueva quieta 2410 a
+  1660 fps (-31 %), superficie 1880 a 1566 (-17 %). Es mucho: el dueño decide si el juego lo paga
+  ya o espera la regla de abajo.
 - **Una regla más barata y correcta**, para después: AO en las caras oscuras solo en los chunks
   cerca de una luz, remallados cuando una luz se acerca, con margen para que llegue antes que la
   luz. Toca el streaming (las opciones de malla por chunk), así que la decide el dueño.
@@ -105,7 +107,32 @@ entidad, así que sin saber dónde están las luces son todas.
 
 ## Medidas
 
-Se completan en la entrega (perf-smoke del motor y del juego).
+`just perf-smoke surface cave-static` (RTX, radio 16, sin tope) contra 24eeb56, sin luces:
+
+| Caso | fps | p99 ms | Veredicto |
+|---|---:|---:|---|
+| superficie | 2120 a 2007 (-5,4 %) | 1,04 a 1,20 | ok |
+| cueva quieta | 2463 a 2410 (-2,1 %) | 0,88 a 0,89 | ok |
+
+En la 780M: superficie 567 a 582 (+2,7 %), cueva quieta 720 a 720. Una corrida antes, con el
+mismo código, la superficie dio +6,9 %: la base varía de 1900 a 2120 fps entre corridas.
+
+La versión con varying perdía 18 % (superficie) y 24 % (cueva) sin luces; por eso se cambió.
+
+Una antorcha (`stress --held-light 14,11,6`, contra el mismo binario sin ella): cueva quieta 2422 a
+2343 fps (-3,3 %), superficie quieta 1910 a 1937 (ruido). Con `--ao baked` además, la cueva quieta
+baja a 1613 (-34 %): casi todo es el AO.
+
+De las 2427 imágenes de las pruebas de GPU de main, 2422 salen iguales byte a byte. Las otras 5
+son `seam_high` y `seam_high_camera_far_plane` de `gpu_lod` en el tier High (un píxel de borde, 1
+o 2 niveles), y cambian también entre dos corridas de main: es el solape de orden de dibujo de
+High (ADR 0015, sección 12).
+
+El juego (`just perf-smoke`, RTX, contra su main sobre el main del motor), con `Baked`:
+subterráneo 1181 a 992 fps (-16 %, regresión grande), superficie 554 a 509 (-8 %). La antorcha en
+la mano (`--give boxelcraft:torch`, mismo binario): subterráneo -1,1 %, superficie +0,4 %, pero
+esos casos vuelan dentro de la roca o lejos del suelo, así que la luz casi no llega a nada: ningún
+caso del juego fija una antorcha frente a una pared.
 
 ## El juego
 
