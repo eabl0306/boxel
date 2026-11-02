@@ -8,6 +8,7 @@ usage:
   perf.py check [--base REF|BIN] [--ref REF] [--rounds N] [--dry-run] [--no-tag]
                 [--accept-partial] [--off-main]
   perf.py bisect CASE GOOD BAD [--metric M]... [-- STRESS OPTIONS]
+  perf.py edits [--new REF|BIN] [--runs N] [--caps 0,144] [CASE] [-- STRESS OPTIONS]
   perf.py cases [--outside BIN]
 
 smoke (level 1, `just perf-smoke`): one 10 s stress run per side of each case, base against the
@@ -36,6 +37,13 @@ first-parent commits (the merges) of GOOD..BAD, by halves, to find the first bad
 --metric M (what the checkpoint report flagged), the checkpoint rule of M on 3 interleaved runs
 of 20 s per side instead; --fps-min and --p99-max belong to the smoke check and are refused with
 it. On the RTX it samples the NVIDIA state like the checkpoint round.
+
+edits (`just perf-edits`, issue #7): whether edit batches come out whole. `--runs` runs (3) of
+stress --edits on CASE (default surface-static: the camera still over the overworld, radius 16)
+at each cap of --caps (uncapped and 144), the new binary only, on a quiet machine. The table gives
+per run the edits timed, the frames and milliseconds until the world settled again (median and
+slowest) and the edit batches held and split. Exit 0 when no counted run split a batch, 1 when one
+did, 2 when a run failed or never counted.
 
 A run that overlapped a build or another benchmark, or that the compositor throttled, is redone;
 one that still does not count after 4 attempts never feeds a verdict. Builds go through
@@ -82,6 +90,11 @@ MATRIX = [Case(gpu, scenario, 16, cap)
           for scenario in ('surface', 'cave-path', 'cave-static', 'forest', 'dive')
           for cap in (144, 0)] + [Case('rtx', 'cave-path', 32, 144),
                                   Case('rtx', 'surface', 32, 144)]
+# perf.py edits: runs per cap, their seconds (one scripted edit a second), the caps and the case.
+EDITS_RUNS = 3
+EDITS_S = 30
+EDITS_CAPS = (0, 144)
+EDITS_CASE = 'surface-static'
 # Binaries of dirty trees older than this are removed from the cache (no smoke runs that long).
 DIRTY_KEEP_S = 3 * 24 * 3600
 
@@ -619,6 +632,70 @@ def cmd_smoke(a):
                2: 'could not measure everything (see the verdicts; nothing here says ok)'}[code]
     say(f'perf-smoke: {verdict}. Runs in {folder} '
         f'(every metric: just bench-report --compare {folder}/base {folder}/new)')
+    return code
+
+
+# ---------------------------------------------------------------------------------------------
+# Edit batches (issue #7)
+
+def edits_row(run):
+    """One row of the edits table: the run's case and numbers, or why it has none."""
+    e = run.metrics.get('edits') if run.counts else None
+    if run.error or not run.counts or not e:
+        why = run.error or run.noisy or 'no edits in the summary (a stress without --edits?)'
+        return f'| {run.case} | {why} |' + ' - |' * 7
+    return (f"| {run.case} | {fmt(run.metrics['fps'])} | {e.get('timed')} | "
+            f"{e.get('frames_p50')} / {e.get('frames_max')} | "
+            f"{fmt(e.get('ms_p50'))} / {fmt(e.get('ms_max'))} | {e.get('batches_held')} | "
+            f"{e.get('batches_split')} | {e.get('light_fanout')} |")
+
+
+def edits_table(results):
+    """Markdown table of the edits runs, in the order they ran."""
+    lines = ['| case | fps | edits timed | frames p50 / max | ms p50 / max | batches held | '
+             'batches split | light fan-out |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|']
+    return '\n'.join(lines + [edits_row(r) for r in results])
+
+
+def edits_code(results):
+    """1 if a counted run split a batch, else 2 if a run has no numbers, else 0."""
+    edits = [r.metrics.get('edits') if r.counts else None for r in results]
+    if any(e and e.get('batches_split') for e in edits):
+        return 1
+    return 2 if not results or not all(edits) else 0
+
+
+def cmd_edits(a):
+    no_quiet_slot()
+    caps = [int(c) for c in a.caps.split(',') if c.strip()]
+    default = Case(gpu=a.gpu, radius=a.radius, extra=('--edits', *a.extra))
+    cases = [runs.parse_case(f'{a.case}/{cap or "uncapped"}', default) for cap in caps]
+    runs_s = sum(a.runs * runs.estimate_s(c, a.duration) for c in cases)
+    say(f'perf-edits: {len(cases)} cases, {a.runs * len(cases)} runs of {a.duration:g} s, about '
+        f'{minutes(runs_s)} of runs (more with a build or repeats)')
+    new = resolve(a.new)
+    say(f'perf-edits: {new} (md5 {md5(new.path)})')
+    folder = bench('edits', stamp())
+    os.makedirs(folder, exist_ok=True)
+    results = []
+    for case in cases:
+        for i in range(1, a.runs + 1):
+            prefix = os.path.join(folder, f'{case.slug}-{i}')
+            run = runs.measure(new.path, case, prefix, f'edits-{new.label}', a.duration, say=say)
+            results.append(run)
+            say(run_line('new', run))
+            if run.gave_up:
+                break
+        if results and results[-1].gave_up:
+            break
+    code = edits_code(results)
+    say()
+    say(edits_table(results))
+    say()
+    verdict = {0: 'ok, no edit batch split', 1: 'SPLIT: some edit batch came out in parts',
+               2: 'could not measure everything (nothing here says ok)'}[code]
+    say(f'perf-edits: {verdict}. Runs in {folder}')
     return code
 
 
@@ -1369,6 +1446,17 @@ def parser():
                    help='pairs per commit with --metric (default 3)')
     b.add_argument('--duration', type=float,
                    help=f'seconds per run (default {SMOKE_S}, {CHECK_S} with --metric)')
+    e = sub.add_parser('edits', help='whether edit batches come out whole (issue #7)')
+    e.add_argument('case', nargs='?', default=EDITS_CASE,
+                   help=f'default: {EDITS_CASE} (no cap: --caps sets them)')
+    e.add_argument('--new', help='git ref or stress binary (default: this tree as it is)')
+    e.add_argument('--gpu', choices=sorted(runs.GPUS), default='rtx')
+    e.add_argument('--radius', type=int, default=16)
+    e.add_argument('--caps', default=','.join(map(str, EDITS_CAPS)),
+                   help='fps caps, comma separated (default 0,144; 0: uncapped)')
+    e.add_argument('--runs', type=int, default=EDITS_RUNS, help='runs per cap (default 3)')
+    e.add_argument('--duration', type=float, default=EDITS_S,
+                   help=f'seconds per run (default {EDITS_S}: one edit a second)')
     k = sub.add_parser('cases', help='scenarios and the checkpoint matrix')
     k.add_argument('--outside', metavar='BIN', help="an outside app's cases instead")
     return p
@@ -1386,11 +1474,11 @@ def main(argv):
         return 64 if e.code else 0
     a.extra = extra
     try:
-        if extra and a.command not in ('smoke', 'bisect'):
-            raise ValueError(f'only smoke and bisect take stress options after --, not '
+        if extra and a.command not in ('smoke', 'bisect', 'edits'):
+            raise ValueError(f'only smoke, bisect and edits take stress options after --, not '
                              f'{a.command}')
         return {'smoke': cmd_smoke, 'check': cmd_check, 'bisect': cmd_bisect,
-                'cases': cmd_cases}[a.command](a)
+                'edits': cmd_edits, 'cases': cmd_cases}[a.command](a)
     except ValueError as e:
         print(f'perf: {e}', file=sys.stderr)
         return 64

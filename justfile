@@ -174,6 +174,11 @@ perf-smoke *args:
     python3 tools/perf/perf.py smoke {{ args }}
 
 [group('bench')]
+[doc('Edit batches whole (issue #7): stress --edits, still surface, uncapped and 144, 3 runs each')]
+perf-edits *args:
+    python3 tools/perf/perf.py edits {{ args }}
+
+[group('bench')]
 [doc('Checkpoint round on main (over an hour): the fixed matrix against the last one. --dry-run: plan')]
 perf-check *args:
     python3 tools/perf/perf.py check {{ args }}

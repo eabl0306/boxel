@@ -232,6 +232,14 @@ quieto toda la corrida y el resumen la anota. `tools/bench_report.py` no mezcla 
 sin `--edits`, compara la latencia de las ediciones cuando la hay y solo avisa si cambia la hora
 (el día y la noche no cambian ninguna malla).
 
+Para ver si los lotes de edición salen enteros (issue #7) está `just perf-edits`: corre
+`stress --edits` en `surface-static` (la cámara quieta sobre la superficie del overworld, radio 16),
+3 corridas de 30 s sin tope y otras 3 con tope 144, solo con el binario de la rama. La tabla da
+por corrida las ediciones medidas, los frames y ms hasta que el mundo vuelve a estar quieto
+(mediana y máximo) y los lotes retenidos y partidos. Sale con 0 si ninguna corrida partió un lote,
+1 si alguna lo hizo y 2 si una corrida falló o no contó. `--caps 144`, `--runs 5` y las opciones
+de stress tras `--` cambian la ronda.
+
 Cuerpos de física (ADR 0016): `--bodies N` pone N cuerpos sobre el suelo alrededor del inicio de
 la cámara cuando el mundo terminó de cargar, tan repartidos como en los benches de física (10 000
 en un cuadrado de 304 bloques). `--body-kind item` (por defecto) son objetos tirados que caen y se

@@ -855,6 +855,58 @@ class SmokeRunTest(FakeMachine):
         self.assertIn('both binaries are the same', self.output())
 
 
+def edits_summary(split=0, cap=0):
+    """A stress --edits summary: 30 edits timed, `split` of its batches split."""
+    data = summary(cap=cap)
+    data['world']['edits'] = {'steps': 30, 'skipped': 0, 'timed': 30, 'frames_p50': 3,
+                              'frames_max': 5, 'ms_p50': 16.4, 'ms_max': 21.0,
+                              'batches_held': 30, 'batches_split': split, 'light_fanout': 4}
+    return data
+
+
+class EditsTest(FakeMachine):
+    """cmd_edits (issue #7) on fake binaries."""
+
+    def cmd_edits(self, new, flags=(), extra=()):
+        a = perf.parser().parse_args(['edits', '--duration', '3', '--runs', '2', *flags])
+        a.extra = list(extra)
+        with mock.patch.object(perf, 'resolve', return_value=new), \
+                mock.patch.object(perf, 'root', return_value=self.dir):
+            return perf.cmd_edits(a)
+
+    def test_runs_each_cap_with_edits_on_the_still_surface(self):
+        new = self.binary('new', data=edits_summary())
+        self.assertEqual(self.cmd_edits(new), 0, self.output())
+        self.assertEqual(calls(new.path), 4, 'two runs at each of the two caps')
+        with open(new.path + '.args') as f:
+            args = f.read().splitlines()
+        self.assertTrue(all('--scenario static --world overworld --caves mc' in a and
+                            a.endswith('--edits') or ' --edits ' in a for a in args), args)
+        self.assertEqual([a.split('--fps-limit ')[1].split()[0] for a in args],
+                         ['0', '0', '144', '144'])
+        out = self.output()
+        self.assertIn('| rtx/surface-static/r16/144 --edits | 1000 | 30 | 3 / 5 | 16.40 / 21 | '
+                      '30 | 0 | 4 |', out)
+        self.assertIn('ok, no edit batch split', out)
+
+    def test_a_split_batch_fails_and_a_summary_without_edits_says_nothing(self):
+        self.assertEqual(self.cmd_edits(self.binary('split', data=edits_summary(split=1))), 1)
+        self.assertIn('SPLIT', self.output())
+        self.said.clear()
+        self.assertEqual(self.cmd_edits(self.binary('plain'), flags=['--caps', '144']), 2)
+        self.assertIn('no edits in the summary', self.output())
+
+    def test_a_failed_run_is_no_ok(self):
+        self.assertEqual(self.cmd_edits(self.binary('nogpu', fail=True)), 2)
+        self.assertIn('exit code 2', self.output())
+
+    def test_options_after_the_dashes_go_to_every_run(self):
+        new = self.binary('new', data=edits_summary())
+        self.assertEqual(self.cmd_edits(new, extra=['--time', '21:00']), 0, self.output())
+        with open(new.path + '.args') as f:
+            self.assertTrue(all('--edits --time 21:00' in a for a in f.read().splitlines()))
+
+
 # The cases a fake outside app declares.
 APP_CASES = {'surface': 'superficie, vuelo a 64', 'underground': 'bajo tierra, vuelo a 64'}
 

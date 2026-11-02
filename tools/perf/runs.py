@@ -87,6 +87,9 @@ SCENARIOS = {
     'switch': Scenario('switch', (*OVERWORLD, '--speed', '64', '--switch-every', '4'),
                        'superficie, vuelo a 64, otro mundo cada 4 s', (SWITCH_SCENARIO,),
                        ('--switch-every',)),
+    # The camera still over the overworld's surface: the case of `perf.py edits` (issue #7),
+    # where stress's --edits places and removes a lamp and digs and caps a shaft near it.
+    'surface-static': Scenario('static', OVERWORLD, 'superficie, quieta'),
 }
 
 # Over this radius runs take longer to settle. Every case starts from the binary's own chunk
@@ -530,6 +533,9 @@ def metrics(summary, times_ms, nv=None, nv_state=None):
         'fps_s': [s.get('fps') for s in summary.get('timeline') or []],
         # The NVIDIA's mean state while measuring (nv_means), None without samples.
         'nv': nv_state,
+        # stress --edits: the scripted edits' latencies and the edit batches held or split (its
+        # summary's `world.edits`), None without --edits.
+        'edits': get(summary, ('world', 'edits')),
     }
 
 
