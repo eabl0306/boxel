@@ -1711,6 +1711,7 @@ impl VoxelRenderer {
             realm_planes,
             realm_env,
             dynamic_count,
+            unproject: view.view_proj.inverse().to_cols_array_2d(),
             dynamic_lights,
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));

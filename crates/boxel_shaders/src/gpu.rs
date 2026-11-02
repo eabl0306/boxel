@@ -49,7 +49,7 @@ pub struct DynamicLightGpu {
     pub level: [f32; 4],
 }
 
-/// The per-frame part of the uniform `View` (1344 bytes, std140-compatible: only vec4/mat4
+/// The per-frame part of the uniform `View` (1408 bytes, std140-compatible: only vec4/mat4
 /// members and arrays of them). The buffer continues with the model box table
 /// ([`VIEW_BOXES_OFFSET`]).
 #[repr(C)]
@@ -100,6 +100,9 @@ pub struct ViewUniform {
     /// x = dynamic lights in use (at most [`MAX_DYNAMIC_LIGHTS`]; 0: the shaders skip them),
     /// yzw = 0.
     pub dynamic_count: [u32; 4],
+    /// The inverse of `view_proj` (column-major): the dynamic lights find a fragment's
+    /// position from its framebuffer position and depth (ADR 0062).
+    pub unproject: [[f32; 4]; 4],
     /// The dynamic lights, the first `dynamic_count.x` in use (ADR 0062).
     pub dynamic_lights: [DynamicLightGpu; MAX_DYNAMIC_LIGHTS],
 }

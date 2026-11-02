@@ -152,6 +152,7 @@ struct View {
   realm_planes: array<vec4<i32>, 2>, // the planes between realms relative to render_origin.y, clamped to i32, ascending (plane 4k + j at [k][j]); unused ones i32::MAX
   realm_env: array<RealmEnv, 9>,   // each realm's light, bottom realm first (realm_at)
   dynamic_count: vec4<u32>,        // x = dynamic lights in use (0: none, the shaders skip them)
+  unproject: mat4x4<f32>,          // inverse of view_proj: a fragment's position from its framebuffer position and depth (dynamic lights)
   dynamic_lights: array<DynamicLight, 16>, // ADR 0062, the first dynamic_count.x in use
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
   // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
@@ -177,7 +178,6 @@ struct VsOut {
   @location(4) st: vec2<f32>,                       // quad-local (s, t): corner k sits at (k & 1, k >> 1)
   @location(5) @interpolate(flat) light: vec2<u32>, // the quad's light palette entry (4 corner lights)
   @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE), then its realm (bits 12..16, AO_REALM_SHIFT), then the dynamic lights that may reach it (bit 16 + k for light k, AO_DYNAMIC_SHIFT)
-  @location(7) pos: vec3<f32>,                      // the point relative to render_origin, before edge growth (dynamic lights)
 };
 
 struct Decoded {
@@ -579,7 +579,6 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
     lights = dynamic_mask(base - vec3(2.0), base + far + vec3(3.0));
   }
   o.ao = d.ao | (d.flags << 8u) | (realm << AO_REALM_SHIFT) | (lights << AO_DYNAMIC_SHIFT);
-  o.pos = rel;
   return o;
 }
 
@@ -618,6 +617,16 @@ fn out_realm(i: VsOut) -> u32 {
   return (i.ao >> AO_REALM_SHIFT) & 15u;
 }
 
+// The position of the fragment at framebuffer position `frag` (its @builtin(position): pixel
+// center, depth) relative to render_origin, through View::unproject. No varying: a varying
+// costs every fragment, this only the fragments a dynamic light reaches. The pattern quads read
+// the same framebuffer position, the same on every tier (cell.wgsl).
+fn fragment_position(frag: vec4<f32>) -> vec3<f32> {
+  let ndc = vec2(2.0 * frag.x / view.viewport.x - 1.0, 1.0 - 2.0 * frag.y / view.viewport.y);
+  let p = view.unproject * vec4(ndc, frag.z, 1.0);
+  return p.xyz / p.w;
+}
+
 // The block light levels (red, green, blue) the dynamic lights give fragment `i` (ADR 0062),
 // the brightest per channel: a light of level L gives L - d at Manhattan distance d, as a
 // block emitter's light falls off in open air, measured from the point half a block in front of
@@ -628,12 +637,13 @@ fn dynamic_levels(i: VsOut) -> vec3<f32> {
   let mask = i.ao >> AO_DYNAMIC_SHIFT;
   let cross = ((i.ao >> 9u) & GEO_SHAPE_MASK) == SHAPE_CROSS;
   let n = select(face_normal(i.face), vec3(0.0), cross);
-  let front = i.pos + 0.5 * n;
+  let pos = fragment_position(i.clip);
+  let front = pos + 0.5 * n;
   var level = vec3(0.0);
   for (var k = 0u; (mask >> k) != 0u; k++) {
     if (((mask >> k) & 1u) == 0u) { continue; }
     let l = view.dynamic_lights[k];
-    if (!cross && dot(l.pos.xyz - i.pos, n) <= 0.0) { continue; }
+    if (!cross && dot(l.pos.xyz - pos, n) <= 0.0) { continue; }
     let d = abs(l.pos.xyz - front);
     level = max(level, l.level.rgb - vec3(d.x + d.y + d.z));
   }

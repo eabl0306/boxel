@@ -29,16 +29,19 @@ Lo que pesaba:
 
 ### Cómo llegan al shader
 
-- **Uniform**: `View` suma `dynamic_count` (`vec4<u32>`) y 16 `DynamicLight` de 2 `vec4`
-  (posición relativa al `render_origin` y alcance; nivel por canal). Son 528 bytes: `View` pasa
-  de 816 + 8192 a 1344 + 8192 bytes (9536), un solo uniform block en Low, lejos de los 16 KiB.
-  Los tres tiers leen el mismo uniform con el mismo código.
+- **Uniform**: `View` suma `dynamic_count` (`vec4<u32>`), `unproject` (la inversa de
+  `view_proj`) y 16 `DynamicLight` de 2 `vec4` (posición relativa al `render_origin` y alcance;
+  nivel por canal). Son 592 bytes: `View` pasa de 816 + 8192 a 1408 + 8192 bytes (9600), un solo
+  uniform block en Low, lejos de los 16 KiB. Los tres tiers leen el mismo uniform con el mismo
+  código.
 - **Vértice**: cada quad calcula qué luces pueden llegar a la caja de sus celdas (con 2 bloques
   de margen) y guarda una máscara de 16 bits en los bits libres 16 a 31 de `VsOut::ao`. Es la
   misma en sus 4 esquinas. Sin luces el bucle no corre y la máscara vale 0.
-- **Fragmento**: un varying nuevo, `pos` (location 7), la posición antes del crecimiento de
-  bordes. Si la máscara vale 0 el fragmento hace lo mismo que antes. Si no, recorre solo las
-  luces de la máscara.
+- **Fragmento**: si la máscara vale 0 hace lo mismo que antes. Si no, saca su posición de su
+  posición en el framebuffer y su profundidad con `unproject`, y recorre solo las luces de la
+  máscara. No hay varying nuevo: la primera versión llevaba la posición en un varying y costaba
+  18 a 24 % de los fps sin ninguna luz (abajo). Los quads de patrón ya leen la posición en el
+  framebuffer igual en los tres tiers (ADR 0056).
 - **Celdas** (`cell.wgsl`): igual, con la máscara por vértice (un quad de celda mide un bloque
   como mucho) en los bits altos de su varying de reino.
 - **Modelos**: en la CPU. Un modelo con sonda (ADR 0040) sube cada canal de su luz al nivel de
@@ -96,7 +99,7 @@ entidad, así que sin saber dónde están las luces son todas.
 
 ### Costo
 
-- Sin luces: un varying de 3 floats y una prueba de bits por fragmento. Medido abajo.
+- Sin luces: una prueba de bits por fragmento y un `if` por vértice. Medido abajo.
 - Con luces: por vértice, una prueba de caja por luz; por fragmento, solo los quads al alcance, una
   cuenta por luz de su máscara.
 
@@ -115,4 +118,4 @@ las entidades todavía no se dibujan, así que por ahora solo la mano.
 
 - Un mundo con luces dinámicas paga AO en las caras oscuras: más quads, más arena.
 - Las luces no remallan nada ni suben nada a la GPU salvo el uniform de cada frame.
-- `View` crece 528 bytes por frame.
+- `View` crece 592 bytes por frame.

@@ -42,7 +42,6 @@ struct CellOut {
   @location(1) @interpolate(flat) data: vec2<u32>,
   @location(2) view_dist: f32,
   @location(3) @interpolate(flat) realm: u32,      // the realm of the quad's chunk (realm_at), then the dynamic lights that may reach it from bit 16 (AO_DYNAMIC_SHIFT)
-  @location(4) pos: vec3<f32>,                     // the point relative to render_origin (dynamic lights)
 };
 
 // A cell quad's corners are within about a block of each other, so the dynamic lights within
@@ -73,7 +72,6 @@ fn vs_cell(
     let lights = dynamic_mask(rel - vec3(CELL_DYNAMIC_MARGIN), rel + vec3(CELL_DYNAMIC_MARGIN));
     o.realm = o.realm | (lights << AO_DYNAMIC_SHIFT);
   }
-  o.pos = rel;
   return o;
 }
 
@@ -126,7 +124,6 @@ fn vs_cell_pattern(
   o.data = data;
   o.view_dist = length(rel - view.camera_rel.xyz);
   o.realm = 0u;
-  o.pos = rel;
   return o;
 }
 
@@ -159,7 +156,6 @@ fn cell_shade(albedo: vec4<f32>, i: CellOut) -> vec4<f32> {
   v.light = vec2(corners, corners);
   v.ao = 0xFFu | select(0u, FLAG_EMISSIVE << 8u, (i.data.x & CELL_BRIGHT_BIT) != 0u)
     | ((i.realm & 15u) << AO_REALM_SHIFT) | ((i.realm >> AO_DYNAMIC_SHIFT) << AO_DYNAMIC_SHIFT);
-  v.pos = i.pos;
   return shade_fragment(vec4(albedo.rgb * cell_linear(tint), albedo.a), v, view);
 }
 
