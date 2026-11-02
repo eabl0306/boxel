@@ -15,6 +15,8 @@ boxel_transform.workspace = true
 boxel_window.workspace = true
 boxel_camera.workspace = true
 boxel_render.workspace = true
+# The beams of the sky sources (ADR 0061) the overlay shows.
+boxel_light.workspace = true
 boxel_voxel.workspace = true
 boxel_world.workspace = true
 tracing.workspace = true
@@ -24,6 +26,9 @@ tracing.workspace = true
 boxel_ecs = { workspace = true, features = ["debug"] }
 # `RenderInfo::present_mode` values in the overlay text tests.
 wgpu.workspace = true
+# The `test:sky_source` world of the sky source tests (ADR 0061).
+boxel_voxel = { workspace = true, features = ["testing"] }
+boxel_worldgen.workspace = true
 
 [lints]
 workspace = true

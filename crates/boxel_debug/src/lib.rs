@@ -13,6 +13,11 @@
 //! `boxel_render::RenderInfo`. Missing resources (no world, no renderer yet) just hide their
 //! lines.
 //!
+//! Sky sources and realms (ADR 0061): a `Realm` line gives the realm at the eye with its daylight
+//! curve, and in a world whose registry has sky sources a `Source` line gives the source whose
+//! beam lights the [`CrosshairTarget`] ([`SourceProbe`]). [`SkySourceMarkers`] (off by default)
+//! marks the sources and their beams near the camera, with or without the text.
+//!
 //! Optional debug keys ([`FrameKeys`], off by default; F5 and F6 when on) cycle the frame limit
 //! and toggle vsync at runtime; the overlay then shows a hint line for them.
 //!
@@ -24,19 +29,25 @@
 //! 90 east), pitch is positive looking up.
 
 mod font;
+mod sky;
 
 pub use font::{GLYPH_SIZE, TextStyle, glyph, layout_text};
+pub use sky::{MAX_MARKS, RealmProbe, SkySourceMarkers, SourceProbe, project};
 
 use boxel_app::{App, FrameLimit, Last, Plugin, Time, Update};
-use boxel_camera::Camera;
+use boxel_camera::{Camera, CameraView};
 use boxel_ecs::prelude::*;
+use boxel_ecs::system::SystemParam;
 use boxel_math::{DVec3, UVec2};
 use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, SurfaceInfo};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, LightValue};
 use boxel_window::{ButtonInput, FramePacingInfo, KeyCode};
 use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
-use boxel_world::{ChunkMap, TimeOfDay, WorldStats};
+use boxel_world::{
+    ChunkMap, DaylightCurve, RealmLighting, RealmPlanes, SkyMap, TimeOfDay, WorldContent,
+    WorldStats,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
@@ -307,6 +318,7 @@ impl Plugin for DebugOverlayPlugin {
         .init_resource::<OverlayLines>()
         .init_resource::<Crosshair>()
         .init_resource::<CrosshairTarget>()
+        .init_resource::<SkySourceMarkers>()
         .world_resource::<CrosshairTarget>(|t| t.0.is_none())
         .add_systems(Update, (toggle_overlay, frame_keys))
         .add_systems(Last, (track_frames, build_overlay).chain())
@@ -401,6 +413,11 @@ pub struct OverlayInputs {
     pub light: Option<LightProbe>,
     /// World clock (`None`: no `DaylightPlugin`).
     pub time: Option<TimeOfDay>,
+    /// The realm at the eye (`None`: no world or no camera).
+    pub realm: Option<RealmProbe>,
+    /// The sky source lighting the crosshair target (`None`: no target, or a registry without
+    /// sky sources).
+    pub source: Option<SourceProbe>,
     /// Lines added by apps ([`OverlayLines`]), shown last.
     pub extra: Vec<String>,
 }
@@ -528,6 +545,12 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
             ));
         }
     }
+    if let Some(realm) = &inputs.realm {
+        lines.push(realm.line());
+    }
+    if let Some(source) = &inputs.source {
+        lines.push(source.line());
+    }
     if let Some(time) = &inputs.time {
         let state = if time.paused {
             "  paused".to_string()
@@ -573,8 +596,19 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
     lines
 }
 
-/// Rebuilds `OverlayDraw` from the current state. While hidden it holds only the crosshair (or
-/// nothing), and is written only when that changes.
+/// What the overlay reads of the sky sources and realms (ADR 0061).
+#[derive(SystemParam)]
+struct SkyView<'w> {
+    markers: Option<Res<'w, SkySourceMarkers>>,
+    sky: Option<Res<'w, SkyMap>>,
+    content: Option<Res<'w, WorldContent>>,
+    planes: Option<Res<'w, RealmPlanes>>,
+    lighting: Option<Res<'w, RealmLighting>>,
+    curve: Option<Res<'w, DaylightCurve>>,
+}
+
+/// Rebuilds `OverlayDraw` from the current state. While hidden it holds only the crosshair and
+/// the [`SkySourceMarkers`] (or nothing), and is written only when that changes.
 fn build_overlay(
     overlay: Res<DebugOverlay>,
     window: Res<FrameWindow>,
@@ -588,6 +622,7 @@ fn build_overlay(
     crosshair: Option<Res<Crosshair>>,
     surface: Option<Res<SurfaceInfo>>,
     cameras: Query<(&Camera, &Transform)>,
+    sky_view: SkyView,
     world_view: (
         Option<Res<ChunkMap>>,
         Option<Res<CrosshairTarget>>,
@@ -600,25 +635,52 @@ fn build_overlay(
         (Some(c), Some(frame)) if c.visible => Some(c.rects(frame)),
         _ => None,
     };
+    let active = cameras.iter().find(|(camera, _)| camera.active);
+    let mut marks = Vec::new();
+    if let (Some(markers), Some(sky), Some(frame), Some((cam, transform))) = (
+        sky_view.markers.as_deref().filter(|m| m.visible),
+        sky_view.sky.as_deref(),
+        frame,
+        active,
+    ) {
+        let view = CameraView::compute(cam, transform, frame.x as f32 / frame.y as f32);
+        markers.marks_in(sky, &view, transform.translation, frame, &mut marks);
+    }
     if !overlay.visible {
-        let want: &[OverlayRect] = cross.as_ref().map_or(&[], |r| r.as_slice());
-        if draw.rects.as_slice() != want {
-            draw.rects.clear();
-            draw.rects.extend_from_slice(want);
+        if let Some(cross) = &cross {
+            marks.extend_from_slice(cross);
+        }
+        if draw.rects != marks {
+            draw.rects = marks;
         }
         return;
     }
-    let camera = cameras
-        .iter()
-        .find(|(camera, _)| camera.active)
-        .map(|(_, transform)| (transform.translation, transform.forward()));
+    let camera = active.map(|(_, transform)| (transform.translation, transform.forward()));
     let (map, target, time) = world_view;
+    let target = target.as_deref().and_then(|t| t.0);
+    let realm = sky_view
+        .planes
+        .as_deref()
+        .zip(camera)
+        .map(|(planes, (eye, _))| {
+            RealmProbe::at(
+                BlockPos::from_world(eye).y,
+                planes,
+                sky_view.lighting.as_deref(),
+                sky_view.curve.as_deref().zip(time.as_deref()),
+            )
+        });
+    let sources = sky_view
+        .content
+        .as_deref()
+        .is_some_and(|c| c.light_tables.any_sky_source());
+    let source = match (sky_view.sky.as_deref(), target) {
+        (Some(sky), Some(pos)) if sources => Some(SourceProbe::at(sky, pos)),
+        _ => None,
+    };
     let light = map.as_deref().map(|map| LightProbe {
         eye: camera.and_then(|(eye, _)| map.light_at(BlockPos::from_world(eye))),
-        target: target
-            .as_deref()
-            .and_then(|t| t.0)
-            .map(|pos| (pos, map.light_at(pos))),
+        target: target.map(|pos| (pos, map.light_at(pos))),
     });
     let inputs = OverlayInputs {
         frames: (window.fps(), window.average(), window.worst()),
@@ -632,6 +694,8 @@ fn build_overlay(
         world: world.as_deref().copied(),
         light,
         time: time.as_deref().copied(),
+        realm,
+        source,
         extra: extra
             .as_deref()
             .map(|e| e.iter().map(str::to_string).collect())
@@ -639,6 +703,7 @@ fn build_overlay(
     };
     let lines = overlay_lines(&inputs);
     draw.rects.clear();
+    draw.rects.append(&mut marks);
     layout_text(&lines, &overlay.style, &mut draw.rects);
     if let Some(cross) = cross {
         draw.rects.extend_from_slice(&cross);
@@ -829,6 +894,279 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("Light") || l.starts_with("Time"))
         );
+    }
+
+    #[test]
+    fn lines_show_the_source_at_the_crosshair_and_the_realm_at_the_eye() {
+        use boxel_light::Beam;
+        use boxel_voxel::{BeamDir, SkySourceDef};
+        // Two realms meeting at y = 0; the upper one has its own curve.
+        let planes = RealmPlanes {
+            planes: vec![0],
+            drawn: 0,
+        };
+        let lighting = RealmLighting {
+            realms: vec![
+                boxel_world::RealmLight::default(),
+                boxel_world::RealmLight {
+                    curve: Some(DaylightCurve::default()),
+                    ..boxel_world::RealmLight::default()
+                },
+            ],
+        };
+        let (curve, noon) = (DaylightCurve::default(), TimeOfDay::default());
+        let below = RealmProbe::at(-1, &planes, Some(&lighting), Some((&curve, &noon)));
+        let above = RealmProbe::at(1 << 40, &planes, Some(&lighting), None);
+        assert_eq!((below.realm, below.realms, below.own_curve), (0, 2, false));
+        assert_eq!(
+            (above.realm, above.own_curve, above.sky_light),
+            (1, true, None)
+        );
+        let [r, g, b] = lighting.at(0, &curve, &noon).sky_light;
+        let beam = Beam {
+            source: 74,
+            lo: 11,
+            hi: 74,
+            def: SkySourceDef {
+                dir: BeamDir::Down,
+                range: 64,
+            },
+        };
+        let inputs = OverlayInputs {
+            light: Some(LightProbe {
+                eye: None,
+                target: Some((BlockPos::new(3, 20, -2), None)),
+            }),
+            realm: Some(below),
+            source: Some(SourceProbe::Beam(BlockPos::new(3, 74, -2), beam)),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        let at = |prefix: &str| lines.iter().position(|l| l.starts_with(prefix));
+        assert_eq!(
+            lines[at("Realm").expect("realm line")],
+            format!("Realm 0 of 2  curve global  sky {r:.2} {g:.2} {b:.2}")
+        );
+        assert_eq!(
+            lines[at("Source").expect("source line")],
+            "Source 3 74 -2  down range 64  beam 11..74"
+        );
+        // The realm after the light, the source after the realm.
+        assert!(at("      target") < at("Realm") && at("Realm") < at("Source"));
+        assert_eq!(above.line(), "Realm 1 of 2  curve own");
+        assert_eq!(SourceProbe::None.line(), "Source none");
+        assert_eq!(SourceProbe::Unknown.line(), "Source -");
+        let up = Beam {
+            def: SkySourceDef {
+                dir: BeamDir::Up,
+                range: 16,
+            },
+            ..beam
+        };
+        assert!(
+            SourceProbe::Beam(BlockPos::new(0, 74, 0), up)
+                .line()
+                .contains("up range 16")
+        );
+        // Neither line without a world (or without sources in it).
+        let lines = overlay_lines(&OverlayInputs::default());
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Realm") || l.starts_with("Source"))
+        );
+    }
+
+    /// A camera at `eye` looking along -X (yaw 90 degrees), for a frame of 800 x 600.
+    fn west_view(eye: DVec3) -> (CameraView, UVec2) {
+        let size = UVec2::new(800, 600);
+        let transform = Transform::from_yaw_pitch(eye, std::f32::consts::FRAC_PI_2, 0.0);
+        assert!((transform.forward() - boxel_math::Vec3::NEG_X).length() < 1e-6);
+        let view = CameraView::compute(&Camera::default(), &transform, 800.0 / 600.0);
+        (view, size)
+    }
+
+    #[test]
+    fn markers_project_inside_the_screen() {
+        use boxel_light::Beam;
+        use boxel_voxel::{BeamDir, SkySourceDef};
+        // The same scene at the origin, past the former i32 edge and at 2^40 (ADR 0014).
+        for base in [0i64, 1 << 31, -(1 << 40)] {
+            let eye = DVec3::new(base as f64 + 8.5, 0.5, base as f64 + 3.5);
+            let (view, size) = west_view(eye);
+            let at = |x: i64, y: i64, z: i64| BlockPos::new(base + x, y, base + z);
+            // Straight ahead: the center; behind, nearer than the near plane or off the sides of
+            // the frame: nothing.
+            assert_eq!(project(&view, size, at(3, 0, 3)), Some([400.0, 300.0]));
+            assert_eq!(project(&view, size, at(14, 0, 3)), None, "behind");
+            assert_eq!(project(&view, size, at(8, 0, 3)), None, "at the eye");
+            assert_eq!(project(&view, size, at(3, 0, 40)), None, "off the side");
+            assert_eq!(project(&view, size, at(3, 40, 3)), None, "over the top");
+            // A down beam from the center: the source's square over the dots under it.
+            let beam = |source: i64, lo: i64| Beam {
+                source,
+                lo,
+                hi: source,
+                def: SkySourceDef {
+                    dir: BeamDir::Down,
+                    range: 64,
+                },
+            };
+            let markers = SkySourceMarkers {
+                visible: true,
+                ..SkySourceMarkers::default()
+            };
+            let mut out = Vec::new();
+            let beams = [
+                (base + 3, base + 3, beam(0, -40)),
+                // Behind the camera, and farther than the radius: left out.
+                (base + 20, base + 3, beam(0, -10)),
+                (base - 60, base + 3, beam(0, -10)),
+            ];
+            markers.marks(&view, eye, size, beams, &mut out);
+            let source = out.last().expect("the source");
+            assert_eq!((source.min, source.max), ([396.0, 296.0], [404.0, 304.0]));
+            assert_eq!(source.color, markers.source_color);
+            let dots = &out[..out.len() - 1];
+            // Every other cell from the bottom (-40) to the cell under the source, within the
+            // frame (the lowest ones leave it under the bottom edge).
+            assert!(!dots.is_empty() && dots.len() <= 20, "{}", dots.len());
+            for dot in dots {
+                assert_eq!(dot.color, markers.beam_color);
+                let center = (dot.min[0] + dot.max[0]) / 2.0;
+                assert!((center - 400.0).abs() < 1e-3, "{dot:?}");
+                assert!(dot.min[1] > 300.0, "under the source: {dot:?}");
+            }
+            for rect in &out {
+                assert!(rect.min[0] >= 0.0 && rect.min[1] >= 0.0, "{rect:?}");
+                assert!(rect.max[0] <= 800.0 && rect.max[1] <= 600.0, "{rect:?}");
+            }
+            // The first beam is not seen looking the other way.
+            let east = Transform::from_yaw_pitch(eye, -std::f32::consts::FRAC_PI_2, 0.0);
+            let back = CameraView::compute(&Camera::default(), &east, 800.0 / 600.0);
+            let mut none = Vec::new();
+            markers.marks(&back, eye, size, [beams[0]], &mut none);
+            assert!(none.is_empty(), "{none:?}");
+        }
+    }
+
+    /// Stone at chunk layers 0 and -3, air between, and one sky source under the roof at
+    /// `(3, -1, 3)` (`test:sky_source`, down, range 16), declared in layer -1.
+    struct SunbeamHall;
+
+    impl boxel_worldgen::WorldGenerator for SunbeamHall {
+        fn generate(
+            &self,
+            key: boxel_voxel::ChunkKey,
+            registry: &boxel_voxel::BlockRegistry,
+        ) -> boxel_voxel::ChunkData {
+            use boxel_voxel::{BlockState, ChunkData, LocalPos};
+            let solid = registry.by_name("test:solid").expect("solid");
+            match key.pos.y {
+                0 | -3 => ChunkData::uniform(solid),
+                -1 if (key.pos.x, key.pos.z) == (0, 0) => {
+                    let mut chunk = ChunkData::uniform(BlockState::AIR);
+                    let source = registry.by_name("test:sky_source").expect("source");
+                    chunk.set(LocalPos::new(3, 31, 3), source);
+                    chunk
+                }
+                _ => ChunkData::uniform(BlockState::AIR),
+            }
+        }
+        fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+            -3..=0
+        }
+        fn sky_source_layers(&self) -> std::ops::RangeInclusive<i64> {
+            -1..=-1
+        }
+        fn name(&self) -> &str {
+            "sunbeam hall"
+        }
+    }
+
+    /// The overlay in a world with a sky source: the source at the crosshair from the world's
+    /// beam tile, and its marks drawn with the text hidden.
+    #[test]
+    fn a_world_with_a_source_shows_it_at_the_crosshair_and_marks_it() {
+        use boxel_world::jobs::InlineExecutor;
+        use boxel_world::{ChunkViewer, WorldPlugin};
+        let mut b = boxel_voxel::testing::builder();
+        boxel_voxel::testing::add_sky_source(&mut b).expect("sources");
+        let mut app = App::new();
+        app.add_plugins((
+            TimePlugin,
+            DebugOverlayPlugin::default(),
+            WorldPlugin {
+                generator: std::sync::Arc::new(SunbeamHall),
+                registry: std::sync::Arc::new(b.build()),
+                executor: std::sync::Arc::new(InlineExecutor),
+                ..WorldPlugin::default()
+            },
+        ))
+        .insert_resource(SurfaceInfo {
+            size: UVec2::new(800, 600),
+            ..SurfaceInfo::default()
+        });
+        // Level with the source, 5 blocks east of its column, looking west at it.
+        let eye = DVec3::new(8.5, -0.5, 3.5);
+        app.world_mut().spawn((
+            Camera::default(),
+            Transform::from_yaw_pitch(eye, std::f32::consts::FRAC_PI_2, 0.0),
+            ChunkViewer {
+                radius: 1,
+                vertical_radius: 2,
+            },
+        ));
+        let start = Instant::now();
+        loop {
+            app.update();
+            let stats = *app.world().resource::<WorldStats>();
+            if stats.chunks > 0 && stats.is_settled() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "{stats:?}");
+        }
+        let sky = app.world().resource::<SkyMap>();
+        let SourceProbe::Beam(source, beam) = SourceProbe::at(sky, BlockPos::new(3, -5, 3)) else {
+            panic!("a beam through (3, -5, 3)");
+        };
+        assert_eq!(
+            (source, beam.lo, beam.hi),
+            (BlockPos::new(3, -1, 3), -16, -1)
+        );
+        assert_eq!(
+            SourceProbe::at(sky, BlockPos::new(3, -20, 3)),
+            SourceProbe::None
+        );
+        assert_eq!(
+            SourceProbe::at(sky, BlockPos::new(4, -5, 3)),
+            SourceProbe::None
+        );
+        assert_eq!(
+            SourceProbe::at(sky, BlockPos::new(3, -5, 1000)),
+            SourceProbe::Unknown,
+            "not loaded"
+        );
+        // Off by default; on, the marks alone while the text is hidden.
+        assert!(app.world().resource::<OverlayDraw>().rects.is_empty());
+        app.world_mut().resource_mut::<SkySourceMarkers>().visible = true;
+        app.update();
+        let rects = app.world().resource::<OverlayDraw>().rects.clone();
+        let markers = *app.world().resource::<SkySourceMarkers>();
+        let source = rects.last().expect("the source's square");
+        assert_eq!((source.min, source.max), ([396.0, 296.0], [404.0, 304.0]));
+        assert!(rects.len() > 1, "and its beam");
+        assert!(
+            rects[..rects.len() - 1]
+                .iter()
+                .all(|r| r.color == markers.beam_color && r.min[1] > 300.0)
+        );
+        // With the text the marks go under it.
+        app.world_mut().resource_mut::<DebugOverlay>().visible = true;
+        app.update();
+        let with_text = &app.world().resource::<OverlayDraw>().rects;
+        assert_eq!(with_text[..rects.len()], rects[..]);
+        assert!(with_text.len() > rects.len());
     }
 
     #[test]

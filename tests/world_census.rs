@@ -54,6 +54,7 @@ const APP_WIDE: &[&str] = &[
     "boxel_debug::FrameWindow",
     "boxel_debug::OverlayLines",
     "boxel_debug::PresentWindow",
+    "boxel_debug::sky::SkySourceMarkers",
     "boxel_diagnostic::DiagnosticsBoard",
     "boxel_diagnostic::FrameStats",
     "boxel_diagnostic::history::FrameTimeHistory",
