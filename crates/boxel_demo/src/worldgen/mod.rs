@@ -12,6 +12,8 @@
 //! level of detail (ADR 0031): each answers for coarse cells from its heights, sea and trees,
 //! reading its fields on every call.
 //!
+//! [`LitCaves`] wraps any of them with sky sources under its cave roofs (ADR 0061).
+//!
 //! The blocks they place are settings too: [`BlockNames`] in [`TerrainSettings::names`] and
 //! [`OverworldSettings::names`], the demo's `boxel:` names by default. A game with its own
 //! registry sets its own names and gets the same world, chunk by chunk and far cell by far cell,
@@ -19,6 +21,7 @@
 //! its registry lacks.
 
 mod forest;
+mod lit_caves;
 mod lod;
 mod names;
 pub mod overworld;
@@ -28,6 +31,7 @@ mod terrain;
 mod trees;
 
 pub use forest::ForestGenerator;
+pub use lit_caves::LitCaves;
 pub use names::{BlockNames, MissingBlocks};
 pub use overworld::{
     CaveSettings, Caves, Heightmap, OverworldGenerator, OverworldSettings, SurfaceRules,

@@ -33,6 +33,11 @@
 //! Every emitter is drawn full bright (ADR 0036): the lamps and torches are marked, and lava
 //! glows because it emits.
 //!
+//! Not in [`registry`]: the sky source of ADR 0061, `boxel:sky_source` ([`add_sky_source`],
+//! [`registry_with_sky_source`]), which only the sky source demos add after the other blocks. A
+//! registry with a source makes the world count its beam tiles, so the other demos stay
+//! without one.
+//!
 //! The texture layers, in this order: 0 stone to 20 poppy (stone, dirt, grass top, grass side,
 //! sand, gravel, snow, bedrock, log side, log top, leaves, water, planks, the 4 lamps, lava,
 //! glass, short grass, poppy), 21 torch, 22 cobblestone, 23 obsidian, 24 `water_flow` and 25
@@ -44,9 +49,10 @@ use crate::textures::{self, Pattern};
 use boxel_voxel::rules::{NeighborRule, UseRule};
 use boxel_voxel::shapes::half_from_name;
 use boxel_voxel::{
-    Axis, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder, BlockState,
-    BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures, Facing, ModelBox,
-    OPAQUE_OPACITY, Property, RenderShape, SlabHalf, StateValues, TextureId, WATERLOGGED,
+    Axis, BeamDir, BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockRegistryBuilder,
+    BlockState, BoxModel, BoxModelId, CollisionBox, FLUID_LEVEL, FaceTextures, Facing, ModelBox,
+    OPAQUE_OPACITY, Property, RenderShape, SkySourceDef, SlabHalf, StateValues, TextureId,
+    WATERLOGGED,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,6 +109,58 @@ pub const TORCH_EMISSION: [u8; 3] = [14, 13, 10];
 /// The demo registry (see the [module docs](self) for its states and layers).
 pub fn registry() -> BlockRegistry {
     builder().build()
+}
+
+/// The demo's sky source block (ADR 0061).
+pub const SKY_SOURCE: &str = "boxel:sky_source";
+
+/// The `range` values of [`SKY_SOURCE`], in state order (64 is the default).
+pub const SKY_SOURCE_RANGES: [u16; 3] = [16, 64, 256];
+
+/// Adds [`SKY_SOURCE`] to `b` (after every other block, so no other state moves) and returns
+/// its default state, `boxel:sky_source[dir=down,range=64]`. It is what a game's source block
+/// is: invisible, without collision, letting light through, with a `dir` property (`down`,
+/// `up`) and a `range` property ([`SKY_SOURCE_RANGES`]); every state is a sky source of its
+/// direction and range, and it keeps flowing fluids out (the owner's decision 4 of the plan).
+pub fn add_sky_source(b: &mut BlockRegistryBuilder) -> BlockState {
+    let ranges = SKY_SOURCE_RANGES.map(|r| r.to_string());
+    let default = b
+        .add_block_with_states(
+            BlockDef {
+                name: SKY_SOURCE.to_string(),
+                shape: RenderShape::None,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::None,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: FaceTextures::all(TextureId(0)),
+            },
+            vec![
+                Property::new("dir", ["down", "up"]),
+                Property::new("range", ranges).with_default("64"),
+            ],
+            |_, _| {},
+        )
+        .expect("demo sky source");
+    let block = b.block_by_name(SKY_SOURCE).expect("just added");
+    b.set_keeps_fluids_out(block).expect("demo sky source");
+    // `dir` then `range` (sorted by name), the last varying fastest; the default is `down`.
+    let first = default.0 - 1;
+    for (d, dir) in [BeamDir::Down, BeamDir::Up].into_iter().enumerate() {
+        for (r, &range) in SKY_SOURCE_RANGES.iter().enumerate() {
+            let state = BlockState(first + (d * SKY_SOURCE_RANGES.len() + r) as u16);
+            b.set_sky_source(state, SkySourceDef { dir, range })
+                .expect("demo sky source");
+        }
+    }
+    default
+}
+
+/// The demo registry with [`SKY_SOURCE`] after its blocks: every other state keeps its id.
+pub fn registry_with_sky_source() -> BlockRegistry {
+    let mut b = builder();
+    add_sky_source(&mut b);
+    b.build()
 }
 
 /// The texture layers of the demo, by id.
