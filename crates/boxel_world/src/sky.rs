@@ -191,6 +191,10 @@ impl SkyMap {
             open: Arc::new(SkyTile::uniform(i64::MIN, i64::MIN)),
         }
     }
+    /// The world computes no light (`WorldSettings::light` off): meshes and ticks see open sky.
+    pub(crate) fn light_off(&self) -> bool {
+        self.rule == SkyRule::Off
+    }
     /// Empties the columns for a world's close: every walk is cancelled, the columns are
     /// drained in place (no `ColumnId` is handed out twice) and returned with the index, to drop
     /// off the main thread. The rule stays until the next world sets its own.

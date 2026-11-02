@@ -66,5 +66,9 @@ harness = false
 name = "persist"
 harness = false
 
+[[bench]]
+name = "ticks"
+harness = false
+
 [lints]
 workspace = true

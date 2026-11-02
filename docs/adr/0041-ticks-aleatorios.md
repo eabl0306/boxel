@@ -42,5 +42,5 @@ bloques con handler, así que el sistema sale en la primera línea.
 ## Fuera de esta parte
 
 - La luz: el `TickContext` no la lee, así que los cultivos crecen también a oscuras (Minecraft
-  pide luz 9).
+  pide luz 9). Resuelto en el ADR 0059.
 - La lluvia, que en Minecraft también moja la tierra de cultivo.

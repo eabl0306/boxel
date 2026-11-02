@@ -30,12 +30,22 @@
 //!   ticks. A chunk whose palette holds no such state gets no picks. The picks hash the game
 //!   tick, the chunk and the pick's number, and [`TickContext::random`] the tick's block and
 //!   game tick, so a run is deterministic.
+//! - Light (ADR 0059): a tick reads a cell's light ([`TickContext::light`], sky and block level)
+//!   and the brightness Minecraft's growth rules ask for ([`TickContext::brightness`], the sky
+//!   level darkened by the time of day, [`BlockTickSettings::sky_darken`]). It is the light the
+//!   chunk's last mesh or light job computed, kept within `WorldSettings::light_cache_radius`:
+//!   after an edit that changes the light, the light from before until the remesh of the edit's
+//!   batch lands. `None` where the chunk has no light yet; a world without light reads open sky.
 use crate::streaming::ViewerChunks;
-use crate::{BlockChanged, BlockEdit, ChunkDataEvent, ChunkMap, EditQueue, WorldContent};
+use crate::{
+    BlockChanged, BlockEdit, ChunkDataEvent, ChunkMap, DaylightCurve, EditQueue, SkyMap, TimeOfDay,
+    WorldContent,
+};
 use boxel_ecs::prelude::*;
+use boxel_light::ChunkLight;
 use boxel_voxel::{
     BlockId, BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkPos, Face,
-    LocalPos, Paletted,
+    LightValue, LocalPos, MAX_LIGHT, Paletted,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -98,6 +108,12 @@ pub struct BlockTickSettings {
     /// The most game ticks of random ticks one frame catches up after a stall (the rest are
     /// skipped, as a server that falls behind skips them).
     pub random_catch_up: u32,
+    /// How many levels the time of day takes off the sky light ticks read
+    /// ([`TickContext::brightness`], Minecraft's `skyDarken`: 0 by day, 11 at night), from the
+    /// world clock and its curve. Asked once per frame, in `First` (before `Update`, where apps
+    /// move the clock); 0 without a clock (no `DaylightPlugin`).
+    /// The default is [`curve_sky_darken`].
+    pub sky_darken: fn(&TimeOfDay, &DaylightCurve) -> u8,
 }
 
 impl Default for BlockTickSettings {
@@ -111,6 +127,66 @@ impl Default for BlockTickSettings {
             random_ticks_per_chunk: 24,
             random_tick_radius: [4, 4],
             random_catch_up: GAME_TICKS_PER_SECOND as u32,
+            sky_darken: curve_sky_darken,
+        }
+    }
+}
+
+/// The default [`BlockTickSettings::sky_darken`]: the curve's sky light at `time` (its
+/// brightest channel, 1 at noon) taken off the full 15 levels, rounded. The default curve gives
+/// 0 by day, 6 with the sun on the horizon and 12 at night.
+pub fn curve_sky_darken(time: &TimeOfDay, curve: &DaylightCurve) -> u8 {
+    let sky = curve.at(time).sky_light;
+    let bright = sky.iter().copied().fold(0.0f32, f32::max).clamp(0.0, 1.0);
+    ((1.0 - bright) * f32::from(MAX_LIGHT)).round() as u8
+}
+
+/// The light of a cell as a tick reads it (ADR 0059): the sky level and the block level, the
+/// brightest of the block light's red, green and blue (Minecraft's block light has one level).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickLight {
+    /// Sky level, 0 to 15 (15 under open sky, at any time of day).
+    pub sky: u8,
+    /// Block level, 0 to 15.
+    pub block: u8,
+}
+
+impl TickLight {
+    /// Open sky and no block light: what a world without light reads everywhere.
+    pub const OPEN: TickLight = TickLight { sky: 15, block: 0 };
+
+    /// The levels of a voxel's light.
+    pub const fn of(light: LightValue) -> Self {
+        let [r, g, b] = light.rgb();
+        let rg = if r > g { r } else { g };
+        TickLight {
+            sky: light.sky(),
+            block: if rg > b { rg } else { b },
+        }
+    }
+
+    /// Minecraft's `getRawBrightness(pos, darken)`: the sky level less `darken` (at least 0) or
+    /// the block level, the higher. With `darken` 0 the time of day does not count (crops grow
+    /// at night under open sky).
+    pub const fn raw(self, darken: u8) -> u8 {
+        let sky = self.sky.saturating_sub(darken);
+        if sky > self.block { sky } else { self.block }
+    }
+}
+
+/// What the ticks of one frame know of the light: whether the world has any, and the time of
+/// day's [`BlockTickSettings::sky_darken`].
+#[derive(Clone, Copy, Debug, Default)]
+struct LightInput {
+    off: bool,
+    darken: u8,
+}
+
+impl LightInput {
+    fn new(sky: Option<&SkyMap>, ticks: &BlockTicks) -> Self {
+        LightInput {
+            off: sky.is_some_and(SkyMap::light_off),
+            darken: ticks.sky_darken,
         }
     }
 }
@@ -219,6 +295,8 @@ pub struct BlockTicks {
     /// The cells whose data the running ticks keep through a change of their block
     /// ([`TickContext::keep_data`]), queued with the writes.
     kept: Vec<BlockPos>,
+    /// The frame's [`BlockTickSettings::sky_darken`] (`sample_sky_darken`, in `First`).
+    sky_darken: u8,
     stats: BlockTickStats,
 }
 
@@ -427,6 +505,10 @@ pub struct TickContext<'a> {
     cache: ChunkCache<'a>,
     /// The state of [`TickContext::random`].
     rng: u64,
+    /// The frame's light rule and darkening.
+    light: LightInput,
+    /// The last chunk whose light was read (`None` inside: it has none yet).
+    light_cache: Cell<Option<(ChunkPos, Option<&'a ChunkLight>)>>,
 }
 
 /// The last chunk a [`TickContext`] read, so most reads skip the map's hash lookup.
@@ -460,6 +542,47 @@ impl<'a> TickContext<'a> {
     /// batch of the tick's writes.
     pub fn keep_data(&mut self, pos: BlockPos) {
         self.ticks.kept.push(pos);
+    }
+
+    /// The light at `pos` (ADR 0059): the chunk's light as its last mesh or light job computed
+    /// it, so after an edit that changes the light it is the light from before until the
+    /// remesh of the edit's batch lands (a few frames). `None` while the chunk has none: not
+    /// loaded, not meshed or lit yet, or farther than `WorldSettings::light_cache_radius` from
+    /// every viewer (keep the random tick radius inside it). A handler takes `None` as a check
+    /// that fails (a crop does not grow this time). A world without light
+    /// (`WorldSettings::light` off) reads [`TickLight::OPEN`] everywhere, as its meshes do. The
+    /// writes of this frame's ticks do not change it.
+    pub fn light(&self, pos: BlockPos) -> Option<TickLight> {
+        if self.light.off {
+            return Some(TickLight::OPEN);
+        }
+        let (chunk, local) = pos.split();
+        let light = match self.light_cache.get() {
+            Some((c, light)) if c == chunk => light,
+            _ => {
+                let map: &'a ChunkMap = self.map;
+                let light = map
+                    .id_at(chunk)
+                    .and_then(|id| map.get(id))
+                    .and_then(|slot| slot.light());
+                self.light_cache.set(Some((chunk, light)));
+                light
+            }
+        };
+        light.map(|l| TickLight::of(l.get(local)))
+    }
+
+    /// Minecraft's `getMaxLocalRawBrightness`: the light at `pos` with the sky darkened by the
+    /// time of day ([`TickLight::raw`] of [`TickContext::sky_darken`]). Saplings and grass ask
+    /// for 9. `None` as [`TickContext::light`].
+    pub fn brightness(&self, pos: BlockPos) -> Option<u8> {
+        self.light(pos).map(|l| l.raw(self.light.darken))
+    }
+
+    /// How many levels the time of day takes off the sky light this frame
+    /// ([`BlockTickSettings::sky_darken`]; 0 without a clock).
+    pub fn sky_darken(&self) -> u8 {
+        self.light.darken
     }
 
     /// The block at `pos` (`None` where the chunk is not loaded: outside the handler's reach).
@@ -589,6 +712,10 @@ impl boxel_app::Plugin for BlockTicksPlugin {
             // A closed world's clock stands (the next world starts at 0).
             .add_systems(boxel_app::FixedUpdate, advance_clock.run_if(world_open))
             .add_systems(
+                boxel_app::First,
+                sample_sky_darken.after(boxel_ecs::message::MessageUpdateSystems),
+            )
+            .add_systems(
                 boxel_app::Update,
                 (
                     run_ticks
@@ -670,6 +797,25 @@ fn missing_chunk(
     None
 }
 
+/// `First`: the frame's [`BlockTickSettings::sky_darken`] from the world clock, kept for the
+/// ticks of the frame. Sampled before `Update`, where apps move the clock (keys, sleep), so the
+/// ticks read no clock of their own.
+fn sample_sky_darken(
+    settings: Res<BlockTickSettings>,
+    time: Option<Res<TimeOfDay>>,
+    curve: Option<Res<DaylightCurve>>,
+    mut ticks: ResMut<BlockTicks>,
+) {
+    let darken = time.map_or(0, |time| match curve {
+        Some(curve) => (settings.sky_darken)(&time, &curve),
+        None => (settings.sky_darken)(&time, &DaylightCurve::default()),
+    });
+    let darken = darken.min(MAX_LIGHT);
+    if ticks.sky_darken != darken {
+        ticks.sky_darken = darken;
+    }
+}
+
 /// Runs the due ticks within the budget and queues their writes as one edit batch.
 fn run_ticks(
     mut ticks: ResMut<BlockTicks>,
@@ -678,6 +824,7 @@ fn run_ticks(
     map: Res<ChunkMap>,
     content: Res<WorldContent>,
     settings: Res<BlockTickSettings>,
+    sky: Option<Res<SkyMap>>,
 ) {
     let ticks = &mut *ticks;
     ticks.echoes.clear();
@@ -701,6 +848,7 @@ fn run_ticks(
         return;
     }
     let start = Instant::now();
+    let light = LightInput::new(sky.as_deref(), ticks);
     let mut overlay = HashMap::with_hasher(foldhash::fast::FixedState::default());
     let mut writes = Vec::new();
     let mut loaded = HashMap::with_hasher(foldhash::fast::FixedState::default());
@@ -715,6 +863,8 @@ fn run_ticks(
             tick: at,
             cache: Cell::new(None),
             rng: seed_of(pos, at),
+            light,
+            light_cache: Cell::new(None),
         };
         cx.react_around(pos);
     }
@@ -757,6 +907,8 @@ fn run_ticks(
             tick: due,
             cache: Cell::new(None),
             rng: seed_of(pos, due),
+            light,
+            light_cache: Cell::new(None),
         };
         (handler.tick)(&mut cx, pos, state);
     }
@@ -783,6 +935,7 @@ fn run_random_ticks(
     content: Res<WorldContent>,
     settings: Res<BlockTickSettings>,
     viewers: Option<Res<ViewerChunks>>,
+    sky: Option<Res<SkyMap>>,
 ) {
     let ticks = &mut *ticks;
     let now = ticks.now;
@@ -823,6 +976,7 @@ fn run_random_ticks(
         .collect();
     let mut ran = 0usize;
     if !chunks.is_empty() {
+        let light = LightInput::new(sky.as_deref(), ticks);
         let mut overlay = std::mem::take(&mut ticks.echoes);
         let mut writes = Vec::new();
         let mut loaded = HashMap::with_hasher(foldhash::fast::FixedState::default());
@@ -831,6 +985,12 @@ fn run_random_ticks(
                 let Some(data) = map.data_at(chunk) else {
                     continue;
                 };
+                // Every pick starts with its own chunk's blocks and light at hand.
+                let data: &ChunkData = data;
+                let chunk_light = map
+                    .id_at(chunk)
+                    .and_then(|id| map.get(id))
+                    .and_then(|slot| slot.light());
                 let seed = chunk_seed(chunk, tick);
                 for i in 0..settings.random_ticks_per_chunk {
                     let pick = mix(seed ^ u64::from(i));
@@ -854,8 +1014,10 @@ fn run_random_ticks(
                         writes: &mut writes,
                         ticks: &mut *ticks,
                         tick,
-                        cache: Cell::new(None),
+                        cache: Cell::new(Some((chunk, data))),
                         rng: mix(pick),
+                        light,
+                        light_cache: Cell::new(Some((chunk, chunk_light))),
                     };
                     (handler.tick)(&mut cx, pos, state);
                 }
@@ -1029,6 +1191,201 @@ mod tests {
         app.update();
         app.update();
         assert_eq!(hardened(&app, 0, 0), first);
+    }
+
+    /// [`Plants`], with the origin's chunk roofed at local y 3 and a lamp under the roof in its
+    /// middle: dark in the middle but around the lamp, lit along the open sides.
+    struct Roofed;
+
+    /// The lamp of [`Roofed`].
+    const LAMP: BlockPos = BlockPos::new(16, 2, 16);
+
+    impl WorldGenerator for Roofed {
+        fn generate(&self, key: ChunkKey, registry: &BlockRegistry) -> ChunkData {
+            let mut data = Plants.generate(key, registry);
+            if key.pos == ChunkPos::new(0, 0, 0) {
+                let solid = registry.by_name("test:solid").expect("solid");
+                for z in 0..32 {
+                    for x in 0..32 {
+                        data.set(LocalPos::new(x, 3, z), solid);
+                    }
+                }
+                let lamp = registry.by_name("test:lamp").expect("lamp");
+                data.set(LocalPos::new(16, 2, 16), lamp);
+            }
+            data
+        }
+        fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+            -1..=1
+        }
+        fn name(&self) -> &str {
+            "roofed"
+        }
+    }
+
+    /// Hardens a plant in light 9 or more, the time of day aside (a crop's rule).
+    fn harden_lit(cx: &mut TickContext<'_>, pos: BlockPos, _: BlockState) {
+        let solid = cx.registry().by_name("test:solid").expect("solid");
+        if cx.light(pos).is_some_and(|l| l.raw(0) >= 9) {
+            cx.set(pos, solid);
+        }
+    }
+
+    /// Hardens a plant in a brightness of 9 or more, the time of day counted (a sapling's).
+    fn harden_bright(cx: &mut TickContext<'_>, pos: BlockPos, _: BlockState) {
+        let solid = cx.registry().by_name("test:solid").expect("solid");
+        if cx.brightness(pos).is_some_and(|b| b >= 9) {
+            cx.set(pos, solid);
+        }
+    }
+
+    /// A settled world of [`Roofed`] with `tick` on the plants of the origin's chunk, `setup`
+    /// run on the app before it starts, then 4000 game ticks in one frame (so every tick reads
+    /// the light from before them); with the light of the plants' cells before the ticks.
+    fn roofed(
+        tick: fn(&mut TickContext<'_>, BlockPos, BlockState),
+        setup: impl FnOnce(&mut App),
+    ) -> (
+        App,
+        HashMap<BlockPos, Option<TickLight>, foldhash::fast::FixedState>,
+    ) {
+        let registry = Arc::new(testing::registry());
+        let mut app = App::new();
+        app.add_plugins(WorldPlugin {
+            generator: Arc::new(Roofed),
+            registry: Arc::clone(&registry),
+            executor: Arc::new(InlineExecutor),
+            ..WorldPlugin::default()
+        })
+        .add_plugins(BlockTicksPlugin);
+        {
+            let mut settings = app.world_mut().resource_mut::<BlockTickSettings>();
+            settings.random_tick_radius = [0, 0];
+            settings.random_catch_up = 10_000;
+            settings.paused = true;
+        }
+        setup(&mut app);
+        let plant = registry.block_by_name("test:plant").expect("plant");
+        app.world_mut()
+            .resource_mut::<BlockTicks>()
+            .register_random(
+                &registry,
+                plant,
+                RandomTickHandler {
+                    reach: [0, 0, 0],
+                    tick,
+                },
+            );
+        app.world_mut().spawn((
+            Transform::from_translation(DVec3::new(16.0, 8.0, 16.0)),
+            ChunkViewer::new(2).with_vertical_radius(1),
+        ));
+        for _ in 0..200 {
+            app.update();
+        }
+        let map = app.world().resource::<ChunkMap>();
+        let before = (0..32)
+            .flat_map(|z| (0..32).map(move |x| BlockPos::new(x, 1, z)))
+            .map(|pos| (pos, map.light_at(pos).map(TickLight::of)))
+            .collect();
+        app.world_mut().resource_mut::<BlockTicks>().advance(4000);
+        app.update();
+        app.update();
+        (app, before)
+    }
+
+    /// The plants of the origin's chunk that hardened and those that did not, with the light
+    /// they had before the ticks (`None`: no light).
+    fn hardened_and_light(
+        (app, before): &(
+            App,
+            HashMap<BlockPos, Option<TickLight>, foldhash::fast::FixedState>,
+        ),
+    ) -> Vec<(BlockPos, bool, Option<TickLight>)> {
+        let map = app.world().resource::<ChunkMap>();
+        let solid = testing::registry().by_name("test:solid").expect("solid");
+        let mut out = Vec::new();
+        for z in 0..32 {
+            for x in 0..32 {
+                let pos = BlockPos::new(x, 1, z);
+                out.push((pos, map.block_at(pos) == Some(solid), before[&pos]));
+            }
+        }
+        out
+    }
+
+    /// A random tick reads the cell's light: under the roof only the plants by the open sides
+    /// and around the lamp (light 9 or more) harden, the dark middle keeps its plants, and the
+    /// light it read is the map's.
+    #[test]
+    fn a_random_tick_reads_the_light_of_its_cell() {
+        let cells = hardened_and_light(&roofed(harden_lit, |_| {}));
+        assert!(
+            cells.iter().all(|(_, _, l)| l.is_some()),
+            "the chunk is lit"
+        );
+        let lit = |l: &Option<TickLight>| l.is_some_and(|l| l.raw(0) >= 9);
+        for (pos, hard, light) in &cells {
+            assert!(!hard || lit(light), "{pos:?} hardened in {light:?}");
+        }
+        let hard =
+            |f: &dyn Fn(BlockPos) -> bool| cells.iter().filter(|(p, h, _)| *h && f(*p)).count();
+        assert!(hard(&|p| p.x <= 2) > 0, "by an open side");
+        let near_lamp = |p: BlockPos| (p.x - LAMP.x).abs() + (p.z - LAMP.z).abs() <= 3;
+        assert!(hard(&near_lamp) > 0, "around the lamp");
+        let dark = cells.iter().filter(|(_, _, l)| !lit(l)).count();
+        assert!(dark > 100, "{dark} dark plants");
+        // The lamp's level: its color's brightest channel less one per block.
+        let beside = cells
+            .iter()
+            .find(|(p, _, _)| *p == BlockPos::new(LAMP.x + 1, 1, LAMP.z))
+            .and_then(|c| c.2);
+        let [r, g, b] = testing::EMISSION;
+        assert_eq!(beside.map(|l| l.block), Some(r.max(g).max(b) - 2));
+    }
+
+    /// At midnight the sky is darkened by the time of day for `brightness` (Minecraft's
+    /// `getMaxLocalRawBrightness`): the plants by the open sides do not harden, the ones around
+    /// the lamp still do. Without light every cell reads open sky.
+    #[test]
+    fn brightness_darkens_the_sky_at_night_and_a_world_without_light_is_open() {
+        let night = TimeOfDay {
+            paused: true,
+            ..TimeOfDay::at_clock(0.0)
+        };
+        assert_eq!(curve_sky_darken(&night, &DaylightCurve::default()), 12);
+        let noon = TimeOfDay::at_clock(12.0);
+        assert_eq!(curve_sky_darken(&noon, &DaylightCurve::default()), 0);
+        let cells = hardened_and_light(&roofed(harden_bright, |app| {
+            app.insert_resource(night);
+        }));
+        for (pos, hard, light) in &cells {
+            let block = light.map_or(0, |l| l.block);
+            assert!(
+                !hard || block >= 9,
+                "{pos:?} hardened in {light:?} at night"
+            );
+        }
+        assert!(
+            cells.iter().any(|c| c.1),
+            "the lamp's light does not change at night"
+        );
+        // No light: open sky everywhere, so the dark middle hardens too.
+        let cells = hardened_and_light(&roofed(harden_lit, |app| {
+            app.world_mut().resource_mut::<crate::WorldSettings>().light = false;
+        }));
+        assert!(cells.iter().all(|c| c.2.is_none()), "no light is computed");
+        let middle = |p: BlockPos| (10..22).contains(&p.x) && (10..22).contains(&p.z);
+        assert!(cells.iter().any(|c| c.1 && middle(c.0)));
+    }
+
+    #[test]
+    fn tick_light_levels() {
+        let l = TickLight::of(LightValue::new(12, 3, 9, 5));
+        assert_eq!(l, TickLight { sky: 12, block: 9 });
+        assert_eq!((l.raw(0), l.raw(2), l.raw(11), l.raw(15)), (12, 10, 9, 9));
+        assert_eq!(TickLight::of(LightValue::FULL_SKY), TickLight::OPEN);
+        assert_eq!(TickLight::OPEN.raw(11), 4);
     }
 
     #[test]

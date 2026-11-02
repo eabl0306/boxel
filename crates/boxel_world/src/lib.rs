@@ -110,7 +110,7 @@ pub use plugin::{
 pub use sky::{ColumnId, SkyMap};
 pub use ticks::{
     BlockTickSettings, BlockTickStats, BlockTicks, BlockTicksPlugin, GAME_TICKS_PER_SECOND,
-    RandomTickHandler, TickContext, TickHandler,
+    RandomTickHandler, TickContext, TickHandler, TickLight, curve_sky_darken,
 };
 pub use visibility::{ChunkVisibility, VisibilityStats, VisibilityView, VisibleSet};
 
