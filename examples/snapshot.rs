@@ -686,6 +686,7 @@ fn scene_light(hours: f64, settings: &RenderSettings) -> ([f32; 4], SceneLight) 
         ao_strength: settings.ao_strength,
         block_gain: settings.block_light_gain,
         curve: light_curve(settings.light_gamma),
+        ..SceneLight::noon()
     };
     (daylight.sky_color, light)
 }

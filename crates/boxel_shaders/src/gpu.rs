@@ -11,8 +11,28 @@ pub const VIEW_BOXES_OFFSET: u64 = size_of::<ViewUniform>() as u64;
 /// and the model box table (written when the blocks change).
 pub const VIEW_BUFFER_SIZE: u64 = VIEW_BOXES_OFFSET + 8 * VIEW_BOX_CAPACITY as u64;
 
-/// The per-frame part of the uniform `View` (352 bytes, std140-compatible: only vec4/mat4
-/// members). The buffer continues with the model box table ([`VIEW_BOXES_OFFSET`]).
+/// Realm planes the `View` uniform holds (`boxel_worldgen::realm::MAX_REALM_PLANES`).
+pub const REALM_PLANES: usize = 8;
+/// Realm entries the `View` uniform holds: one more than [`REALM_PLANES`].
+pub const REALM_ENVS: usize = REALM_PLANES + 1;
+
+/// One realm's light in the `View` uniform (`RealmEnv` in `common.wgsl`, 48 bytes, std140):
+/// its sky light, its ambient floor and its 6 face shade factors (ADR 0015, sec. 3 of the sky
+/// sources plan). Face order is the mesher's: +Y, -Y, +X, -X, +Z, -Z.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct RealmEnvGpu {
+    /// rgb = sky light color times the daylight intensity (linear), a = the shade of +Y faces.
+    pub sky: [f32; 4],
+    /// rgb = ambient floor (linear, per channel), a = the shade of -Y faces.
+    pub ambient: [f32; 4],
+    /// The shade of +X, -X, +Z and -Z faces.
+    pub shade: [f32; 4],
+}
+
+/// The per-frame part of the uniform `View` (816 bytes, std140-compatible: only vec4/mat4
+/// members and arrays of them). The buffer continues with the model box table
+/// ([`VIEW_BOXES_OFFSET`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct ViewUniform {
@@ -34,11 +54,13 @@ pub struct ViewUniform {
     /// [`bindings::MAX_DRAWS_PER_LIST`].
     pub counts: [u32; 4],
     /// rgb = sky light color times the daylight intensity (linear), a = ambient floor (no lit
-    /// surface is darker than its albedo times this).
+    /// surface is darker than its albedo times this). The light of realms without their own:
+    /// the shaders read [`ViewUniform::realm_env`].
     pub sky_light: [f32; 4],
     /// x = AO strength (`1 - x` is what the darkest corner keeps), y = block-light gain, z = the
     /// phase of the pattern quads' drift (ADR 0056: game ticks modulo 24,000 over 24,000, in
-    /// `0..1`), w = 0.
+    /// `0..1`), w = the realm the far LOD draws (an index into [`ViewUniform::realm_env`], as a
+    /// float).
     pub light_params: [f32; 4],
     /// Brightness of light levels `0..=15`: level `4k + j` at `[k][j]`, level 15 = 1. The
     /// shader interpolates it linearly between levels.
@@ -49,6 +71,13 @@ pub struct ViewUniform {
     /// not scroll because their resource pack animates them (ADR 0028): bit 0 water, bit 1 lava,
     /// as a float (0 to 3).
     pub viewport: [f32; 4],
+    /// The planes between the realms, relative to the render origin's y and clamped to the
+    /// `i32` range, ascending: plane `4k + j` at `[k][j]`; unused planes are `i32::MAX`. A voxel
+    /// is in realm `n`, the number of planes at or under its relative y: exact for every voxel
+    /// less than `2^31` from the camera.
+    pub realm_planes: [[i32; 4]; 2],
+    /// Each realm's sky light, ambient floor and face shade, bottom realm first.
+    pub realm_env: [RealmEnvGpu; REALM_ENVS],
 }
 
 /// Layers the fog uniform holds (`boxel_fog::MAX_FOG_LAYERS`).
@@ -445,7 +474,8 @@ pub struct ModelVertex {
     /// texel into them.
     pub rect: [u16; 4],
     /// The instance's light (`boxel_voxel::LightValue` bits) in the low 16 bits, the face's shade
-    /// (`0..=255`, 255 = 1) at [`model::SHADE_SHIFT`].
+    /// (`0..=255`, 255 = 1) at [`model::SHADE_SHIFT`] and the instance's realm (4 bits, the
+    /// `View`'s realm entry its light takes) at [`model::REALM_SHIFT`].
     pub data: u32,
 }
 
@@ -453,6 +483,8 @@ pub struct ModelVertex {
 pub mod model {
     /// Where the face's shade sits in [`super::ModelVertex::data`].
     pub const SHADE_SHIFT: u32 = 16;
+    /// Where the instance's realm sits in [`super::ModelVertex::data`] (4 bits).
+    pub const REALM_SHIFT: u32 = 24;
     /// Group of the skin texture (binding 0, `texture_2d<f32>` read with `textureLoad`). The
     /// `View` uniform stays in [`super::bindings::GROUP_VIEW`].
     pub const GROUP_SKIN: u32 = 0;

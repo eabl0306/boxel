@@ -4,7 +4,9 @@
 use super::{Cuboid, Model, PartPose, Pose};
 use boxel_math::glam::Affine3A;
 use boxel_math::{Mat3, Vec3};
-use boxel_shaders::gpu::{ModelVertex, model::SHADE_SHIFT};
+use boxel_shaders::gpu::model::{REALM_SHIFT, SHADE_SHIFT};
+use boxel_shaders::gpu::{ModelVertex, REALM_ENVS};
+use boxel_world::DEFAULT_FACE_SHADE;
 
 /// The two light directions of Minecraft's entity shading (`DIFFUSE_LIGHT_0` and
 /// `DIFFUSE_LIGHT_1`), not normalized, in the frame of the shaded normals: the world (+Y up,
@@ -19,6 +21,36 @@ pub const ENTITY_LIGHT_DIRECTIONS: [Vec3; 2] =
 pub fn entity_shade(normal: Vec3) -> f32 {
     let [a, b] = ENTITY_LIGHT_DIRECTIONS.map(Vec3::normalize);
     (0.4 + 0.6 * (normal.dot(a).max(0.0) + normal.dot(b).max(0.0))).min(1.0)
+}
+
+/// [`entity_shade`] in a realm whose cube faces are shaded by `table` (the mesher's face order,
+/// +Y, -Y, +X, -X, +Z, -Z) instead of [`DEFAULT_FACE_SHADE`]: Minecraft's entity shading with
+/// its darkness scaled as the realm scales the darkness of the cube faces, blended over the
+/// normal's axes (by the squares of its components). The default table gives `entity_shade`
+/// exactly, a flat table (all 1) a flat model, and the result stays in `0..=1`. The darkness of
+/// a top face is 0 in both tables, so a face that looks straight up keeps its shade of 1.
+pub fn realm_shade(normal: Vec3, table: &[f32; 6]) -> f32 {
+    let shade = entity_shade(normal);
+    if *table == DEFAULT_FACE_SHADE {
+        return shade;
+    }
+    let dark = |t: &[f32; 6]| {
+        let pick = |c: f32, pos: usize| {
+            if c >= 0.0 {
+                1.0 - t[pos]
+            } else {
+                1.0 - t[pos + 1]
+            }
+        };
+        normal.y * normal.y * pick(normal.y, 0)
+            + normal.x * normal.x * pick(normal.x, 2)
+            + normal.z * normal.z * pick(normal.z, 4)
+    };
+    let base = dark(&DEFAULT_FACE_SHADE);
+    if base <= 0.0 {
+        return shade;
+    }
+    (1.0 - (1.0 - shade) * (dark(table) / base)).clamp(0.0, 1.0)
 }
 
 /// The texture rectangle of a face, in the model's texels: `[min, max)` on each axis.
@@ -133,12 +165,15 @@ pub(crate) struct InstanceFrame {
     pub texel_scale: [f32; 2],
     /// The instance's light (`LightValue` bits).
     pub light: u16,
+    /// The realm it is lit in.
+    pub realm: super::ModelRealm,
 }
 
 /// The box faces of `model` at `pose` as vertices (four per face, counter-clockwise from
 /// outside) in the space of `frame`, appended to `out[0]` (opaque boxes) and `out[1]` (cutout
 /// boxes) in part order; `parts` is scratch. Faces whose texture rectangle is empty on the skin
-/// are left out. Each face is shaded by its normal in that space ([`entity_shade`]).
+/// are left out. Each face is shaded by its normal in that space, relative to the realm's face
+/// shade ([`realm_shade`]), and carries the realm the shader lights it with.
 pub(crate) fn pose_vertices(
     model: &Model,
     pose: &Pose,
@@ -149,6 +184,7 @@ pub(crate) fn pose_vertices(
     pose_parts(model, pose, parts);
     let [su, sv] = frame.texel_scale;
     let texel = |x: f32| x.clamp(0.0, f32::from(u16::MAX)) as u16;
+    let realm = u32::from(frame.realm.index).min(REALM_ENVS as u32 - 1) << REALM_SHIFT;
     for (part, &(at, shown)) in model.parts().iter().zip(parts.iter()) {
         if !shown {
             continue;
@@ -168,8 +204,8 @@ pub(crate) fn pose_vertices(
                     continue;
                 }
                 let normal = (turn * face.normal).normalize_or_zero();
-                let shade = (entity_shade(normal) * 255.0).round() as u32;
-                let data = u32::from(frame.light) | (shade.min(255) << SHADE_SHIFT);
+                let shade = (realm_shade(normal, &frame.realm.face_shade) * 255.0).round() as u32;
+                let data = u32::from(frame.light) | (shade.min(255) << SHADE_SHIFT) | realm;
                 for (corner, uv) in face.corners.iter().zip(face.uv) {
                     out.push(ModelVertex {
                         pos: to.transform_point3(*corner).to_array(),
@@ -395,6 +431,77 @@ mod tests {
         assert!((east - 0.4970).abs() < 1e-3, "{east}");
     }
 
+    /// The default table keeps Minecraft's entity shading bit for bit; a flat table makes every
+    /// face full bright; a table between keeps the order of the faces and stays in `0..=1`.
+    #[test]
+    fn realm_shading_scales_the_entity_shading() {
+        let normals = [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(0.8, 0.6, 0.0),
+            Vec3::new(-0.36, -0.48, 0.8),
+            Vec3::ZERO,
+        ];
+        for n in normals {
+            assert_eq!(
+                realm_shade(n, &DEFAULT_FACE_SHADE).to_bits(),
+                entity_shade(n).to_bits(),
+                "{n}"
+            );
+            if n != Vec3::ZERO {
+                assert_eq!(realm_shade(n, &[1.0; 6]), 1.0, "{n}");
+            }
+        }
+        // Halfway to flat: every face but the top brighter than Minecraft's, never past 1.
+        let half = DEFAULT_FACE_SHADE.map(|s| s + (1.0 - s) * 0.5);
+        for n in &normals[1..8] {
+            let s = realm_shade(*n, &half);
+            assert!(s > entity_shade(*n) && s <= 1.0, "{n}: {s}");
+        }
+        assert_eq!(realm_shade(Vec3::Y, &half), 1.0);
+        // A darker table: darker faces, never under 0.
+        let dark = [1.0, 0.0, 0.2, 0.2, 0.1, 0.1];
+        for n in &normals[1..8] {
+            let s = realm_shade(*n, &dark);
+            assert!(s < entity_shade(*n) && s >= 0.0, "{n}: {s}");
+        }
+    }
+
+    /// An instance in another realm carries its realm in the vertex data and its faces take
+    /// that realm's shade.
+    #[test]
+    fn an_instance_carries_its_realm() {
+        let model = figure();
+        let flat = [1.0; 6];
+        let frame = InstanceFrame {
+            to_space: model_to_local(Vec3::ZERO, 1.0),
+            texel_scale: [1.0, 1.0],
+            light: 0x0F00,
+            realm: crate::model::ModelRealm {
+                index: 5,
+                face_shade: flat,
+            },
+        };
+        let mut out = [Vec::new(), Vec::new()];
+        pose_vertices(
+            &model,
+            &model.rest_pose(),
+            &frame,
+            &mut Vec::new(),
+            &mut out,
+        );
+        assert!(!out[0].is_empty());
+        for v in out.iter().flatten() {
+            assert_eq!(v.data >> REALM_SHIFT, 5);
+            assert_eq!((v.data >> SHADE_SHIFT) & 255, 255);
+            assert_eq!(v.data & 0xFFFF, 0x0F00);
+        }
+    }
+
     #[test]
     fn an_instance_faces_its_forward_with_its_feet_at_the_origin() {
         // A figure posed into an instance frame turned a quarter turn left (yaw 90 degrees:
@@ -406,6 +513,7 @@ mod tests {
                 * model_to_local(Vec3::new(0.0, 12.0, 0.0), 16.0),
             texel_scale: [2.0, 2.0],
             light: 0xF000,
+            realm: crate::model::ModelRealm::default(),
         };
         let mut out = [Vec::new(), Vec::new()];
         pose_vertices(
@@ -437,6 +545,8 @@ mod tests {
         let shade = (front[0][0].data >> SHADE_SHIFT) & 255;
         assert_eq!(shade, (entity_shade(Vec3::NEG_X) * 255.0).round() as u32);
         assert_eq!(front[0][0].data & 0xFFFF, 0xF000);
+        // Realm 0.
+        assert_eq!(front[0][0].data >> REALM_SHIFT, 0);
         // The arm (pivot at x = -5 in model space) is on the entity's right: facing -X, its
         // right is forward x up = -Z.
         let arm_z: Vec<f32> = out[1].iter().map(|v| v.pos[2]).collect();

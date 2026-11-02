@@ -3,7 +3,7 @@
 //! desktop: GLSL (GL tiers), MSL (Metal), HLSL SM 5.1 (FXC) and SM 6.0 (DXC), SPIR-V (Vulkan).
 use boxel_shaders::gpu::{
     ChunkGpu, ChunkImmediate, DrawIndexedIndirect, FogHeader, FogLayerGpu, LodImmediate,
-    ViewUniform,
+    RealmEnvGpu, ViewUniform,
 };
 use boxel_shaders::{ShaderModuleId, Stage};
 use naga::back::{glsl, hlsl, msl, spv};
@@ -348,6 +348,37 @@ fn wgsl_bit_layout_matches_boxel_mesh() {
     );
 }
 
+/// The realm table (ADR 0039, the sky sources plan's sec. 3): the shaders' last entry is the
+/// mirror's, the realm sits above the quad's flags in `VsOut::ao` and above the shade in a model
+/// vertex, with room for every realm, in every module that reads it.
+#[test]
+fn wgsl_realm_bits_match_the_mirrors() {
+    use boxel_shaders::gpu::{REALM_ENVS, REALM_PLANES, model};
+    assert_eq!(REALM_ENVS, REALM_PLANES + 1);
+    const { assert!(REALM_ENVS <= 16, "4 bits of realm") };
+    for id in [
+        ShaderModuleId::VoxelPull,
+        ShaderModuleId::VoxelInstanced,
+        ShaderModuleId::Cell,
+        ShaderModuleId::Lod,
+        ShaderModuleId::Model,
+    ] {
+        let (module, _) = load(id);
+        assert_eq!(
+            const_u32(&module, "REALM_LAST") as usize,
+            REALM_ENVS - 1,
+            "{id:?}"
+        );
+        // The AO byte (bits 0..8) and the 4 flags (8..12) come first.
+        assert_eq!(const_u32(&module, "AO_REALM_SHIFT"), 12, "{id:?}");
+    }
+    let (module, _) = load(ShaderModuleId::Model);
+    assert_eq!(const_u32(&module, "MODEL_REALM_SHIFT"), model::REALM_SHIFT);
+    // The shade's 8 bits end where the realm starts, and 4 bits fit in the word.
+    assert_eq!(model::SHADE_SHIFT + 8, model::REALM_SHIFT);
+    const { assert!(model::REALM_SHIFT + 4 <= 32) };
+}
+
 #[test]
 fn wgsl_light_nibbles_match_light_value() {
     use boxel_voxel::LightValue as L;
@@ -472,15 +503,18 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
     use std::mem::{offset_of, size_of};
     let (pull, _) = load(ShaderModuleId::VoxelPull);
     let (size, offsets) = struct_layout(&pull, "View");
-    // The per-frame part, then the model box table (ADR 0020).
+    // The per-frame part, then the model box table (ADR 0020). The realm planes and entries
+    // (2 + 27 vec4) take it from 352 to 816 bytes: 9,008 with the table, one uniform block on
+    // Low, well under the 16 KiB GL ES 3.0 guarantees.
     assert_eq!(u64::from(size), boxel_shaders::gpu::VIEW_BUFFER_SIZE);
-    assert_eq!(size, 352 + 8192);
+    assert_eq!(size, 816 + 8192);
+    assert!(size <= 16384);
     assert_eq!(
-        u64::from(offsets[11]),
+        u64::from(offsets[13]),
         boxel_shaders::gpu::VIEW_BOXES_OFFSET
     );
-    assert_eq!(size_of::<ViewUniform>(), 352);
-    let offsets = offsets[..11].to_vec();
+    assert_eq!(size_of::<ViewUniform>(), 816);
+    let offsets = offsets[..13].to_vec();
     let rust = [
         offset_of!(ViewUniform, view_proj),
         offset_of!(ViewUniform, frustum),
@@ -493,9 +527,22 @@ fn gpu_struct_layouts_match_the_rust_mirrors() {
         offset_of!(ViewUniform, light_params),
         offset_of!(ViewUniform, light_curve),
         offset_of!(ViewUniform, viewport),
+        offset_of!(ViewUniform, realm_planes),
+        offset_of!(ViewUniform, realm_env),
     ];
     assert_eq!(offsets, rust.map(|o| o as u32));
-    assert_eq!(offsets[7..], [240, 256, 272, 336]);
+    assert_eq!(offsets[7..], [240, 256, 272, 336, 352, 384]);
+    let (size, offsets) = struct_layout(&pull, "RealmEnv");
+    assert_eq!((size, size_of::<RealmEnvGpu>()), (48, 48));
+    assert_eq!(
+        offsets,
+        [
+            offset_of!(RealmEnvGpu, sky),
+            offset_of!(RealmEnvGpu, ambient),
+            offset_of!(RealmEnvGpu, shade)
+        ]
+        .map(|o| o as u32)
+    );
     let (size, offsets) = struct_layout(&pull, "ChunkGpu");
     assert_eq!((size, size_of::<ChunkGpu>()), (64, 64));
     assert_eq!(offsets, [0, 12, 16, 48, 52, 56, 60]);
@@ -1502,7 +1549,8 @@ fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
             _ => None,
         })
         .collect();
-    assert_eq!(flat, [1]);
+    // The data and the realm of the quad's chunk (the sky sources plan, sec. 3).
+    assert_eq!(flat, [1, 3]);
     assert_eq!(const_u32(&module, "CELL_LAYER_MASK"), cell::LAYER_MASK);
     assert_eq!(const_u32(&module, "CELL_FACE_SHIFT"), cell::FACE_SHIFT);
     assert_eq!(const_u32(&module, "CELL_BRIGHT_BIT"), cell::FULL_BRIGHT);

@@ -1543,6 +1543,7 @@ impl Recorder {
             ao_strength: settings.ao_strength,
             block_gain: settings.block_light_gain,
             curve: light_curve(settings.light_gamma),
+            ..SceneLight::noon()
         };
         let sky = daylight.map_or(settings.clear_color, |d| d.sky_color);
         let view = CameraView::compute(&camera, &transform, WIDTH as f32 / HEIGHT as f32);

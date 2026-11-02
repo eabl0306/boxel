@@ -63,7 +63,7 @@ mod upload;
 
 pub use cells::{CellStats, MovingCellQuad};
 pub use distance_fog::{DistanceFog, DistanceFogError};
-pub use light::{LIGHT_LEVELS, SceneLight, light_curve};
+pub use light::{LIGHT_LEVELS, RealmShading, SceneLight, SceneRealms, light_curve};
 pub use memory::{
     ChunkMemoryError, ChunkMemorySettings, ChunkMemoryStats, DEFAULT_PAGE_QUADS, MIN_PAGE_QUADS,
     MemoryCeiling,

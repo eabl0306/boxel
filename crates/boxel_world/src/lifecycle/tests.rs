@@ -349,3 +349,106 @@ fn a_backend_closed_again_and_again_is_remembered_once() {
         Err(super::OpenWorldError::StoreOpenedEarly)
     );
 }
+
+/// [`LayerGen`] in a dimension of two realms that meet at `y = 4096`, the lower one drawn by
+/// the far LOD.
+struct TwoRealms {
+    layers: LayerGen,
+    stack: boxel_worldgen::RealmStack,
+}
+
+impl TwoRealms {
+    fn new() -> Self {
+        use boxel_worldgen::GenId;
+        use boxel_worldgen::realm::{
+            FluidRule, RealmForm, RealmLod, RealmSky, RealmSpan, RealmSpec,
+        };
+        use boxel_worldgen::registry::Checks;
+        let id = |s: &str| GenId::new(s).expect("an id");
+        let realm = |span, lod| RealmSpec {
+            span,
+            form: RealmForm::Ground,
+            datum: 0,
+            fluid: FluidRule::None,
+            floor: "boxel:stone".to_owned(),
+            sky: RealmSky::Open,
+            lod,
+            env: id("test:env"),
+            version: 0,
+        };
+        let mut checks = Checks::new();
+        let stack = boxel_worldgen::RealmStack::build(
+            &mut checks,
+            &id("test:dim"),
+            vec![
+                (id("test:up"), realm(RealmSpan::above(4096), RealmLod::Off)),
+                (
+                    id("test:down"),
+                    realm(RealmSpan::below(4096), RealmLod::Draw),
+                ),
+            ],
+        )
+        .expect("a good stack");
+        Self {
+            layers: LayerGen::new(-2..=1),
+            stack,
+        }
+    }
+}
+
+impl boxel_worldgen::WorldGenerator for TwoRealms {
+    fn generate(
+        &self,
+        key: boxel_voxel::ChunkKey,
+        registry: &boxel_voxel::BlockRegistry,
+    ) -> boxel_voxel::ChunkData {
+        self.layers.generate(key, registry)
+    }
+    fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+        self.layers.vertical_chunks()
+    }
+    fn name(&self) -> &str {
+        "two realms"
+    }
+    fn realms(&self) -> &boxel_worldgen::RealmStack {
+        &self.stack
+    }
+}
+
+/// The world publishes its dimension's realm planes when it opens and takes them back when it
+/// closes; a world of one realm has none.
+#[test]
+fn the_realm_planes_are_the_open_worlds() {
+    use crate::RealmPlanes;
+    let mut app = app(Arc::new(InlineExecutor), None);
+    assert_eq!(
+        *app.world().resource::<RealmPlanes>(),
+        RealmPlanes::default()
+    );
+    open(
+        &mut app,
+        WorldSpec::new(Arc::new(TwoRealms::new()), settings()),
+    );
+    let planes = app.world().resource::<RealmPlanes>().clone();
+    assert_eq!(
+        planes,
+        RealmPlanes {
+            planes: vec![4096],
+            drawn: 0,
+        }
+    );
+    assert_eq!(
+        (planes.realm_of(4095), planes.realm_of(4096), planes.len()),
+        (0, 1, 2)
+    );
+    assert!(close_world(app.world_mut(), CloseOptions::default()));
+    assert_eq!(
+        *app.world().resource::<RealmPlanes>(),
+        RealmPlanes::default()
+    );
+    open(&mut app, spec(0));
+    assert_eq!(
+        *app.world().resource::<RealmPlanes>(),
+        RealmPlanes::default()
+    );
+}

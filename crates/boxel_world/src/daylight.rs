@@ -5,9 +5,16 @@
 //! (`FixedUpdate`, 64 Hz), so the clock is the same at any frame rate. [`DaylightCurve`] maps the
 //! sun's elevation to the sky light color and intensity, the ambient floor and the sky (clear
 //! and fog) color; the render plugin reads both every frame.
+//!
+//! Each realm of the dimension (ADR 0039) can light its voxels its own way ([`RealmLighting`]):
+//! its own curve (a cavern with no night), ambient color and face shading. The world publishes
+//! where the realms meet ([`RealmPlanes`]) when it opens; the render plugin applies each realm's
+//! entry to the voxels of that realm.
 
 use boxel_app::{App, FixedUpdate, Plugin};
 use boxel_ecs::prelude::*;
+use boxel_worldgen::RealmStack;
+use boxel_worldgen::realm::MAX_REALM_PLANES;
 use std::f64::consts::TAU;
 
 /// Fixed steps per second (`boxel_app::FixedTime`'s default 64 Hz).
@@ -247,9 +254,125 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Adds the world clock: [`TimeOfDay`] (noon of day one, unless the app inserted one) and
-/// [`DaylightCurve`] (defaults, unless inserted), and advances the clock in `FixedUpdate`. The
-/// render plugin turns them into the scene light; without this plugin the sky stays at noon.
+/// The most realms of a dimension: one more than its planes (`MAX_REALM_PLANES`).
+pub const MAX_REALMS: usize = MAX_REALM_PLANES + 1;
+
+/// Face shade factors of the default look, in the mesher's face order (+Y, -Y, +X, -X, +Z,
+/// -Z): tops 1, bottoms 0.5, x faces 0.8, z faces 0.65 (ADR 0015).
+pub const DEFAULT_FACE_SHADE: [f32; 6] = [1.0, 0.5, 0.8, 0.8, 0.65, 0.65];
+
+/// How one realm lights its voxels. [`RealmLight::default`] is the look of a world without
+/// realms: the global [`DaylightCurve`], its ambient floor on every channel and
+/// [`DEFAULT_FACE_SHADE`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RealmLight {
+    /// The realm's own sky over the day, sampled at the one global [`TimeOfDay`]; `None`: the
+    /// global [`DaylightCurve`]. A constant curve (day, dusk and night keys equal) is a realm
+    /// with no night (a lit cavern); a curve of zero intensity is a realm with no sky light.
+    pub curve: Option<DaylightCurve>,
+    /// The ambient floor as a color (linear RGB): no surface of the realm is darker than its
+    /// albedo times it (a warm or green-gray floor, as Minecraft's `ambient_light_color`).
+    /// `None`: the curve's [`DaylightCurve::ambient`] on every channel.
+    pub ambient: Option<[f32; 3]>,
+    /// The shade of each face direction, in the mesher's face order (+Y, -Y, +X, -X, +Z, -Z);
+    /// all 1 (or close) is the flat look of Minecraft's Nether (`cardinal_light`). Models are
+    /// shaded relative to it (the render crate's `ModelRealm`).
+    pub face_shade: [f32; 6],
+}
+
+impl Default for RealmLight {
+    fn default() -> Self {
+        Self {
+            curve: None,
+            ambient: None,
+            face_shade: DEFAULT_FACE_SHADE,
+        }
+    }
+}
+
+/// What one realm's voxels are lit by at one time of day.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RealmDaylight {
+    /// Sky light on surfaces (linear RGB), as [`Daylight::sky_light`].
+    pub sky_light: [f32; 3],
+    /// Ambient floor (linear RGB).
+    pub ambient: [f32; 3],
+    /// Face shade factors ([`RealmLight::face_shade`]).
+    pub face_shade: [f32; 6],
+}
+
+/// How each realm of the current dimension lights its voxels, by realm index (bottom first) of
+/// the dimension's realm stack ([`RealmPlanes`]); a realm past the end lights as
+/// [`RealmLight::default`]. Game data, not saved: the game fills it from its environment table
+/// (ADR 0039 sec. 16). Empty by default, so a world looks as it did before realms.
+#[derive(Resource, Clone, Debug, Default, PartialEq)]
+pub struct RealmLighting {
+    /// The entry of each realm, bottom first.
+    pub realms: Vec<RealmLight>,
+}
+
+impl RealmLighting {
+    /// The entry of realm `realm` (the default past the end).
+    pub fn get(&self, realm: usize) -> RealmLight {
+        self.realms.get(realm).copied().unwrap_or_default()
+    }
+
+    /// What lights realm `realm` at `time`: its curve's (or else `global`'s) sky light, its
+    /// ambient color (or else the curve's ambient on every channel) and its face shade.
+    pub fn at(&self, realm: usize, global: &DaylightCurve, time: &TimeOfDay) -> RealmDaylight {
+        let entry = self.get(realm);
+        let curve = entry.curve.as_ref().unwrap_or(global);
+        let daylight = curve.at(time);
+        RealmDaylight {
+            sky_light: daylight.sky_light,
+            ambient: entry.ambient.unwrap_or([daylight.ambient; 3]),
+            face_shade: entry.face_shade,
+        }
+    }
+}
+
+/// Where the realms of the open world's dimension meet (ADR 0039 sec. 2): its realm stack's
+/// planes, published by the world when it opens (none while no world is open, or for a
+/// generator of one realm). A voxel at `y` is in realm [`RealmPlanes::realm_of`].
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RealmPlanes {
+    /// The planes between the realms, ascending (at most `MAX_REALM_PLANES`): `planes[i]` is
+    /// the bottom of realm `i + 1`.
+    pub planes: Vec<i64>,
+    /// The realm the far LOD draws ([`RealmStack::drawn`]).
+    pub drawn: usize,
+}
+
+impl RealmPlanes {
+    /// The planes of `stack`.
+    pub fn of(stack: &RealmStack) -> Self {
+        Self {
+            planes: stack.planes().to_vec(),
+            drawn: stack.drawn(),
+        }
+    }
+
+    /// The realm of the voxels at `y`: the number of planes at or under it, as
+    /// [`RealmStack::realm_of`].
+    pub fn realm_of(&self, y: i64) -> usize {
+        self.planes.partition_point(|&plane| plane <= y)
+    }
+
+    /// The number of realms (one more than the planes).
+    pub fn len(&self) -> usize {
+        self.planes.len() + 1
+    }
+
+    /// Never: a dimension has at least one realm.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Adds the world clock: [`TimeOfDay`] (noon of day one, unless the app inserted one),
+/// [`DaylightCurve`] (defaults, unless inserted) and [`RealmLighting`] (empty, unless
+/// inserted), and advances the clock in `FixedUpdate`. The render plugin turns them into the
+/// scene light; without this plugin the sky stays at noon.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DaylightPlugin;
 
@@ -257,6 +380,7 @@ impl Plugin for DaylightPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TimeOfDay>()
             .init_resource::<DaylightCurve>()
+            .init_resource::<RealmLighting>()
             .add_systems(FixedUpdate, advance_time);
     }
 }
@@ -380,5 +504,84 @@ mod tests {
         for i in 0..3 {
             assert!((dawn.sky_light[i] - evening.sky_light[i]).abs() < 1e-5);
         }
+    }
+
+    /// A realm without an entry, or with the default one, is lit by the global curve bit for
+    /// bit, its ambient on every channel, with today's face shades; an entry's curve, ambient
+    /// color and shades replace them for its realm only.
+    #[test]
+    fn realms_light_by_their_entry() {
+        let global = DaylightCurve::default();
+        let constant = DaylightCurve {
+            night: global.day,
+            dusk: global.day,
+            ambient: 0.15,
+            ..global
+        };
+        let lighting = RealmLighting {
+            realms: vec![
+                RealmLight::default(),
+                RealmLight {
+                    curve: Some(constant),
+                    ambient: Some([0.2, 0.15, 0.1]),
+                    face_shade: [0.9; 6],
+                },
+                RealmLight {
+                    curve: Some(constant),
+                    ..RealmLight::default()
+                },
+            ],
+        };
+        for hours in [0.0, 6.5, 12.0, 18.0, 23.0] {
+            let time = TimeOfDay::at_clock(hours);
+            let today = global.at(&time);
+            for realm in [0, 3, 8, 100] {
+                let lit = lighting.at(realm, &global, &time);
+                assert_eq!(
+                    lit.sky_light.map(f32::to_bits),
+                    today.sky_light.map(f32::to_bits)
+                );
+                assert_eq!(lit.ambient, [today.ambient; 3]);
+                assert_eq!(lit.face_shade, DEFAULT_FACE_SHADE);
+            }
+            let cavern = lighting.at(1, &global, &time);
+            assert_eq!(cavern.sky_light, constant.at(&time).sky_light);
+            assert_eq!(
+                (cavern.ambient, cavern.face_shade),
+                ([0.2, 0.15, 0.1], [0.9; 6])
+            );
+            // A curve of its own without an ambient color: that curve's ambient.
+            assert_eq!(lighting.at(2, &global, &time).ambient, [0.15; 3]);
+        }
+        // The constant curve is the same at noon and midnight.
+        let noon = lighting.at(1, &global, &TimeOfDay::at_clock(12.0));
+        let midnight = lighting.at(1, &global, &TimeOfDay::at_clock(0.0));
+        assert_eq!(noon, midnight);
+        assert_eq!(DEFAULT_FACE_SHADE, [1.0, 0.5, 0.8, 0.8, 0.65, 0.65]);
+    }
+
+    #[test]
+    fn realm_planes_find_the_realm_of_every_y() {
+        let one = RealmPlanes::of(RealmStack::single());
+        assert_eq!(one, RealmPlanes::default());
+        assert_eq!(
+            (one.realm_of(i64::MIN), one.realm_of(i64::MAX), one.len()),
+            (0, 0, 1)
+        );
+        let planes = RealmPlanes {
+            planes: vec![-4096, 12288],
+            drawn: 1,
+        };
+        for (y, realm) in [
+            (i64::MIN, 0),
+            (-4097, 0),
+            (-4096, 1),
+            (12287, 1),
+            (12288, 2),
+            (i64::MAX, 2),
+        ] {
+            assert_eq!(planes.realm_of(y), realm, "{y}");
+        }
+        assert_eq!(MAX_REALMS, 9);
     }
 }

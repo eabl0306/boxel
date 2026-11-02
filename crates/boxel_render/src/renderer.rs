@@ -1676,6 +1676,8 @@ impl VoxelRenderer {
         let culled = self.occlusion.set.is_some() && !reached_refused && !self.uploads.lost();
         let (sky_light, mut light_params, light_curve) = view.light.uniform();
         light_params[2] = pattern_phase(view.texture_tick);
+        let (realm_planes, realm_env) =
+            view.light.realms.uniform(&view.light, view.render_origin.y);
         let uniform = ViewUniform {
             view_proj: view.view_proj.to_cols_array_2d(),
             frustum: cull_view.frustum.to_array(),
@@ -1705,6 +1707,8 @@ impl VoxelRenderer {
                 view.fluid_time,
                 self.still_flow,
             ],
+            realm_planes,
+            realm_env,
         };
         queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&uniform));
         self.view_uniform = uniform;

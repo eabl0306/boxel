@@ -250,6 +250,7 @@ fn posed(model: &Arc<Model>, texture: &ModelTexture, feet: DVec3, light: LightVa
         origin: Vec3::new(0.0, 24.0, 0.0),
         scale: 1.0,
         light,
+        realm: boxel_render::model::ModelRealm::default(),
     }
 }
 
@@ -274,6 +275,7 @@ fn hand(texture: &ModelTexture) -> ModelDraw {
         origin: Vec3::new(-5.0, 2.0, 0.0),
         scale: 1.0,
         light: LightValue::FULL_SKY,
+        realm: boxel_render::model::ModelRealm::default(),
     }
 }
 

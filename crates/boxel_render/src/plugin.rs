@@ -17,9 +17,10 @@ use crate::outline::{BlockOutline, Outline, OutlineCache};
 use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     AllocProbeReport, BlockTextureData, ChunkMemorySettings, ChunkMemoryStats, ChunkOp,
-    DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RendererConfig, RendererSmokeTest,
-    SceneLight, TextureReport, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
-    generate_block_textures, light_curve, load_block_textures, texture_tick,
+    DEFAULT_SKY_COLOR, DistanceFog, FLUID_TIME_PERIOD, RealmShading, RendererConfig,
+    RendererSmokeTest, SceneLight, SceneRealms, TextureReport, TextureSource, TranslucentSort,
+    ViewParams, VoxelRenderer, generate_block_textures, light_curve, load_block_textures,
+    texture_tick,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -41,7 +42,7 @@ use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
-    TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
+    RealmLighting, RealmPlanes, TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -756,7 +757,7 @@ pub(crate) struct ExtractedFrame {
     /// Clear and fog color of this frame.
     sky_color: [f32; 4],
     /// Scene light of this frame.
-    light: SceneLight,
+    pub(crate) light: SceneLight,
     /// Seconds of the fluid animation ([`ViewParams::fluid_time`]).
     fluid_time: f32,
     /// Game ticks of the texture animations ([`ViewParams::texture_tick`]).
@@ -1447,18 +1448,43 @@ fn recreate_surface(
 // Extract
 
 /// The sky color and scene light of a frame: from the world clock and its curve when the app has
-/// them, else a noon sky of `settings.clear_color`.
+/// them, else a noon sky of `settings.clear_color`. The realms of the open world (`planes`)
+/// meet where its realm stack says, and each takes its `lighting` entry: its own curve sampled
+/// at the clock (noon without one), its ambient color and face shade; a realm without a curve
+/// takes the global one, as the frame's `sky` and `ambient`. The sky color stays the global
+/// curve's (fog and clear color are per camera, the game's).
 fn scene_light(
     settings: &RenderSettings,
     clock: Option<(&TimeOfDay, &DaylightCurve)>,
+    planes: Option<&RealmPlanes>,
+    lighting: Option<&RealmLighting>,
 ) -> ([f32; 4], SceneLight) {
     let daylight = clock.map(|(time, curve)| curve.at(time));
+    let mut realms = planes.map_or_else(SceneRealms::default, |p| {
+        let mut realms = SceneRealms::with_planes(&p.planes);
+        realms.drawn = p.drawn.min(realms.realms.len() - 1) as u8;
+        realms
+    });
+    if let Some(lighting) = lighting {
+        let noon = TimeOfDay::default();
+        let time = clock.map_or(&noon, |(time, _)| time);
+        for (i, realm) in realms.realms.iter_mut().enumerate() {
+            let entry = lighting.get(i);
+            let own = entry.curve.map(|curve| curve.at(time));
+            *realm = RealmShading {
+                sky: own.map(|d| d.sky_light),
+                ambient: entry.ambient.or(own.map(|d| [d.ambient; 3])),
+                face_shade: entry.face_shade,
+            };
+        }
+    }
     let light = SceneLight {
         sky: daylight.map_or([1.0; 3], |d| d.sky_light),
         ambient: daylight.map_or(SceneLight::DEFAULT_AMBIENT, |d| d.ambient),
         ao_strength: settings.ao_strength,
         block_gain: settings.block_light_gain,
         curve: light_curve(settings.light_gamma),
+        realms,
     };
     (
         daylight.map_or(settings.clear_color, |d| d.sky_color),
@@ -1485,6 +1511,7 @@ pub(crate) fn extract(
     window: Option<Res<WindowState>>,
     cameras: Query<(&Camera, &Transform)>,
     clock: Option<(Res<TimeOfDay>, Res<DaylightCurve>)>,
+    realms: (Option<Res<RealmPlanes>>, Option<Res<RealmLighting>>),
     chunks: Option<Res<ChunkMap>>,
     mut mesh_events: MessageReader<ChunkMeshEvent>,
     mut resyncs: MessageWriter<ChunkMeshResync>,
@@ -1522,6 +1549,8 @@ pub(crate) fn extract(
     (frame.sky_color, frame.light) = scene_light(
         &settings,
         clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
+        realms.0.as_deref(),
+        realms.1.as_deref(),
     );
     if settings.is_changed() {
         frame.distance_fog = valid_distance_fog(settings.distance_fog, frame.distance_fog);
@@ -2471,7 +2500,7 @@ mod tests {
             ..RenderSettings::default()
         };
         // Without a clock: a white noon sky of the configured color.
-        let (sky, light) = scene_light(&settings, None);
+        let (sky, light) = scene_light(&settings, None, None, None);
         assert_eq!(sky, settings.clear_color);
         assert_eq!(light.sky, [1.0; 3]);
         assert_eq!(light.ambient, SceneLight::DEFAULT_AMBIENT);
@@ -2480,14 +2509,113 @@ mod tests {
         // With one: the curve's sky at that time; the shading settings stay.
         let curve = DaylightCurve::default();
         let midnight = TimeOfDay::at_clock(0.0);
-        let (sky, night) = scene_light(&settings, Some((&midnight, &curve)));
+        let (sky, night) = scene_light(&settings, Some((&midnight, &curve)), None, None);
         let expected = curve.at(&midnight);
         assert_eq!((sky, night.sky), (expected.sky_color, expected.sky_light));
         assert_eq!(night.ambient, expected.ambient);
         assert_eq!((night.ao_strength, night.block_gain), (0.4, 1.5));
         let noon = TimeOfDay::at_clock(12.0);
-        let (sky, day) = scene_light(&RenderSettings::default(), Some((&noon, &curve)));
+        let (sky, day) = scene_light(
+            &RenderSettings::default(),
+            Some((&noon, &curve)),
+            None,
+            None,
+        );
         assert_eq!((sky, day), (DEFAULT_SKY_COLOR, SceneLight::noon()));
+        // An empty realm table and one plane-less world are the same as none.
+        let one = RealmPlanes::default();
+        let empty = RealmLighting::default();
+        let (_, same) = scene_light(
+            &settings,
+            Some((&midnight, &curve)),
+            Some(&one),
+            Some(&empty),
+        );
+        assert_eq!(same, night);
+    }
+
+    /// The extract samples one curve per realm, at the world clock; a realm without its own
+    /// takes the global curve (its sky and ambient stay `None`, the frame's). Ambient colors and
+    /// face shades pass through per realm, and the planes and the drawn realm are the world's.
+    #[test]
+    fn the_scene_light_samples_one_curve_per_realm() {
+        use boxel_world::{DEFAULT_FACE_SHADE, RealmLight, SkyKey};
+        let global = DaylightCurve::default();
+        let key = |intensity| SkyKey {
+            tint: [1.0, 0.5, 0.25],
+            intensity,
+            sky_color: [0.0; 3],
+        };
+        // A cavern lit the same at every hour.
+        let constant = DaylightCurve {
+            day: key(0.75),
+            dusk: key(0.75),
+            night: key(0.75),
+            ambient: 0.1,
+            ..global
+        };
+        let flat = [0.9; 6];
+        let lighting = RealmLighting {
+            realms: vec![
+                RealmLight {
+                    curve: Some(constant),
+                    ..RealmLight::default()
+                },
+                RealmLight::default(),
+                RealmLight {
+                    ambient: Some([0.1, 0.05, 0.02]),
+                    face_shade: flat,
+                    ..RealmLight::default()
+                },
+            ],
+        };
+        let planes = RealmPlanes {
+            planes: vec![-4096, 4096],
+            drawn: 1,
+        };
+        let settings = RenderSettings::default();
+        for hours in [0.0, 12.0, 18.0] {
+            let time = TimeOfDay::at_clock(hours);
+            let (_, light) = scene_light(
+                &settings,
+                Some((&time, &global)),
+                Some(&planes),
+                Some(&lighting),
+            );
+            let r = light.realms;
+            assert_eq!(r.planes[..3], [-4096, 4096, i64::MAX]);
+            assert_eq!(r.drawn, 1);
+            assert_eq!(
+                (r.realm_of(-4097), r.realm_of(-4096), r.realm_of(4096)),
+                (0, 1, 2)
+            );
+            // Realm 0: its own curve at that hour, the same at every hour.
+            let own = constant.at(&time);
+            assert_eq!(r.realms[0].sky, Some(own.sky_light), "{hours}");
+            for (got, want) in own.sky_light.iter().zip([0.75, 0.375, 0.1875]) {
+                assert!((got - want).abs() < 1e-6, "{hours}: {got} {want}");
+            }
+            assert_eq!(r.realms[0].ambient, Some([0.1; 3]));
+            // Realm 1 and those past the table: the global curve, the frame's own.
+            for realm in &r.realms[1..2] {
+                assert_eq!(*realm, RealmShading::default());
+            }
+            for realm in &r.realms[3..] {
+                assert_eq!(*realm, RealmShading::default());
+            }
+            assert_eq!(light.sky, global.at(&time).sky_light);
+            // Realm 2: the global sky, its own ambient color and shade.
+            assert_eq!(r.realms[2].sky, None);
+            assert_eq!(r.realms[2].ambient, Some([0.1, 0.05, 0.02]));
+            assert_eq!(r.realms[2].face_shade, flat);
+            assert_eq!(r.realms[1].face_shade, DEFAULT_FACE_SHADE);
+        }
+        // Without a clock, a realm's curve is sampled at noon.
+        let (_, light) = scene_light(&settings, None, Some(&planes), Some(&lighting));
+        assert_eq!(
+            light.realms.realms[0].sky,
+            Some(constant.at(&TimeOfDay::default()).sky_light)
+        );
     }
 
     /// A refusal change of the main renderer reaches the cave culling: its next update searches

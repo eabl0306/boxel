@@ -13,7 +13,7 @@ use crate::persist::{
 };
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::WorldJobs;
-use crate::{BlockTicks, EditQueue, TimeOfDay, WorldContent, WorldSettings};
+use crate::{BlockTicks, EditQueue, RealmPlanes, TimeOfDay, WorldContent, WorldSettings};
 use boxel_app::{IdleStep, Time};
 use boxel_ecs::prelude::*;
 use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
@@ -265,6 +265,7 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
              without sky tops, every column is open sky"
         );
     }
+    *world.resource_mut::<RealmPlanes>() = RealmPlanes::of(generator.realms());
     world.resource_mut::<WorldContent>().generator = generator;
     world.resource_mut::<SkyMap>().rule = rule;
     {

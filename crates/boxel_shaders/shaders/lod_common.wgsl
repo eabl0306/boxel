@@ -166,8 +166,9 @@ fn lod_tint(k: u32) -> vec3<f32> {
 
 // The color of a LOD face with `bits` (LodOut) at `view_dist`: shade_fragment with the light of
 // open sky less its darkness (sky 15 - dark, no block light) and AO open, the same math: the
-// face shade, the sky light (day and night), emissive faces at full brightness, the terrain fog.
-// Its alpha is the texture's mean (the 1x1 mip's).
+// face shade, the sky light (day and night) and the ambient floor of the realm the LOD draws
+// (View::light_params.w), emissive faces at full brightness, the terrain fog. Its alpha is the
+// texture's mean (the 1x1 mip's).
 fn lod_color(bits: u32, view_dist: f32) -> vec4<f32> {
   let mip = i32((bits >> LOD_OUT_MIP_SHIFT) & LOD_MIP_MASK);
   let c = textureLoad(block_textures, vec2<i32>(0, 0), i32(bits & MAT_LAYER_MASK), mip);
@@ -177,10 +178,12 @@ fn lod_color(bits: u32, view_dist: f32) -> vec4<f32> {
   }
   if ((bits & LOD_OUT_EMISSIVE_BIT) == 0u) {
     let dark = f32((bits >> LOD_OUT_DARK_SHIFT) & LOD_DARK_MASK);
-    let sky = level_curve(LIGHT_MAX_LEVEL - dark) * view.sky_light.rgb;
+    let realm = u32(view.light_params.w);
+    let env = realm_env(realm);
+    let sky = level_curve(LIGHT_MAX_LEVEL - dark) * env.sky.rgb;
     let block = vec3(level_curve(0.0)) * view.light_params.y;
-    let light = max(max(sky, block), vec3(view.sky_light.a));
-    lit = lit * face_shade((bits >> LOD_OUT_FACE_SHIFT) & 7u) * light;
+    let light = max(max(sky, block), env.ambient.rgb);
+    lit = lit * face_shade((bits >> LOD_OUT_FACE_SHIFT) & 7u, realm) * light;
   }
   let fog = clamp((view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
   return vec4(mix(lit, view.fog_color.rgb, fog), c.a);

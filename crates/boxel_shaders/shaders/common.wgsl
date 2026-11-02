@@ -112,6 +112,19 @@ const LIGHT_MAX_LEVEL: f32 = 15.0;
 // A light palette entry with sky 15 at the 4 corners (boxel_mesh::FULL_SKY_ENTRY).
 const FULL_SKY_LIGHT: vec2<u32> = vec2<u32>(0xF000F000u, 0xF000F000u);
 const CHUNK_SIZE: f32 = 32.0;
+// Where VsOut::ao keeps the realm of the voxel whose light the quad shows (4 bits).
+const AO_REALM_SHIFT: u32 = 12u;
+// The last realm entry of View::realm_env (boxel_shaders::gpu::REALM_ENVS - 1).
+const REALM_LAST: u32 = 8u;
+
+// One realm's light (ADR 0015 and 0039; boxel_shaders::gpu::RealmEnvGpu): its sky light (rgb),
+// its ambient floor (rgb) and its 6 face shade factors, in the w of the first two and in the
+// third, in face order (+Y, -Y, +X, -X, +Z, -Z).
+struct RealmEnv {
+  sky: vec4<f32>,                  // rgb = sky light color times the daylight intensity (linear), w = shade of +Y faces
+  ambient: vec4<f32>,              // rgb = ambient floor (linear), w = shade of -Y faces
+  shade: vec4<f32>,                // shade of +X, -X, +Z, -Z faces
+};
 
 struct View {
   view_proj: mat4x4<f32>,          // camera-relative: positions are (world - render_origin)
@@ -121,10 +134,12 @@ struct View {
   fog_color: vec4<f32>,
   fog_params: vec4<f32>,           // x = fog start, y = fog end (world units)
   counts: vec4<u32>,               // x = chunk slot count, y = pages with draw lists (L), z = opaque draws per page list (stride; the cutout lists hold stride / 6, after L opaque ones), w = 1: cave culling bits in use (High)
-  sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor
-  light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, z = pattern drift phase in 0..1 (cell.wgsl, ADR 0056), w = 0
+  sky_light: vec4<f32>,            // rgb = sky light color times the daylight intensity (linear), a = ambient floor; the light of realms without their own (the shaders read realm_env)
+  light_params: vec4<f32>,         // x = AO strength (0.55: the darkest corner keeps 45 %), y = block-light gain, z = pattern drift phase in 0..1 (cell.wgsl, ADR 0056), w = the realm the far LOD draws (a float)
   light_curve: array<vec4<f32>, 4>, // brightness of light levels 0..15 (level 4k + j at [k][j]; level 15 = 1)
   viewport: vec4<f32>,             // xy = render target size in pixels, z = fluid animation time in seconds (wraps), w = still flow textures (bit 0 water, bit 1 lava; ADR 0028)
+  realm_planes: array<vec4<i32>, 2>, // the planes between realms relative to render_origin.y, clamped to i32, ascending (plane 4k + j at [k][j]); unused ones i32::MAX
+  realm_env: array<RealmEnv, 9>,   // each realm's light, bottom realm first (realm_at)
   // Model box table (ADR 0020), written once per renderer: box k is boxes[k >> 1].xy (k even) or
   // .zw (k odd), packed as boxel_mesh::pack_model_box. Read only by SHAPE_BOX quads.
   boxes: array<vec4<u32>, 512>,
@@ -148,7 +163,7 @@ struct VsOut {
   @location(3) view_dist: f32,
   @location(4) st: vec2<f32>,                       // quad-local (s, t): corner k sits at (k & 1, k >> 1)
   @location(5) @interpolate(flat) light: vec2<u32>, // the quad's light palette entry (4 corner lights)
-  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE)
+  @location(6) @interpolate(flat) ao: u32,          // the quad's AO byte (corner k at bits 2k..2k+2), then its 4 flags (bits 8..12; FLAG_EMISSIVE), then its realm (bits 12..16, AO_REALM_SHIFT)
 };
 
 struct Decoded {
@@ -161,6 +176,7 @@ struct Decoded {
   ao: u32,
   flags: u32,
   grow: vec2<f32>,                 // the corner's outward direction along u and v (-1 or 1)
+  front_y: i32,                    // chunk-local y of the voxel whose light the quad shows (-1..=32): its realm's light lights it
 };
 
 fn face_normal(f: u32) -> vec3<f32> {
@@ -175,12 +191,33 @@ fn face_normal(f: u32) -> vec3<f32> {
 }
 fn face_u(f: u32) -> vec3<f32> { if (f == 2u || f == 3u) { return vec3(0.0, 0.0, 1.0); } return vec3(1.0, 0.0, 0.0); }
 fn face_v(f: u32) -> vec3<f32> { if (f < 2u) { return vec3(0.0, 0.0, 1.0); } return vec3(0.0, 1.0, 0.0); }
-fn face_shade(f: u32) -> f32 {
+// The realm of a voxel whose y relative to the render origin is `y` (wrapping i32, exact for
+// any voxel less than 2^31 from the camera): the number of View::realm_planes at or under it
+// (boxel_worldgen::RealmStack::realm_of). Integer compares only; the planes of a one-realm world
+// are all i32::MAX, so every drawn voxel is in realm 0.
+fn realm_at(y: i32) -> u32 {
+  let c = vec4<u32>(view.realm_planes[0] <= vec4(y)) + vec4<u32>(view.realm_planes[1] <= vec4(y));
+  return c.x + c.y + c.z + c.w;
+}
+
+// The light of realm `realm`, indexed in the uniform itself (as level_curve: a function-local
+// copy of the array, dynamically indexed, may live in scratch memory).
+fn realm_env(realm: u32) -> RealmEnv {
+  return view.realm_env[min(realm, REALM_LAST)];
+}
+
+// The shade of face f in realm `realm`: its entry's factor for the face (the default is top 1.0,
+// bottom 0.5, x faces 0.8, z faces 0.65; the CPU writes those f32 values, the same bits as
+// these literals were).
+fn face_shade(f: u32, realm: u32) -> f32 {
+  let e = realm_env(realm);
   switch f {
-    case 0u: { return 1.0; }
-    case 1u: { return 0.5; }
-    case 2u, 3u: { return 0.8; }
-    default: { return 0.65; }
+    case 0u: { return e.sky.w; }
+    case 1u: { return e.ambient.w; }
+    case 2u: { return e.shade.x; }
+    case 3u: { return e.shade.y; }
+    case 4u: { return e.shade.z; }
+    default: { return e.shade.w; }
   }
 }
 
@@ -217,7 +254,15 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
   o.ao = select((mat >> MAT_AO_SHIFT) & 0xFFu, 0xFFu, sloped);
   o.flags = (geo >> GEO_FLAGS_SHIFT) & 15u;
   o.grow = vec2(2.0 * cu - 1.0, 2.0 * cv - 1.0);
+  // The voxel whose light the face shows: the one in front of it (as the mesher reads it). An
+  // edge wall, a cross and a plane show the light of their own cell (below). A box face inside
+  // its cell with an opaque cube in front takes its own cell's light too (boxel_mesh's
+  // box_face_layer); the shader cannot tell, so it takes the voxel in front: the two differ
+  // only for a +Y or -Y box face on the layer next to a realm plane.
+  let cell_y = i32((geo >> GEO_Y_SHIFT) & GEO_POS_MASK);
+  o.front_y = cell_y + select(select(0, -1, f == 1u), 1, f == 0u);
   if (shape == SHAPE_WALL) {
+    o.front_y = cell_y;
     // The cube face moved to the cell's far side, then WALL_INSET back toward its normal: in
     // front of a far LOD face on the border plane, behind whatever the cell holds.
     o.local = o.local - n * (1.0 - WALL_INSET);
@@ -373,6 +418,7 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     o.uv = (uv0 + (uv1 - uv0) * ts) / 16.0;
     // Drawn from both sides at full face brightness, without AO and never grown, as a cross.
     o.face = 0u;
+    o.front_y = cell_y;
     o.ao = 0xFFu;
     o.grow = vec2(0.0);
   } else if (shape == SHAPE_CROSS) {
@@ -384,6 +430,7 @@ fn decode_quad(q: vec2<u32>, light: vec2<u32>, corner_in: u32) -> Decoded {
     o.local = p + start + along * cu + vec3(0.0, cv, 0.0);
     o.uv = vec2(cu, 1.0 - cv);
     o.face = 0u;
+    o.front_y = cell_y;
     o.grow = vec2(0.0);
   }
   // The side faces of a fluid show its flow texture running down (ADR 0025).
@@ -481,7 +528,11 @@ fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   o.view_dist = length(rel - view.camera_rel.xyz);
   o.st = d.st;
   o.light = d.light;
-  o.ao = d.ao | (d.flags << 8u);
+  // The realm of the voxel whose light the quad shows (ADR 0039): a top face on the last layer
+  // under a plane shows the light of the cell above it, so it takes the upper realm's light.
+  // Integers before any growth, and flat per quad.
+  let realm = realm_at(chunk_origin.y - view.render_origin.y + d.front_y);
+  o.ao = d.ao | (d.flags << 8u) | (realm << AO_REALM_SHIFT);
   return o;
 }
 
@@ -515,14 +566,20 @@ fn level_curve(l: f32) -> f32 {
   return mix(view.light_curve[i >> 2u][i & 3u], view.light_curve[j >> 2u][j & 3u], x - f32(i));
 }
 
+// The realm of a fragment (VsOut::ao bits 12..16).
+fn out_realm(i: VsOut) -> u32 {
+  return (i.ao >> AO_REALM_SHIFT) & 15u;
+}
+
 // The light reaching a fragment: the 4 corner lights interpolated per channel at (s, t), each
-// channel through the brightness curve, then the brightest of sky light (times the sky color),
-// block light (times its gain) and the ambient floor.
+// channel through the brightness curve, then the brightest of sky light (times its realm's sky
+// color), block light (times its gain) and its realm's ambient floor.
 fn voxel_light(i: VsOut, view: View) -> vec3<f32> {
   let l = bilinear(corner_light(i.light, 0u), corner_light(i.light, 1u), corner_light(i.light, 2u), corner_light(i.light, 3u), i.st);
-  let sky = level_curve(l.x) * view.sky_light.rgb;
+  let env = realm_env(out_realm(i));
+  let sky = level_curve(l.x) * env.sky.rgb;
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
-  return max(max(sky, block), vec3(view.sky_light.a));
+  return max(max(sky, block), env.ambient.rgb);
 }
 
 // Ambient occlusion factor: the 4 corner AO values (0..3, 3 = open) interpolated at (s, t), from
@@ -534,13 +591,14 @@ fn ao_factor(i: VsOut, view: View) -> f32 {
   return mix(1.0 - view.light_params.x, 1.0, (near + (far - near) * i.st.y) / 3.0);
 }
 
-// albedo * face shade * AO * light, then fog. At sky 15 under a white noon sky with AO open
-// this is albedo * face shade: the look before light. Emissive quads (lamps, lava) glow as in
-// Minecraft: their albedo at full brightness, with no face shade, AO or light, then fog.
+// albedo * face shade * AO * light, then fog, the face shade and the light those of the
+// fragment's realm. At sky 15 under a white noon sky with AO open this is albedo * face shade:
+// the look before light. Emissive quads (lamps, lava) glow as in Minecraft: their albedo at full
+// brightness, with no face shade, AO or light, then fog.
 fn shade_fragment(albedo: vec4<f32>, i: VsOut, view: View) -> vec4<f32> {
   var lit = albedo.rgb;
   if (((i.ao >> 8u) & FLAG_EMISSIVE) == 0u) {
-    lit = albedo.rgb * (face_shade(i.face) * ao_factor(i, view)) * voxel_light(i, view);
+    lit = albedo.rgb * (face_shade(i.face, out_realm(i)) * ao_factor(i, view)) * voxel_light(i, view);
   }
   let fog = clamp((i.view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
   return vec4(mix(lit, view.fog_color.rgb, fog), 1.0);

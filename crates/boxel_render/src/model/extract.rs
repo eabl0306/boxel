@@ -1,7 +1,8 @@
 //! `RenderSystems::Extract` of the entity models: every visible [`ModelInstance`] with its
 //! `Transform` and its light this frame, as [`ModelDraw`]s for the renderer.
 
-use super::{ModelDraw, ModelInstance, ModelLayer, ModelLight};
+use super::{ModelDraw, ModelInstance, ModelLayer, ModelLight, ModelRealm};
+use crate::SceneRealms;
 use crate::plugin::ExtractedFrame;
 use boxel_camera::Camera;
 use boxel_ecs::prelude::*;
@@ -22,9 +23,24 @@ fn light_at(chunks: Option<&ChunkMap>, at: DVec3) -> LightValue {
         .unwrap_or(LightValue::FULL_SKY)
 }
 
+/// The realm of the block at `at` (realm 0 where it is not finite).
+fn realm_at(realms: &SceneRealms, at: DVec3) -> ModelRealm {
+    if !at.is_finite() {
+        return ModelRealm::default();
+    }
+    let index = realms
+        .realm_of(BlockPos::from_world(at).y)
+        .min(realms.realms.len() - 1);
+    ModelRealm {
+        index: index as u8,
+        face_shade: realms.realms[index].face_shade,
+    }
+}
+
 /// Copies the visible instances into the frame (after `extract`, which found the camera: the
-/// view layer is lit at its eye). Sorted by entity, so the renderer's draw order and posing
-/// cache see the same list every frame.
+/// view layer is lit at its eye, and the frame's realms are known). Each takes the realm of the
+/// block its light comes from (of its translation, or the eye, with a fixed light). Sorted by
+/// entity, so the renderer's draw order and posing cache see the same list every frame.
 pub(crate) fn extract_models(
     mut frame: ResMut<ExtractedFrame>,
     instances: Query<(Entity, &ModelInstance, &Transform)>,
@@ -42,16 +58,20 @@ pub(crate) fn extract_models(
         if !instance.visible {
             continue;
         }
-        let light = match (instance.light, instance.layer) {
-            (ModelLight::Fixed(light), _) => light,
-            (ModelLight::Probe(offset), ModelLayer::World) => {
-                light_at(chunks, transform.translation + offset.as_dvec3())
-            }
-            (ModelLight::Probe(offset), ModelLayer::View) => match eye {
-                Some(eye) => light_at(chunks, eye + offset.as_dvec3()),
-                None => LightValue::FULL_SKY,
-            },
+        let offset = match instance.light {
+            ModelLight::Fixed(_) => DVec3::ZERO,
+            ModelLight::Probe(offset) => offset.as_dvec3(),
         };
+        let probe = match instance.layer {
+            ModelLayer::World => Some(transform.translation + offset),
+            ModelLayer::View => eye.map(|eye| eye + offset),
+        };
+        let light = match (instance.light, probe) {
+            (ModelLight::Fixed(light), _) => light,
+            (ModelLight::Probe(_), Some(at)) => light_at(chunks, at),
+            (ModelLight::Probe(_), None) => LightValue::FULL_SKY,
+        };
+        let realm = probe.map_or_else(ModelRealm::default, |at| realm_at(&frame.light.realms, at));
         frame.models.push(ModelDraw {
             id: entity.to_bits(),
             model: Arc::clone(&instance.model),
@@ -63,6 +83,7 @@ pub(crate) fn extract_models(
             origin: instance.origin,
             scale: instance.scale,
             light,
+            realm,
         });
     }
     frame.models.sort_unstable_by_key(|d| d.id);

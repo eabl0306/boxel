@@ -94,8 +94,9 @@ pub mod scheduler;
 pub mod ticks;
 
 pub use daylight::{
-    DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, SUNRISE_HOUR, SkyKey,
-    TICKS_PER_SECOND, TimeOfDay,
+    DEFAULT_FACE_SHADE, DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, MAX_REALMS,
+    RealmDaylight, RealmLight, RealmLighting, RealmPlanes, SUNRISE_HOUR, SkyKey, TICKS_PER_SECOND,
+    TimeOfDay,
 };
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;

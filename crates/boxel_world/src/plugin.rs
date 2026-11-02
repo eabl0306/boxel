@@ -12,7 +12,7 @@ use crate::neighbor_rules::{BlockUses, NeighborRules};
 use crate::persist::close_store_on_exit;
 use crate::sky::{SkyMap, SkyRule};
 use crate::streaming::{Ctx, ViewerChunks, WorldJobs};
-use crate::{ChunkId, ChunkMap, ChunkVisibility, WorldStats};
+use crate::{ChunkId, ChunkMap, ChunkVisibility, RealmPlanes, WorldStats};
 use boxel_app::{
     App, Idle, IdleStep, IdleWanted, IdleWork, Last, Plugin, PreStartup, PreUpdate, Shutdown,
     Update,
@@ -522,6 +522,7 @@ impl Plugin for WorldPlugin {
             .insert_resource(BlockUses::from_registry(&self.registry))
             .insert_resource(content)
             .init_resource::<ChunkMap>()
+            .init_resource::<RealmPlanes>()
             .insert_resource(SkyMap::new(rule))
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
@@ -645,6 +646,7 @@ fn add_lifecycle(app: &mut App, closed: bool) {
         .add_systems(WorldOpen, open_engine_state.in_set(OpenSystems::Engine))
         .world_resource::<ChunkMap>(ChunkMap::is_clear)
         .world_resource::<SkyMap>(SkyMap::is_clear)
+        .world_resource::<RealmPlanes>(|p| *p == RealmPlanes::default())
         .world_resource::<WorldJobs>(WorldJobs::is_clear)
         .world_resource::<WorldContent>(|c| Arc::ptr_eq(&c.generator, placeholder_generator()))
         .world_resource::<ChunkVisibility>(ChunkVisibility::is_clear)
@@ -659,7 +661,7 @@ fn add_lifecycle(app: &mut App, closed: bool) {
 
 /// `WorldTeardown`, `TeardownSystems::Streaming`: the map, the sky tops and the jobs back to a
 /// new world's (their contents dropped off the main thread), the generator back to the
-/// placeholder. The `"world"` and `"light"` board lines go too: `publish_stats` compares with
+/// placeholder and its realm planes to none. The `"world"` and `"light"` board lines go too: `publish_stats` compares with
 /// the `WorldStats` reset here, so it would never refresh them.
 #[expect(
     clippy::too_many_arguments,
@@ -673,7 +675,7 @@ fn teardown_streaming(
     mut viewers: ResMut<ViewerChunks>,
     mut stats: ResMut<WorldStats>,
     mut edits: ResMut<EditQueue>,
-    mut content: ResMut<WorldContent>,
+    (mut content, mut planes): (ResMut<WorldContent>, ResMut<RealmPlanes>),
     mut garbage: ResMut<WorldGarbage>,
     board: Option<ResMut<DiagnosticsBoard>>,
 ) {
@@ -686,6 +688,7 @@ fn teardown_streaming(
     garbage.push(std::mem::take(&mut edits.edits));
     let generator = std::mem::replace(&mut content.generator, Arc::clone(placeholder_generator()));
     garbage.push(generator);
+    *planes = RealmPlanes::default();
     if let Some(mut board) = board {
         board.remove("world");
         board.remove("light");

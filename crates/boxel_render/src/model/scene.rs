@@ -270,6 +270,7 @@ fn pose_instance(
             draw.texture.height() as f32 / th as f32,
         ],
         light: draw.light.0,
+        realm: draw.realm,
     };
     pose_vertices(&draw.model, &draw.pose, &frame, parts, out);
 }
@@ -277,7 +278,7 @@ fn pose_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Cuboid, Model, ModelTexture, PartPose};
+    use crate::model::{Cuboid, Model, ModelRealm, ModelTexture, PartPose};
     use boxel_math::DVec3;
     use boxel_voxel::LightValue;
     use std::sync::Arc;
@@ -314,6 +315,7 @@ mod tests {
             origin: Vec3::ZERO,
             scale: 1.0,
             light: LightValue::FULL_SKY,
+            realm: ModelRealm::default(),
         }
     }
 

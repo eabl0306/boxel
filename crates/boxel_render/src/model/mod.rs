@@ -32,6 +32,7 @@ mod scene;
 pub(crate) use extract::extract_models;
 pub use mesh::{
     ENTITY_LIGHT_DIRECTIONS, FaceTexels, PosedFace, cuboid_faces, entity_shade, pose_parts,
+    realm_shade,
 };
 pub(crate) use pass::ModelPass;
 pub use scene::{ModelDrawRange, ModelScene};
@@ -564,6 +565,29 @@ pub struct ModelDraw {
     pub scale: f32,
     /// Its light this frame.
     pub light: LightValue,
+    /// The realm it is lit in.
+    pub realm: ModelRealm,
+}
+
+/// The realm an instance is lit in (ADR 0039): the realm of the block its light comes from. Its
+/// light takes that realm's sky light and ambient floor, and its faces are shaded relative to
+/// that realm's face shade ([`realm_shade`]). [`ModelRealm::default`] is realm 0 with the
+/// default shade: the look of a world without realms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelRealm {
+    /// The realm (below `boxel_shaders::gpu::REALM_ENVS`).
+    pub index: u8,
+    /// Its face shade, in the mesher's face order (+Y, -Y, +X, -X, +Z, -Z).
+    pub face_shade: [f32; 6],
+}
+
+impl Default for ModelRealm {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            face_shade: boxel_world::DEFAULT_FACE_SHADE,
+        }
+    }
 }
 
 impl PartialEq for ModelDraw {
@@ -577,6 +601,7 @@ impl PartialEq for ModelDraw {
             && self.origin == other.origin
             && self.scale == other.scale
             && self.light == other.light
+            && self.realm == other.realm
             && self.pose == other.pose
     }
 }

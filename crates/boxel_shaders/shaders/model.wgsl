@@ -9,9 +9,13 @@
 //   rect = the face's texels [min, max) on the skin: the texel is clamped into it, so a face
 //          never shows a neighbor's column at its edge
 //   data = the instance's light (a LightValue: sky:4 | red:4 | green:4 | blue:4) | the face's
-//          shade (0..255, 255 = 1) << 16
+//          shade (0..255, 255 = 1) << 16 | the instance's realm (4 bits) << 24
 // The fragment lights the skin as the terrain is lit (the brightness curve, the sky color of the
-// time of day, the block light gain, the ambient floor), without AO, then fades it into the fog.
+// time of day and the ambient floor of the instance's realm, the block light gain), without AO,
+// then fades it into the fog. The face's shade is the CPU's (it takes the realm's into account).
+
+// Where the instance's realm sits in `data` (boxel_shaders::gpu::model::REALM_SHIFT).
+const MODEL_REALM_SHIFT: u32 = 24u;
 
 @group(0) @binding(0) var skin: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> view: View;
@@ -52,9 +56,10 @@ fn model_texel(i: ModelOut) -> vec4<f32> {
 // light for the whole instance and no AO).
 fn model_shade(albedo: vec3<f32>, i: ModelOut) -> vec4<f32> {
   let l = vec4<f32>((vec4(i.data) >> vec4(LIGHT_SKY_SHIFT, LIGHT_RED_SHIFT, LIGHT_GREEN_SHIFT, LIGHT_BLUE_SHIFT)) & vec4(15u));
-  let sky = level_curve(l.x) * view.sky_light.rgb;
+  let env = realm_env((i.data >> MODEL_REALM_SHIFT) & 15u);
+  let sky = level_curve(l.x) * env.sky.rgb;
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
-  let light = max(max(sky, block), vec3(view.sky_light.a));
+  let light = max(max(sky, block), env.ambient.rgb);
   let shade = f32((i.data >> 16u) & 255u) / 255.0;
   let lit = albedo * shade * light;
   let fog = clamp((i.view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
