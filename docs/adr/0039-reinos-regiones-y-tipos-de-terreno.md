@@ -4,7 +4,8 @@
   diseño B como base y todas las recomendaciones del plan. Es un contrato. Lo construyen los
   pasos de la sección 20, cada uno en su rama, y cada parte protegida pide su propio OK cuando le
   toca. Hechos: WG1, WG-REG, WG-REGION (#119), WG-SAVE (#121), WG-REGIONLOD (#120) y WG-DECOR
-  (#133); donde el código precisó el contrato, este texto ya lo dice.
+  (#133); donde el código precisó el contrato, este texto ya lo dice. ADR 0061 (fuentes de cielo)
+  enmienda las secciones 3, 15 y 16: el reino del techo es `Closed` con fuentes, sin `Under`.
 - Fecha: 2026-10-15
 - Revisa: ADR 0024 sección 4 y ADR 0029 sección 7 (una clave de metadatos reservada más,
   `boxel:worldgen`).
@@ -119,7 +120,7 @@ ser +infinito e `y_lo`, -infinito.
   mueve el azar de otro.
 - `vertical_chunks()` sigue siendo la unión de los límites de todos los reinos, para los lectores
   de hoy y el respaldo de la lejanía. Los lectores por reino llegan con WG4, EW-REALMSKY y
-  EW-SKYUNDER (secciones 14 y 15). Con un solo reino la unión es el rango de hoy y nada cambia en
+  EW-SKYSRC (secciones 14 y 15). Con un solo reino la unión es el rango de hoy y nada cambia en
   el streaming, la luz ni la lejanía.
 
 `RealmSpec { span, form, datum, fluid, floor, sky, lod, env, version }`, registrado bajo su id:
@@ -177,10 +178,10 @@ Ejemplo: el reparto que el dueño eligió para el juego (decisión 5 del plan).
 
 ```
 +infinito  +
-           | reino del techo del cielo (Ceiling, sky Under, lod Off): sólido hacia arriba
+           | reino del techo del cielo (Ceiling, sky Closed, lod Off): sólido hacia arriba
            | para siempre, con cuevas y ciudades a toda altura
   14336    | datum de la cara de abajo U: relieve colgante, montañas invertidas hasta el plano;
-           | el aire bajo ella se ilumina desde abajo
+           | el aire bajo ella lo iluminan sus fuentes de cielo (ADR 0061)
   12288 ---+ plano (el horizonte del preset far; el techo nunca está en la lejanía)
            | reino de la superficie (Ground, sky Open, lod Draw): terreno de SEA - 180 a
            | SEA + 400, agujas hasta el plano, el agujero hacia abajo
@@ -858,7 +859,9 @@ de spans en debug.
 ### 15. Luz del cielo por reino (dirección)
 
 Esta sección es la dirección acordada, no el código. La luz es zona protegida: EW-REALMSKY (V3) y
-EW-SKYUNDER (V4) piden cada uno el OK del dueño cuando les toca.
+EW-SKYSRC (#140, ADR 0061) piden cada uno el OK del dueño cuando les toca. Enmienda del 2026-11-02
+(ADR 0061): la regla `Under` y EW-SKYUNDER (#130) no se construyen; el reino del techo es `Closed`
+y la cara de abajo se ilumina con fuentes de cielo.
 
 - **Open.** Un vóxel del reino r tiene cielo directo si `y > T_r(x, z)`. `T_r` camina solo el
   contenido de r y no lee ninguna capa fuera de su span.
@@ -876,20 +879,20 @@ EW-SKYUNDER (V4) piden cada uno el OK del dueño cuando les toca.
   bajo la superficie abierta por construcción: toda superficie abierta queda iluminada, y los pozos
   naturales reciben cielo hasta el límite bajo el suelo más bajo de la columna (la regla de hoy,
   medida por columna).
-- **Under** (EW-SKYUNDER). Un vóxel de un reino `Under` tiene cielo directo si `y < B_r(x, z)`, con
-  `B_r` el primer bloqueador que se encuentra caminando hacia arriba desde el plano de abajo del
-  reino, con tope en el `ground_lo` espejado de la columna más el límite (el espejo del piso).
-  - En el reino del techo ilumina el aire entre el plano y la cara de abajo: la cara de abajo y las
-    montañas invertidas se ven iluminadas por el cielo, con día y noche.
-  - Las capas bajo la cota de la cara de abajo son aire conocido (WG4) y la caminata las salta.
-  - Un bloque que un jugador pone en ese aire le da sombra a la columna de arriba (la luz viene de
-    abajo).
+- **Under: no se construye** (ADR 0061). El reino del techo es `Closed`. Su generador pone una
+  fuente de cielo hacia abajo en el primer aire bajo la cara de abajo, en cada columna, con alcance
+  32 a 64. La cara de abajo y las montañas invertidas se ven iluminadas, con la curva del día de
+  su reino. Un bloque que un jugador pone en ese aire corta los rayos de su columna y da sombra
+  hacia abajo, como bajo el cielo abierto. EW-REALMSKY (#129) quita la variante `RealmSky::Under`,
+  que nada lee todavía.
 - **Closed.** Sin cielo directo. La luz que se esparce desde un vecino iluminado cruza el plano
   igual: las cajas de luz cruzan el plano como hoy, y una caja a menos de 16 vóxeles de un plano lee
   las reglas de los dos reinos.
-- En el juego: la superficie es `Open`, el Nether `Closed`, el techo `Under` (su roca y sus cuevas
-  quedan sobre el primer bloqueador y siguen oscuras como cualquier cueva) y unas islas del cielo
-  futuras, `Open`.
+- **Fuentes de cielo** (ADR 0061), en cualquier reino, también en uno `Closed`: sus rayos son
+  cielo directo y nunca cruzan el plano de su reino.
+- En el juego: la superficie es `Open`, el Nether `Closed` (con fuentes de cielo si el juego lo
+  quiere iluminado), el techo `Closed` con fuentes bajo su cara de abajo (su roca y sus cuevas
+  siguen oscuras como cualquier cueva) y unas islas del cielo futuras, `Open`.
 
 Por qué por columna y por reino, con números. Hoy el piso es el tope global menos 1024
 (`sky_walk_limit`):
@@ -908,8 +911,8 @@ por columna desde `ground_lo` sí.
 Consecuencias del modelo:
 
 - Ningún reino le da sombra a otro. El techo y las montañas invertidas no proyectan sombra de cielo
-  sobre la superficie, y el sol de la superficie también ilumina la cara de abajo. Es una decisión
-  de aspecto, barata y estable.
+  sobre la superficie, y la cara de abajo la iluminan sus fuentes. Es una decisión de aspecto,
+  barata y estable.
 - Bajo una isla flotante, el fondo del agujero tiene sombra como bajo cualquier alero.
 - La luz que entra por una brecha al Nether se corta en el plano: abajo solo queda la luz que se
   esparce (15 bloques) y la lava del propio Nether.
@@ -923,7 +926,7 @@ Consecuencias del modelo:
   `boxel_world` la `SkyRule` por reino y el atajo de "caja bajo el piso", que usa el piso más bajo
   de sus 3 x 3 tiles). Una caminata abarca a lo sumo `(S - ground_lo) + límite`: el límite en
   columnas planas, como hoy, y más solo en columnas con pendiente o agujeros, donde igual se corta
-  en el primer bloqueador. EW-SKYUNDER es de S a M (la caminata espejada y su regla de cajas).
+  en el primer bloqueador. Las fuentes de cielo (EW-SKYSRC) son L y tienen su propio ADR (0061).
 
 ### 16. Entorno y gravedad por reino
 
@@ -931,16 +934,28 @@ Consecuencias del modelo:
   del día y el piso de ambiente (`DaylightCurve`), las capas de niebla y las nubes (`FogSettings`),
   la niebla de distancia (`DistanceFog`), el color del cielo, el LOD encendido o apagado
   (`LodSettings.enabled`), y más adelante el signo de la gravedad.
-- El juego los cambia según `environment_at(cámara)` por el lado de consultas, con una mezcla de 64
+- La niebla, el color de fondo y el LOD siguen siendo de la cámara: el juego los cambia según
+  `environment_at(cámara)` por el lado de consultas, con una mezcla de 64
   bloques al cruzar un plano para que el cambio no sea un corte (el LOD usa la misma histéresis de
   64 bloques). `environment_at` es por posición, no solo por reino: el aire bajo la cara de abajo
   del techo usa un entorno como el de la superficie (LOD encendido, sol), y su roca y sus cuevas uno
   oscuro (LOD apagado).
-- Los reinos `Closed`, y las partes oscuras de los demás (la roca y las cuevas del techo, que es
-  `Under`), usan una curva sin sol y su propio ambiente (en el juego, el Nether cerca de 0,15 y las
-  cuevas del techo 0,02, como las de hoy). Su color de cielo es el de su niebla, así no se ve nada
-  más allá del radio cargado.
-- El día y la noche siguen siendo globales: un reloj por mundo. Los reinos `Closed` no lo ven.
+- **Luz por reino (ADR 0061).** El motor da `RealmLighting`: por reino de la dimensión, una
+  `DaylightCurve` (`None`: la global), un color de ambiente RGB y 6 factores de sombreado de cara
+  (+Y, -Y, +X, -X, +Z, -Z). El shader la aplica a cada cara según el reino del vóxel de delante,
+  así dos reinos se ven bien a la vez cerca de un plano. El juego la llena desde esta tabla. Los
+  valores por defecto son los de hoy.
+- La tabla de entornos tiene que poder expresar lo que guardan los tipos de dimensión de
+  Minecraft 26.3: `has_skylight` (sin sol en la curva: un reino `Closed`), `ambient_light` y
+  `ambient_light_color` (el color de ambiente, pasado a lineal), `sky_light_color` (el tinte de
+  la curva), `sky_light_factor` 0 (una curva constante), `cardinal_light` (la tabla de 6
+  factores; la del Nether es casi plana) y el comienzo y el fin de la niebla (por cámara).
+- Los reinos `Closed`, y las partes oscuras de los demás (la roca y las cuevas del techo), usan una
+  curva sin sol y su propio ambiente (en el juego, el Nether cerca de 0,15 y las cuevas del techo
+  0,02, como las de hoy). Su color de cielo es el de su niebla, así no se ve nada más allá del
+  radio cargado.
+- El día y la noche siguen siendo globales: un reloj por mundo. Los reinos con curva constante no
+  lo ven.
 - EW-REALMENV (render, protegido) existe solo si alguno de esos recursos resulta leído una sola vez
   al arrancar. `FogSettings` cambia en tiempo de ejecución y `DaylightCurve` se lee en cada frame.
   Falta mirar `DistanceFog` (un campo de `RenderSettings`) en V0.
@@ -1083,7 +1098,7 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
 | V1 | el Nether abajo | reino `Cavern`, `Closed`, `lod Off`, mar de lava por `FluidRule` | WG-CAVERN |
 | V2 | agujero gigante con islas | tipo `HeightAndVolume`: núcleo que hunde, islas como volumen, tierra adentro y seco | WG-VOLUME |
 | V3 | agujas de 12 km | tipo con núcleo que sube, regla `Point` sobre la distancia del `ContactField` | WG4, EW-REALMSKY |
-| V4 | techo del cielo | reino `Ceiling`, `Under`, `lod Off`; ciudades como estructuras | forma `Ceiling`, EW-SKYUNDER (más WG4 y EW-REALMSKY de V3) |
+| V4 | techo del cielo | reino `Ceiling`, `Closed` con fuentes de cielo, `lod Off`; ciudades como estructuras | forma `Ceiling`, EW-SKYSRC (más WG4 y EW-REALMSKY de V3) |
 | V5 | bioma al revés | tipo del techo con montañas invertidas en los sitios de contacto de V3 | ninguno más |
 | V6 | torre con escalera | set de estructuras (#116) que puede romper el techo por una huella de contacto | la puerta de estructuras |
 | V7 | gravedad invertida | campo de gravedad | EW-GRAVITY |
@@ -1097,7 +1112,7 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
 | WG4 #98 (`column_bounds`) | streaming y lado del mundo de la lejanía, OK | M | V3 |
 | EW-REALMSKY | luz, OK | M | V3 |
 | forma `Ceiling` | `boxel_worldgen`, no protegido | S | V4 |
-| EW-SKYUNDER | luz, OK | S a M | V4 |
+| EW-SKYSRC #140 (fuentes de cielo y luz por reino, ADR 0061) | luz, streaming, render y shaders, OK | L | V1 y V4 |
 | EW-REALMENV | render, OK | S | solo si un recurso no se puede cambiar |
 | EW-GRAVITY | interior de la física, OK | L | V7 |
 
@@ -1106,7 +1121,7 @@ El diseño de las estructuras es de #116. Acá queda solo la puerta.
   agujero, las agujas y el techo quedan en el tipo de mundo "Vertical" hasta que la ronda de control
   los mida.
 - Un OK del dueño por item protegido, cuando le toca. Del mundo vertical: WG4, EW-REALMSKY,
-  EW-SKYUNDER, EW-REALMENV solo si hace falta, y EW-GRAVITY después de la gran ronda de control.
+  EW-SKYSRC, EW-REALMENV solo si hace falta, y EW-GRAVITY después de la gran ronda de control.
   Del resto de la generación, fuera de este contrato: EW-SNOWLOD (después de W2), EW-TINT (W2), WG6
   (W3) y WG3 solo si una medición lo pide.
 - No planeado: dos dimensiones cargadas a la vez; un Nether como dimensión aparte con portales (el
@@ -1240,7 +1255,7 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
     reino; las huellas del `ContactField` coinciden desde los dos lados de un plano; el gradiente
     del relleno no deja aire en un plano de roca con roca. El chequeo rechaza dos reinos `Draw` en
     una dimensión, una forma que no está hecha, un hueco entre reinos y un plano fuera del mundo.
-12. **Cielo** (EW-REALMSKY, EW-SKYUNDER): un reino de techo deja igual todo techo de cielo de la
+12. **Cielo** (EW-REALMSKY; las fuentes de cielo se prueban en ADR 0061): un reino de techo deja igual todo techo de cielo de la
     superficie; caminar desde el comienzo local da lo mismo que desde el tope global cuando no hay
     nada más del reino arriba; los pisos no dependen de las ediciones ni del orden de carga; un
     reino `Closed` no tiene cielo directo a ninguna profundidad; una aguja de 12 km deja igual los
@@ -1283,7 +1298,7 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
   medidos desde una cota de abajo del suelo, y un reino de techo se ilumina desde abajo. Puede haber
   errores de luz sutiles; los contienen los tests de cielo y los OK del dueño. Sin EW-REALMSKY no
   puede salir ningún reino sobre la superficie ni ningún tipo más alto que el límite de la caminata,
-  y sin EW-SKYUNDER la cara de abajo del techo queda negra.
+  y sin EW-SKYSRC la cara de abajo del techo queda negra.
 - Una entrada nueva de un mod cambia el mundo donde gana. El digest lo informa y el rendezvous lo
   limita.
 
@@ -1320,7 +1335,8 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
 - **El piso del cielo en `S - límite` por columna.** Oscurece laderas y fondos de agujeros.
   Empezar la caminata por columna, sin cambiar el piso, ahorra trabajo pero no arregla ningún caso.
 - **El reino del techo `Closed`.** El aire entre el plano y la cara de abajo quedaba oscuro, y el
-  contacto entre una aguja y una montaña invertida se veía negro. Por eso existe `Under`.
+  contacto entre una aguja y una montaña invertida se veía negro. Por eso existía `Under`. Desde
+  ADR 0061 el techo sí es `Closed`, y ese aire lo iluminan fuentes de cielo.
 - **Dibujar otro reino en la lejanía (EW-REALMLOD).** Pide un árbol por reino y una paleta de luz
   por nodo. No planeado.
 
@@ -1329,8 +1345,7 @@ Los tests del motor usan ids `test:`; los del juego, su contenido.
 - Se mide más adelante: las caminatas más largas en columnas de aguja y de agujero (V3), el llenado
   de la lejanía al salir del Nether (V1), y si `DistanceFog` se puede cambiar en tiempo de ejecución
   (V0), que decide si existe EW-REALMENV.
-- EW-SKYUNDER es un diseño chequeado contra el contrato de la caminata (`sky_tile.rs`), no contra el
-  código de las cajas de luz. Su tamaño (S a M) es una estimación.
+- EW-SKYUNDER ya no se construye: lo reemplazan las fuentes de cielo (ADR 0061).
 - Del juego, sobre imágenes: la escala y el clima (W0), el tamaño de región (W0b, 2^12 para
   empezar) y qué formas de relieve de W2 pasan a ser tipos con borde (por defecto, ninguna).
 - La forma de la distancia del `ContactField` (cuadrado de Chebyshev de 5,6 km o disco redondo de

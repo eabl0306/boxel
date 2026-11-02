@@ -8,6 +8,8 @@ design document: nothing here is built. Paths are relative to the repo root. Num
 recorded as decisions in sec. 9, and per-realm face shading was added to Option A (sec. 3 and
 lane 4).
 
+**Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039).
+
 **Verdict.** Build Option A: sky sources write the existing sky channel, and each realm gets its
 own sky color, intensity, daylight curve, ambient color and face shading, applied in the shader
 per realm. This is what the

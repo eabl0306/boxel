@@ -1,7 +1,8 @@
 # ADR 0015: luz de vóxeles
 
 - Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
-  medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060)
+  medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060).
+  Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061)
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -154,6 +155,14 @@ caminar de nuevo. Así los techos de un tile editado son siempre los de una cami
 `LayerData::AirUntil` salta de una vez un tramo de aire (una plataforma a 2^50 vóxeles de altura
 no recorre 2^45 capas).
 
+**Fuentes de cielo (ADR 0061, por construir).** Un estado marcado como fuente
+(`BlockRegistryBuilder::set_sky_source`) emite un rayo de cielo 15 por su columna, hacia abajo o
+hacia arriba, hasta `R` celdas (256 como mucho), hasta el primer vóxel con opacidad mayor que 0 o
+hasta el plano de su reino. Las celdas del rayo son cielo directo, igual que las que están sobre
+`T`. Una fuente tiene opacidad 0, así que no mueve `T` y nunca toca `SkyTile`. Los rayos de una
+columna de chunks los guarda aparte un `BeamTile`, calculado desde el contenido como `T`: el
+streaming tampoco los cambia.
+
 ### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla desde P3)
 
 `boxel_light::compute` calcula la luz del chunk acolchado (local -1 a 32, lo que lee el mesher):
@@ -169,12 +178,17 @@ no recorre 2^45 capas).
   uniforme (`FastOpen`). Los emisores se buscan solo en los chunks cuya paleta puede emitir, así
   que una lámpara que ya no está pero sigue en la paleta, o una fuera de la caja, no los impide.
 - **Camino completo**: filas opacas desde las 27 `LightMasks`; filas de cielo directo desde los 9
-  tiles; semillas en los vóxeles abiertos no directos vecinos de uno directo, con `15 - costo`; una
-  inundación por canal (cielo, rojo, verde, azul) con una cola por niveles, del más alto al más
-  bajo. En cada canal un vóxel se procesa una sola vez, ya con su valor final. Los vóxeles de
+  tiles (y, con ADR 0061, los rayos de las fuentes de cielo de sus 9 `BeamTile`); semillas en
+  los vóxeles abiertos no directos vecinos de uno directo, con `15 - costo`; una inundación
+  por canal (cielo, rojo, verde, azul) con una cola por niveles, del más alto al más bajo. En cada canal un vóxel se procesa una sola vez, ya con su valor final. Los vóxeles de
   nivel 1 se escriben pero no se encolan. Las filas escritas se limpian con un bitset (sin borrar
   512 KiB). Las opacidades parciales mayores que 1 piden la opacidad del vóxel solo si el registry
   tiene alguna.
+- **Rayos de fuentes de cielo (ADR 0061, por construir).** Las celdas de un rayo son cielo
+  directo: `build_direct` las suma a las filas de cielo directo después de los techos. Una caja
+  que cruza algún rayo no toma `FastDark`; `FastOpen` no cambia. La exactitud se mantiene: una
+  celda de rayo es una fuente de nivel 15 como el cielo directo, así que toda luz del chunk
+  acolchado sigue viniendo de una fuente a 14 vóxeles o menos, dentro de la caja.
 - **Coordenadas**: dentro de la caja todo es chico. La única comparación absoluta (techos contra
   la caja) es una resta en `i64` relativa a la caja, saturada: el resultado es el mismo en
   cualquier posición hasta el límite del mundo (ADR 0014).
@@ -343,6 +357,11 @@ de gameplay.
   `f / (4 - 3f)`, llevada hacia `1 - (1 - b)^4` por la gamma; por defecto gamma 0 (la curva
   "moody"). `RenderSettings` suma `ao_strength`, `block_light_gain` y `light_gamma`; su
   `clear_color` queda como el cielo de las apps sin reloj.
+- **Luz y sombreado por reino (ADR 0061, por construir).** `sky_light` pasa a ser una entrada
+  por reino (`realm_env`: cielo por luz del día, ambiente RGB y 6 factores de sombreado de cara),
+  elegida por el vóxel de delante de cada cara. `face_shade` lee su factor de esa entrada en vez
+  del valor fijo. Por defecto son los valores de hoy (1.0 arriba, 0.5 abajo, 0.8 en x, 0.65 en
+  z; ambiente 0.02 en los tres canales), así un mundo de un reino da los mismos píxeles.
 
 ### 9. Día y noche (P5, hecho)
 
