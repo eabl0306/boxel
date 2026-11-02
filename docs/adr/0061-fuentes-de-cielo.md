@@ -5,7 +5,8 @@
   preguntas abiertas (sección 9 del plan). Se construye por carriles (sección 8 del plan). Cada
   carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR), el 1
   (los estados de fuente en `boxel_voxel`), el 2 (los rayos en `boxel_light`), el 3 (el mundo, en
-  `boxel_world`) y el 4 (ambiente y sombreado por reino).
+  `boxel_world`), el 4 (ambiente y sombreado por reino) y el 5 (depuración, demo y herramientas).
+  Falta el 6, el juego.
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -251,6 +252,37 @@ Una zona con su propia curva dentro de un reino (una caverna de la superficie qu
 de noche) no la pide la decisión. Si algún día hace falta, va como "fuentes constantes", que
 escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer canal de luz (XL).
 
+### 9. Carril 5: cómo quedó
+
+- **F3** (`boxel_debug`): una línea `Realm 0 of 1  curve global  sky 1.00 1.00 1.00` con el reino
+  del ojo, si su curva es propia o la global y su luz de cielo ahora. Con fuentes en el registro,
+  una línea `Source 3 74 -2  down range 64  beam 11..74` con la fuente cuyo rayo pasa por la celda
+  del `CrosshairTarget` (la de delante de la cara apuntada, la que da su luz). Sale `Source none`
+  si no pasa ningún rayo y `Source -` si ningún tile cubre esa celda todavía. Las fuentes no se
+  apuntan (no tienen contorno); el modo para elegirlas es del juego.
+- **`SkySourceMarkers`** (`boxel_debug`, apagado por defecto): un cuadrado sobre cada fuente y un
+  punto cada 2 celdas de su rayo, a 48 bloques del ojo o menos, debajo del texto y con el texto
+  oculto también. Lee los tiles que construyó el mundo (`SkyMap::beam_tile`) y proyecta con
+  `CameraView` en enteros relativos al origen de render, así que sirve a cualquier coordenada.
+  Son rectángulos de `OverlayDraw`: no toca el render. Como mucho 16 384 marcas por frame.
+- **La fuente de la demo** (`boxel_demo::blocks`): `boxel:sky_source` con `dir` (`down`, `up`) y
+  `range` (16, 64, 256; por defecto abajo y 64), invisible, sin colisión y con
+  `set_keeps_fluids_out`. No está en `registry()`: un registro con fuentes hace que el mundo
+  cuente sus tiles, así que la agregan solo las demos de fuentes (`registry_with_sky_source`),
+  después de los otros bloques, y ningún otro id cambia.
+- **`LitCaves`** (`boxel_demo::worldgen`): envuelve cualquier generador y pone una fuente en la
+  primera celda de aire bajo cada techo de cueva, en cada otra columna, en una banda de capas que
+  declara en `sky_source_layers`. Reemplaza el arnés `CaveSources` de `headless_world`, que ahora
+  usa esta versión con `--sky-sources`.
+- **`voxel_world --sky-sources`**: una caverna cerrada de 21 x 21 x 12 sobre el suelo del comienzo,
+  con una fuente en cada columna bajo el techo, un pilar, un alero contra la pared oeste y una
+  puerta al sur. La cámara empieza adentro (salvo con `--camera` o `--walk`). B prende y apaga los
+  marcadores. La caverna está en el reino de la superficie, así que se oscurece de noche.
+- **`stress --sky-sources`** usa `LitCaves` a 24 capas del comienzo. Con `--edits`, el guion suma
+  cuatro pasos: pone una fuente sobre el suelo, tapa su rayo a mitad de camino, lo destapa y quita
+  la fuente.
+- **`lit-cavern`** (`tools/perf`): `cave-static` con `--sky-sources`.
+
 ## Medidas
 
 - Carril 1, criterion `masks`, una corrida por lado contra a9a0abf, una detrás de la otra:
@@ -273,6 +305,13 @@ escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer 
   toma el camino completo (13 546) y la caché de luz pasa de 0 a 31,4 MiB.
 - Carril 3, `just perf-smoke cave-static cave-path` (RTX, radio 16, sin tope) contra 4eeb410:
   cueva quieta 2488 a 2484 fps (-0,2 %), ruta en cueva 2542 a 2532 (-0,4 %), p99 igual. Ok.
+- Carril 5, `just perf-smoke cave-static lit-cavern` (RTX, radio 16, sin tope) contra e5a796e:
+  cueva quieta 2338 a 2450 fps (+4,8 %), p99 0,93 a 0,87 ms. Ok. `lit-cavern` es nuevo y la
+  base no lo tiene, así que el smoke lo salta. Para tener su número se midió el mismo binario con
+  y sin la opción (`perf.py smoke --base HEAD --new-extra=--sky-sources cave-static`): 2432 a
+  1647 fps (-32 %), p99 0,88 a 1,71 ms, ningún frame de más de 6,94 ms, y 8 926 346 a 16 607 799
+  quads (1,86 veces). El smoke lo marca peor, como debe: es el costo de iluminar todas las cuevas
+  a 24 capas, no del código. Es la base de las próximas corridas de `lit-cavern`.
 - Nuevos, sin lado base:
 
 | Bench | Tiempo | Qué mide |

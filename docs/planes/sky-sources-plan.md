@@ -9,8 +9,9 @@ recorded as decisions in sec. 9, and per-realm face shading was added to Option 
 lane 4).
 
 **Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039), 1 (source states
-in `boxel_voxel`), 2 (beams in `boxel_light`), 3 (world integration in `boxel_world`) and 4
-(per-realm ambient and face shading). Lane 1 keeps the source list beside the masks
+in `boxel_voxel`), 2 (beams in `boxel_light`), 3 (world integration in `boxel_world`), 4
+(per-realm ambient and face shading), and 5 (debug, demo and tools; ADR 0061 sec. 9 has what
+came out). Lane 1 keeps the source list beside the masks
 (`ChunkData::sky_sources`, `OwnedLightMasks::sky_sources`) instead of in the `LightMasks` view:
 in the view it cost 8 % on `masks/cave_1bit`, and only the beam tiles read it. Lane 2 differs
 from sec. 2.3 in four small ways (ADR 0061 sec. 3 has the detail): the index is `u32` (4 KiB,
@@ -700,7 +701,7 @@ streaming). M to L.
 - Level-1 measurement: `just perf-smoke surface cave-static` (shader cost; expected within noise).
 
 **Lane 5. Debug, demo and tools** (`boxel_debug`, `boxel_demo`, `examples/`, `tools/perf/`). S
-to M.
+to M. Done.
 - F3 lines, `SkySourceMarkers`, `voxel_world --sky-sources`, `stress --edits` with a scripted
   source place, remove and beam block, the `lit-cavern` perf case.
 - Tests: the overlay shows the source at the crosshair and the realm at the eye; markers project
