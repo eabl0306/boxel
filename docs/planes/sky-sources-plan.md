@@ -4,8 +4,13 @@ Issue #140 (EW-SKYSRC), which replaces #130 (EW-SKYUNDER). Owner decision of 202
 design document: nothing here is built. Paths are relative to the repo root. Numbers marked
 "measured" come from ADR 0015; the rest are estimates to check in each lane's measurement.
 
+**Status: approved by the owner (2026-11-02).** The owner's answers to the open questions are
+recorded as decisions in sec. 9, and per-realm face shading was added to Option A (sec. 3 and
+lane 4).
+
 **Verdict.** Build Option A: sky sources write the existing sky channel, and each realm gets its
-own sky color, intensity and daylight curve, applied in the shader per realm. This is what the
+own sky color, intensity, daylight curve, ambient color and face shading, applied in the shader
+per realm. This is what the
 owner's decision implies, it needs no new light channel and no save format change, and it costs
 nothing in a world without sources. Option B (a zone with its own curve inside a realm) is not
 needed by the decision; if it is ever needed, its cheapest form is "constant sources" that write
@@ -54,8 +59,8 @@ the block light channels (S to M on top of A), not a third channel (XL).
 A sky source is a cell that emits sky light at level 15 along a straight beam in its column:
 
 - **Direction**: down (default) or up.
-- **Range** `R`, from 1 to `MAX_BEAM` (engine constant, recommended 256 voxels, 8 chunk layers;
-  open question 1). `R` counts the source cell itself.
+- **Range** `R`, from 1 to `MAX_BEAM` (engine constant, 256 voxels, 8 chunk layers; decided,
+  sec. 9). `R` counts the source cell itself.
 - **Beam**: the source cell and the next cells in its direction, while each cell does not block
   sky (opacity 0, the same test as `LightTables::blocks_sky` uses for `T`), at most `R` cells,
   and never past the plane of the source's realm. Formally, for a down source at `(x, y, z)`:
@@ -110,8 +115,8 @@ BlockRegistryBuilder::set_sky_source(state: BlockState, def: SkySourceDef) -> Re
 
 Validation (`RegistryError::InvalidSkySource`): `RenderShape::None`, light opacity 0, emission 0,
 no collision, `1 <= range <= MAX_BEAM`. The engine never names the block (`tools/no_content.py`);
-tests use `test:sky_source`. The game should also call `set_keeps_fluids_out` on it, so water
-does not wash a generated source away (open question 4).
+tests use `test:sky_source`. The game calls `set_keeps_fluids_out` on it, so water does not
+wash a generated source away (decided, sec. 9).
 
 Why:
 
@@ -265,7 +270,7 @@ priority 0):
 
 Fan-out is bounded: a beam is at most 256 cells, so one edit remeshes at most a band of
 `256 + 2 * 15` cells in 3x3 columns (about 3 x 3 x 10 = 90 chunks in the worst case, usually
-3 x 3 x 2). That is open question 1's trade-off: a longer cap means a larger worst-case batch.
+3 x 3 x 2). That bound is why the cap stays at 256 (decided, sec. 9).
 
 ### 2.7 The range cap, and why there is one
 
@@ -282,9 +287,9 @@ The far LOD does not need to know about sources. LOD faces are lit as open sky (
 sec. 12) and the LOD draws only the drawn realm's surface band (ADR 0039 sec. 10). Sources light
 caverns, cave interiors and the ceiling realm, none of which the LOD draws (the ceiling is `lod
 Off`, and the game turns the LOD off inside a cavern realm). The only LOD change is per-realm
-ambient: LOD fragments use the light of the drawn realm (sec. 3).
+ambient and face shading: LOD fragments use the entry of the drawn realm (sec. 3).
 
-## 3. Per-realm ambient
+## 3. Per-realm ambient and face shading
 
 The owner's rule: a source takes the curve of the realm it is in; a cavern that is its own realm
 has its own curve (for example constant, with no night); a zone in the surface realm darkens at
@@ -302,23 +307,58 @@ to the voxels of that realm.
   `DaylightCurve`), and `RealmPlanes` (the stack's planes), published by the world at open. The
   game fills `RealmLighting` from its environment table (ADR 0039 sec. 16). Fog, clear color and
   the LOD switch stay per camera, in the game, as ADR 0039 sec. 16 already plans.
+- **Ambient as a color**: today the ambient floor is one scalar (0.02) for every channel. The
+  realm entry makes it an RGB color, so a realm can have a warm or green-gray floor (see the
+  dimension types below). In a one-realm world all three channels hold today's 0.02.
+- **Face shading per realm**: today `common.wgsl::face_shade` is fixed: top 1.0, bottom 0.5,
+  x faces 0.8, z faces 0.65. Minecraft 26.3 shades faces per dimension (`cardinal_light` in the
+  dimension type; `the_nether.json` has `cardinal_light: "nether"`, where bottom faces are almost
+  as bright as top ones). The realm entry gets a table of 6 factors, one per face in the mesher's
+  face order (+Y, -Y, +X, -X, +Z, -Z). The default table is today's values, so nothing changes
+  until a realm sets its own; a "flat" table (all 1.0, or close to it) gives the Nether look.
 - **Uniform** (`ViewUniform`, `View`): `realm_planes: array<vec4<i32>, 2>` (8 planes relative to
-  `render_origin.y`, clamped to the i32 range; unused planes `i32::MAX`) and `realm_light:
-  array<vec4<f32>, 9>` (rgb = sky color times daylight, a = ambient). 11 vec4, 176 B: View goes
-  from 352 + 8192 to 528 + 8192 B, still one uniform block on Low and under GL's 16 KiB.
+  `render_origin.y`, clamped to the i32 range; unused planes `i32::MAX`) and `realm_env:
+  array<RealmEnv, 9>`, with `RealmEnv` 3 vec4: `sky` (rgb = sky color times daylight, w = shade
+  of +Y), `ambient` (rgb = ambient color, w = shade of -Y) and `shade` (x, y, z, w = shade of +X,
+  -X, +Z, -Z). 2 + 27 = 29 vec4, 464 B: View goes from 352 + 8192 to 816 + 8192 B (9 008 B),
+  still one uniform block on Low and well under GL ES 3.0's guaranteed 16 KiB.
 - **Shader**: `finish_vertex` computes the front voxel's relative y from the quad's own voxel and
   its face normal (integers, before the corner growth), counts the planes at or under it (8
   integer compares), and packs the realm index in `VsOut::ao` bits 12..15 (no new varying).
-  `voxel_light` reads `view.realm_light[realm]` instead of `view.sky_light`. The same in
-  `model.wgsl` (realm from the instance position, packed in `ModelVertex.data` bits 24..27),
-  `cell.wgsl` (from the cell origin) and `lod_common.wgsl` (the drawn realm's entry).
+  `voxel_light` reads `view.realm_env[realm]` instead of `view.sky_light`, and `face_shade`
+  takes the realm and reads its factor from the same entry instead of the fixed switch. The
+  same in `cell.wgsl` (realm from the cell origin; cells already go through `shade_fragment`)
+  and `lod_common.wgsl` (the drawn realm's entry). `model.wgsl` reads the light from the realm
+  entry (realm from the instance position, packed in `ModelVertex.data` bits 24..27); a model's
+  face shade is already baked per vertex on the CPU (`ModelVertex.data`, `model::SHADE_SHIFT`),
+  so the CPU poser takes it from the instance's realm table and the shader does not change for
+  it.
   The relative compare is exact for every chunk less than 2^31 from the camera (ADR 0014).
 - **Why planes in the uniform and not a per-chunk index**: no change to `ChunkGpu`, the Low
   immediates, `CellVertex` or the arena; the front-voxel rule falls out for free; and the
   shader cannot disagree with `RealmStack::realm_of`.
 - **Pixel identity**: in a one-realm world every plane is `i32::MAX`, every fragment takes realm
-  0, and `realm_light[0]` holds the same floats as today's `sky_light`, so every image is the same
-  bit for bit on every tier.
+  0, `realm_env[0].sky` and `.ambient` hold the same floats as today's `sky_light` (with the
+  ambient copied to all three channels), and the shade factors are the same f32 values as the
+  literals of today's `face_shade` (1.0, 0.5, 0.8, 0.65, written from Rust as `f32`, which round
+  to the same bits as the WGSL literals). The products are taken in the same order, so every
+  image is the same bit for bit on every tier. Lane 4 tests it on the existing gpu views.
+- **The model for a realm environment** (what the Minecraft 26.3 jar's dimension types hold; the
+  game's environment table, ADR 0039 sec. 16, should be able to express all of it):
+
+  | Dimension | `has_skylight` | `ambient_light` | `ambient_light_color` | Other |
+  |---|---|---|---|---|
+  | Nether | false | 0.1 | #302821 | fog start 10, end 96; `sky_light_factor` 0; `cardinal_light` "nether" |
+  | End | true | 0.25 | #3f473f | `sky_light_color` #ac60cd; `sky_light_factor` 0 |
+  | Overworld | (true) | 0 | #0a0a0a | |
+
+  How each maps here: `has_skylight` false is a `Closed` realm sky (after #129) with no sun in
+  its curve; `ambient_light` and `ambient_light_color` become the realm's ambient color (the
+  game converts the sRGB color to linear and scales it); `sky_light_color` is the tint of the
+  realm's `DaylightCurve`; `sky_light_factor` 0 reads as a sky light that does not follow the
+  day (a constant curve); fog start and end stay the game's per-camera environment swap;
+  `cardinal_light` is the 6-factor shade table. The exact formulas of the jar are the game's to
+  copy; the engine only needs the fields.
 - **CPU gameplay**: `ChunkMap::light_at` keeps returning levels. A helper
   `RealmLighting::effective(level, realm, time)` gives the brightness for game rules that care
   (spawning, plant growth), optional.
@@ -384,9 +424,11 @@ darkens at night with the sky.
   from scratch), `daylight.rs` (`RealmLighting`), `lifecycle` (publishes `RealmPlanes` at open).
 - `crates/boxel_render`: `plugin.rs` (extract samples one curve per realm), `light.rs`
   (`SceneLight` gains the realm table), the uniform writer.
-- `crates/boxel_shaders`: `common.wgsl` (`View`, `finish_vertex`, `voxel_light`), `model.wgsl`,
-  `cell.wgsl`, `lod_common.wgsl`; `src/gpu.rs` (`ViewUniform`, `ModelVertex` realm bits);
-  `tests/naga.rs` (sizes).
+- `crates/boxel_shaders`: `common.wgsl` (`View`, `RealmEnv`, `finish_vertex`, `voxel_light`,
+  `face_shade`), `model.wgsl`, `cell.wgsl`, `lod_common.wgsl`; `src/gpu.rs` (`ViewUniform`,
+  `ModelVertex` realm bits); `tests/naga.rs` (sizes).
+- The model poser (`boxel_render`, where `ModelVertex.data` gets its shade): the shade factor
+  from the instance's realm.
 - `crates/boxel_debug`: F3 lines and source markers (sec. 6).
 - `crates/boxel_demo`, `examples/`: a demo source block and a lit cavern (sec. 6).
 
@@ -425,7 +467,10 @@ table and the realm lookup). Not touched: frame pacing, physics, `boxel_gfx`, `v
 - High, Mid, Low run the same `common.wgsl`: per vertex, about 8 integer compares and a pack;
   per fragment, one dynamically indexed uniform vec4 (Low already indexes `light_curve`
   dynamically, so GL ES accepts it). Estimated well under the 2.8 % the edge growth cost.
-- Low keeps one uniform block (View grows by 176 B) and no new binding or attribute.
+- Face shading: today's switch on the face becomes one more read of the same realm entry, by
+  face (the index is flat per quad). About the same cost as the switch on every tier; on Low it
+  is a dynamically indexed member of the one uniform block, as `light_curve` already is.
+- Low keeps one uniform block (View grows by 464 B, to 9 008 B) and no new binding or attribute.
 - Pixel identity: unchanged images in every one-realm world (sec. 3); new two-realm images must be
   identical on High, Mid and Low and at `FAR_SHIFTS`.
 
@@ -433,7 +478,8 @@ table and the realm lookup). Not touched: frame pacing, physics, `boxel_gfx`, `v
 saved. Beam tiles are not saved (like sky tops). An old engine reading a world with source states
 treats them as any unknown block.
 
-**Size:** L (S voxel flag, M `boxel_light`, M to L world integration, M per-realm ambient,
+**Size:** L (S voxel flag, M `boxel_light`, M to L world integration, M per-realm ambient and
+shading,
 S debug and demo).
 
 **Risks:**
@@ -448,6 +494,8 @@ S debug and demo).
   (16 ms, 2 frames) may split such a batch.
 - The realm lookup per vertex must use the face's front voxel; getting it wrong shows a seam
   one layer under each plane. A gpu test covers it.
+- The shade factors must reach the shader as exactly today's f32 values, or every image drifts by
+  one level in places. The existing gpu views catch it.
 
 ### 5.2 Option B: a zone with its own curve inside one realm
 
@@ -564,9 +612,11 @@ Lanes 1 to 3 are sequential; lane 4 runs in parallel with 1 to 3; lane 5 after 3
 (game) after 5. Each lane gets the owner's OK for its protected area (the design OK is from
 2026-11-02).
 
-**Lane 0. ADR (docs only).** `docs/adr/0059-fuentes-de-cielo.md` (Spanish) from this plan;
-amendments to ADR 0015 (sec. 4 and 5: beams are direct cells) and ADR 0039 (sec. 15 without
-`Under`, sec. 16 with `RealmLighting`). XS.
+**Lane 0. ADR (docs only).** `docs/adr/0061-fuentes-de-cielo.md` (Spanish) from this plan (0059
+and 0060 go to lanes E15 and E16);
+amendments to ADR 0015 (sec. 4 and 5: beams are direct cells; sec. 8: face shade per realm) and
+ADR 0039 (sec. 15 without `Under`, sec. 16 with `RealmLighting` and the environment fields of
+sec. 3). XS.
 
 **Lane 1. Source states and masks** (`boxel_voxel`; not protected). S.
 - Tests: registry validation (shape, opacity, emission, collision, range); masks equal brute
@@ -611,17 +661,23 @@ streaming). M to L.
   `just perf-smoke cave-static cave-path` (and a new `lit-cavern` case from lane 5 once it
   exists; a new case goes in `tools/perf/` with its test). Paste the table in the PR.
 
-**Lane 4. Per-realm ambient** (`boxel_world` daylight, `boxel_render`, `boxel_shaders`;
-protected: render and shaders). M.
-- Code: `RealmLighting`, `RealmPlanes`, the `View` fields, the realm lookup in `finish_vertex`,
-  `model.wgsl`, `cell.wgsl`, `lod_common.wgsl`.
+**Lane 4. Per-realm ambient and face shading** (`boxel_world` daylight, `boxel_render`,
+`boxel_shaders`; protected: render and shaders). M.
+- Code: `RealmLighting` (curve, ambient color, 6 shade factors per realm, defaults equal to
+  today), `RealmPlanes`, the `View` fields, the realm lookup in `finish_vertex`, `face_shade` from
+  the realm entry, `model.wgsl`, `cell.wgsl`, `lod_common.wgsl`, the model poser's shade.
 - Tests:
-  - `tests/naga.rs`: `View` at 528 + 8192 B, still one uniform block and one texture pair on Low.
+  - `tests/naga.rs`: `View` at 816 + 8192 B, still one uniform block and one texture pair on Low.
   - `gpu_terrain`: every existing view identical on High, Mid and Low (one realm).
   - New gpu scene with two realms meeting at a plane, at noon and at midnight: the lower realm
     with a constant curve stays lit, the upper darkens; a top face just under the plane takes
     the upper realm's curve; identical pixels on all tiers and at every `FAR_SHIFTS` position;
     a plane farther than 2^31 from the camera clamps without changing any visible pixel.
+  - New gpu test for flat shading: a realm whose shade table is flat gives top and bottom faces
+    of the same block, under the same light, equal pixels; the default table keeps today's 1.0
+    and 0.5 ratio. Identical on all tiers.
+  - Unit: a realm's ambient color reaches the uniform per channel; the default entry equals
+    today's `sky_light` and `face_shade` values bit for bit.
   - Unit: the extract samples one curve per realm; `None` falls back to the global curve.
   - GPU tests: `BOXEL_REQUIRE_GPU=1 tools/quiet.sh cargo test --workspace --locked --test '*gpu*' -- --test-threads=1`.
 - Level-1 measurement: `just perf-smoke surface cave-static` (shader cost; expected within noise).
@@ -640,16 +696,16 @@ pick mode, the environment table into `RealmLighting`. Measured with the game's 
 `Block` sources (the oracle floods RGB from beams), plus `gpu_terrain` showing a constant zone
 identical at noon and midnight.
 
-## 9. Open questions for the owner
+## 9. Decisions of the owner (2026-11-02)
 
-1. **Range cap.** 256 cells (8 chunk layers). Longer reaches taller caverns but makes beam jobs
-   read more layers and the worst edit batch larger (about 90 chunks at 256). Recommendation:
-   256; a game that needs taller lit caverns places a second row of sources.
-2. **Leaves and water end the beam** (as they end the open sky), instead of the beam passing
-   through them and losing levels. Recommendation: end it, so a source looks exactly like the
-   sky above the same blocks.
-3. **Option B now or later.** Recommendation: later, and as constant sources if ever; nothing in
-   the decision needs it.
-4. **Fluids and sources.** Water flowing into a source cell would delete it. Recommendation: the
-   game marks the source block `keeps_fluids_out`, so generated ambience stays where worldgen put
-   it.
+The plan's open questions, answered by the owner when approving it:
+
+1. **Range cap: 256 cells** (8 chunk layers). A game that needs taller lit caverns places a
+   second row of sources.
+2. **Leaves and water end the beam**, as they end the open sky, so a source looks exactly like
+   the sky above the same blocks.
+3. **Option B: later**, and as constant sources if ever. Nothing in the decision needs it now.
+4. **Source blocks keep fluids out**: the game marks the source block `keeps_fluids_out`, so
+   generated ambience stays where worldgen put it.
+
+Also decided when approving: per-realm face shading is part of Option A (sec. 3, lane 4).

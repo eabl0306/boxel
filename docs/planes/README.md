@@ -9,6 +9,6 @@ las fases que todavía faltan, para no perder detalle.
 | [caves-plan.md](caves-plan.md) | Fases 1-2 y 4 hechas (ruido 3D, `OverworldGenerator`, cave culling del ADR 0022: la puerta de la superficie no pasa). Faltan 3 (presupuesto de subida), 5 (radio 32: Hi-Z o subceldas de 16³, arena que crece), 6 (contenido en profundidad), 7 (API `Pipeline`). |
 | [light-plan.md](light-plan.md) | P0-P6 hechas (luz de color, AO, día y noche, lámparas; ADR 0015). P7 medida (`docs/rendimiento/luz-fisicas-2026-10.md`). Falta P8 (sombras del sol, luces dinámicas, filtros de vidrio, etc.). |
 | [physics-plan.md](physics-plan.md) | P0-P4 hechas (ADR 0016). Falta P5 (step-up, formas no cúbicas, fluidos, fricción, jinetes, esfera exacta, distancia de simulación, `cast_box`). |
-| [sky-sources-plan.md](sky-sources-plan.md) | Plan nuevo (2026-11-02, #140, reemplaza a #130): puntos que emiten cielo en un haz con tope de alcance, guardados como estado de bloque, y luz ambiente propia por reino. Recomienda la opción A (canal de cielo y curva por reino en el shader). Nada hecho todavía. |
+| [sky-sources-plan.md](sky-sources-plan.md) | Aprobado por el dueño (2026-11-02, #140, reemplaza a #130): puntos que emiten cielo en un haz de hasta 256 bloques, guardados como estado de bloque, y luz ambiente y sombreado de caras propios por reino. Va la opción A (canal de cielo, curva y sombreado por reino en el shader). Nada hecho todavía. |
 
 Los pendientes de todos los planes están como issues en el GitHub Project del repo.
