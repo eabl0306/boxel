@@ -9,13 +9,19 @@ recorded as decisions in sec. 9, and per-realm face shading was added to Option 
 lane 4).
 
 **Lanes done:** 0 (ADR 0061, and the amendments to ADR 0015 and ADR 0039), 1 (source states
-in `boxel_voxel`) and 2 (beams in `boxel_light`). Lane 1 keeps the source list beside the masks
+in `boxel_voxel`), 2 (beams in `boxel_light`), 3 (world integration in `boxel_world`) and 4
+(per-realm ambient and face shading). Lane 1 keeps the source list beside the masks
 (`ChunkData::sky_sources`, `OwnedLightMasks::sky_sources`) instead of in the `LightMasks` view:
 in the view it cost 8 % on `masks/cave_1bit`, and only the beam tiles read it. Lane 2 differs
 from sec. 2.3 in four small ways (ADR 0061 sec. 3 has the detail): the index is `u32` (4 KiB,
 none for an empty tile), since a column can hold more than 65 535 beams in reach; a window is
 at most `MAX_WINDOW` (65 024) rows; `build` takes the realm planes as a plain ascending slice and
 no column argument; and it adds `BeamTile::edit`, the in-place retrace lane 3 calls on edits.
+Lane 3 differs from sec. 2.5 and 2.6 in small ways (ADR 0061 sec. 5.1 has the detail): the
+`SourceColumn` is boxed and created lazily; a tile keeps serving the meshes it covers while a
+wider build is pending; a build reads unloaded layers as air on a side of the window where no
+source can be; edits retrace once per position with its final state; light jobs wait for beam
+tiles like meshes; and `RegionGenerator` keeps an empty band (the game wraps it).
 
 **Verdict.** Build Option A: sky sources write the existing sky channel, and each realm gets its
 own sky color, intensity, daylight curve, ambient color and face shading, applied in the shader

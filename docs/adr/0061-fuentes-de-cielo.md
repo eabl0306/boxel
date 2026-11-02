@@ -4,7 +4,8 @@
   (`docs/planes/sky-sources-plan.md`) el 2026-11-02, con la opción A y sus respuestas a las
   preguntas abiertas (sección 9 del plan). Se construye por carriles (sección 8 del plan). Cada
   carril que toca una zona protegida pide su OK cuando le toca. Hechos: el carril 0 (este ADR), el 1
-  (los estados de fuente en `boxel_voxel`) y el 2 (los rayos en `boxel_light`).
+  (los estados de fuente en `boxel_voxel`), el 2 (los rayos en `boxel_light`), el 3 (el mundo, en
+  `boxel_world`) y el 4 (ambiente y sombreado por reino).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -140,6 +141,46 @@ En el mismo lote atómico de la edición: poner o quitar una fuente, poner un bl
 un rayo o quitar el que lo terminaba retraza el rayo en el tile y remalla el tramo que cambió, más
 o menos 14. Una edición remalla como mucho una banda de `256 + 2 * 15` celdas en 3 x 3 columnas
 (unos 90 chunks en el peor caso, casi siempre 3 x 3 x 2). Ese límite es la razón del tope de 256.
+
+### 5.1 Carril 3: cómo quedó
+
+El dueño dio el OK para tocar el streaming y el trait del generador el 2026-11-02.
+
+- **`SourceColumn`** (`boxel_world::beams`) vive dentro de `SkyColumn` como
+  `Option<Box<SourceColumn>>`. Se crea cuando una malla pide el tile o cuando un chunk cargado
+  puede tener una fuente. En un mundo sin fuentes no existe: cero bytes por columna. Guarda las
+  capas cargadas con fuentes, el tile, el tile de antes de un cambio (`old`), la ventana que pide
+  el próximo build (`want`), el build en vuelo con su versión y su ventana, los que esperan y el
+  lote de la edición.
+- **El tile sigue sirviendo mientras se pide uno más ancho.** Si una malla cae fuera de la
+  ventana, se pide un build de la unión (`widen`) y la malla espera, pero las mallas que ya
+  cubre siguen usando el tile: su contenido no cambió. Si la unión pasa de `MAX_WINDOW` (dos
+  viewers a miles de capas en la misma columna), la ventana nueva reemplaza a la vieja y la
+  columna queda marcada (`replaced`): desde ahí, una edición que puede tocar filas fuera de la
+  ventana remalla todo lo que su rayo alcanza.
+- **Un build no genera de más.** Las capas sin cargar de un lado de la ventana donde la compuerta
+  dice que no puede haber fuentes se leen como aire: no cambian ninguna celda de rayo de la
+  ventana, solo dónde terminan los rayos que salen de ella. Antes de arrancar, el build espera las
+  capas cargadas que todavía se generan, como la caminata.
+- **Ediciones.** Se retrazan después de aplicar todos los datos del lote, una vez por posición
+  con su estado final (la lista de `BlockChanged`). Una fuente nueva lejos de la ventana del tile,
+  o en una columna sin tile, pide un build que se compara con "sin rayos": esas mallas se
+  hicieron sin tile porque nada podía iluminarlas. La comparación (`beams::changed_band`) mira
+  solo la ventana nueva y toma como vacías las filas que la vieja no tenía.
+- **Los jobs de luz** (la caché de luz que leen los ticks, ADR 0059) esperan los tiles igual
+  que las mallas.
+- **Un build que falla** deja un tile vacío (sin rayos) en vez de bloquear las mallas, como una
+  caminata que falla deja la columna abierta.
+- **Público**: `SkyMap::beam_tile`, `SkyMap::beam_stats` (`BeamStats`: tiles, rayos y memoria),
+  los campos de `WorldStats` (`beam_tiles`, `beam_jobs`, `beam_private_generations`,
+  `waiting_beams`, `light_beam_boxes`) y una línea `"beams"` del tablero, solo con fuentes en el
+  registro. `beam_tiles` se cuenta recorriendo las columnas, también solo con fuentes.
+- **Generadores**: `DimensionGenerator::sky_source_layers` es la envolvente de las bandas de sus
+  reinos, cada una dentro de su reino. `RegionGenerator` deja la banda vacía: un juego que pone
+  fuentes desde una etapa de región tiene que envolverlo y declarar su banda (carril 6).
+- **Medir**: `headless_world` imprime una línea `beams:` y tiene `--sky-sources`, un arnés de
+  medición (no una demo): una fuente hacia abajo de alcance 64 en cada otra columna bajo cada
+  techo de cueva, a 24 capas o menos del viewer.
 
 ### 6. Ambiente y sombreado de cara por reino
 
