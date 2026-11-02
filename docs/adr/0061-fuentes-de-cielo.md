@@ -136,6 +136,37 @@ de noche con el cielo.
   tres tiers.
 - La niebla, el color de fondo y el LOD siguen por cámara, en el juego.
 
+### 6.1 Carril 4: cómo quedó
+
+- **`View`**: 816 + 8192 bytes (9 008), un solo uniform block en Low. Suma `realm_planes` (2
+  `vec4<i32>`: los 8 planos relativos a `render_origin.y`, recortados al rango de `i32`; los que no
+  se usan valen `i32::MAX`) y `realm_env` (9 entradas `RealmEnv` de 3 `vec4`: cielo y sombreado de
+  +Y, ambiente y sombreado de -Y, y los sombreados de +X, -X, +Z y -Z). El reino que dibuja el LOD
+  va en `light_params.w`, que estaba libre.
+- **El vóxel de delante**: `finish_vertex` toma la `y` del vóxel delante de la cara (la del quad
+  más la normal, en enteros) y guarda el reino en los bits 12 a 15 de `VsOut::ao`. Los muros de
+  borde, las cruces y los planos toman su propia celda, como el mesher. Excepción conocida: una
+  cara ±Y de un modelo de cajas dentro de su celda, con un cubo opaco delante, toma la luz de su
+  propia celda en el mesher, pero el shader no lo sabe y usa la de delante. Solo cambia algo en la
+  capa junto a un plano.
+- **Celdas** (`cell.wgsl`): un varying plano nuevo (location 3) con el reino del chunk. Los planos
+  están alineados a chunks, así que el reino del chunk es el de la celda.
+- **Modelos**: el reino va en los bits 24 a 27 de `ModelVertex.data` y sale del bloque donde se
+  mide su luz. Su sombreado es el de entidades de Minecraft, no la tabla de caras, así que el poser
+  usa `realm_shade`: escala la oscuridad de cada cara en la misma proporción en que el reino
+  escala la de las caras del cubo, mezclada por los ejes de la normal. Con la tabla por defecto da
+  lo de hoy bit a bit, y con una tabla plana da un modelo plano. Una cara que mira justo arriba
+  queda en 1.
+- **Recursos**: `RealmPlanes` es por mundo (se publica al abrir y se limpia al cerrar).
+  `RealmLighting` es de la app, como `DaylightCurve`, y está en `DaylightPlugin`. Sin reloj, las
+  curvas de los reinos se toman al mediodía.
+- **Sigue global**: el color del cielo, la niebla y el color de fondo son los de la curva global.
+  Cambiarlos por reino es cosa del juego, por cámara.
+- **Píxeles idénticos**: de las 2237 imágenes de las pruebas de GPU, 2234 salen iguales byte a
+  byte que en main. Las otras 3 son del tier High (llvmpipe y la RTX) y cambian un píxel de borde
+  entre pasto y tierra en 1 o 2 niveles, siempre igual de una corrida a otra. Es el solape de
+  orden de dibujo de High que ya acepta el ADR 0015, sección 12.
+
 ### 7. Por qué no cubrir el cielo con fuentes
 
 El cielo abierto sigue implícito: un techo por columna. Un rayo empieza en su fuente (el aire de
@@ -156,6 +187,8 @@ escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer 
   `cave_1bit` 4,52 a 4,50 ns (sin cambio), `surface_packed` 12,09 a 12,21 µs (+0,9 %, dentro del
   ruido). Nuevo: `cave_with_sources` (la cueva de 1 bit con 434 fuentes bajo sus techos, 2 bits)
   16,8 µs para construir máscaras y lista.
+- Carril 4, `just perf-smoke surface cave-static` (RTX, radio 16, sin tope) contra a9a0abf:
+  superficie 2020 a 2058 fps (+1,9 %), cueva quieta 2474 a 2463 (-0,4 %), p99 igual. Ok.
 
 ## El juego
 
