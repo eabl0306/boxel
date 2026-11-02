@@ -406,6 +406,154 @@ fn removing_a_lamp_equals_never_placing_it() {
     );
 }
 
+/// The default blocks plus a white lamp and two colored glasses (red, blue): opacity 0,
+/// emission 0 and a light filter each (ADR 0060).
+fn glass_registry() -> (Arc<BlockRegistry>, BlockState, [BlockState; 2]) {
+    let mut b = boxel_demo::blocks::builder();
+    let lamp = b
+        .add_block(BlockDef {
+            name: "test:lamp_white".into(),
+            shape: RenderShape::Opaque,
+            model: BlockModel::CUBE,
+            collision: BlockCollision::Full,
+            emission: [14, 14, 14],
+            light_opacity: 15,
+            textures: FaceTextures::all(TextureId(0)),
+        })
+        .expect("lamp");
+    let mut glass = |name: &str, filter| {
+        let name = format!("test:{name}");
+        let state = b
+            .add_block(BlockDef {
+                name: name.clone(),
+                shape: RenderShape::Translucent,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: FaceTextures::all(TextureId(0)),
+            })
+            .expect("glass");
+        let block = b.block_by_name(&name).expect("glass");
+        b.set_light_filter(block, filter).expect("filter");
+        state
+    };
+    let glasses = [
+        glass("red_glass", [15, 3, 2]),
+        glass("blue_glass", [2, 3, 15]),
+    ];
+    (Arc::new(b.build()), lamp, glasses)
+}
+
+/// Where the white lamp of the glass tests goes, in chunk (0, 0, 0).
+const LAMP: BlockPos = BlockPos::new(25, 1, 16);
+
+/// A voxel of chunk (1, 0, 0) lit by [`LAMP`] through the wall of [`glass_wall`].
+const PAST_THE_WALL: BlockPos = BlockPos::new(33, 1, 16);
+
+/// A wall of `glass` at x = 28, between [`LAMP`] and chunk (1, 0, 0): its edits remesh only
+/// chunks at x <= 0 unless the light change widens them.
+fn glass_wall(glass: BlockState) -> Vec<(BlockPos, BlockState)> {
+    let mut wall = Vec::new();
+    for y in 0..=3 {
+        for z in 13..=19 {
+            wall.push((BlockPos::new(28, y, z), glass));
+        }
+    }
+    wall
+}
+
+/// Stone layers under air, settled, with a stone in chunk (1, 0, 0) so the air chunk gets a
+/// mesh job and its light is cached.
+fn glass_world() -> (App, BlockState, [BlockState; 2]) {
+    let (registry, lamp, glasses) = glass_registry();
+    let generator = LayerGen::new(-3..=1);
+    let settings = WorldSettings {
+        vertical_bounds: Some(generator.vertical.clone()),
+        ..small()
+    };
+    let mut app = lit_app(generator, registry, settings, Arc::new(InlineExecutor));
+    spawn(&mut app, ChunkPos::new(0, 0, 0), 1, 8);
+    settle(&mut app);
+    edit(&mut app, &[(BlockPos::new(50, 0, 20), STONE)]);
+    settle(&mut app);
+    (app, lamp, glasses)
+}
+
+/// Every cached light equals the light from scratch. Returns how many chunks were compared.
+fn assert_light_matches_reference(app: &App) -> usize {
+    let map = app.world().resource::<ChunkMap>();
+    let sky = app.world().resource::<SkyMap>();
+    let content = app.world().resource::<WorldContent>();
+    let mut reference = Reference::new(map, sky, content);
+    let mut compared = 0;
+    for (_, slot) in map.iter() {
+        let Some(light) = slot.light() else {
+            continue;
+        };
+        if map.data_at(slot.pos).is_none() {
+            continue;
+        }
+        let direct = reference.light(slot.pos).expect("light on");
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                for z in 0..32u32 {
+                    let (i, j, k) = (x as i32, y as i32, z as i32);
+                    assert_eq!(
+                        light.get(LocalPos::new(x, y, z)),
+                        direct.get(i, j, k),
+                        "{:?} at {x} {y} {z}: cached == from scratch",
+                        slot.pos
+                    );
+                }
+            }
+        }
+        compared += 1;
+    }
+    compared
+}
+
+/// Colored glass placed in air keeps opacity and emission at 0, but its filter changes the
+/// light past it: the edit remeshes as far as the light reaches, like an opacity change.
+#[test]
+fn colored_glass_placed_in_air_relights_the_chunks_past_it() {
+    let (mut app, lamp, [red, _]) = glass_world();
+    edit(&mut app, &[(LAMP, lamp)]);
+    settle(&mut app);
+    let before = light_at(&app, PAST_THE_WALL);
+    assert_eq!(before.rgb(), [6, 6, 6], "8 voxels from the lamp");
+    edit(&mut app, &glass_wall(red));
+    settle(&mut app);
+    assert!(assert_light_matches_reference(&app) > 0);
+    assert!(assert_matches_reference(&app) > 0);
+    let after = light_at(&app, PAST_THE_WALL);
+    assert_eq!(after.red(), before.red(), "red goes through red glass");
+    assert!(after.green() < before.green(), "{after:?}");
+}
+
+/// Swapping red glass for blue keeps opacity and emission, but not the filter: the light past
+/// the wall changes color.
+#[test]
+fn swapping_colored_glass_relights_the_chunks_past_it() {
+    let (mut app, lamp, [red, blue]) = glass_world();
+    // The wall, then the lamp: the lamp's emission relights all it reaches.
+    edit(&mut app, &glass_wall(red));
+    settle(&mut app);
+    edit(&mut app, &[(LAMP, lamp)]);
+    settle(&mut app);
+    assert!(assert_light_matches_reference(&app) > 0);
+    let before = light_at(&app, PAST_THE_WALL);
+    edit(&mut app, &glass_wall(blue));
+    settle(&mut app);
+    assert!(assert_light_matches_reference(&app) > 0);
+    assert!(assert_matches_reference(&app) > 0);
+    let after = light_at(&app, PAST_THE_WALL);
+    assert!(
+        after.red() < before.red() && after.blue() > before.blue(),
+        "{before:?} -> {after:?}"
+    );
+}
+
 /// Deep in the overworld every box is under the walk floor: no sky tile at all, dark light,
 /// and digging in the dark remeshes only the chunks whose padded region holds the voxel.
 #[test]

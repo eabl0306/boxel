@@ -1768,11 +1768,11 @@ impl WorldJobs {
     ///
     /// - every chunk whose padded region (what its mesh reads) holds a changed voxel: the center
     ///   and up to 7 neighbors, edges and corners included (faces and AO);
-    /// - when the voxel's opacity or emission changed, every chunk whose padded region meets the
-    ///   box `p +- r`, with `r` the reach of the light change: the highest level, by channel,
-    ///   of the old light at `p` and its 6 neighbors, and of the old and new emission, at most
-    ///   14. The old light comes from the chunks' light caches; without a current one, `r` is
-    ///   14. Up to 8 chunks;
+    /// - when the voxel's opacity, emission or light filter changed, every chunk whose padded
+    ///   region meets the box `p +- r`, with `r` the reach of the light change: the highest
+    ///   level, by channel, of the old light at `p` and its 6 neighbors, and of the old and new
+    ///   emission, at most 14. The old light comes from the chunks' light caches; without a
+    ///   current one, `r` is 14. Up to 8 chunks;
     /// - when the voxel's sky top moved (a blocker placed over it, or the blocker at it removed),
     ///   every loaded chunk whose padded region meets the column's band: 14 voxels around the
     ///   column, from 14 under the lower of the two tops to 14 over the higher. A removed top
@@ -1872,9 +1872,13 @@ impl WorldJobs {
                 changed[entry].1.new = state;
                 let p = BlockPos::from_parts(chunk, local);
                 box_chunks(p, 0, &mut faces);
+                // A filter change moves light like an opacity change (ADR 0060); a registry
+                // without filters skips the lookups.
                 let reach = if light_on
                     && (tables.opacity(old) != tables.opacity(state)
-                        || tables.emission(old) != tables.emission(state))
+                        || tables.emission(old) != tables.emission(state)
+                        || (tables.any_filter()
+                            && tables.light_filter(old) != tables.light_filter(state)))
                 {
                     light_reach(cx.map, &tables, p, old, state)
                 } else {
