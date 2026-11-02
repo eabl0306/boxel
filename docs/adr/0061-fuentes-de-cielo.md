@@ -264,6 +264,15 @@ escriben su rayo en los canales de bloque (S a M sobre esto), no como un tercer 
   `walk_generate` 130,9 a 129,7 µs y `walk_loaded` 16,5 a 16,2 µs. Las cajas con inundación
   salieron entre 8 y 15 % más rápidas (`box_surface` 47,6 a 40,3 µs), que es ruido de la máquina:
   el cambio no toca la inundación.
+- Carril 3, `headless_world --world overworld --view-distance 16 --viewer-y -1000`: sin
+  fuentes, 17 727 chunks, 12 981 mallas y 9 050 803 quads, cero tiles de rayos, cero jobs y cero
+  esperas (las mallas son las de main bit a bit: lo fija un test). Con `--sky-sources` (una
+  fuente en cada otra columna bajo cada techo de cueva, a 24 capas del viewer) los mismos chunks
+  y 16 829 291 quads (1,86 veces), 933 tiles con 2,5 millones de rayos (23,3 MiB), 2 007 builds y
+  31 783 generaciones privadas: las fuentes llegan hasta 8 capas fuera de lo cargado. Toda caja
+  toma el camino completo (13 546) y la caché de luz pasa de 0 a 31,4 MiB.
+- Carril 3, `just perf-smoke cave-static cave-path` (RTX, radio 16, sin tope) contra 4eeb410:
+  cueva quieta 2488 a 2484 fps (-0,2 %), ruta en cueva 2542 a 2532 (-0,4 %), p99 igual. Ok.
 - Nuevos, sin lado base:
 
 | Bench | Tiempo | Qué mide |
