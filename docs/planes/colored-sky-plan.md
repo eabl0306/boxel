@@ -4,7 +4,7 @@ Follows ADR 0060 (issue #11, light plan P8). This is a design document: nothing 
 Paths are relative to the repo root. Numbers marked "measured" come from ADR 0015 and ADR 0060;
 the rest are estimates that each lane's measurement checks.
 
-**Status: proposal (2026-11-02), waiting for the owner.** Sec. 10 lists his questions.
+**Status: approved (2026-11-02).** The owner's answers are in sec. 11.
 
 **Verdict.** Build Option D, "sparse colored sky": sky light gets three channels only in the
 boxes and chunks where a filter actually changed its color, and the mesh carries it in a second
@@ -522,3 +522,18 @@ streaming order (`interest.rs`), `vendor/`.
    a block (water, say) without tinting the sky there (and without the cost in every ocean)?
 5. **The edit bug of sec. 1** (filter changes do not widen the remesh): fix it now on its own, or
    with lane C2?
+
+## 11. Decisions of the owner (2026-11-02)
+
+1. **Option D on Low and Mid, exact faces on High only.** Low and Mid keep the flattened faces
+   of sec. 4.5. High draws tinted faces exactly (D' or an equivalent that needs no Low buffer).
+   This is a High-only difference, like sun shadows (#9): the tier pixel tests compare Low and
+   Mid with each other, and High with its own reference on scenes with tinted faces. Scenes
+   without tinted faces stay identical on all three tiers.
+2. **Gameplay reads the uncolored sky.** Crops (and spawning, later) see the sky level the
+   column would have without the tint, so greenhouses of any stained glass work as in
+   Minecraft. Only the picture is tinted.
+3. **Off by default.** The engine ships `colored_sky` off; the game turns it on.
+4. **One filter for both lights.** No per-block sky opt-out. The game puts no filter on water.
+5. **The edit bug of sec. 1 is fixed now**, on its own, before lane C2.
+
