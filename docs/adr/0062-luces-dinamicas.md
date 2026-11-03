@@ -1,6 +1,8 @@
 # ADR 0062: luces dinámicas
 
-- Estado: aceptado (issue #10, plan de luz P8)
+- Estado: aceptado (issue #10, plan de luz P8). El ADR 0063 hornea en las mallas las luces cercanas
+  a un viewer: ya no atraviesan muros y el AO sale con `BakedLitOnly`. Este shader queda para las
+  demás.
 - Fecha: 2026-11-02
 
 ## Contexto

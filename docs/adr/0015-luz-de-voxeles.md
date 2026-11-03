@@ -221,7 +221,8 @@ streaming tampoco los cambia.
 - **AO omitido en caras oscuras**: una cara con sus 4 esquinas en 0 lleva AO "abierto" en su
   clave. Casi toda la geometría de cuevas está a oscuras, así que se fusiona como hoy. Es
   invisible con el piso de ambiente por defecto. Política `AoPolicy::BakedLitOnly` por defecto
-  (`Off` y `Baked` también existen). Un mundo con luces dinámicas malla con `Baked` (ADR 0062).
+  (`Off` y `Baked` también existen). Las luces dinámicas que el mundo hornea (ADR 0063) entran en la luz con la que se malla, así
+  que las caras que iluminan llevan AO también con `BakedLitOnly`.
 - Clave del merge: (material, byte de AO, índice de paleta), llevada a un id `u32` denso. Hace
   falta un fork en el repo de `binary-greedy-meshing` 0.5.2 (aviso MIT incluido) que fusione por
   clave de cara en lugar del `u16` del vóxel. El crate queda como dependencia de desarrollo para
