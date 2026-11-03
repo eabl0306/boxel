@@ -18,9 +18,9 @@ use crate::overlay::{OverlayDraw, OverlayPass, OverlayRect};
 use crate::{
     AllocProbeReport, BlockTextureData, ChunkMemorySettings, ChunkMemoryStats, ChunkOp,
     DEFAULT_SKY_COLOR, DistanceFog, DynamicLights, FLUID_TIME_PERIOD, RealmShading, RendererConfig,
-    RendererSmokeTest, SceneLight, SceneRealms, TextureReport, TextureSource, TranslucentSort,
-    ViewParams, VoxelRenderer, generate_block_textures, light_curve, load_block_textures,
-    texture_tick,
+    RendererSmokeTest, SceneLight, SceneRealms, SceneSun, SunShadowSettings, TextureReport,
+    TextureSource, TranslucentSort, ViewParams, VoxelRenderer, generate_block_textures,
+    light_curve, load_block_textures, texture_tick,
 };
 use boxel_app::{App, Last, MainScheduleOrder, Plugin, Shutdown, Time};
 use boxel_camera::{Camera, CameraView};
@@ -42,7 +42,8 @@ use boxel_window::{DisplayHandle, PrimaryWindow, WindowState};
 use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{
     ChunkMap, ChunkMeshEvent, ChunkMeshResync, ChunkViewer, ChunkVisibility, DaylightCurve,
-    RealmLighting, RealmPlanes, TimeOfDay, VisibilityView, VisibleSet, WorldContent, WorldSettings,
+    RealmLighting, RealmPlanes, SunPath, TimeOfDay, VisibilityView, VisibleSet, WorldContent,
+    WorldSettings,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -122,6 +123,12 @@ pub struct RenderSettings {
     /// [`TranslucentSort::Background`]: on the async compute pool, applied a frame or so later.
     /// Read every frame.
     pub translucent_sort: TranslucentSort,
+    /// Sun shadows on High (sun shadows plan, ADR 0065): off by default; on, the sky light is
+    /// 40 % lower in the sun's shadow out to 160 blocks. Ignored on Mid and Low, and on
+    /// integrated GPUs unless [`SunShadowSettings::on_integrated`]. The sun follows
+    /// `boxel_world::SunPath` at the world clock. Read every frame; an invalid change is logged
+    /// and the last valid settings stay ([`SunShadowSettings::validate`]).
+    pub sun_shadows: SunShadowSettings,
 }
 
 impl Default for RenderSettings {
@@ -141,6 +148,7 @@ impl Default for RenderSettings {
             render_when_hidden: false,
             textures: TextureSource::Procedural,
             translucent_sort: TranslucentSort::default(),
+            sun_shadows: SunShadowSettings::default(),
         }
     }
 }
@@ -775,6 +783,8 @@ pub(crate) struct ExtractedFrame {
     translucent_sort: TranslucentSort,
     /// The last valid `RenderSettings::chunk_memory`: its ceiling is live (ADR 0035).
     pub(crate) chunk_memory: ChunkMemorySettings,
+    /// The last valid `RenderSettings::sun_shadows`.
+    pub(crate) sun_shadows: SunShadowSettings,
     /// Full resync: `meshes` holds every ready mesh, and `renderer.clear_chunks` (or, for a new
     /// world, `renderer.clear_world`) runs first.
     pub(crate) resync: Resync,
@@ -1500,11 +1510,52 @@ fn scene_light(
         curve: light_curve(settings.light_gamma),
         realms,
         dynamic: DynamicLights::default(),
+        sun: None,
     };
     (
         daylight.map_or(settings.clear_color, |d| d.sky_color),
         light,
     )
+}
+
+/// The sun of a frame for sun shadows, `None` while `shadows` is off: the direction of `path`
+/// (the default one without it) at `time` (noon without a clock), with the shadow strength in
+/// each realm that has the sun by its `lighting` entry (every realm without a table), seen from
+/// the realm of `realms` that holds the camera's `camera_y`.
+fn scene_sun(
+    shadows: &SunShadowSettings,
+    path: Option<&SunPath>,
+    time: Option<&TimeOfDay>,
+    lighting: Option<&RealmLighting>,
+    realms: &SceneRealms,
+    camera_y: i64,
+) -> Option<SceneSun> {
+    if !shadows.enabled {
+        return None;
+    }
+    let noon = TimeOfDay::default();
+    let direction = path
+        .copied()
+        .unwrap_or_default()
+        .direction(time.unwrap_or(&noon));
+    let has_sun = |realm| lighting.is_none_or(|l| l.get(realm).has_sun());
+    Some(SceneSun::new(
+        direction,
+        shadows.strength,
+        has_sun,
+        realms.realm_of(camera_y),
+    ))
+}
+
+/// The sun shadows of the next frames: `shadows` if valid, else (logged) the `last` valid ones.
+fn valid_sun_shadows(shadows: SunShadowSettings, last: SunShadowSettings) -> SunShadowSettings {
+    match shadows.validate() {
+        Ok(()) => shadows,
+        Err(e) => {
+            tracing::warn!("RenderSettings::sun_shadows: {e}; the last valid ones stay");
+            last
+        }
+    }
 }
 
 /// The distance fog of the next frames: `fog` if valid, else (logged) the `last` valid one.
@@ -1526,7 +1577,11 @@ pub(crate) fn extract(
     window: Option<Res<WindowState>>,
     cameras: Query<(&Camera, &Transform)>,
     clock: Option<(Res<TimeOfDay>, Res<DaylightCurve>)>,
-    realms: (Option<Res<RealmPlanes>>, Option<Res<RealmLighting>>),
+    realms: (
+        Option<Res<RealmPlanes>>,
+        Option<Res<RealmLighting>>,
+        Option<Res<SunPath>>,
+    ),
     chunks: Option<Res<ChunkMap>>,
     mut mesh_events: MessageReader<ChunkMeshEvent>,
     mut resyncs: MessageWriter<ChunkMeshResync>,
@@ -1561,19 +1616,32 @@ pub(crate) fn extract(
         .find(|(camera, _)| camera.active)
         .map(|(camera, transform)| (*camera, *transform));
     frame.window = window.as_deref().copied().unwrap_or_default();
-    (frame.sky_color, frame.light) = scene_light(
-        &settings,
-        clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
-        realms.0.as_deref(),
-        realms.1.as_deref(),
-    );
     if settings.is_changed() {
         frame.distance_fog = valid_distance_fog(settings.distance_fog, frame.distance_fog);
         match settings.chunk_memory.validate() {
             Ok(()) => frame.chunk_memory = settings.chunk_memory,
             Err(e) => tracing::warn!("RenderSettings::chunk_memory: {e}; the last valid one stays"),
         }
+        frame.sun_shadows = valid_sun_shadows(settings.sun_shadows, frame.sun_shadows);
     }
+    (frame.sky_color, frame.light) = scene_light(
+        &settings,
+        clock.as_ref().map(|(time, curve)| (&**time, &**curve)),
+        realms.0.as_deref(),
+        realms.1.as_deref(),
+    );
+    // The realm of the eye's voxel (saturating far outside the world).
+    let camera_y = frame
+        .camera
+        .map_or(0, |(_, transform)| transform.translation.y.floor() as i64);
+    frame.light.sun = scene_sun(
+        &frame.sun_shadows,
+        realms.2.as_deref(),
+        clock.as_ref().map(|(time, _)| &**time),
+        realms.1.as_deref(),
+        &frame.light.realms,
+        camera_y,
+    );
     frame.fluid_time = time
         .as_ref()
         .map_or(0.0, |t| (t.elapsed_secs_f64() % FLUID_TIME_PERIOD) as f32);
@@ -2547,6 +2615,59 @@ mod tests {
             Some(&empty),
         );
         assert_eq!(same, night);
+    }
+
+    /// The extract's sun: none while sun shadows are off; on, the sun path's direction at the
+    /// clock (noon without one), the strength in each realm with the sun, faded at night, seen
+    /// from the camera's realm.
+    #[test]
+    fn the_scene_sun_follows_the_sun_path() {
+        use boxel_world::RealmLight;
+        let on = SunShadowSettings::on();
+        let one = SceneRealms::default();
+        let noon = TimeOfDay::at_clock(12.0);
+        let off = RenderSettings::default().sun_shadows;
+        assert_eq!(scene_sun(&off, None, None, None, &one, 0), None);
+        let path = SunPath::default();
+        let sun = scene_sun(&on, None, None, None, &one, 0).unwrap();
+        assert_eq!(sun.direction, path.direction(&noon));
+        assert_eq!((sun.strength, sun.camera_realm), ([0.4; 9], 0));
+        let flat = SunPath { tilt_degrees: 0.0 };
+        let sun = scene_sun(&on, Some(&flat), Some(&noon), None, &one, 0).unwrap();
+        assert!((sun.direction - DVec3::Y).length() < 1e-12);
+        let midnight = TimeOfDay::at_clock(0.0);
+        let night = scene_sun(&on, Some(&path), Some(&midnight), None, &one, 0).unwrap();
+        assert_eq!(night.strength, [0.0; 9]);
+        // Realms: a cavern with its own curve has no sun unless it says so.
+        let lighting = RealmLighting {
+            realms: vec![
+                RealmLight::default(),
+                RealmLight {
+                    curve: Some(DaylightCurve::default()),
+                    ..RealmLight::default()
+                },
+                RealmLight {
+                    curve: Some(DaylightCurve::default()),
+                    sun: Some(true),
+                    ..RealmLight::default()
+                },
+            ],
+        };
+        let realms = SceneRealms::with_planes(&[-4096, 4096]);
+        let half = SunShadowSettings {
+            strength: 0.5,
+            ..on
+        };
+        for (y, realm) in [(-5000, 0), (0, 1), (1 << 40, 2)] {
+            let sun = scene_sun(&half, Some(&path), Some(&noon), Some(&lighting), &realms, y);
+            let sun = sun.unwrap();
+            assert_eq!(sun.strength[..4], [0.5, 0.0, 0.5, 0.5]);
+            assert_eq!(usize::from(sun.camera_realm), realm);
+        }
+        // An invalid change keeps the last valid settings.
+        let bad = SunShadowSettings { cascades: 0, ..on };
+        assert_eq!(valid_sun_shadows(bad, half), half);
+        assert_eq!(valid_sun_shadows(on, half), on);
     }
 
     /// The extract samples one curve per realm, at the world clock; a realm without its own

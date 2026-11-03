@@ -6,7 +6,7 @@
 //! ambient floor and face shade. The shaders find a voxel's realm from the planes in the same
 //! uniform, so a realm costs no per-chunk data.
 
-use crate::DynamicLights;
+use crate::{DynamicLights, SceneSun};
 use boxel_shaders::gpu::{REALM_ENVS, REALM_PLANES, RealmEnvGpu};
 use boxel_world::DEFAULT_FACE_SHADE;
 
@@ -136,6 +136,10 @@ pub struct SceneLight {
     /// shaders by the brightest per channel. Empty by default. The plugin leaves out the ones the
     /// world bakes into its meshes (ADR 0063).
     pub dynamic: DynamicLights,
+    /// The sun for sun shadows (High only): where it is and each realm's shadow strength.
+    /// `None` (the default) draws none; the plugin fills it while
+    /// [`crate::RenderSettings::sun_shadows`] is on. It never reaches the `View` uniform.
+    pub sun: Option<SceneSun>,
 }
 
 impl SceneLight {
@@ -156,6 +160,7 @@ impl SceneLight {
             curve: light_curve(Self::DEFAULT_GAMMA),
             realms: SceneRealms::default(),
             dynamic: DynamicLights::default(),
+            sun: None,
         }
     }
 

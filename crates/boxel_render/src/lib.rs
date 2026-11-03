@@ -45,6 +45,7 @@ mod overlay;
 mod pack_textures;
 mod plugin;
 mod renderer;
+pub mod shadow;
 mod smoke;
 mod texture_animation;
 mod textures;
@@ -91,6 +92,7 @@ pub use renderer::{
     PATTERN_PERIOD_TICKS, RenderStats, RendererConfig, RendererError, ReserveMode,
     TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, pattern_phase, texture_tick,
 };
+pub use shadow::{SceneSun, SunShadowError, SunShadowSettings};
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;
 pub use texture_animation::{DEFAULT_TEXTURE_UPLOAD_BUDGET, FrameKey, LayerAnimation};
