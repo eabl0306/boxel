@@ -99,8 +99,8 @@ pub mod ticks;
 
 pub use daylight::{
     DEFAULT_FACE_SHADE, DEFAULT_TICKS_PER_DAY, Daylight, DaylightCurve, DaylightPlugin, MAX_REALMS,
-    RealmDaylight, RealmLight, RealmLighting, RealmPlanes, SUNRISE_HOUR, SkyKey, TICKS_PER_SECOND,
-    TimeOfDay,
+    RealmDaylight, RealmLight, RealmLighting, RealmPlanes, SUN_STEPS_PER_DAY, SUNRISE_HOUR, SkyKey,
+    SunPath, TICKS_PER_SECOND, TimeOfDay,
 };
 pub use dynamic_light::{BakedLights, DynamicLight};
 pub use fluid::FluidPlugin;

@@ -10,9 +10,15 @@
 //! its own curve (a cavern with no night), ambient color and face shading. The world publishes
 //! where the realms meet ([`RealmPlanes`]) when it opens; the render plugin applies each realm's
 //! entry to the voxels of that realm.
+//!
+//! The sun is also a direction ([`SunPath`]): it rises in the east (+X), crosses the sky tilted
+//! toward +Z and sets in the west, moving in small steps so sun shadows (High only, the render
+//! crate's `SunShadowSettings`) stand still between steps. A realm has the sun or not
+//! ([`RealmLight::sun`]).
 
 use boxel_app::{App, FixedUpdate, Plugin};
 use boxel_ecs::prelude::*;
+use boxel_math::DVec3;
 use boxel_worldgen::RealmStack;
 use boxel_worldgen::realm::MAX_REALM_PLANES;
 use std::f64::consts::TAU;
@@ -129,6 +135,60 @@ impl TimeOfDay {
             u128::from(self.tick_of_day()) * DAY_MINUTES / u128::from(self.day_len());
         let minutes = (since_sunrise + SUNRISE_HOUR as u128 * 60) % DAY_MINUTES;
         format!("{:02}:{:02}", minutes / 60, minutes % 60)
+    }
+}
+
+/// Steps of the sun's angle in a day: 0.05 degrees each, one every 1/6 s with the 20-minute day
+/// ([`SunPath::step`]).
+pub const SUN_STEPS_PER_DAY: u64 = 7200;
+
+/// The sun's path over the sky (sun shadows, ADR 0065): with `theta = 2 pi * day_fraction`
+/// rounded to a whole [`SunPath::step`], the direction toward the sun is
+/// `(cos theta, sin theta * cos tilt, sin theta * sin tilt)`. It rises at +X (east, as in
+/// Minecraft) at 06:00, is highest at noon (elevation sine `cos tilt`) and sets at -X at 18:00.
+/// Tilt 0 is Minecraft's path straight over the top; the tilt keeps noon shadows from falling
+/// straight down and the +Z and -Z walls from being edge-on to the sun all day.
+///
+/// Only the direction steps: [`TimeOfDay::sun_elevation`] keeps driving the sky light and
+/// [`DaylightCurve`] does not change.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct SunPath {
+    /// How far the noon sun leans from straight up, toward +Z, in degrees. Default 30.
+    pub tilt_degrees: f64,
+}
+
+impl Default for SunPath {
+    fn default() -> Self {
+        Self {
+            tilt_degrees: Self::DEFAULT_TILT_DEGREES,
+        }
+    }
+}
+
+impl SunPath {
+    /// The default [`SunPath::tilt_degrees`].
+    pub const DEFAULT_TILT_DEGREES: f64 = 30.0;
+
+    /// The sun's step at `time`: its angle since sunrise in whole steps of
+    /// `360 / SUN_STEPS_PER_DAY` degrees, rounded to the nearest (`0..SUN_STEPS_PER_DAY`, exact:
+    /// integer ticks). The direction is the same for every tick of a step.
+    pub fn step(time: &TimeOfDay) -> u64 {
+        let len = u128::from(time.day_len());
+        let steps = u128::from(SUN_STEPS_PER_DAY);
+        let step = (u128::from(time.tick_of_day()) * steps + len / 2) / len;
+        (step % steps) as u64
+    }
+
+    /// The sun's angle since sunrise at `time` (radians, `0..2 pi`), on its step.
+    pub fn angle(time: &TimeOfDay) -> f64 {
+        Self::step(time) as f64 * TAU / SUN_STEPS_PER_DAY as f64
+    }
+
+    /// The unit direction toward the sun at `time`, on its step.
+    pub fn direction(self, time: &TimeOfDay) -> DVec3 {
+        let (sin, cos) = Self::angle(time).sin_cos();
+        let (tilt_sin, tilt_cos) = self.tilt_degrees.to_radians().sin_cos();
+        DVec3::new(cos, sin * tilt_cos, sin * tilt_sin)
     }
 }
 
@@ -278,6 +338,10 @@ pub struct RealmLight {
     /// all 1 (or close) is the flat look of Minecraft's Nether (`cardinal_light`). Models are
     /// shaded relative to it (the render crate's `ModelRealm`).
     pub face_shade: [f32; 6],
+    /// Whether the realm's sky has the sun ([`SunPath`]), so things in it cast sun shadows.
+    /// `None`: it has the sun when it follows the global curve (`curve` is `None`), and not with
+    /// a curve of its own (a lit cavern, a realm whose light comes from sources).
+    pub sun: Option<bool>,
 }
 
 impl Default for RealmLight {
@@ -286,7 +350,16 @@ impl Default for RealmLight {
             curve: None,
             ambient: None,
             face_shade: DEFAULT_FACE_SHADE,
+            sun: None,
         }
+    }
+}
+
+impl RealmLight {
+    /// Whether the realm has the sun: [`RealmLight::sun`], else whether it follows the global
+    /// curve.
+    pub fn has_sun(&self) -> bool {
+        self.sun.unwrap_or(self.curve.is_none())
     }
 }
 
@@ -370,8 +443,8 @@ impl RealmPlanes {
 }
 
 /// Adds the world clock: [`TimeOfDay`] (noon of day one, unless the app inserted one),
-/// [`DaylightCurve`] (defaults, unless inserted) and [`RealmLighting`] (empty, unless
-/// inserted), and advances the clock in `FixedUpdate`. The render plugin turns them into the
+/// [`DaylightCurve`] (defaults, unless inserted), [`RealmLighting`] (empty, unless inserted)
+/// and [`SunPath`] (tilted 30 degrees, unless inserted), and advances the clock in `FixedUpdate`. The render plugin turns them into the
 /// scene light; without this plugin the sky stays at noon.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DaylightPlugin;
@@ -381,6 +454,7 @@ impl Plugin for DaylightPlugin {
         app.init_resource::<TimeOfDay>()
             .init_resource::<DaylightCurve>()
             .init_resource::<RealmLighting>()
+            .init_resource::<SunPath>()
             .add_systems(FixedUpdate, advance_time);
     }
 }
@@ -525,6 +599,7 @@ mod tests {
                     curve: Some(constant),
                     ambient: Some([0.2, 0.15, 0.1]),
                     face_shade: [0.9; 6],
+                    sun: None,
                 },
                 RealmLight {
                     curve: Some(constant),
@@ -558,6 +633,136 @@ mod tests {
         let midnight = lighting.at(1, &global, &TimeOfDay::at_clock(0.0));
         assert_eq!(noon, midnight);
         assert_eq!(DEFAULT_FACE_SHADE, [1.0, 0.5, 0.8, 0.8, 0.65, 0.65]);
+    }
+
+    /// The sun rises at +X, stands highest at noon leaning toward +Z by the tilt, sets at -X and
+    /// is under the horizon at midnight; with tilt 0 its elevation is
+    /// [`TimeOfDay::sun_elevation`] (exactly on a step, within half a step between).
+    #[test]
+    fn the_sun_rises_in_the_east_and_leans_by_the_tilt() {
+        let path = SunPath::default();
+        assert_eq!(path.tilt_degrees, 30.0);
+        let near = |a: DVec3, b: DVec3| (a - b).length() < 1e-12;
+        let sunrise = TimeOfDay::at_clock(6.0);
+        assert_eq!(SunPath::step(&sunrise), 0);
+        assert_eq!(path.direction(&sunrise), DVec3::X);
+        let (sin30, cos30) = 30f64.to_radians().sin_cos();
+        let noon = path.direction(&TimeOfDay::at_clock(12.0));
+        assert!(near(noon, DVec3::new(0.0, cos30, sin30)), "{noon}");
+        let sunset = path.direction(&TimeOfDay::at_clock(18.0));
+        assert!(near(sunset, -DVec3::X), "{sunset}");
+        let midnight = path.direction(&TimeOfDay::at_clock(0.0));
+        assert!(
+            near(midnight, DVec3::new(0.0, -cos30, -sin30)),
+            "{midnight}"
+        );
+        // Above the horizon exactly from sunrise to sunset, and always a unit vector.
+        let flat = SunPath { tilt_degrees: 0.0 };
+        let half_step = std::f64::consts::PI / SUN_STEPS_PER_DAY as f64;
+        let mut time = TimeOfDay::at_clock(6.0);
+        for _ in 0..1000 {
+            let dir = path.direction(&time);
+            assert!((dir.length() - 1.0).abs() < 1e-12);
+            let day = time.tick_of_day() < time.ticks_per_day / 2;
+            assert!(dir.y >= 0.0 || !day, "{} {dir}", time.clock_text());
+            assert!(dir.y <= 1e-12 || day, "{} {dir}", time.clock_text());
+            // Tilt 0: Minecraft's path, the daylight curve's elevation.
+            let elevation = time.sun_elevation();
+            assert!((flat.direction(&time).y - elevation).abs() <= half_step + 1e-12);
+            assert_eq!(flat.direction(&time).z, 0.0);
+            time.tick += 77;
+        }
+        // A step is 10 2/3 ticks of the default day: every third one starts on a tick.
+        for step in [0, 3, 1800, 3597, 3600, 7197] {
+            let on_step = TimeOfDay {
+                tick: step * DEFAULT_TICKS_PER_DAY / SUN_STEPS_PER_DAY,
+                ..TimeOfDay::default()
+            };
+            assert_eq!(SunPath::step(&on_step), step);
+            assert!((flat.direction(&on_step).y - on_step.sun_elevation()).abs() < 1e-12);
+        }
+    }
+
+    /// The direction only changes from one step to the next: 0.05 degrees, every 1/6 s of the
+    /// 20-minute day, the last step of a day coming back to sunrise.
+    #[test]
+    fn the_sun_moves_in_steps() {
+        let path = SunPath::default();
+        // 32 ticks are 3 steps (1/6 s each at 64 ticks a second).
+        assert_eq!(DEFAULT_TICKS_PER_DAY * 3, SUN_STEPS_PER_DAY * 32);
+        let mut time = TimeOfDay::at_clock(9.0);
+        let mut last = (SunPath::step(&time), path.direction(&time));
+        let mut changes = 0;
+        for _ in 0..320 {
+            time.advance();
+            let now = (SunPath::step(&time), path.direction(&time));
+            if now.0 == last.0 {
+                assert_eq!(now.1, last.1);
+            } else {
+                assert_eq!(now.0, last.0 + 1);
+                let angle = now.1.angle_between(last.1).to_degrees();
+                assert!((angle - 0.05).abs() < 1e-9, "{angle}");
+                changes += 1;
+            }
+            last = now;
+        }
+        assert_eq!(changes, 30);
+        // The steps round to the nearest: the end of a day is the next sunrise.
+        let late = TimeOfDay {
+            tick: DEFAULT_TICKS_PER_DAY - 1,
+            ..TimeOfDay::default()
+        };
+        assert_eq!(SunPath::step(&late), 0);
+        // Another day length steps the same over the day.
+        let short = TimeOfDay {
+            tick: 250,
+            ticks_per_day: 1000,
+            ..TimeOfDay::default()
+        };
+        assert_eq!(SunPath::step(&short), 1800);
+        let odd = TimeOfDay {
+            ticks_per_day: 0,
+            ..TimeOfDay::default()
+        };
+        assert_eq!(SunPath::step(&odd), 0);
+    }
+
+    /// A realm on the global curve has the sun; one with its own curve does not, unless it
+    /// says so; `sun` overrides both ways.
+    #[test]
+    fn realms_on_the_global_curve_have_the_sun() {
+        let own = RealmLight {
+            curve: Some(DaylightCurve::default()),
+            ..RealmLight::default()
+        };
+        assert_eq!(RealmLight::default().sun, None);
+        assert!(RealmLight::default().has_sun());
+        assert!(!own.has_sun());
+        assert!(
+            RealmLight {
+                sun: Some(true),
+                ..own
+            }
+            .has_sun()
+        );
+        let dark = RealmLight {
+            sun: Some(false),
+            ..RealmLight::default()
+        };
+        assert!(!dark.has_sun());
+        // Past the table: the default, with the sun.
+        assert!(RealmLighting::default().get(5).has_sun());
+    }
+
+    #[test]
+    fn the_plugin_adds_the_sun_path() {
+        let mut app = App::new();
+        app.insert_resource(SunPath { tilt_degrees: 10.0 });
+        app.add_plugins(DaylightPlugin);
+        assert_eq!(app.world().resource::<SunPath>().tilt_degrees, 10.0);
+        let mut app = App::new();
+        app.add_plugins(DaylightPlugin);
+        assert_eq!(*app.world().resource::<SunPath>(), SunPath::default());
     }
 
     #[test]
