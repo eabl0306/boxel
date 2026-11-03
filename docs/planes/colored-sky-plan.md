@@ -4,7 +4,11 @@ Follows ADR 0060 (issue #11, light plan P8). This is a design document: nothing 
 Paths are relative to the repo root. Numbers marked "measured" come from ADR 0015 and ADR 0060;
 the rest are estimates that each lane's measurement checks.
 
-**Status: approved (2026-11-02).** The owner's answers are in sec. 11.
+**Status: approved (2026-11-02).** The owner's answers are in sec. 11. Lanes C0 and C1 are done:
+ADR 0064, whose sec. 9 lists where C1 differs from this plan (the low 16 bits carry the uncolored
+sky, decision 2; two `u16` arrays instead of one `u32`; separate colored walk and beam build). Sec. 1
+and 4.6 are stale on one point: `VsOut::ao` bits 16..31 are the dynamic light mask of ADR 0062,
+so C4 needs another place for the tint bit (ADR 0064 sec. 8).
 
 **Verdict.** Build Option D, "sparse colored sky": sky light gets three channels only in the
 boxes and chunks where a filter actually changed its color, and the mesh carries it in a second

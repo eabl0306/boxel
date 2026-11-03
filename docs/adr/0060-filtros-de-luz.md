@@ -1,6 +1,7 @@
 # ADR 0060: filtros de luz por canal (vidrio de color)
 
-- Estado: aceptado (issue #11, el punto del vidrio de color; fase P8 del plan de luz)
+- Estado: aceptado (issue #11, el punto del vidrio de color; fase P8 del plan de luz). Enmendado
+  por ADR 0064: el cielo también se tiñe.
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -52,23 +53,26 @@ Tres formas, con el mismo costo (una tabla o una cuenta por vóxel con filtro):
 El color del tinte es una transmitancia: dice qué parte de la luz pasa. Escalar el brillo es lo
 que hace un vidrio de verdad.
 
-### El cielo queda blanco
+### El cielo se tiñe (ADR 0064)
 
-La luz del cielo no pasa por ningún filtro. Las opciones:
+Al principio este ADR dejó el cielo blanco: costaba cero, y las otras formas parecían caras o
+falsas. ADR 0064 lo cambia: con `WorldSettings::colored_sky` (apagado en el motor, el juego lo
+prende), el cielo se filtra igual que la luz de bloque, canal por canal, y un cuarto detrás de un
+vitral se ve del color del vidrio también de día.
 
-1. **Blanco (elegida).** Costo cero. El vidrio de color sigue con opacidad 0, así que el cielo
-   directo pasa como hoy. De día, un cuarto detrás de un vitral se ve con luz blanca. De noche, o
-   con una antorcha, la luz de bloque sí se tiñe.
-2. **Cielo de color.** Tres canales de cielo más por vóxel: `LightValue` pasa de 16 a 28 o 32
-   bits. Eso duplica `PaddedLight` (77 KiB a 154 KiB por job), `ChunkLight`, las esquinas de la
-   paleta de luz de cada malla y su formato en la GPU de los tres tiers, y el shader tiene que
-   multiplicar el color del cielo por canal. Toca render y shaders protegidos, y la memoria de
-   luz de todo el mundo, por un efecto que solo se ve de día detrás de un vitral.
-3. **Pasar el cielo filtrado a la luz de bloque.** Barato, pero deja de seguir el día: de noche la
-   ventana seguiría iluminando. No es honesto.
-4. **Solo oscurecer el cielo, sin color.** El vidrio tendría que contar para el techo de cielo de
-   su columna (opacidad mayor que 0), lo que cambia la caminata del cielo y hace oscuro todo lo
-   que hay debajo de un techo de vidrio. Gana poco.
+Las formas que se miraron (detalle y costos en ADR 0064 y en `docs/planes/colored-sky-plan.md`):
+
+1. **Blanco.** Lo de antes. Sigue siendo lo que da el motor con el interruptor apagado.
+2. **RGB de cielo en todo vóxel.** Exacta, pero duplica la memoria de luz, la paleta y la VRAM fija
+   de Low en todo el mundo, haya vidrio o no.
+3. **Pasar el cielo filtrado a la luz de bloque.** Deja de seguir el día: de noche la ventana
+   seguiría iluminando.
+4. **Solo oscurecer el cielo.** El vidrio contaría para el techo de cielo y oscurecería todo lo
+   que tiene debajo.
+5. **Cielo de color ralo (la elegida, ADR 0064).** La regla exacta, guardada ancha solo donde se
+   ve el color. Sin vidrio de color, nada cambia ni cuesta.
+
+El gameplay sigue leyendo el cielo sin teñir: un cultivo bajo vidrio rojo ve 15 de cielo.
 
 ### La exactitud de la caja sigue valiendo
 
@@ -80,7 +84,7 @@ La luz del cielo no pasa por ningún filtro. Las opciones:
 - El oráculo (`oracle.rs`) aplica la misma regla. Las pruebas comparan la caja con él bit a bit
   en mundos al azar con filtros (con y sin opacidades 2 a 14, cerca y lejos del origen) y en una
   escena hecha a mano: una lámpara detrás de vidrio rojo y de agua cian, y un pozo bajo un techo
-  de vidrio rojo, donde el cielo llega blanco.
+  de vidrio rojo, donde el cielo llega blanco (con `colored_sky` apagado).
 
 ### Cómo se calcula
 
@@ -89,8 +93,9 @@ La luz del cielo no pasa por ningún filtro. Las opciones:
   de color paga un escaneo de paleta, y nada si ningún estado del registro filtra.
 - En la caja, si hay emisores y alguno de los 27 chunks tiene filtro, se juntan sus filas (más
   las parciales, si hay opacidades 2 a 14) y las inundaciones de bloque toman esos vóxeles uno
-  por uno: leen el estado, su costo y su filtro. La inundación del cielo no cambia. Sin filtros
-  cerca, el camino es el de antes.
+  por uno: leen el estado, su costo y su filtro. La inundación del cielo no cambia (con
+  `colored_sky`, ADR 0064 suma tres inundaciones de cielo que sí filtran). Sin filtros cerca, el
+  camino es el de antes.
 - Las inundaciones quedan en una función aparte (`floods`), fuera de línea, para que los caminos
   rápidos sigan siendo una función chica.
 - Nada cambia en la malla, el quad, la paleta de luz ni los shaders: los quads ya llevan luz RGB
@@ -149,9 +154,10 @@ La luz del cielo no pasa por ningún filtro. Las opciones:
 - El nivel es entero: cerca de una fuente fuerte el color es fiel, y a pocos vóxeles los canales
   débiles se apagan antes. Un vitral cian lejos de la antorcha se ve verde azulado y después
   azul. Pasa igual con la luz de colores de las lámparas (ADR 0015).
-- Los ticks leen la luz del canal más brillante (ADR 0059): un cultivo detrás de un vidrio rojo
-  crece con el nivel del rojo, y detrás de un vidrio oscuro puede quedarse sin luz suficiente.
-- El cielo no se tiñe. Si algún día se quiere, la opción 2 de arriba es el camino, con su costo.
+- Los ticks leen la luz del canal más brillante (ADR 0059): con una antorcha detrás de un vidrio
+  rojo, un cultivo crece con el nivel del rojo, y detrás de un vidrio oscuro puede quedarse sin luz
+  suficiente. El cielo lo ven sin teñir (ADR 0064).
+- El cielo se tiñe solo con `colored_sky` (ADR 0064). El gameplay lee el cielo sin teñir.
 
 ## Alternativas descartadas
 

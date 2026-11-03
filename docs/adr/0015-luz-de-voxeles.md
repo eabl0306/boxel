@@ -3,7 +3,8 @@
 - Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
   medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060, y las
   luces dinámicas: ADR 0062).
-  Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061)
+  Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061), y el
+  cielo de color las secciones 4 a 6 y 8 (ADR 0064).
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -164,6 +165,13 @@ hasta el plano de su reino. Las celdas del rayo son cielo directo, igual que las
 columna de chunks los guarda aparte un `BeamTile`, calculado desde el contenido como `T`: el
 streaming tampoco los cambia.
 
+**Cielo de color (ADR 0064).** Con `WorldSettings::colored_sky`, el tile también guarda por
+columna los filtros (vidrio de color, opacidad 0) que están sobre `T`, del más alto al más bajo
+(`SkyTile::tints`). Los encuentra `sky_tile::walk_colored` en la misma caminata, y `raise`,
+`rescan_column` y `set_filter` los mantienen en las ediciones. `T` no cambia. Un tile sin vidrio
+sobre sus techos no guarda nada, y `walk` da el tile de siempre. `beam_tile::build_colored` guarda
+igual las celdas con filtro de cada rayo.
+
 ### 5. Caja exacta por chunk (P1, hecho; corre dentro del job de malla desde P3)
 
 `boxel_light::compute` calcula la luz del chunk acolchado (local -1 a 32, lo que lee el mesher):
@@ -197,6 +205,15 @@ streaming tampoco los cambia.
   `ChunkLight` (la luz del chunk para gameplay: uniforme 0 B, solo cielo 16 KiB o completa
   64 KiB), que el mundo guarda dentro de `light_cache_radius` (8 chunks).
 - `LightScratch` ocupa unos 0.7 MiB por hilo.
+- **Cielo de color (ADR 0064).** Con `LightInput::colored_sky`, una caja donde un filtro puede
+  teñir el cielo (vóxeles con filtro en sus chunks, tintes de sus tiles en o sobre su fondo, o un
+  rayo teñido que la cruza) corre, además de la inundación del cielo de siempre, una por canal
+  del cielo que filtra como la luz de bloque. Los vóxeles directos bajo un tinte son fuentes a su
+  nivel filtrado y quedan abiertos. Sale `PaddedLight::Colored` (154 KiB: la luz de siempre y el
+  cielo RGB) solo si algún vóxel quedó teñido, y `ChunkLight::Colored` (128 KiB) si el tinte está
+  dentro del chunk. Los 16 bits de siempre llevan el cielo sin teñir, que es lo que lee el
+  gameplay. `FastOpen` pide además que no haya tintes sobre el chunk acolchado. El scratch de
+  color (unos 0,7 MiB más) se crea en la primera caja teñida. Las demás cajas no cambian.
 
 ### 6. Malla: `PackedQuad` v2 con paleta de luz (P2, hecho)
 
@@ -236,6 +253,11 @@ streaming tampoco los cambia.
 - La política es `WorldSettings::ao_policy`. Como el AO lee vecinos de arista y esquina, una
   edición remalla todo chunk cuya región acolchada contiene el vóxel (hasta 8), no solo los
   vecinos de cara.
+- **Cielo de color (ADR 0064, carril C3, por construir).** La entrada sigue en 8 bytes. Un chunk
+  teñido suma entradas teñidas antes de las normales: 4 esquinas de un tipo de luz (cielo RGB o
+  bloque), el otro tipo plano para la cara y un bit que dice cuál. `ChunkMesh::tinted_entries`
+  dice cuántas son. Un chunk sin entradas teñidas queda igual byte a byte. Hasta el C3, el mesher
+  lee de `PaddedLight::Colored` solo la luz de siempre.
 
 ### 7. Mundo (P3, hecho)
 
@@ -364,6 +386,12 @@ de gameplay.
   elegida por el vóxel de delante de cada cara. `face_shade` lee su factor de esa entrada en vez
   del valor fijo. Por defecto son los valores de hoy (1.0 arriba, 0.5 abajo, 0.8 en x, 0.65 en
   z; ambiente 0.02 en los tres canales), así un mundo de un reino da los mismos píxeles.
+- **Cielo de color (ADR 0064, carril C4, por construir).** Ningún buffer, binding, uniform ni
+  vertex buffer nuevo. High y Mid leen la cuenta de entradas teñidas de `ChunkGpu.flags` (bits 7
+  a 19), Low de `ChunkImmediate.origin.w`. Un bit plano elige la decodificación (no en
+  `VsOut::ao`: sus bits 16 a 31 son la máscara de luces dinámicas de ADR 0062; el C4 elige dónde) y
+  `voxel_light` multiplica cada canal del cielo por el color del cielo. High dibuja exactas las
+  caras con cielo teñido y luz de bloque variando a la vez; Low y Mid las aplanan.
 
 ### 9. Día y noche (P5, hecho)
 
