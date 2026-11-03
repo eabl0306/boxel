@@ -643,3 +643,12 @@ Cada una trae lo que recomiendo. Con un "sí" a todo, se construye como dice el 
 8. **Una fuente de cielo bajo roca, en un reino con sol, se ve con sombra en High** (un 40 % más
    oscura que hoy). **¿Está bien?** Recomiendo: sí. Un reino caverna con su propia curva no tiene
    sol y se ve igual que hoy.
+
+## 10. Decisiones del dueño (2026-11-03)
+
+El dueño acepta las ocho recomendaciones de la sección 9 tal cual. Se construye como dice el plan:
+apagadas en el motor y prendidas por el juego (apagadas en GPU integradas salvo que el jugador las
+pida), sombra que baja la luz del cielo un 40 %, paredes de espaldas al sol en sombra con paso
+suave, sol inclinado 30 grados, 160 bloques con desvanecido, sombra de bloques, hojas, entidades y
+carteles (no de vidrio, agua ni plantas chicas, y sin tinte), sin luna, y fuentes de cielo bajo roca
+con sombra en reinos con sol.
