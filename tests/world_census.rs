@@ -109,6 +109,7 @@ const APP_WIDE: &[&str] = &[
     "boxel_window::input::CursorPosition",
     "boxel_world::daylight::DaylightCurve",
     "boxel_world::daylight::RealmLighting",
+    "boxel_world::daylight::SunPath",
     "boxel_world::daylight::TimeOfDay",
     "boxel_world::lifecycle::WorldEpoch",
     "boxel_world::lifecycle::WorldGarbage",
