@@ -17,6 +17,8 @@
 //! | `beam_tile/build_loaded` (the cave's column, 19 layers loaded with masks, sources under every cave roof) | 20 to 60 us |
 //! | `beam_tile/build_loaded_cold_masks` (the same, masks not built yet: each layer with a source builds them) | none |
 //! | `beam_tile/build_generate` (the same column, every layer generated and decorated) | 22 to 60 us per layer, plus generation |
+//! | `light/point_cave` (ADR 0063: a torch in the air nearest the center of `box_cave_lamps_rgb`, added to its light) | none (part of a mesh job near the light) |
+//! | `light/point_surface` (a torch 2 blocks over the ground at the center of `box_surface`) | none |
 //!
 //! The box benches run with the chunk masks cached (each chunk's masks are built once and
 //! shared by the 27 boxes that read it); `light/box_surface_cold_masks` builds them too.
@@ -27,10 +29,13 @@ mod scenes;
 use boxel_demo::worldgen::OverworldGenerator;
 use boxel_light::box_light::{MARGIN, tile_index};
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
-use boxel_light::{BeamTile, LayerData, LightPath, LightScratch, PaddedLight, beam_tile, compute};
+use boxel_light::{
+    BeamTile, LayerData, LightPath, LightScratch, PaddedLight, PointEmitter, PointScratch,
+    add_point_lights, beam_tile, compute,
+};
 use boxel_voxel::{
-    BeamDir, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos, LightTables,
-    LocalPos, SkySourceDef,
+    BeamDir, BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
+    LightTables, LocalPos, SkySourceDef,
 };
 use boxel_worldgen::WorldGenerator;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -129,6 +134,25 @@ fn bench(c: &mut Criterion) {
             b.iter(|| compute(black_box(&input), &mut scratch, &mut out));
         });
     }
+    // A torch (ADR 0063) in each: the flood a mesh job near it adds to the box's light.
+    for (name, n, light) in [
+        ("point_cave", &cave, nearest_air(&cave)),
+        ("point_surface", &surface, over_ground(&surface)),
+    ] {
+        let input = n.input(&tables);
+        compute(&input, &mut scratch, &mut out);
+        let base = out.clone();
+        let torch = [PointEmitter::new(light, [14, 11, 6])];
+        let mut points = PointScratch::new();
+        eprintln!("{name}: torch at {light:?}");
+        g_light.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || base.clone(),
+                |lit| add_point_lights(black_box(&input), &torch, &mut points, lit),
+                BatchSize::SmallInput,
+            );
+        });
+    }
     g_light.bench_function("box_surface_cold_masks", |b| {
         b.iter_batched(
             // A clone starts without masks.
@@ -204,6 +228,43 @@ fn bench(c: &mut Criterion) {
 }
 
 /// The demo blocks plus `test:sky_source` (ADR 0061), and its down state of range `range`.
+/// The air voxel of the center chunk of `n` nearest its center.
+fn nearest_air(n: &Neighborhood) -> BlockPos {
+    let center = &n.chunks[13];
+    let o = n.origin.origin();
+    (0..CHUNK_VOLUME)
+        .map(LocalPos::from_index)
+        .filter(|&p| center.get(p).is_air())
+        .min_by_key(|p| {
+            let d = |c: u32| (i64::from(c) - 16).abs();
+            d(p.x()) + d(p.y()) + d(p.z())
+        })
+        .map(|p| {
+            let [x, y, z] = [p.x(), p.y(), p.z()].map(i64::from);
+            BlockPos::new(o.x + x, o.y + y, o.z + z)
+        })
+        .expect("an air voxel")
+}
+
+/// Two blocks over the highest non-air voxel of the center column of `n`.
+fn over_ground(n: &Neighborhood) -> BlockPos {
+    let o = n.origin.origin();
+    for dy in [1, 0, -1] {
+        let chunk = &n.chunks[boxel_light::box_light::chunk_index(0, dy, 0)];
+        if let Some(y) = (0..32)
+            .rev()
+            .find(|&y| !chunk.get(LocalPos::new(16, y, 16)).is_air())
+        {
+            return BlockPos::new(
+                o.x + 16,
+                o.y + i64::from(dy) * 32 + i64::from(y) + 2,
+                o.z + 16,
+            );
+        }
+    }
+    BlockPos::new(o.x + 16, o.y + 16, o.z + 16)
+}
+
 fn source_registry(range: u16) -> (BlockRegistry, BlockState) {
     let mut b = boxel_demo::blocks::builder();
     boxel_voxel::testing::add_sky_source(&mut b).expect("test:sky_source");

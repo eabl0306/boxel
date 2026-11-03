@@ -17,6 +17,9 @@
 //!   chunks.
 //! - [`PaddedLight`]: that result, in the mesher's padded order; [`ChunkLight`]: the chunk's
 //!   own 32^3 light, compressed, for gameplay queries.
+//! - [`point_light`]: point lights that are not blocks (a torch in the hand, ADR 0063), flooded
+//!   with the same rules and added to a padded light by the brightest per channel: the light of
+//!   an emitter placed at their voxel.
 //! - `oracle` (feature `oracle`): a scalar global solver over an explicit world, the reference
 //!   the tests compare against.
 //!
@@ -32,10 +35,12 @@ mod chunk_light;
 #[cfg(any(test, feature = "oracle"))]
 pub mod oracle;
 mod padded;
+pub mod point_light;
 pub mod sky_tile;
 
 pub use beam_tile::{Beam, BeamTile, Retrace};
 pub use box_light::{LightInput, LightPath, LightScratch, SkyInput, compute, compute_full};
 pub use chunk_light::ChunkLight;
 pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedLight};
+pub use point_light::{PointEmitter, PointScratch, add_point_lights};
 pub use sky_tile::{LayerData, Rescan, SkyTile};
