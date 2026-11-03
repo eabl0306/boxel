@@ -2,9 +2,9 @@
 
 - Estado: aceptado (issue #11, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/colored-sky-plan.md`) el 2026-11-02, con sus respuestas a las preguntas abiertas
-  (sección 11 del plan). Se construye por carriles (sección 7 del plan). Hechos: el C0 (este ADR)
-  y el C1 (la luz, en `boxel_light`). Faltan el C2 (mundo), el C3 (malla), el C4 (render y
-  shaders) y el C5 (depuración, demo y herramientas).
+  (sección 11 del plan). Se construye por carriles (sección 7 del plan). Hechos: el C0 (este ADR),
+  el C1 (la luz, en `boxel_light`) y el C2 (el mundo, en `boxel_world`). Faltan el C3 (malla), el
+  C4 (render y shaders) y el C5 (depuración, demo y herramientas).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -203,6 +203,25 @@ Lo que cambió respecto del plan:
 Para el C2: el gameplay ya lee el cielo sin teñir. `ChunkMap::light_at`, `TickContext::light` y
 `brightness` leen `ChunkLight::get`, que lo da en todas las formas: no hay que cambiar nada ahí.
 Para la imagen y F3 está `ChunkLight::sky_rgb` (el futuro `ChunkMap::sky_rgb_at`).
+
+### 10. Carril C2: cómo quedó
+
+- Con `colored_sky` prendido, las caminatas, los tiles de rayos y `Reference` usan
+  `walk_colored` y `build_colored`. Bajo el rango del generador, un chunk cargado con solo vidrio
+  también cuenta como contenido. `SkyMap::open` guarda tintes, para que una edición le agregue
+  uno.
+- Ediciones: un filtro de opacidad 0 puesto, cambiado o quitado sobre `T` llama a `set_filter` y
+  remallea, en el mismo lote, la franja de su columna de 14 bajo `T` a 14 sobre el filtro. Bajo
+  `T` alcanza el radio de luz de la edición (el arreglo de 24eeb56). `edit_top` sube también con
+  los filtros. Un filtro cambiado en un rayo lo retiñe en el lugar.
+- Lo que no estaba en el plan: cuando un tile caminado de nuevo aterriza (una columna pendiente,
+  o un chunk editado que se descarga sin persistencia), la franja que se remallea cuenta también
+  las columnas cuyos tintes cambiaron, y lo mismo al aterrizar un tile de rayos.
+- Nuevos: `ChunkMap::sky_rgb_at`, `SkyMap::colored_sky`, `Reference::mesh_light` y, en
+  `WorldStats`, `colored_light_boxes`, `colored_padded` y `colored_chunk_light` (desde el inicio).
+- Las luces dinámicas horneadas (ADR 0063) siguen iguales sobre las cajas teñidas.
+- Límite: con `SkyRule::Open` (un generador que no declara su techo) no hay tiles, así que el
+  vidrio no tiñe el cielo.
 
 ## Medidas
 

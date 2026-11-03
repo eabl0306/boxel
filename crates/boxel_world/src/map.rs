@@ -225,6 +225,15 @@ pub struct WorldStats {
     pub waiting_beams: usize,
     /// Light boxes of mesh jobs that had a beam tile with beams, since start.
     pub light_beam_boxes: usize,
+    /// Light boxes of mesh jobs that took the colored sky path (ADR 0064: a light filter may
+    /// tint their sky), since start. Always 0 with `WorldSettings::colored_sky` off.
+    pub colored_light_boxes: usize,
+    /// Of those, the boxes whose padded light came out colored (some voxel's sky is tinted;
+    /// 154 KiB instead of 77), since start.
+    pub colored_padded: usize,
+    /// Chunk lights kept for gameplay (mesh and light jobs within
+    /// `WorldSettings::light_cache_radius`) in the colored form (128 KiB), since start.
+    pub colored_chunk_light: usize,
     /// Edit batches whose meshes were held back so they publish together, since start.
     pub edit_batches_held: usize,
     /// Edit batches published in parts because some meshes took longer than
@@ -530,6 +539,15 @@ impl ChunkMap {
         let (chunk, local) = p.split();
         let light = self.slots.get(self.id_at(chunk)?)?.light()?;
         Some(light.get(local))
+    }
+    /// Sky light `[red, green, blue]` at a world position, as [`ChunkMap::light_at`] keeps it:
+    /// tinted by the light filters it went through with colored sky (ADR 0064), else the sky
+    /// level of [`ChunkMap::light_at`] three times. For the picture and debugging: gameplay reads
+    /// the uncolored sky of [`ChunkMap::light_at`].
+    pub fn sky_rgb_at(&self, p: BlockPos) -> Option<[u8; 3]> {
+        let (chunk, local) = p.split();
+        let light = self.slots.get(self.id_at(chunk)?)?.light()?;
+        Some(light.sky_rgb(local))
     }
     /// Number of slots.
     pub fn len(&self) -> usize {

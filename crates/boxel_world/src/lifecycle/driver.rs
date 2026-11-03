@@ -270,7 +270,7 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
     {
         let mut sky = world.resource_mut::<SkyMap>();
         sky.rule = rule;
-        sky.colored_sky = settings.colored_sky;
+        sky.set_colored_sky(settings.colored_sky);
     }
     {
         let mut jobs = world.resource_mut::<WorldJobs>();

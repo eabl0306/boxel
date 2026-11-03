@@ -10,13 +10,22 @@ use proptest::prelude::*;
 use std::sync::OnceLock;
 
 /// [`golden_digest`] on `main` before sky sources (4eeb410).
-const MAIN: u64 = 0x4308_db9a_f635_9758;
+pub(super) const MAIN: u64 = 0x4308_db9a_f635_9758;
 
 /// The meshes of a small overworld view, before and after a few edits (stone, air, leaves,
 /// lamps), folded into one number.
 fn golden_digest(registry: Arc<BlockRegistry>, lamps: [BlockState; 2]) -> (u64, App) {
+    golden_digest_with(registry, lamps, small())
+}
+
+/// [`golden_digest`] with `settings`.
+pub(super) fn golden_digest_with(
+    registry: Arc<BlockRegistry>,
+    lamps: [BlockState; 2],
+    settings: WorldSettings,
+) -> (u64, App) {
     let leaves = registry.by_name("boxel:leaves").expect("leaves");
-    let mut app = lit_app(overworld(), registry, small(), Arc::new(InlineExecutor));
+    let mut app = lit_app(overworld(), registry, settings, Arc::new(InlineExecutor));
     spawn(&mut app, ChunkPos::new(0, 2, 0), 2, 2);
     settle(&mut app);
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
@@ -66,20 +75,20 @@ fn a_world_without_sources_is_the_world_before_them() {
 }
 
 /// Runs held jobs in an order of its seed: a few per call, each picked at random.
-struct ShuffleExecutor {
+pub(super) struct ShuffleExecutor {
     rng: Mutex<u64>,
     jobs: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl ShuffleExecutor {
-    fn new(seed: u64) -> Arc<Self> {
+    pub(super) fn new(seed: u64) -> Arc<Self> {
         Arc::new(Self {
             rng: Mutex::new(seed | 1),
             jobs: Mutex::default(),
         })
     }
     /// Runs up to `n` held jobs (the jobs they make the world spawn wait for the next call).
-    fn run(&self, n: usize) {
+    pub(super) fn run(&self, n: usize) {
         for _ in 0..n {
             let job = {
                 let mut jobs = self.jobs.lock().expect("lock");

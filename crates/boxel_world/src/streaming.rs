@@ -163,6 +163,8 @@ pub(crate) enum JobMessage {
         beams: bool,
         /// Dynamic lights baked into the mesh's light (ADR 0063).
         points: usize,
+        /// The box's padded light came out colored (ADR 0064).
+        colored: bool,
     },
     /// A light job finished.
     Lit {
@@ -857,6 +859,9 @@ impl WorldJobs {
         stats.beam_private_generations = c.beam_private_generations;
         stats.waiting_beams = c.waiting_beams;
         stats.light_beam_boxes = c.light_beam_boxes;
+        stats.colored_light_boxes = c.colored_light_boxes;
+        stats.colored_padded = c.colored_padded;
+        stats.colored_chunk_light = c.colored_chunk_light;
         stats.edit_batches_held = c.edit_batches_held;
         stats.edit_batches_split = c.edit_batches_split;
         stats.light_fanout = c.light_fanout;
@@ -2020,7 +2025,10 @@ impl WorldJobs {
     ///   every loaded chunk whose padded region meets the column's band: 14 voxels around the
     ///   column, from 14 under the lower of the two tops to 14 over the higher. A removed top
     ///   whose next blocker is not in the loaded data sends the column back to a walk: the
-    ///   chunks around it are remeshed when the new tile lands.
+    ///   chunks around it are remeshed when the new tile lands;
+    /// - with colored sky (ADR 0064), when a light filter of opacity 0 is placed, changed or
+    ///   removed above its column's top: the same band, from 14 under the top to 14 over the
+    ///   filter (it tints the direct sky between them).
     ///
     /// Edits to chunks that are not `Ready` are dropped.
     ///
@@ -2199,28 +2207,49 @@ impl WorldJobs {
                 cx.map.set_shown(id, false);
             }
         }
-        // 3. The sky tops, from the new data.
+        // 3. The sky tops, from the new data, and with colored sky (ADR 0064) the light filters
+        // above them.
         let batch = self.new_batch();
         let walked = matches!(cx.sky.rule, SkyRule::Walk(_));
+        let tints = walked && cx.sky.colored_sky && tables.any_filter();
+        let retints = |old: BlockState, new: BlockState| {
+            tints && tables.light_filter(old) != tables.light_filter(new)
+        };
         for &(id, local, old, state) in &changes {
             let (placed, removed) = (tables.blocks_sky(state), tables.blocks_sky(old));
-            if !walked || placed == removed {
+            if !walked || (placed == removed && (placed || !retints(old, state))) {
                 continue;
             }
             let p = BlockPos::from_parts(cx.map.slots[id].pos, local);
             cx.map.slots[id].set_sky_edited();
-            if let Some(band) = self.sky_edit(cx, p, placed, batch) {
+            if tints && !placed && tables.filters(state) {
+                // A walk must start at or above every filter (`SkyColumn::edit_top`).
+                if let Some(col) = cx.sky.id_at(p.x >> CHUNK_SHIFT, p.z >> CHUNK_SHIFT) {
+                    let c = &mut cx.sky.columns[col];
+                    c.edit_top = c.edit_top.max(p.y);
+                }
+            }
+            let band = if placed == removed {
+                // A light filter of opacity 0 placed, removed or changed.
+                let filter = tables.filters(state).then(|| tables.light_filter(state));
+                self.tint_edit(cx, p, filter, batch)
+            } else {
+                self.sky_edit(cx, p, placed, batch)
+            };
+            if let Some(band) = band {
                 band_chunks(cx.map, cx.sky, &band, &mut remesh);
             }
         }
         // 3b. The beams of the sky sources (ADR 0061), from the new data: one retrace per
-        // position, with its final state.
+        // position, with its final state. With colored sky, a filter changed in a beam retints
+        // it.
         if walked && tables.any_sky_source() {
             for change in &changed {
                 let (old, new) = (change.old, change.new);
                 if tables.is_sky_source(old)
                     || tables.is_sky_source(new)
                     || tables.blocks_sky(old) != tables.blocks_sky(new)
+                    || retints(old, new)
                 {
                     self.beam_edit(cx, change.pos, new, batch, &mut remesh);
                 }
@@ -2315,6 +2344,42 @@ impl WorldJobs {
                 None
             }
         }
+    }
+
+    /// The voxel at `p`, of opacity 0 before and after, now holds the light filter `filter`
+    /// (`None`: none), with colored sky (ADR 0064): above its column's top it tints the direct
+    /// sky under it, so the tile's tints change ([`SkyTile::set_filter`]). Returns the band to
+    /// remesh, from 14 under the top to 14 over the filter; `None` when nothing changed (at or
+    /// below the top the light reach of the edit covers the change), or when the tile is not
+    /// walked yet (the walk being discarded, as in [`WorldJobs::sky_edit`]).
+    fn tint_edit(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        p: BlockPos,
+        filter: Option<[u8; 3]>,
+        batch: u32,
+    ) -> Option<[RangeInclusive<i64>; 3]> {
+        let SkyRule::Walk(rule) = &cx.sky.rule else {
+            return None;
+        };
+        // Walks keep no filter at or under the floor.
+        if p.y <= rule.floor {
+            return None;
+        }
+        let (chunk, local) = p.split();
+        let col = cx.sky.id_at(chunk.x, chunk.z)?;
+        let c = &mut cx.sky.columns[col];
+        let SkyState::Exact(tile) = &mut c.state else {
+            c.version = c.version.wrapping_add(1);
+            c.batch = Some(batch);
+            return None;
+        };
+        let (lx, lz) = (local.x(), local.z());
+        let top = tile.top(lx, lz);
+        if p.y <= top || !Arc::make_mut(tile).set_filter(lx, lz, p.y, filter) {
+            return None;
+        }
+        Some(sky_band(p.x, p.z, top, p.y))
     }
 
     /// The voxel at `p` became `state` (after every edit of the call is in the data), a change
@@ -2795,6 +2860,7 @@ impl WorldJobs {
                         faces,
                         beams: false,
                         points: 0,
+                        colored: false,
                     };
                 };
                 // The 27 chunks in `boxel_light::box_light::chunk_index` order: the
@@ -2821,6 +2887,7 @@ impl WorldJobs {
                         faces,
                         beams: has_beams,
                         points,
+                        colored: blocks.is_colored(),
                     }
                 })
             },
@@ -2941,6 +3008,7 @@ impl WorldJobs {
             saved: saved_in,
             saved_below,
             store,
+            colored: cx.sky.colored_sky,
         };
         let cancel = Arc::clone(&c.cancel);
         let generator = Arc::clone(&cx.content.generator);
@@ -3245,6 +3313,7 @@ impl WorldJobs {
             air_below,
             saved,
             store,
+            colored: cx.sky.colored_sky,
         };
         let cancel = Arc::clone(&c.cancel);
         let generator = Arc::clone(&cx.content.generator);
@@ -3411,12 +3480,20 @@ impl WorldJobs {
                     faces,
                     beams,
                     points,
+                    colored,
                 } => {
                     self.auto_cap.observe_job(busy);
                     self.light_counts.light_beam_boxes += usize::from(beams);
                     self.point_counts.boxes += usize::from(points > 0);
+                    self.light_counts.colored_padded += usize::from(colored);
+                    self.light_counts.colored_chunk_light +=
+                        usize::from(light.as_ref().is_some_and(ChunkLight::is_colored));
                     match path {
-                        Some(LightPath::Full { .. }) => self.light_counts.light_full += 1,
+                        Some(LightPath::Full { colored_pops, .. }) => {
+                            self.light_counts.light_full += 1;
+                            self.light_counts.colored_light_boxes +=
+                                usize::from(colored_pops.is_some());
+                        }
                         Some(LightPath::FastDark | LightPath::FastOpen) => {
                             self.light_counts.light_fast += 1;
                         }
@@ -3444,6 +3521,7 @@ impl WorldJobs {
                 } => {
                     self.auto_cap.observe_job(busy);
                     self.light_counts.light_jobs += 1;
+                    self.light_counts.colored_chunk_light += usize::from(light.is_colored());
                     self.on_lit(cx, id, data_version, epoch, light);
                 }
                 JobMessage::Walked {
@@ -3579,7 +3657,15 @@ impl WorldJobs {
                 else {
                     return;
                 };
-                self.land_beams(cx, col, Arc::new(BeamTile::empty(window.0..=window.1)));
+                let window = window.0..=window.1;
+                let empty = if cx.sky.colored_sky {
+                    // Empty, but keeping the filter cells of the beams edits may add.
+                    let tables = &cx.content.light_tables;
+                    boxel_light::beam_tile::build_colored(window, &[], tables, |_| LayerData::Air)
+                } else {
+                    BeamTile::empty(window)
+                };
+                self.land_beams(cx, col, Arc::new(empty));
                 return;
             }
             JobId::Column(col) => {
@@ -3818,16 +3904,30 @@ fn light_priority(priority: u32) -> u32 {
 
 /// The voxels whose light a change of sky tops from `old` to `new` (column `(x, z)`) can reach:
 /// the columns whose top moved, +-14 horizontally, from 14 under the lower of the two tops to 14
-/// over the higher. `None` if no top moved.
+/// over the higher. With colored sky (ADR 0064), a column whose tints differ counts up to its
+/// highest tint in either tile: they tint the direct sky down to the top. `None` if no top
+/// moved and no tint changed.
 fn changed_band(old: &SkyTile, new: &SkyTile, x: i64, z: i64) -> Option<[RangeInclusive<i64>; 3]> {
+    let tinted = old.tint_count() > 0 || new.tint_count() > 0;
     let mut band: Option<[(i64, i64); 3]> = None;
     for (i, (&a, &b)) in old.tops().iter().zip(new.tops()).enumerate() {
-        if a == b {
+        let (lx, lz) = ((i >> CHUNK_SHIFT) as u32, (i & 31) as u32);
+        let retinted = tinted && old.tints(lx, lz) != new.tints(lx, lz);
+        if a == b && !retinted {
             continue;
         }
         let wx = (x << CHUNK_SHIFT) + (i >> CHUNK_SHIFT) as i64;
         let wz = (z << CHUNK_SHIFT) + (i & 31) as i64;
-        let (lo, hi) = (a.min(b).saturating_add(1), a.max(b));
+        let (lo, mut hi) = (a.min(b).saturating_add(1), a.max(b));
+        if retinted {
+            // Each column's tints are highest first.
+            for t in [old.tints(lx, lz).first(), new.tints(lx, lz).first()]
+                .into_iter()
+                .flatten()
+            {
+                hi = hi.max(t.y);
+            }
+        }
         let r = band.get_or_insert([(wx, wx), (lo, hi), (wz, wz)]);
         for (axis, (l, h)) in r.iter_mut().zip([(wx, wx), (lo, hi), (wz, wz)]) {
             axis.0 = axis.0.min(l);

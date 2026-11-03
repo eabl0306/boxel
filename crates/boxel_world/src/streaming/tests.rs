@@ -85,6 +85,24 @@ impl Harness {
         self
     }
 
+    /// The same world with the blocks of `registry` (before anything is loaded).
+    fn with_registry(mut self, registry: Arc<BlockRegistry>) -> Self {
+        assert!(self.map.is_empty(), "blocks are chosen before streaming");
+        self.content = WorldContent::new(Arc::clone(&self.content.generator), registry);
+        self
+    }
+
+    /// The same lit world with colored sky (ADR 0064, before anything is loaded).
+    fn colored(mut self) -> Self {
+        assert!(
+            self.map.is_empty(),
+            "colored sky is chosen before streaming"
+        );
+        self.settings.colored_sky = true;
+        self.sky.set_colored_sky(true);
+        self
+    }
+
     fn with<R>(&mut self, f: impl FnOnce(&mut WorldJobs, &mut Ctx<'_>, &WorldSettings) -> R) -> R {
         let mut cx = Ctx::new(
             &mut self.map,

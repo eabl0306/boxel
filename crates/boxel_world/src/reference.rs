@@ -5,11 +5,12 @@
 //! incremental update, no fast path of the world (every box gets its 9 tiles, even under the
 //! walk floor, and its 9 beam tiles, without the gate). A settled world's meshes must equal
 //! these, with the dynamic lights the world bakes given to [`Reference::with_points`] (ADR 0063).
-//! Slow: every tile is a fresh walk, every beam tile a fresh build for one box.
+//! With colored sky (ADR 0064) the tiles keep their tints and the light its sky channels, as the
+//! world's do. Slow: every tile is a fresh walk, every beam tile a fresh build for one box.
 use crate::beams::box_rows;
-use crate::sky::{SkyRule, may_block};
+use crate::sky::{SkyRule, may_block, may_shade};
 use crate::{ChunkMap, ChunkSlot, DataState, SkyMap, WorldContent};
-use boxel_light::sky_tile::walk;
+use boxel_light::sky_tile::{walk, walk_colored};
 use boxel_light::{
     BeamTile, LayerData, LightInput, LightScratch, PaddedLight, PointEmitter, PointScratch,
     SkyInput, SkyTile,
@@ -57,9 +58,9 @@ impl<'w> Reference<'w> {
     }
 
     /// The sky tile of chunk column `(cx, cz)`, walked from scratch: from the generator's top
-    /// or the highest blocker of a loaded chunk above it, through the loaded chunks (and the
-    /// generator where none is loaded). `None` when the world has no sky tops (light off, or
-    /// every column open).
+    /// or the highest blocker (or light filter, with colored sky) of a loaded chunk above it,
+    /// through the loaded chunks (and the generator where none is loaded). `None` when the world
+    /// has no sky tops (light off, or every column open).
     pub fn tile(&mut self, cx: i64, cz: i64) -> Option<Arc<SkyTile>> {
         let SkyRule::Walk(rule) = &self.sky.rule else {
             return None;
@@ -68,6 +69,8 @@ impl<'w> Reference<'w> {
             return Some(Arc::clone(tile));
         }
         let tables = &self.content.light_tables;
+        let colored = self.sky.colored_sky;
+        let shades = |s| tables.blocks_sky(s) || (colored && tables.filters(s));
         let loaded: BTreeMap<i64, &DataState> = self
             .map
             .iter()
@@ -78,7 +81,7 @@ impl<'w> Reference<'w> {
             DataState::Ready(d) => Some(Arc::clone(d)),
             _ => None,
         };
-        // The highest blocker of a loaded chunk above the generator's range.
+        // The highest blocker (or filter) of a loaded chunk above the generator's range.
         let above = |cy: i64| rule.layers.is_empty() || cy > *rule.layers.end();
         let edit_top = loaded
             .iter()
@@ -87,13 +90,14 @@ impl<'w> Reference<'w> {
             .find_map(|(&cy, data)| {
                 let d = ready(data)?;
                 let top = (0..32u32).rev().find(|&ly| {
-                    (0..32)
-                        .any(|x| (0..32).any(|z| tables.blocks_sky(d.get(LocalPos::new(x, ly, z)))))
+                    (0..32).any(|x| (0..32).any(|z| shades(d.get(LocalPos::new(x, ly, z)))))
                 })?;
                 Some((cy << CHUNK_SHIFT) + i64::from(top))
             })
             .unwrap_or(i64::MIN);
+        let walk = if colored { walk_colored } else { walk };
         let tile = match rule.start(edit_top) {
+            None if colored => SkyTile::uniform(i64::MIN, i64::MIN).with_colored_sky(),
             None => SkyTile::uniform(i64::MIN, i64::MIN),
             Some(start) => {
                 let (content, layers) = (self.content, &rule.layers);
@@ -112,13 +116,21 @@ impl<'w> Reference<'w> {
                         };
                     }
                     // Under the generator only content counts: a layer is void when no loaded
-                    // chunk at or under it holds a blocker.
-                    if let Some(d) = here.filter(|d| may_block(d, tables)) {
+                    // chunk at or under it holds a blocker (or a filter above the floor, where
+                    // walks keep tints).
+                    if let Some(d) = here.filter(|d| may_shade(d, tables, colored)) {
                         return LayerData::Shared(d);
                     }
-                    let lower = loaded
-                        .range(..cy)
-                        .any(|(_, d)| ready(d).is_some_and(|d| may_block(&d, tables)));
+                    let floor = rule.floor >> CHUNK_SHIFT;
+                    let lower = loaded.range(..cy).any(|(&c, d)| {
+                        ready(d).is_some_and(|d| {
+                            if c >= floor {
+                                may_shade(&d, tables, colored)
+                            } else {
+                                may_block(&d, tables)
+                            }
+                        })
+                    });
                     if lower {
                         LayerData::Air
                     } else {
@@ -171,7 +183,12 @@ impl<'w> Reference<'w> {
             }
         }
         let planes = content.generator.realms().planes();
-        let tile = boxel_light::beam_tile::build(lo..=hi, planes, &content.light_tables, |cy| {
+        let build = if self.sky.colored_sky {
+            boxel_light::beam_tile::build_colored
+        } else {
+            boxel_light::beam_tile::build
+        };
+        let tile = build(lo..=hi, planes, &content.light_tables, |cy| {
             chunks
                 .get(&cy)
                 .and_then(Option::as_ref)
@@ -187,6 +204,12 @@ impl<'w> Reference<'w> {
     /// `None` with light off.
     pub fn light(&mut self, pos: ChunkPos) -> Option<PaddedLight> {
         self.light_with(pos, false)
+    }
+
+    /// The light [`Reference::mesh`] meshes the chunk at `pos` with: [`Reference::light`] plus
+    /// the dynamic lights of [`Reference::with_points`].
+    pub fn mesh_light(&mut self, pos: ChunkPos) -> Option<PaddedLight> {
+        self.light_with(pos, true)
     }
 
     /// [`Reference::light`], with the dynamic lights of [`Reference::with_points`] when
@@ -211,7 +234,7 @@ impl<'w> Reference<'w> {
             sky: SkyInput::Tiles(std::array::from_fn(|i| &*tiles[i])),
             beams: std::array::from_fn(|i| beams[i].as_deref()),
             tables: &self.content.light_tables,
-            colored_sky: false,
+            colored_sky: self.sky.colored_sky,
         };
         let mut out = PaddedLight::default();
         boxel_light::compute_full(&input, &mut self.scratch, &mut out);

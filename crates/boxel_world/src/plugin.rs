@@ -171,8 +171,9 @@ pub struct WorldSettings {
     pub light_cache_radius: u32,
     /// Colored sky (ADR 0064): light filters (colored glass, ADR 0060) tint the sky light too,
     /// so a red pane lights a room red by day. Gameplay still reads the uncolored sky
-    /// (`ChunkMap::light_at`, the ticks). Off by default; the game turns it on. Read when the
-    /// world starts. Off, every light box is bit for bit the one of before.
+    /// (`ChunkMap::light_at`, the ticks); `ChunkMap::sky_rgb_at` gives the tinted one. Off by
+    /// default; the game turns it on. Read when the world starts. Off, every sky tile and light
+    /// box is bit for bit the one of before.
     pub colored_sky: bool,
     /// How long the finished meshes of one edit batch wait for the rest of the batch before
     /// they are published anyway (zero: no wait). A batch is published as soon as its last mesh

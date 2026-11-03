@@ -13,7 +13,7 @@ use crate::ChunkId;
 use crate::beams::SourceColumn;
 use crate::persist::WorldStore;
 use boxel_ecs::prelude::*;
-use boxel_light::sky_tile::{GeneratorTop, walk, walk_floor};
+use boxel_light::sky_tile::{GeneratorTop, walk, walk_colored, walk_floor};
 use boxel_light::{BeamTile, LayerData, SkyTile};
 use boxel_voxel::{
     CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, DimensionId, LightTables, MAX_CHUNK_COORD,
@@ -131,8 +131,9 @@ pub(crate) struct SkyColumn {
     pub(crate) version: u32,
     /// An edit changed a voxel that stops direct sky in this column.
     pub(crate) edited: bool,
-    /// Highest blocker placed by an edit (`i64::MIN`: none). Never lowered: a stale value only
-    /// makes a walk start higher, through air.
+    /// Highest blocker placed by an edit, or light filter with colored sky (ADR 0064: a walk
+    /// must read every filter above the tops), `i64::MIN`: none. Never lowered: a stale value
+    /// only makes a walk start higher, through air.
     pub(crate) edit_top: i64,
     /// Layers of the column's loaded slots, ascending (one entry per slot). Loops over the
     /// column visit these instead of every layer of a range, which may span `2^56` layers
@@ -211,8 +212,24 @@ impl SkyMap {
     }
     /// The same map with `WorldSettings::colored_sky` (ADR 0064).
     pub(crate) fn with_colored_sky(mut self, on: bool) -> Self {
-        self.colored_sky = on;
+        self.set_colored_sky(on);
         self
+    }
+    /// Sets `WorldSettings::colored_sky` (ADR 0064), before any column exists: tiles then keep
+    /// the light filters above their tops (the open tile too, so an edit can add one to it).
+    pub(crate) fn set_colored_sky(&mut self, on: bool) {
+        debug_assert!(
+            self.columns.is_empty(),
+            "colored sky is set before streaming"
+        );
+        self.colored_sky = on;
+        let open = SkyTile::uniform(i64::MIN, i64::MIN);
+        self.open = Arc::new(if on { open.with_colored_sky() } else { open });
+    }
+    /// True if the world tints the sky through light filters (`WorldSettings::colored_sky`,
+    /// ADR 0064).
+    pub fn colored_sky(&self) -> bool {
+        self.colored_sky
     }
     /// The world computes no light (`WorldSettings::light` off): meshes and ticks see open sky.
     pub(crate) fn light_off(&self) -> bool {
@@ -274,13 +291,14 @@ impl SkyMap {
             SkyRule::Off | SkyRule::Open => None,
         }
     }
-    /// Heap bytes of the tiles (8 KiB each) and the column entries.
+    /// Heap bytes of the tiles (8 KiB each, plus their tints with colored sky) and the column
+    /// entries.
     pub fn heap_bytes(&self) -> usize {
         let tiles = self
             .columns
             .values()
             .filter_map(|c| match &c.state {
-                SkyState::Exact(t) if !Arc::ptr_eq(t, &self.open) => Some(size_of_val(t.tops())),
+                SkyState::Exact(t) if !Arc::ptr_eq(t, &self.open) => Some(t.heap_bytes()),
                 _ => None,
             })
             .sum::<usize>();
@@ -410,6 +428,20 @@ pub(crate) fn may_block(data: &ChunkData, tables: &LightTables) -> bool {
     (0..boxel_voxel::CHUNK_AREA).any(|r| masks.opaque.row(r) | masks.partial.row(r) != 0)
 }
 
+/// True if `data` holds a voxel a sky walk reads: one that stops direct sky, or, with colored
+/// sky (`colored`, ADR 0064), a light filter (a tint above the tops).
+pub(crate) fn may_shade(data: &ChunkData, tables: &LightTables, colored: bool) -> bool {
+    if !colored || !tables.any_filter() {
+        return may_block(data, tables);
+    }
+    if let Some(s) = data.as_uniform() {
+        return tables.blocks_sky(s) || tables.filters(s);
+    }
+    let masks = data.light_masks(tables);
+    !masks.filter.is_empty()
+        || (0..boxel_voxel::CHUNK_AREA).any(|r| masks.opaque.row(r) | masks.partial.row(r) != 0)
+}
+
 /// A sky walk, captured on the main thread and run on a worker.
 pub(crate) struct WalkJob {
     pub(crate) x: i64,
@@ -434,6 +466,8 @@ pub(crate) struct WalkJob {
     pub(crate) saved_below: Vec<i64>,
     /// The world's store, when `saved` or `saved_below` is not empty.
     pub(crate) store: Option<WorldStore>,
+    /// Colored sky (ADR 0064): the tile keeps the light filters above its tops.
+    pub(crate) colored: bool,
 }
 
 impl WalkJob {
@@ -449,6 +483,7 @@ impl WalkJob {
     ) -> (SkyTile, u32) {
         let mut generated = 0;
         self.read_saved(generator, registry, tables, &mut generated);
+        let walk = if self.colored { walk_colored } else { walk };
         let tile = walk(self.start, self.floor, tables, |cy| {
             self.layer(cy, tables, |pos| {
                 generated += 1;
@@ -511,9 +546,9 @@ impl WalkJob {
     }
 
     /// Layer `cy` of the column; `generate` makes a chunk that is not loaded. Under the
-    /// generator's range only content counts: a loaded chunk without a blocker reads like an
-    /// unloaded one, so what is loaded never moves a top (all-air chunks there are loaded or
-    /// not depending on the viewers).
+    /// generator's range only content counts: a loaded chunk without a blocker (or a light
+    /// filter, with colored sky) reads like an unloaded one, so what is loaded never moves a top
+    /// (all-air chunks there are loaded or not depending on the viewers).
     fn layer(
         &self,
         cy: i64,
@@ -541,13 +576,14 @@ impl WalkJob {
             return LayerData::AirUntil(lower.first().map_or(end, |(c, _)| (*c).max(end)));
         }
         if let Some((_, Some(data))) = here
-            && may_block(data, tables)
+            && may_shade(data, tables, self.colored)
         {
             return LayerData::Ref(data);
         }
-        let content = lower
-            .iter()
-            .find(|(_, d)| d.as_deref().is_some_and(|d| may_block(d, tables)));
+        let content = lower.iter().find(|(_, d)| {
+            d.as_deref()
+                .is_some_and(|d| may_shade(d, tables, self.colored))
+        });
         match content {
             Some((c, _)) => LayerData::AirUntil(*c),
             None if self.content_below => {
@@ -651,6 +687,7 @@ mod tests {
             saved: Vec::new(),
             saved_below: Vec::new(),
             store: None,
+            colored: false,
         };
         let (plain, generated) = job(Vec::new()).run(&g, &registry, &tables);
         assert!(generated > 0);
@@ -695,6 +732,7 @@ mod tests {
             saved: Vec::new(),
             saved_below: Vec::new(),
             store: None,
+            colored: false,
         };
         let holed = Arc::new(holed);
         let (open, _) = job(vec![(0, Some(Arc::clone(&holed)))], false).run(&g, &registry, &tables);

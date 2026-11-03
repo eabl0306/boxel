@@ -659,3 +659,104 @@ fn a_sky_source_lights_its_beam() {
     assert!(stats.beam_tiles > 0 && stats.beam_jobs > 0 && stats.light_beam_boxes > 0);
     assert_eq!(stats.waiting_beams, 0);
 }
+
+/// Stone under y = 0, air above.
+struct StoneFloor;
+
+impl WorldGenerator for StoneFloor {
+    fn generate(
+        &self,
+        key: ChunkKey,
+        registry: &boxel_voxel::BlockRegistry,
+    ) -> boxel_voxel::ChunkData {
+        let stone = registry.by_name("boxel:stone").expect("stone");
+        let state = if key.pos.y < 0 {
+            stone
+        } else {
+            BlockState::AIR
+        };
+        boxel_voxel::ChunkData::uniform(state)
+    }
+    fn vertical_chunks(&self) -> std::ops::RangeInclusive<i64> {
+        -2..=0
+    }
+    fn name(&self) -> &str {
+        "stone floor"
+    }
+}
+
+/// Colored sky (ADR 0064) through the public API: a red glass roof placed with edits over a
+/// chunk tints the sky under it in the cached light (`ChunkMap::sky_rgb_at`) while gameplay
+/// reads the uncolored sky (`ChunkMap::light_at`), and the counters see the colored boxes.
+/// With `WorldSettings::colored_sky` off the same roof leaves the sky white.
+#[test]
+fn a_glass_roof_tints_the_sky_with_colored_sky_on() {
+    for colored_sky in [true, false] {
+        let mut b = boxel_demo::blocks::builder();
+        let red = b
+            .add_block(boxel_voxel::BlockDef {
+                name: "test:red_glass".into(),
+                shape: RenderShape::Translucent,
+                model: boxel_voxel::BlockModel::CUBE,
+                collision: boxel_voxel::BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: boxel_voxel::FaceTextures::all(boxel_voxel::TextureId(0)),
+            })
+            .expect("glass");
+        let block = b.block_by_name("test:red_glass").expect("glass");
+        b.set_light_filter(block, [10, 3, 2]).expect("filter");
+        let mut app = App::new();
+        app.add_plugins(WorldPlugin {
+            generator: Arc::new(StoneFloor),
+            registry: Arc::new(b.build()),
+            settings: WorldSettings {
+                colored_sky,
+                ..WorldSettings::default()
+            },
+            executor: Arc::new(InlineExecutor),
+        });
+        app.world_mut().spawn((
+            Transform::from_translation(DVec3::new(16.0, 8.0, 16.0)),
+            ChunkViewer {
+                radius: 2,
+                vertical_radius: 1,
+            },
+        ));
+        settle(&mut app);
+        {
+            let mut queue = app.world_mut().resource_mut::<EditQueue>();
+            for x in 0..32 {
+                for z in 0..32 {
+                    queue.set_block(BlockPos::new(x, 10, z), red);
+                }
+            }
+        }
+        settle(&mut app);
+        let map = app.world().resource::<ChunkMap>();
+        // 16 voxels from the white sky around the roof.
+        let under = BlockPos::new(16, 2, 16);
+        assert_eq!(map.light_at(under).expect("cached").sky(), 15);
+        let stats = *app.world().resource::<WorldStats>();
+        let sky = app.world().resource::<SkyMap>();
+        assert_eq!(sky.colored_sky(), colored_sky);
+        let tints = sky.tile(0, 0).expect("walked").tint_count();
+        if colored_sky {
+            assert_eq!(map.sky_rgb_at(under), Some([13, 7, 6]));
+            assert_eq!(tints, 32 * 32);
+            assert!(stats.colored_light_boxes > 0 && stats.colored_padded > 0);
+            assert!(stats.colored_chunk_light > 0);
+        } else {
+            assert_eq!(map.sky_rgb_at(under), Some([15; 3]));
+            assert_eq!(tints, 0);
+            assert_eq!(
+                [
+                    stats.colored_light_boxes,
+                    stats.colored_padded,
+                    stats.colored_chunk_light
+                ],
+                [0; 3]
+            );
+        }
+    }
+}

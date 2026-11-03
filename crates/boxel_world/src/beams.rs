@@ -157,8 +157,9 @@ fn cells(tile: &BeamTile, col: usize, lo: i64, hi: i64) -> Vec<(i64, i64)> {
 /// The voxels whose light a change of beams from `old` to `new` (chunk column `(x, z)`) can
 /// reach: the columns whose beam cells differ, inside `new`'s window, +-14 horizontally, from 14
 /// under the lowest changed cell to 14 over the highest. Rows of `new`'s window outside `old`'s
-/// count as empty in `old`: a mesh there had no tile, so no beam reached it. `None` if nothing
-/// changed.
+/// count as empty in `old`: a mesh there had no tile, so no beam reached it. With colored sky
+/// (ADR 0064), a column whose filter cells differ counts every beam cell it has in either
+/// tile: a filter tints the cells past it. `None` if nothing changed.
 pub(crate) fn changed_band(
     old: &BeamTile,
     new: &BeamTile,
@@ -176,7 +177,10 @@ pub(crate) fn changed_band(
             Vec::new()
         };
         let b = cells(new, col, n_lo, n_hi);
-        if a == b {
+        let (cx, cz) = ((col >> CHUNK_SHIFT) as u32, (col & 31) as u32);
+        let retinted = (old.colored_sky() || new.colored_sky())
+            && !old.column_tints(cx, cz).eq(new.column_tints(cx, cz));
+        if a == b && !retinted {
             continue;
         }
         // The symmetric difference: the toggles of both, pairs of equal ones cancelled.
@@ -189,6 +193,13 @@ pub(crate) fn changed_band(
             } else {
                 odd.push(v);
             }
+        }
+        if retinted {
+            // Every beam cell of either tile in the window.
+            for &(l, h) in a.iter().chain(&b) {
+                odd.extend([l, h + 1]);
+            }
+            odd.sort_unstable();
         }
         let (Some(&lo), Some(&end)) = (odd.first(), odd.last()) else {
             continue;
@@ -251,6 +262,8 @@ pub(crate) struct BeamJob {
     pub(crate) saved: Vec<i64>,
     /// The world's store, when `saved` is not empty.
     pub(crate) store: Option<WorldStore>,
+    /// Colored sky (ADR 0064): the tile keeps the filter cells of its beams.
+    pub(crate) colored: bool,
 }
 
 impl BeamJob {
@@ -282,7 +295,12 @@ impl BeamJob {
                 .sort_unstable_by_key(|(cy, _)| std::cmp::Reverse(*cy));
         }
         let window = self.window.0..=self.window.1;
-        let tile = boxel_light::beam_tile::build(window, &self.planes, tables, |cy| {
+        let build = if self.colored {
+            boxel_light::beam_tile::build_colored
+        } else {
+            boxel_light::beam_tile::build
+        };
+        let tile = build(window, &self.planes, tables, |cy| {
             let i = self.captured.partition_point(|(c, _)| *c > cy);
             if let Some((_, data)) = self.captured.get(i).filter(|(c, _)| *c == cy) {
                 return data.as_deref().map_or(LayerData::Air, LayerData::Ref);
@@ -398,5 +416,55 @@ mod tests {
         // Inside both windows nothing changed.
         let both = tile(Some((3, 20, 5)), (0, 127));
         assert_eq!(changed_band(&both, &high, 1, -1), None);
+    }
+
+    /// Colored sky (ADR 0064): the same beam with and without a pane in it changes the colors of
+    /// its cells, so the band holds the whole beam in the window; equal panes change nothing.
+    #[test]
+    fn changed_bands_hold_the_beams_whose_filter_cells_differ() {
+        let mut b = boxel_voxel::testing::builder();
+        let first = add_sky_source(&mut b).expect("sources").0 - 1;
+        let pane = b
+            .add_block(boxel_voxel::BlockDef {
+                name: "test:red_pane".into(),
+                shape: boxel_voxel::RenderShape::Translucent,
+                model: boxel_voxel::BlockModel::CUBE,
+                collision: boxel_voxel::BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: boxel_voxel::FaceTextures::all(boxel_voxel::TextureId(0)),
+            })
+            .expect("pane");
+        let block = b.block_by_name("test:red_pane").expect("pane");
+        b.set_light_filter(block, [10, 3, 2]).expect("filter");
+        let registry = b.build();
+        let tables = LightTables::from_registry(&registry);
+        let r64 =
+            BlockState(first + SKY_SOURCE_RANGES.iter().position(|&r| r == 64).unwrap() as u16);
+        let tile = |pane_at: Option<u32>| {
+            let mut chunk = ChunkData::uniform(BlockState::AIR);
+            chunk.set(LocalPos::new(3, 20, 5), r64);
+            if let Some(y) = pane_at {
+                chunk.set(LocalPos::new(3, y, 5), pane);
+            }
+            boxel_light::beam_tile::build_colored(0..=127, &[], &tables, |cy| {
+                if cy == 2 {
+                    LayerData::Ref(&chunk)
+                } else {
+                    LayerData::Air
+                }
+            })
+        };
+        let (clear, red) = (tile(None), tile(Some(10)));
+        assert!(red.has_tints() && !clear.has_tints());
+        assert_eq!(changed_band(&red, &tile(Some(10)), 1, -1), None);
+        // The beam lights 21..=84 in both tiles.
+        let band = changed_band(&clear, &red, 1, -1).expect("retinted");
+        assert_eq!(
+            band,
+            [35 - 14..=35 + 14, 21 - 14..=84 + 14, -27 - 14..=-27 + 14]
+        );
+        assert_eq!(changed_band(&red, &clear, 1, -1), Some(band.clone()));
+        assert_eq!(changed_band(&red, &tile(Some(4)), 1, -1), Some(band));
     }
 }

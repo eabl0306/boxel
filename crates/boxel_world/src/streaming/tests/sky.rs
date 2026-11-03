@@ -98,6 +98,94 @@ fn a_walk_that_read_edited_content_is_walked_again() {
     assert_eq!(h.sky.top(3, 5), Some(-1));
 }
 
+/// The default blocks plus `test:red_glass`: opacity 0, light filter `[10, 3, 2]`.
+fn red_glass_registry() -> (Arc<BlockRegistry>, BlockState) {
+    let mut b = boxel_demo::blocks::builder();
+    let red = b
+        .add_block(boxel_voxel::BlockDef {
+            name: "test:red_glass".into(),
+            shape: RenderShape::Translucent,
+            model: boxel_voxel::BlockModel::CUBE,
+            collision: boxel_voxel::BlockCollision::Full,
+            emission: [0; 3],
+            light_opacity: 0,
+            textures: boxel_voxel::FaceTextures::all(boxel_voxel::TextureId(0)),
+        })
+        .expect("glass");
+    let block = b.block_by_name("test:red_glass").expect("glass");
+    b.set_light_filter(block, [10, 3, 2]).expect("filter");
+    (Arc::new(b.build()), red)
+}
+
+/// Colored sky (ADR 0064): glass placed far above every blocker (and the generator's top)
+/// while the column's walk runs. The walk is discarded, and the next one starts at the glass
+/// (`SkyColumn::edit_top`), so its tile keeps it as a tint. Off, glass is nothing to the sky:
+/// the running walk stands.
+#[test]
+fn a_walk_after_glass_above_every_blocker_starts_at_the_glass() {
+    for colored in [false, true] {
+        let (registry, red) = red_glass_registry();
+        let hold = Arc::new(HoldExecutor::default());
+        let h = Harness::new(LayerGen::new(-3..=1), hold.clone(), 256)
+            .tall()
+            .with_registry(registry)
+            .lit();
+        let mut h = if colored { h.colored() } else { h };
+        h.interest(&origin(0));
+        loop {
+            h.dispatch();
+            let running = h
+                .sky
+                .columns
+                .values()
+                .any(|c| matches!(c.state, SkyState::InFlight { .. }));
+            if running {
+                break;
+            }
+            assert!(hold.held() > 0, "no walk started");
+            hold.run_all();
+            h.collect();
+        }
+        let center = h.sky.id_at(0, 0).expect("column");
+        assert!(matches!(
+            h.sky.columns[center].state,
+            SkyState::InFlight { .. }
+        ));
+        let glass = BlockPos::new(3, 100, 4);
+        assert!(
+            h.map.data_at(ChunkPos::containing(glass)).is_some(),
+            "loaded"
+        );
+        h.edit(glass, red);
+        let c = &h.sky.columns[center];
+        assert_eq!(
+            (c.version, c.edit_top),
+            if colored { (1, 100) } else { (0, i64::MIN) }
+        );
+        loop {
+            h.dispatch();
+            if hold.held() == 0 {
+                break;
+            }
+            hold.run_all();
+            h.collect();
+        }
+        h.settle(20);
+        let tile = h.sky.tile(0, 0).expect("walked");
+        assert_eq!(tile.top(3, 4), -1);
+        let tints = if colored {
+            vec![boxel_light::Tint {
+                y: 100,
+                filter: [10, 3, 2],
+            }]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(tile.tints(3, 4), &tints[..]);
+        assert_eq!(tile.tint_count(), tints.len());
+    }
+}
+
 /// A chunk whose edit moved a sky top unloads: the edit is lost (no persistence here), so
 /// the column is walked again and the top goes back to the generator's.
 #[test]
