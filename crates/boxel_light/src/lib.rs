@@ -20,6 +20,12 @@
 //! - [`point_light`]: point lights that are not blocks (a torch in the hand, ADR 0063), flooded
 //!   with the same rules and added to a padded light by the brightest per channel: the light of
 //!   an emitter placed at their voxel.
+//! - Colored sky (ADR 0064, [`LightInput::colored_sky`]): light filters tint the sky too. Tiles
+//!   walked with [`sky_tile::walk_colored`] keep the filters above each top, beam tiles built
+//!   with [`beam_tile::build_colored`] the filter cells of their beams, and a box where a filter
+//!   tints some sky gives [`PaddedLight::Colored`]: the sky's three channels for the picture
+//!   ([`PaddedLight::sky_rgb`], [`ChunkLight::sky_rgb`]) next to the uncolored light gameplay
+//!   reads ([`PaddedLight::get`], [`ChunkLight::get`]).
 //! - `oracle` (feature `oracle`): a scalar global solver over an explicit world, the reference
 //!   the tests compare against.
 //!
@@ -41,6 +47,6 @@ pub mod sky_tile;
 pub use beam_tile::{Beam, BeamTile, Retrace};
 pub use box_light::{LightInput, LightPath, LightScratch, SkyInput, compute, compute_full};
 pub use chunk_light::ChunkLight;
-pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedLight};
+pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedLight, WHITE_SKY, gray_sky};
 pub use point_light::{PointEmitter, PointScratch, add_point_lights};
-pub use sky_tile::{LayerData, Rescan, SkyTile};
+pub use sky_tile::{LayerData, Rescan, SkyTile, Tint};

@@ -2,10 +2,14 @@
 //! overworld (with trees and a cave entrance), forest, flat and terrain generators, near the
 //! origin and at x = z = 2^40; the limit cap; `i64::MIN` for open columns; the column rescan
 //! after an edit; an edit far above the generator changes only its own column (the floor is
-//! the world's); tiles without a floor; and generators without a top.
+//! the world's); tiles without a floor; and generators without a top. Colored sky (ADR 0064):
+//! the tints of a colored walk equal a brute-force scan, and `raise`, `rescan_column` and
+//! `set_filter` keep an edited tile equal to a fresh walk.
+mod common;
+
 use boxel_demo::worldgen::{ForestGenerator, OverworldGenerator, TerrainGenerator};
-use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
-use boxel_light::{LayerData, Rescan, SkyTile};
+use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_colored, walk_floor};
+use boxel_light::{LayerData, Rescan, SkyTile, Tint};
 use boxel_voxel::{
     BlockRegistry, BlockState, ChunkData, ChunkKey, ChunkPos, LightTables, LocalPos,
     MAX_BLOCK_COORD, MAX_CHUNK_COORD,
@@ -465,4 +469,174 @@ fn generator_tops() {
             .voxel()
             .is_some()
     );
+}
+
+/// A column of 4 chunk layers (y 0..128) for the colored walk tests, with its floor: below
+/// layer 0 is the void (`floor` `i64::MIN`) or air down to the floor.
+struct GlassColumn {
+    layers: Vec<ChunkData>,
+    floor: i64,
+}
+
+impl GlassColumn {
+    fn layer(&self, cy: i64) -> LayerData<'_> {
+        match cy {
+            0..4 => LayerData::Ref(&self.layers[cy as usize]),
+            _ if cy < 0 && self.floor == i64::MIN => LayerData::Void,
+            _ => LayerData::Air,
+        }
+    }
+
+    fn get(&self, x: u32, y: i64, z: u32) -> BlockState {
+        self.layers[(y >> 5) as usize].get(LocalPos::new(x, (y & 31) as u32, z))
+    }
+
+    fn walk(&self, tables: &LightTables) -> SkyTile {
+        walk_colored(127, self.floor, tables, |cy| self.layer(cy))
+    }
+
+    /// Brute force: the top and the tints (highest first) of column `(x, z)`.
+    fn brute_force(&self, tables: &LightTables, x: u32, z: u32) -> (i64, Vec<Tint>) {
+        let mut tints = Vec::new();
+        for y in (0..128i64).rev() {
+            if y <= self.floor {
+                return (self.floor, tints);
+            }
+            let s = self.get(x, y, z);
+            if tables.blocks_sky(s) {
+                return (y, tints);
+            }
+            if tables.filters(s) {
+                tints.push(Tint {
+                    y,
+                    filter: tables.light_filter(s),
+                });
+            }
+        }
+        (self.floor, tints)
+    }
+
+    fn check(&self, tables: &LightTables, tile: &SkyTile, what: &str) {
+        for x in 0..32 {
+            for z in 0..32 {
+                let (top, tints) = self.brute_force(tables, x, z);
+                assert_eq!(tile.top(x, z), top, "{what}: top of ({x}, {z})");
+                assert_eq!(tile.tints(x, z), &tints[..], "{what}: tints of ({x}, {z})");
+            }
+        }
+        let max = (0..1024u32)
+            .flat_map(|i| tile.tints(i >> 5, i & 31).first().map(|t| t.y))
+            .max()
+            .unwrap_or(i64::MIN);
+        assert_eq!(tile.tint_max(), max, "{what}: tint max");
+        let fresh = self.walk(tables);
+        assert_eq!(tile.tops(), fresh.tops(), "{what}: tops of a fresh walk");
+        assert_eq!((tile.min(), tile.max()), (fresh.min(), fresh.max()));
+        assert_eq!(tile.tint_count(), fresh.tint_count());
+    }
+}
+
+/// A colored walk keeps the filters above each top (glass roofs, a layer of uniform glass,
+/// panes under blockers do not count, a filter of opacity 1 is a top), and every edit applied to
+/// the tile as the world applies it gives what a fresh walk of the edited content gives, with a
+/// floor and with the void below.
+#[test]
+fn colored_walk_tints_follow_the_content_and_its_edits() {
+    let (registry, b) = common::test_registry_with(false, true);
+    let tables = LightTables::from_registry(&registry);
+    let [red, cyan] = b.filters.unwrap();
+    let blue = b.blue.unwrap();
+    let palette = [b.air, b.air, b.stone, red, blue, cyan, b.leaves, b.glass];
+    let mut tinted = 0;
+    for (seed, floor) in [(1u64, i64::MIN), (2, 20), (3, i64::MIN), (4, 40)] {
+        let mut rng = common::Rng::new(seed);
+        let mut layers = Vec::new();
+        for cy in 0..4 {
+            let chunk = match (cy, seed % 2) {
+                // A layer of uniform glass over the rest.
+                (2, 1) => ChunkData::uniform(red),
+                (3, _) => {
+                    // Roofs of glass, some red over blue, over random rectangles.
+                    let mut c = ChunkData::uniform(BlockState::AIR);
+                    for _ in 0..3 {
+                        let y = rng.below(32) as u32;
+                        let s = if rng.chance(0.5) { red } else { blue };
+                        for x in rng.below(16) as u32..16 + rng.below(16) as u32 {
+                            for z in rng.below(16) as u32..16 + rng.below(16) as u32 {
+                                c.set(LocalPos::new(x, y, z), s);
+                            }
+                        }
+                    }
+                    c
+                }
+                _ => {
+                    let mut c = ChunkData::uniform(BlockState::AIR);
+                    for _ in 0..1500 {
+                        let p = LocalPos::from_index(rng.below(32768) as usize);
+                        c.set(p, palette[rng.below(palette.len() as u64) as usize]);
+                    }
+                    c
+                }
+            };
+            layers.push(chunk);
+        }
+        let mut column = GlassColumn { layers, floor };
+        let mut tile = column.walk(&tables);
+        column.check(&tables, &tile, "walk");
+        tinted += tile.tint_count();
+        // The plain walk gives the same tops and no tints.
+        let plain = walk(127, floor, &tables, |cy| column.layer(cy));
+        assert_eq!(plain.tops(), tile.tops());
+        assert_eq!(plain.tint_count(), 0);
+        assert!(!plain.colored_sky() && tile.colored_sky());
+        for step in 0..400 {
+            let (x, z) = (rng.below(4) as u32 * 8, rng.below(4) as u32 * 8);
+            // Mostly near the column's top, where edits change something.
+            let top = tile.top(x, z).clamp(0, 127);
+            let y = if rng.chance(0.6) {
+                (top + rng.below(9) as i64 - 4).clamp(0, 127)
+            } else {
+                rng.below(128) as i64
+            };
+            let new = palette[rng.below(palette.len() as u64) as usize];
+            let old = column.get(x, y, z);
+            column.layers[(y >> 5) as usize].set(LocalPos::new(x, (y & 31) as u32, z), new);
+            let t = tile.top(x, z);
+            if tables.blocks_sky(new) {
+                tile.raise(x, z, y);
+            } else if y == t && tables.blocks_sky(old) {
+                let found = tile.rescan_column(x, z, y - 1, &tables, |cy| Some(column.layer(cy)));
+                assert!(matches!(found, Rescan::Found(_)));
+            } else if y > t {
+                let filter = tables.filters(new).then(|| tables.light_filter(new));
+                tile.set_filter(x, z, y, filter);
+            }
+            column.check(&tables, &tile, &format!("seed {seed} step {step}"));
+        }
+    }
+    assert!(tinted > 1000, "few tints: {tinted}");
+}
+
+/// `set_filter` only records filters above the top of a tile that keeps tints; `[15; 3]` and
+/// `None` remove one.
+#[test]
+fn set_filter_keeps_tints_above_the_top_only() {
+    let mut plain = SkyTile::uniform(10, i64::MIN);
+    assert!(!plain.set_filter(1, 2, 20, Some([10, 3, 2])));
+    assert_eq!(plain.tint_count(), 0);
+    let mut tile = SkyTile::uniform(10, i64::MIN).with_colored_sky();
+    assert!(!tile.set_filter(1, 2, 10, Some([10, 3, 2])), "at the top");
+    assert!(tile.set_filter(1, 2, 20, Some([10, 3, 2])));
+    assert!(tile.set_filter(1, 2, 30, Some([3, 11, 13])));
+    assert!(tile.set_filter(1, 2, 25, Some([2, 2, 2])));
+    assert!(!tile.set_filter(1, 2, 25, Some([2, 2, 2])), "the same");
+    let ys: Vec<i64> = tile.tints(1, 2).iter().map(|t| t.y).collect();
+    assert_eq!(ys, [30, 25, 20]);
+    assert_eq!(tile.tint_max(), 30);
+    assert!(tile.set_filter(1, 2, 30, Some([15; 3])));
+    assert!(tile.set_filter(1, 2, 25, None));
+    assert_eq!(tile.tint_max(), 20);
+    assert!(tile.raise(1, 2, 20));
+    assert_eq!((tile.tint_count(), tile.tint_max()), (0, i64::MIN));
+    assert!(tile.edited);
 }

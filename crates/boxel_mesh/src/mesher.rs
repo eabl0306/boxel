@@ -1224,6 +1224,8 @@ fn mesh_into(
         None => Err(LightValue::FULL_SKY),
         Some(PaddedLight::Uniform(v)) => Err(*v),
         Some(PaddedLight::Full(values)) => Ok(&**values),
+        // Colored sky (ADR 0064): the mesh takes the uncolored light until it carries tints.
+        Some(PaddedLight::Colored { light, .. }) => Ok(&**light),
     };
     let mut expanded = None;
     let full = match full {

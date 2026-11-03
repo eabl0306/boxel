@@ -195,6 +195,8 @@ pub struct SkyMap {
     pub(crate) rule: SkyRule,
     /// Every column open forever (`T = i64::MIN`).
     pub(crate) open: Arc<SkyTile>,
+    /// `WorldSettings::colored_sky` (ADR 0064), read when the world starts.
+    pub(crate) colored_sky: bool,
 }
 
 impl SkyMap {
@@ -204,7 +206,13 @@ impl SkyMap {
             index: HashMap::default(),
             rule,
             open: Arc::new(SkyTile::uniform(i64::MIN, i64::MIN)),
+            colored_sky: false,
         }
+    }
+    /// The same map with `WorldSettings::colored_sky` (ADR 0064).
+    pub(crate) fn with_colored_sky(mut self, on: bool) -> Self {
+        self.colored_sky = on;
+        self
     }
     /// The world computes no light (`WorldSettings::light` off): meshes and ticks see open sky.
     pub(crate) fn light_off(&self) -> bool {

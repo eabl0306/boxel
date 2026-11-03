@@ -1,8 +1,9 @@
 //! The reference the tests compare [`compute`](crate::compute) against: a scalar global light
 //! solver over an explicit voxel world, one channel at a time, with a plain FIFO queue (no
 //! buckets, no masks, no box), and sky tops found by brute force. Light filters (ADR 0060) apply
-//! to the block channels only. Sky sources (ADR 0061) light their beams, traced cell by cell,
-//! as direct sky.
+//! to the block channels in [`OracleWorld::solve`], and to the sky's three channels too in
+//! [`OracleWorld::solve_colored`] (ADR 0064). Sky sources (ADR 0061) light their beams, traced
+//! cell by cell, as direct sky.
 //!
 //! Only with the `oracle` feature (and in this crate's unit tests).
 use boxel_voxel::{
@@ -118,13 +119,22 @@ impl OracleWorld {
     /// The beam cells of the sky sources: from each source, cell by cell in its direction, while
     /// the cell has opacity 0, at most `range` cells, inside the world and the source's realm.
     pub fn beam_cells(&self) -> Vec<bool> {
+        let mut beam = vec![false; self.opacity.len()];
+        self.trace_beams(|c, _| beam[c] = true);
+        beam
+    }
+
+    /// Calls `f(cell, sky)` for each cell of each beam, in order from its source, with the
+    /// beam's sky there: 15 per channel from the source, filtered past each filter cell (that
+    /// cell included), with no cost.
+    fn trace_beams(&self, mut f: impl FnMut(usize, [u8; 3])) {
         let [sx, sy, sz] = self.size();
         let y0 = self.min.origin().y;
         let realm = |y: i64| self.planes.partition_point(|&p| p <= y);
-        let mut beam = vec![false; sx * sy * sz];
         for &(v, def) in &self.sources {
             let (y, column) = (v / (sx * sz), v % (sx * sz));
             let home = realm(y0 + y as i64);
+            let mut sky = [MAX_LIGHT; 3];
             for k in 0..i64::from(def.range) {
                 let cy = match def.dir {
                     BeamDir::Down => y as i64 - k,
@@ -137,10 +147,10 @@ impl OracleWorld {
                 if self.opacity[c] > 0 {
                     break;
                 }
-                beam[c] = true;
+                sky = filter(sky, self.filter[c]);
+                f(c, sky);
             }
         }
-        beam
     }
 
     /// The global light of every voxel.
@@ -218,10 +228,78 @@ impl OracleWorld {
         out.into_iter().map(LightValue).collect()
     }
 
-    /// The padded light (local `-1..=32`, in [`PaddedLight::index`](crate::PaddedLight::index)
-    /// order) of `chunk` from a [`OracleWorld::solve`] result. The chunk and its border must be
-    /// inside the world.
-    pub fn padded(&self, solution: &[LightValue], chunk: ChunkPos) -> Vec<LightValue> {
+    /// The sky's red, green and blue of every voxel with colored sky (ADR 0064): each channel
+    /// filtered as a block channel. Direct sky is 15 per channel above the top of its column
+    /// and in the beams, filtered by every filter above it in the column (or in the beam since
+    /// its source), with no cost, and mixed by max; a direct voxel below 15 stays open to its
+    /// neighbors. The uncolored sky, what gameplay reads, is [`OracleWorld::solve`]'s.
+    pub fn solve_colored(&self) -> Vec<[u8; 3]> {
+        let [sx, sy, sz] = self.size();
+        let y0 = self.min.origin().y;
+        let volume = sx * sy * sz;
+        let mut direct = vec![[0u8; 3]; volume];
+        for x in 0..sx {
+            for z in 0..sz {
+                let top = self.tops[x * sz + z];
+                let mut sky = [MAX_LIGHT; 3];
+                for y in (0..sy).rev() {
+                    if y0 + y as i64 <= top {
+                        break;
+                    }
+                    let v = (y * sx + x) * sz + z;
+                    sky = filter(sky, self.filter[v]);
+                    direct[v] = sky;
+                }
+            }
+        }
+        self.trace_beams(|c, sky| {
+            direct[c] = [0, 1, 2].map(|k| direct[c][k].max(sky[k]));
+        });
+        let mut out = vec![[0u8; 3]; volume];
+        for k in 0..3 {
+            let mut level: Vec<u8> = direct.iter().map(|d| d[k]).collect();
+            let mut queue: VecDeque<usize> = (0..volume).filter(|&v| level[v] > 0).collect();
+            while let Some(v) = queue.pop_front() {
+                for n in self.neighbors(v) {
+                    let opacity = self.opacity[n];
+                    if opacity >= 15 {
+                        continue;
+                    }
+                    let lower = level[v].saturating_sub(opacity.max(1));
+                    let value = transmit(u16::from(lower), self.filter[n][k]) as u8;
+                    if value > level[n] {
+                        level[n] = value;
+                        queue.push_back(n);
+                    }
+                }
+            }
+            for (o, &l) in out.iter_mut().zip(&level) {
+                o[k] = l;
+            }
+        }
+        out
+    }
+
+    /// The face neighbors of voxel `v` inside the world.
+    fn neighbors(&self, v: usize) -> impl Iterator<Item = usize> {
+        let [sx, sy, sz] = self.size();
+        let (y, x, z) = (v / (sx * sz), v / sz % sx, v % sz);
+        [
+            (x > 0).then(|| v - sz),
+            (x + 1 < sx).then(|| v + sz),
+            (y > 0).then(|| v - sx * sz),
+            (y + 1 < sy).then(|| v + sx * sz),
+            (z > 0).then(|| v - 1),
+            (z + 1 < sz).then(|| v + 1),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The padded part (local `-1..=32`, in [`PaddedLight::index`](crate::PaddedLight::index)
+    /// order) of `chunk` from a [`OracleWorld::solve`] or [`OracleWorld::solve_colored`] result.
+    /// The chunk and its border must be inside the world.
+    pub fn padded<T: Copy>(&self, solution: &[T], chunk: ChunkPos) -> Vec<T> {
         let [sx, _, sz] = self.size();
         let base = |c: i64, m: i64| (c - m) * i64::from(CHUNK_SIZE);
         let (bx, by, bz) = (
@@ -240,4 +318,9 @@ impl OracleWorld {
         }
         out
     }
+}
+
+/// `sky` after `filter`, per channel, with no cost.
+fn filter(sky: [u8; 3], filter: [u8; 3]) -> [u8; 3] {
+    [0, 1, 2].map(|k| transmit(u16::from(sky[k]), filter[k]) as u8)
 }

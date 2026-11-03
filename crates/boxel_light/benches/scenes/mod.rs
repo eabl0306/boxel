@@ -96,6 +96,7 @@ impl Neighborhood {
             sky: SkyInput::Tiles(tiles),
             beams: [None; 9],
             tables,
+            colored_sky: false,
         }
     }
 

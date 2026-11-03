@@ -1,10 +1,14 @@
 //! [`ChunkLight`]: a chunk's own 32^3 light, kept for gameplay queries.
 use crate::PaddedLight;
+use crate::padded::{PADDED_VOLUME, gray_sky};
 use boxel_voxel::{CHUNK_VOLUME, LightValue, LocalPos};
 
 /// Light of the 32^3 voxels of one chunk, indexed by [`LocalPos::index`], in the smallest of
-/// three forms: uniform (0 bytes), sky only (4 bits per voxel, 16 KiB) or full (16 bits per
-/// voxel, 64 KiB).
+/// four forms: uniform (0 bytes), sky only (4 bits per voxel, 16 KiB), full (16 bits per voxel,
+/// 64 KiB) or colored (twice full, 128 KiB, only where a filter tinted the sky, ADR 0064).
+///
+/// [`ChunkLight::get`] gives the light gameplay reads, with the uncolored sky in every form;
+/// [`ChunkLight::sky_rgb`] the sky's three channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChunkLight {
     /// Every voxel has this light.
@@ -14,6 +18,27 @@ pub enum ChunkLight {
     SkyOnly(Box<[u8; CHUNK_VOLUME / 2]>),
     /// One [`LightValue`] (as `u16`) per voxel.
     Full(Box<[u16; CHUNK_VOLUME]>),
+    /// Colored sky (ADR 0064), as [`PaddedLight::Colored`]: `light` as in `Full`, and the sky's
+    /// red, green and blue in the block nibbles of `sky_rgb`.
+    Colored {
+        /// The light gameplay reads, as in `Full`.
+        light: Box<[u16; CHUNK_VOLUME]>,
+        /// Sky red, green and blue per voxel, in the block nibbles.
+        sky_rgb: Box<[u16; CHUNK_VOLUME]>,
+    },
+}
+
+/// The chunk's part (local `0..32`) of padded values, in [`LocalPos`] order.
+fn inner(values: &[u16; PADDED_VOLUME]) -> Box<[u16; CHUNK_VOLUME]> {
+    let mut out: Box<[u16; CHUNK_VOLUME]> = vec![0u16; CHUNK_VOLUME]
+        .into_boxed_slice()
+        .try_into()
+        .expect("CHUNK_VOLUME entries");
+    for (r, row) in out.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+        let start = PaddedLight::index((r & 31) as i32, (r >> 5) as i32, 0);
+        row.copy_from_slice(&values[start..start + 32]);
+    }
+    out
 }
 
 impl Default for ChunkLight {
@@ -29,6 +54,22 @@ impl ChunkLight {
         let values = match padded {
             PaddedLight::Uniform(v) => return ChunkLight::Uniform(*v),
             PaddedLight::Full(values) => values,
+            PaddedLight::Colored { light, sky_rgb } => {
+                // The tint may lie only in the border: then the chunk keeps a plain form.
+                let sky = inner(sky_rgb);
+                let light_in = inner(light);
+                if light_in
+                    .iter()
+                    .zip(sky.iter())
+                    .any(|(&l, &c)| c != gray_sky(LightValue(l).sky()))
+                {
+                    return ChunkLight::Colored {
+                        light: light_in,
+                        sky_rgb: sky,
+                    };
+                }
+                light
+            }
         };
         // One padded row (34 values along z) per (y, x): its inner 32, in `LocalPos` row order
         // (row `(y << 5) | x`).
@@ -79,8 +120,23 @@ impl ChunkLight {
                 let level = if i & 1 == 0 { byte & 15 } else { byte >> 4 };
                 LightValue::new(level, 0, 0, 0)
             }
-            ChunkLight::Full(values) => LightValue(values[i]),
+            ChunkLight::Full(values) | ChunkLight::Colored { light: values, .. } => {
+                LightValue(values[i])
+            }
         }
+    }
+    /// Sky `[red, green, blue]` at `p`: the colored channels of a `Colored` chunk, the
+    /// uncolored sky level three times otherwise.
+    #[inline]
+    pub fn sky_rgb(&self, p: LocalPos) -> [u8; 3] {
+        match self {
+            ChunkLight::Colored { sky_rgb, .. } => LightValue(sky_rgb[p.index()]).rgb(),
+            _ => [self.get(p).sky(); 3],
+        }
+    }
+    /// True for the colored form.
+    pub fn is_colored(&self) -> bool {
+        matches!(self, ChunkLight::Colored { .. })
     }
     /// Heap bytes used.
     pub fn heap_bytes(&self) -> usize {
@@ -88,6 +144,7 @@ impl ChunkLight {
             ChunkLight::Uniform(_) => 0,
             ChunkLight::SkyOnly(_) => CHUNK_VOLUME / 2,
             ChunkLight::Full(_) => CHUNK_VOLUME * 2,
+            ChunkLight::Colored { .. } => CHUNK_VOLUME * 4,
         }
     }
 }
@@ -139,5 +196,48 @@ mod tests {
                 LightValue::new(sky(x, y, z) as u8, 0, 0, 0)
             );
         }
+    }
+
+    #[test]
+    fn a_colored_result_keeps_its_tint_only_inside_the_chunk() {
+        let sky_15 = || {
+            let mut v = new_full();
+            v.fill(LightValue::FULL_SKY.0);
+            v
+        };
+        let gray = || {
+            let mut v = new_full();
+            v.fill(gray_sky(15));
+            v
+        };
+        // A tint in the border only: the chunk is uniform open sky.
+        let mut sky_rgb = gray();
+        sky_rgb[PaddedLight::index(-1, 3, 3)] = 0x0D76;
+        let border = PaddedLight::Colored {
+            light: sky_15(),
+            sky_rgb,
+        };
+        assert_eq!(border.sky_rgb(-1, 3, 3), [13, 7, 6]);
+        assert_eq!(border.get(-1, 3, 3), LightValue::FULL_SKY);
+        assert_eq!(
+            ChunkLight::from_padded(&border),
+            ChunkLight::Uniform(LightValue::FULL_SKY)
+        );
+        // Inside: the colored form, with the uncolored light for gameplay.
+        let mut sky_rgb = gray();
+        sky_rgb[PaddedLight::index(4, 5, 6)] = 0x0D76;
+        let mut light = sky_15();
+        light[PaddedLight::index(4, 5, 6)] = LightValue::new(15, 2, 0, 0).0;
+        let inside = ChunkLight::from_padded(&PaddedLight::Colored { light, sky_rgb });
+        assert!(inside.is_colored());
+        assert_eq!(inside.heap_bytes(), 131072);
+        let p = LocalPos::new(4, 5, 6);
+        assert_eq!(inside.get(p), LightValue::new(15, 2, 0, 0));
+        assert_eq!(inside.sky_rgb(p), [13, 7, 6]);
+        assert_eq!(inside.sky_rgb(LocalPos::new(0, 0, 0)), [15; 3]);
+        assert_eq!(
+            ChunkLight::Uniform(LightValue::new(9, 0, 0, 0)).sky_rgb(p),
+            [9; 3]
+        );
     }
 }

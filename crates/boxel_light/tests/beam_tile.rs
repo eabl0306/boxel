@@ -3,7 +3,9 @@
 //! directions and every range, realm planes, gaps of air, void below) and on generated overworld
 //! content with sources under its cave roofs. Beams end at leaves and water like the sky, never
 //! cross a plane, windows built in pieces agree with one big window, and an edit retraced in
-//! place equals a rebuild of the edited content.
+//! place equals a rebuild of the edited content. Colored tiles (ADR 0064) keep exactly the
+//! filter cells inside their beams, and keep them through edits, with the band of every cell
+//! whose filtered sky changed.
 mod common;
 
 use boxel_demo::worldgen::OverworldGenerator;
@@ -503,4 +505,159 @@ fn the_tallest_window_holds_its_farthest_beams() {
     assert_eq!(tile.column(0, 0).next().unwrap().lo, hi);
     assert_eq!(tile.column(1, 1).next().unwrap().hi, lo);
     assert_eq!(tile.bounds(), Some((lo - reach, hi + reach)));
+}
+
+/// [`random_column`] with colored glass: panes in air cells, and in some layers a plane of
+/// glass (red, or red over light blue).
+fn glass_column(rng: &mut Rng, b: &Blocks) -> Column {
+    let mut column = random_column(rng, b);
+    let ([red, _], blue) = (b.filters.unwrap(), b.blue.unwrap());
+    let layers: Vec<i64> = column.chunks.keys().copied().collect();
+    for cy in layers {
+        if rng.chance(0.5) {
+            let y = (cy << CHUNK_SHIFT) + rng.below(31) as i64 + 1;
+            let double = rng.chance(0.4);
+            for x in 0..32 {
+                for z in 0..32 {
+                    if column.get(x, y, z).is_air() {
+                        column.set(x, y, z, red);
+                    }
+                    if double && column.get(x, y - 1, z).is_air() {
+                        column.set(x, y - 1, z, blue);
+                    }
+                }
+            }
+        }
+        for _ in 0..200 {
+            let (x, z) = (rng.below(32) as u32, rng.below(32) as u32);
+            let y = (cy << CHUNK_SHIFT) + rng.below(32) as i64;
+            if column.get(x, y, z).is_air() {
+                column.set(x, y, z, if rng.chance(0.5) { red } else { blue });
+            }
+        }
+    }
+    column
+}
+
+/// The filter cells of opacity 0 inside the beams of column `(x, z)`, ascending, by brute force.
+fn brute_tints(
+    column: &Column,
+    beams: &[(u32, u32, Beam)],
+    tables: &LightTables,
+    x: u32,
+    z: u32,
+) -> Vec<(i64, [u8; 3])> {
+    let cells: std::collections::BTreeSet<i64> = beams
+        .iter()
+        .filter(|&&(bx, bz, _)| (bx, bz) == (x, z))
+        .flat_map(|(_, _, b)| b.lo..=b.hi)
+        .collect();
+    cells
+        .into_iter()
+        .filter_map(|y| {
+            let s = column.get(x, y, z);
+            (tables.filters(s) && !tables.blocks_sky(s)).then(|| (y, tables.light_filter(s)))
+        })
+        .collect()
+}
+
+/// The filtered sky of every beam cell of column `(x, z)` of a colored tile, by brute force:
+/// white from each source, filtered past each filter cell, per-channel max over the beams.
+fn cell_colors(tile: &BeamTile, x: u32, z: u32) -> BTreeMap<i64, [u8; 3]> {
+    let tints: BTreeMap<i64, [u8; 3]> = tile.column_tints(x, z).collect();
+    let mut out: BTreeMap<i64, [u8; 3]> = BTreeMap::new();
+    for b in tile.column(x, z) {
+        let cells: Vec<i64> = if b.def.dir == BeamDir::Down {
+            (b.lo..=b.hi).rev().collect()
+        } else {
+            (b.lo..=b.hi).collect()
+        };
+        let mut c = [15u8; 3];
+        for y in cells {
+            if let Some(f) = tints.get(&y) {
+                c = [0, 1, 2].map(|k| boxel_voxel::transmit(u16::from(c[k]), f[k]) as u8);
+            }
+            let e = out.entry(y).or_insert(c);
+            *e = [0, 1, 2].map(|k| e[k].max(c[k]));
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+    #[test]
+    fn colored_build_keeps_the_filter_cells_of_its_beams(seed in any::<u64>(), skip in any::<bool>()) {
+        let (tables, b) = registry(seed % 2 == 0, true);
+        let mut rng = Rng::new(seed);
+        let column = glass_column(&mut rng, &b);
+        let window = random_window(&mut rng);
+        let planes = random_planes(&mut rng);
+        let tile = beam_tile::build_colored(window.clone(), &planes, &tables, |cy| {
+            column.layer(cy, skip)
+        });
+        let plain = column.build(window.clone(), &planes, &tables, skip);
+        let want = brute_force(&column, &window, &planes, &tables);
+        prop_assert_eq!(listed(&tile), want.clone());
+        prop_assert!(!plain.has_tints() && !plain.colored_sky() && tile.colored_sky());
+        for x in 0..32 {
+            for z in 0..32 {
+                let got: Vec<(i64, [u8; 3])> = tile.column_tints(x, z).collect();
+                prop_assert_eq!(got, brute_tints(&column, &want, &tables, x, z), "({}, {})", x, z);
+            }
+        }
+    }
+
+    #[test]
+    fn a_colored_retrace_after_an_edit_equals_a_rebuild(seed in any::<u64>()) {
+        let (tables, b) = registry(true, true);
+        let mut rng = Rng::new(seed);
+        let mut column = glass_column(&mut rng, &b);
+        let window = random_window(&mut rng);
+        let planes = random_planes(&mut rng);
+        let build = |column: &Column| {
+            beam_tile::build_colored(window.clone(), &planes, &tables, |cy| column.layer(cy, false))
+        };
+        let mut tile = build(&column);
+        let mut edits = palette(&b);
+        edits.extend(&b.sources);
+        let ([red, cyan], blue) = (b.filters.unwrap(), b.blue.unwrap());
+        edits.extend([red, red, blue, blue, cyan]);
+        for _ in 0..40 {
+            let (x, z) = (3 + rng.below(2) as u32, 7);
+            let beams: Vec<Beam> = tile.column(x, z).collect();
+            let y = if !beams.is_empty() && rng.chance(0.8) {
+                let b = beams[rng.below(beams.len() as u64) as usize];
+                let inside = b.lo + rng.below((b.hi - b.lo + 1) as u64) as i64;
+                [b.lo - 1, b.hi + 1, b.lo, b.hi, inside, inside][rng.below(6) as usize]
+            } else {
+                let span = (window.end() - window.start() + 600) as u64;
+                window.start() - 300 + rng.below(span) as i64
+            };
+            let s = edits[rng.below(edits.len() as u64) as usize];
+            let before = cell_colors(&tile, x, z);
+            column.set(x, y, z, s);
+            let retrace = tile.edit(x, z, y, s, &planes, &tables, |cy| Some(column.layer(cy, false)));
+            let rebuilt = build(&column);
+            prop_assert!(tile == rebuilt, "edit {s:?} at ({x}, {y}, {z})");
+            let after = cell_colors(&tile, x, z);
+            let changed: Vec<i64> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|y| before.get(y) != after.get(y))
+                .copied()
+                .collect::<std::collections::BTreeSet<i64>>()
+                .into_iter()
+                .collect();
+            match retrace {
+                Retrace::Unchanged => prop_assert!(changed.is_empty(), "{changed:?}"),
+                Retrace::Changed { lo, hi } => {
+                    prop_assert!(!changed.is_empty());
+                    prop_assert_eq!((lo, hi), (changed[0], changed[changed.len() - 1]));
+                }
+                Retrace::Unresolved => prop_assert!(false, "every layer is there"),
+            }
+        }
+    }
 }

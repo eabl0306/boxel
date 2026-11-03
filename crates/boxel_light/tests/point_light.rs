@@ -241,3 +241,49 @@ fn the_same_lights_anywhere_give_the_same_light() {
         }
     }
 }
+
+/// With colored sky (ADR 0064), in worlds of glass roofs and windows: point lights at air voxels
+/// still give the light of placed emitters, and leave the sky's channels as they are (block light
+/// through glass is filtered on both sides; a point light never touches the sky).
+#[test]
+fn point_lights_in_a_colored_box_equal_placed_emitters() {
+    let colored_light = |world: &World, tables: &LightTables, lights: &[PointEmitter]| {
+        let tiles = world.colored_tiles(tables);
+        let mut input = world.input(&tiles, tables, (1, 1, 1));
+        input.colored_sky = true;
+        let mut out = PaddedLight::default();
+        compute(&input, &mut LightScratch::new(), &mut out);
+        add_point_lights(&input, lights, &mut PointScratch::new(), &mut out);
+        out
+    };
+    let mut colored = 0;
+    for seed in 0..20u64 {
+        let (registry, b) = test_registry_full(seed % 3 == 1, true, false);
+        let tables = LightTables::from_registry(&registry);
+        let mut world = random_world(seed, 3, ChunkPos::new(-1, -1, -1), &b, &tables);
+        let mut rng = Rng::new(seed ^ 0x6C0_10E);
+        world.add_glass(&mut rng, &b);
+        let spots = air_voxels(&world, &b, &mut rng, 2);
+        let mut placed = World {
+            min: world.min,
+            n: world.n,
+            chunks: world.chunks.clone(),
+            tops: world.tops.clone(),
+        };
+        let mut lights = Vec::new();
+        for (i, &p) in spots.iter().enumerate() {
+            let emitter = b.glows[i % 2];
+            place(&mut placed, p, emitter);
+            lights.push(PointEmitter::new(p, tables.emission(emitter).rgb()));
+        }
+        let want = colored_light(&placed, &tables, &[]);
+        let got = colored_light(&world, &tables, &lights);
+        assert!(got.to_vec() == want.to_vec(), "seed {seed}: the light");
+        assert!(
+            got.to_sky_rgb_vec() == want.to_sky_rgb_vec(),
+            "seed {seed}: the sky's channels"
+        );
+        colored += usize::from(got.is_colored());
+    }
+    assert!(colored > 5, "colored results: {colored}");
+}

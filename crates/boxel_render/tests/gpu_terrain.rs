@@ -1099,6 +1099,7 @@ fn lit_scene(shift: I64Vec3, light: bool) -> LitScene {
                 })),
                 beams: [None; 9],
                 tables: &tables,
+                colored_sky: false,
             };
             boxel_light::compute(&input, &mut scratch, &mut padded);
         }

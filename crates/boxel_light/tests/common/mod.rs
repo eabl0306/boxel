@@ -2,7 +2,7 @@
 #![allow(dead_code, reason = "each test binary uses a subset of the helpers")]
 
 use boxel_light::box_light::{chunk_index, tile_index};
-use boxel_light::{BeamTile, LayerData, LightInput, SkyInput, SkyTile, beam_tile};
+use boxel_light::{BeamTile, LayerData, LightInput, SkyInput, SkyTile, Tint, beam_tile};
 use boxel_voxel::{
     BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_AREA, CHUNK_SIZE,
     CHUNK_VOLUME, ChunkData, ChunkPos, FaceTextures, LightTables, LocalPos, Occupancy, RenderShape,
@@ -51,6 +51,8 @@ pub struct Blocks {
     /// Light filters (ADR 0060), only in a registry with filters: red glass (opacity 0) and
     /// cyan water (opacity 1, its filter after the cost).
     pub filters: Option<[BlockState; 2]>,
+    /// Light blue glass (opacity 0), only in a registry with filters.
+    pub blue: Option<BlockState>,
     /// Every state of `test:sky_source` (ADR 0061), only in a registry with sources.
     pub sources: Vec<BlockState>,
 }
@@ -59,6 +61,8 @@ pub struct Blocks {
 pub const RED_FILTER: [u8; 3] = [15, 3, 2];
 /// Cyan water's filter.
 pub const CYAN_FILTER: [u8; 3] = [4, 12, 15];
+/// Light blue glass's filter (the game's light blue).
+pub const BLUE_FILTER: [u8; 3] = [3, 11, 13];
 
 /// The built-in blocks plus glass, three opaque lamps, two clear emitters and (with `heavy`)
 /// smoke of opacity 5.
@@ -102,16 +106,21 @@ pub fn test_registry_full(heavy: bool, filters: bool, sources: bool) -> (BlockRe
         add("lantern", RenderShape::Cutout, true, [12, 12, 12], 1),
     ];
     let smoke = heavy.then(|| add("smoke", RenderShape::Translucent, false, [0; 3], 5));
-    let filters = if filters {
+    let (filters, blue) = if filters {
         let red = add("red_glass", RenderShape::Translucent, true, [0; 3], 0);
         let cyan = add("cyan_water", RenderShape::Translucent, false, [0; 3], 1);
-        for (name, filter) in [("red_glass", RED_FILTER), ("cyan_water", CYAN_FILTER)] {
+        let blue = add("blue_glass", RenderShape::Translucent, true, [0; 3], 0);
+        for (name, filter) in [
+            ("red_glass", RED_FILTER),
+            ("cyan_water", CYAN_FILTER),
+            ("blue_glass", BLUE_FILTER),
+        ] {
             let block = b.block_by_name(&format!("test:{name}")).unwrap();
             b.set_light_filter(block, filter).unwrap();
         }
-        Some([red, cyan])
+        (Some([red, cyan]), Some(blue))
     } else {
-        None
+        (None, None)
     };
     if sources {
         boxel_voxel::testing::add_sky_source(&mut b).unwrap();
@@ -131,6 +140,7 @@ pub fn test_registry_full(heavy: bool, filters: bool, sources: bool) -> (BlockRe
         glows,
         smoke,
         filters,
+        blue,
         sources,
     };
     (r, blocks)
@@ -283,6 +293,7 @@ impl World {
             sky: SkyInput::Tiles(picked),
             beams: beamed,
             tables,
+            colored_sky: false,
         }
     }
 
@@ -349,6 +360,119 @@ impl World {
         (0..self.n * self.n)
             .map(|i| self.tile(i / self.n, i % self.n))
             .collect()
+    }
+
+    /// Every tile keeping tints (colored sky, ADR 0064), by `cx * n + cz`: the filters of
+    /// opacity 0 above each column's top, by brute force.
+    pub fn colored_tiles(&self, tables: &LightTables) -> Vec<SkyTile> {
+        let s = CHUNK_SIZE as usize;
+        let y0 = self.min.origin().y;
+        (0..self.n * self.n)
+            .map(|i| {
+                let (cx, cz) = (i / self.n, i % self.n);
+                let tile = self.tile(cx, cz);
+                let mut tints = Vec::new();
+                for x in 0..32u32 {
+                    for z in 0..32u32 {
+                        for cy in 0..self.n {
+                            let chunk = self.chunk(cx, cy, cz);
+                            for ly in 0..32u32 {
+                                let st = chunk.get(LocalPos::new(x, ly, z));
+                                if tables.filters(st) && !tables.blocks_sky(st) {
+                                    let y = y0 + (cy * s) as i64 + i64::from(ly);
+                                    let filter = tables.light_filter(st);
+                                    tints.push((x, z, Tint { y, filter }));
+                                }
+                            }
+                        }
+                    }
+                }
+                tile.with_tints(tints)
+            })
+            .collect()
+    }
+
+    /// [`World::beam_tiles`] for colored sky ([`beam_tile::build_colored`]).
+    pub fn colored_beam_tiles(&self, tables: &LightTables, planes: &[i64]) -> Vec<BeamTile> {
+        let y0 = self.min.origin().y;
+        let window = y0..=y0 + (self.n * CHUNK_SIZE as usize) as i64 - 1;
+        (0..self.n * self.n)
+            .map(|i| {
+                let (cx, cz) = (i / self.n, i % self.n);
+                beam_tile::build_colored(window.clone(), planes, tables, |cy| {
+                    let k = cy - self.min.y;
+                    if (0..self.n as i64).contains(&k) {
+                        LayerData::Ref(self.chunk(cx, k as usize, cz))
+                    } else {
+                        LayerData::Air
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Puts colored glass (opacity 0, so the tops stay right) into air voxels: in some chunk
+    /// columns a roof (a plane over a random rectangle of one of the two top chunk layers,
+    /// sometimes red over light blue), in some chunks a window (a vertical plane), elsewhere a
+    /// few panes.
+    pub fn add_glass(&mut self, rng: &mut Rng, b: &Blocks) {
+        let (Some([red, _]), Some(blue)) = (b.filters, b.blue) else {
+            return;
+        };
+        let n = self.n;
+        let put = |chunk: &mut ChunkData, p: LocalPos, s: BlockState| {
+            if chunk.get(p).is_air() {
+                chunk.set(p, s);
+            }
+        };
+        let rect = |rng: &mut Rng| {
+            let a = rng.below(32) as u32;
+            let b = rng.below(32) as u32;
+            (a.min(b), a.max(b))
+        };
+        for cx in 0..n {
+            for cz in 0..n {
+                if rng.chance(0.5) {
+                    let cy = n - 1 - rng.below(2) as usize;
+                    let ly = rng.below(32) as u32;
+                    let (x0, x1) = rect(rng);
+                    let (z0, z1) = rect(rng);
+                    let first = if rng.chance(0.5) { red } else { blue };
+                    let double = rng.chance(0.3) && ly > 0;
+                    let chunk = &mut self.chunks[(cy * n + cx) * n + cz];
+                    for x in x0..=x1 {
+                        for z in z0..=z1 {
+                            put(chunk, LocalPos::new(x, ly, z), first);
+                            if double {
+                                put(chunk, LocalPos::new(x, ly - 1, z), blue);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for chunk in &mut self.chunks {
+            match rng.below(4) {
+                0 => {
+                    let x = rng.below(32) as u32;
+                    let (y0, y1) = rect(rng);
+                    let (z0, z1) = rect(rng);
+                    let s = if rng.chance(0.5) { red } else { blue };
+                    for y in y0..=y1 {
+                        for z in z0..=z1 {
+                            put(chunk, LocalPos::new(x, y, z), s);
+                        }
+                    }
+                }
+                1 => {
+                    for _ in 0..rng.below(30) {
+                        let p = LocalPos::from_index(rng.below(CHUNK_VOLUME as u64) as usize);
+                        put(chunk, p, if rng.chance(0.5) { red } else { blue });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 

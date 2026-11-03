@@ -1,7 +1,8 @@
 //! Translation invariance: the same neighborhood (blocks and sky tops moved together) at the
 //! origin, across +-2^31, at +-2^40 and next to the world limit (`MAX_BLOCK_COORD - 64`) gives
 //! the same light, bit for bit, and takes the same path. The same with sky sources and a realm
-//! plane moved with it (ADR 0061): the beam tiles and the light they give.
+//! plane moved with it (ADR 0061): the beam tiles and the light they give. The same with colored
+//! sky (ADR 0064): glass roofs, windows and panes, and sources through them.
 mod common;
 
 use boxel_light::{Beam, LightPath, LightScratch, PaddedLight, compute};
@@ -99,4 +100,41 @@ fn same_sources_same_beams_and_light_anywhere() {
         }
     }
     assert!(lit > 0, "no beam in any world");
+}
+
+/// The center chunk's colored light of the 3x3x3 world with min chunk `min`: glass, sky sources
+/// and a realm plane `plane` voxels above the world's bottom, colored tiles and beam tiles.
+fn colored_light_at(seed: u64, min: ChunkPos, plane: i64) -> (PaddedLight, LightPath) {
+    let (registry, blocks) = test_registry_full(seed.is_multiple_of(2), true, true);
+    let tables = LightTables::from_registry(&registry);
+    let mut world = random_world(seed, 3, min, &blocks, &tables);
+    let mut rng = Rng::new(seed);
+    world.add_glass(&mut rng, &blocks);
+    world.add_sources(&mut rng, &blocks, &tables);
+    let y0 = min.origin().y;
+    let tiles = world.colored_tiles(&tables);
+    let beams = world.colored_beam_tiles(&tables, &[y0 + plane]);
+    let mut input = world.input_with(&tiles, &beams, &tables, (1, 1, 1));
+    input.colored_sky = true;
+    let mut out = PaddedLight::default();
+    let path = compute(&input, &mut LightScratch::new(), &mut out);
+    (out, path)
+}
+
+#[test]
+fn same_glass_same_colored_light_anywhere() {
+    let shifts = shifts();
+    let mut colored = 0;
+    for seed in [41, 42, 43, 44, 45, 46] {
+        let base = ChunkPos::new(-1, -1, -1);
+        let (want, path) = colored_light_at(seed, base, 50);
+        colored += usize::from(want.is_colored());
+        for &s in &shifts {
+            let min = ChunkPos::new(base.x + s.x, base.y + s.y, base.z + s.z);
+            let (got, got_path) = colored_light_at(seed, min, 50);
+            assert_eq!(got_path, path, "seed {seed} at {min:?}");
+            assert!(got == want, "seed {seed}: colored light differs at {min:?}");
+        }
+    }
+    assert!(colored > 0, "no colored result");
 }

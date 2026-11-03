@@ -342,6 +342,8 @@ struct LightJob {
     /// The dynamic lights that may reach the chunk (ADR 0063): its mesh shows their light, its
     /// kept light does not (ticks read the light of the blocks alone, ADR 0059).
     points: Vec<PointEmitter>,
+    /// `WorldSettings::colored_sky` (ADR 0064).
+    colored_sky: bool,
 }
 
 /// Computes the light of `pos` from its 27 chunks (center at 13) into this thread's scratch and
@@ -373,6 +375,7 @@ fn with_light<R>(
             sky: tiles.map_or(SkyInput::BelowFloor, SkyInput::Tiles),
             beams: std::array::from_fn(|i| job.beams[i].as_deref()),
             tables: &job.tables,
+            colored_sky: job.colored_sky,
         };
         let path = boxel_light::compute(&input, scratch, padded);
         if job.points.is_empty() {
@@ -2744,6 +2747,7 @@ impl WorldJobs {
                     beams,
                     keep: self.planner.priority(pos) <= self.light_cache_sq,
                     points: self.points_for(pos),
+                    colored_sky: cx.sky.colored_sky,
                 })
             }
         };
@@ -3051,6 +3055,7 @@ impl WorldJobs {
             beams,
             keep: true,
             points: Vec::new(),
+            colored_sky: cx.sky.colored_sky,
         };
         cx.map.slots[id].set_light_job(true);
         spawn_job(

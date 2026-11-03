@@ -24,15 +24,20 @@
 //! plane at or under its source, and an up beam under the smallest plane above it. The clip does
 //! not need the planes to be chunk aligned.
 //!
-//! **Light filters** (ADR 0060) are ignored: a beam is direct sky, which the filters leave white.
-//! A filter of opacity 0 (colored glass) lets the beam through, one of opacity 1 or more ends it
-//! like any other blocker. Every absolute comparison is an `i64` difference, so a tile is the same
+//! **Light filters** (ADR 0060): a filter of opacity 0 (colored glass) lets the beam through, one
+//! of opacity 1 or more ends it like any other blocker. A tile of [`build`] leaves the beam white.
+//! A tile of [`build_colored`] (colored sky, ADR 0064) also keeps the filter cells inside its
+//! beams, and flags the beams that cross one: past each filter cell, in the beam's direction,
+//! each channel is filtered ([`boxel_voxel::transmit`], no cost), so the cells under a red pane
+//! are red direct sky. Every absolute comparison is an `i64` difference, so a tile is the same
 //! at any height up to the world limit (ADR 0014).
 use crate::LayerData;
+use crate::padded::{WHITE_SKY, filter_sky};
 use boxel_voxel::{
-    BeamDir, BlockState, CHUNK_AREA, CHUNK_SHIFT, LightMasks, LightTables, LocalPos, MAX_BEAM,
-    MAX_CHUNK_COORD, SkySourceDef,
+    BeamDir, BlockState, CHUNK_AREA, CHUNK_SHIFT, ChunkData, LightMasks, LightTables, LocalPos,
+    MAX_BEAM, MAX_CHUNK_COORD, SkySourceDef,
 };
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 /// How far a beam reaches past its source, in cells.
@@ -50,9 +55,11 @@ const INDEX_LEN: usize = CHUNK_AREA + 1;
 const FLAG_RANGE: u16 = 0xFF;
 /// The beam goes up.
 const FLAG_UP: u16 = 1 << 8;
+/// The beam crosses a filter cell (a tile of [`build_colored`]).
+const FLAG_TINTED: u16 = 1 << 9;
 
 /// One beam of a source, as a tile stores it (8 B). Offsets count from the tile's base,
-/// `w_lo - MAX_BEAM`. Bits 9..16 of `flags` are free (colored beams, constant sources).
+/// `w_lo - MAX_BEAM`. Bits 10..16 of `flags` are free (constant sources).
 ///
 /// The field order is the sort order of a column (by `lo` first, as [`crate::box_light`] reads
 /// it), and makes the order unique.
@@ -64,8 +71,25 @@ pub(crate) struct Packed {
     pub(crate) hi: u16,
     /// The source.
     y: u16,
-    /// `range - 1` and [`FLAG_UP`].
+    /// `range - 1`, [`FLAG_UP`] and [`FLAG_TINTED`].
     flags: u16,
+}
+
+impl Packed {
+    /// True if the beam crosses a filter cell.
+    #[inline]
+    pub(crate) fn tinted(self) -> bool {
+        self.flags & FLAG_TINTED != 0
+    }
+}
+
+/// A filter cell inside a beam of a tile of [`build_colored`] (8 B): its column, offset (from the
+/// tile's base) and filter. A tile keeps them sorted by column, then offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PackedTint {
+    col: u16,
+    y: u16,
+    filter: [u8; 3],
 }
 
 /// A beam with absolute coordinates.
@@ -101,15 +125,21 @@ pub struct BeamTile {
     hi: i64,
     /// Bumped by every change of the beams (for callers that cache results built from the tile).
     pub version: u32,
+    /// True if the tile keeps the filter cells of its beams ([`build_colored`]).
+    colored: bool,
+    /// The filter cells inside the beams, sorted (empty when not `colored`).
+    tints: Vec<PackedTint>,
 }
 
-/// Two tiles are equal when they have the same window and the same beams; the version is not
-/// compared.
+/// Two tiles are equal when they have the same window, the same beams and the same filter
+/// cells; the version is not compared.
 impl PartialEq for BeamTile {
     fn eq(&self, other: &Self) -> bool {
         (self.w_lo, self.w_hi) == (other.w_lo, other.w_hi)
             && self.index == other.index
             && self.beams == other.beams
+            && self.colored == other.colored
+            && self.tints == other.tints
     }
 }
 
@@ -122,7 +152,8 @@ pub enum Retrace {
     /// same beam).
     Unchanged,
     /// The beam cells changed between `lo` and `hi` (every cell that became or stopped being a
-    /// beam cell lies there). The light changes at most 14 cells beyond.
+    /// beam cell lies there, and in a tile of [`build_colored`] every cell whose filtered sky
+    /// changed). The light changes at most 14 cells beyond.
     Changed {
         /// Lowest changed cell.
         lo: i64,
@@ -198,6 +229,59 @@ impl BeamTile {
             lo: 1,
             hi: 0,
             version: 0,
+            colored: false,
+            tints: Vec::new(),
+        }
+    }
+
+    /// True if the tile keeps the filter cells of its beams ([`build_colored`]).
+    pub fn colored_sky(&self) -> bool {
+        self.colored
+    }
+
+    /// True if some beam crosses a filter cell (only in a tile of [`build_colored`]).
+    #[inline]
+    pub fn has_tints(&self) -> bool {
+        !self.tints.is_empty()
+    }
+
+    /// The filter cells inside the beams of local column `(x, z)`: absolute y and filter,
+    /// ascending.
+    pub fn column_tints(&self, x: u32, z: u32) -> impl Iterator<Item = (i64, [u8; 3])> + '_ {
+        let col = ((x as usize) << CHUNK_SHIFT) | z as usize;
+        self.tints_of(col)
+            .iter()
+            .map(|t| (self.base + i64::from(t.y), t.filter))
+    }
+
+    /// The filter cells of column `col`, ascending.
+    fn tints_of(&self, col: usize) -> &[PackedTint] {
+        let start = self.tints.partition_point(|t| (t.col as usize) < col);
+        let end = self.tints.partition_point(|t| (t.col as usize) <= col);
+        &self.tints[start..end]
+    }
+
+    /// Calls `f(offset, color)` for each cell of beam `b` of column `col` (offsets from
+    /// [`BeamTile::base`]) with its filtered sky (red, green and blue in the block nibbles of a
+    /// `LightValue`): white from the source, filtered past each filter cell in the beam's
+    /// direction, the filter cell included.
+    pub(crate) fn beam_colors(&self, col: usize, b: Packed, mut f: impl FnMut(i64, u16)) {
+        let tints = self.tints_of(col);
+        let mut c = WHITE_SKY;
+        let mut cell = |y: u16, c: &mut u16| {
+            if let Ok(i) = tints.binary_search_by_key(&y, |t| t.y) {
+                *c = filter_sky(*c, tints[i].filter);
+            }
+            f(i64::from(y), *c);
+        };
+        if b.flags & FLAG_UP == 0 {
+            for y in (b.lo..=b.hi).rev() {
+                cell(y, &mut c);
+            }
+        } else {
+            for y in b.lo..=b.hi {
+                cell(y, &mut c);
+            }
         }
     }
 
@@ -285,9 +369,33 @@ impl BeamTile {
         })
     }
 
-    /// Heap bytes of the tile (2 KiB of index plus 8 B per beam when it has beams).
+    /// Heap bytes of the tile (2 KiB of index plus 8 B per beam when it has beams, and 8 B
+    /// per filter cell).
     pub fn heap_bytes(&self) -> usize {
-        self.index.len() * size_of::<u32>() + self.beams.capacity() * size_of::<Packed>()
+        self.index.len() * size_of::<u32>()
+            + self.beams.capacity() * size_of::<Packed>()
+            + self.tints.capacity() * size_of::<PackedTint>()
+    }
+
+    /// Sets [`FLAG_TINTED`] on the beams that hold a filter cell, and clears it on the others.
+    fn mark_tinted(&mut self) {
+        if self.index.is_empty() {
+            return;
+        }
+        for col in 0..CHUNK_AREA {
+            let (start, end) = (self.index[col] as usize, self.index[col + 1] as usize);
+            if start == end {
+                continue;
+            }
+            for i in start..end {
+                let b = self.beams[i];
+                let hit = self
+                    .tints_of(col)
+                    .iter()
+                    .any(|t| b.lo <= t.y && t.y <= b.hi);
+                self.beams[i].flags = (b.flags & !FLAG_TINTED) | if hit { FLAG_TINTED } else { 0 };
+            }
+        }
     }
 
     /// Sets the tile's beams from `found` (any order), with its index and bounds.
@@ -331,6 +439,8 @@ impl BeamTile {
     ///   lets it grow, traced from `y` to the next blocker or its limit.
     ///
     /// Any other edit leaves the beams as they are (a beam that ended at its range never grows).
+    /// A tile of [`build_colored`] then reads the new beams' cells again for their filter cells
+    /// (a pane placed in a beam, or changed, retints it in place).
     /// `planes` are the realm planes the tile was built with. `layer(cy)` reads chunk layer `cy`
     /// of the column as it is after the edit, `None` when the caller does not have it (typically
     /// not loaded): then the result is [`Retrace::Unresolved`] and the tile is unchanged. The
@@ -402,6 +512,9 @@ impl BeamTile {
                 def,
             });
         }
+        if self.colored {
+            return self.edit_colored(x, z, &old, new, tables, &mut layer);
+        }
         let mut packed: Vec<Packed> = new.iter().map(|b| self.pack(b)).collect();
         packed.sort_unstable();
         if packed.as_slice() == self.packed(col) {
@@ -428,6 +541,137 @@ impl BeamTile {
             None => Retrace::Unchanged,
         }
     }
+
+    /// The end of [`BeamTile::edit`] in a colored tile: the column's new beams `new`, their
+    /// filter cells read from the content, and the band of cells whose filtered sky changed.
+    fn edit_colored<'a>(
+        &mut self,
+        x: u32,
+        z: u32,
+        old: &[Beam],
+        mut new: Vec<Beam>,
+        tables: &LightTables,
+        layer: &mut impl FnMut(i64) -> Option<LayerData<'a>>,
+    ) -> Retrace {
+        let col = ((x as usize) << CHUNK_SHIFT) | z as usize;
+        new.sort_unstable_by_key(|b| b.lo);
+        let Some(new_tints) = read_tints(x, z, &merged(&new), tables, layer) else {
+            return Retrace::Unresolved;
+        };
+        let old_tints: Vec<(i64, [u8; 3])> = self.column_tints(x, z).collect();
+        let mut packed: Vec<Packed> = new
+            .iter()
+            .map(|b| {
+                let mut p = self.pack(b);
+                if new_tints.iter().any(|&(y, _)| b.lo <= y && y <= b.hi) {
+                    p.flags |= FLAG_TINTED;
+                }
+                p
+            })
+            .collect();
+        packed.sort_unstable();
+        if packed.as_slice() == self.packed(col) && new_tints == old_tints {
+            return Retrace::Unchanged;
+        }
+        if self.index.is_empty() {
+            self.index = vec![0u32; INDEX_LEN].into_boxed_slice();
+        }
+        let (start, end) = (self.index[col] as usize, self.index[col + 1] as usize);
+        let delta = packed.len() as i64 - (end - start) as i64;
+        self.beams.splice(start..end, packed);
+        for i in &mut self.index[col + 1..] {
+            *i = (i64::from(*i) + delta) as u32;
+        }
+        if self.beams.is_empty() {
+            self.index = Box::new([]);
+        }
+        let t_start = self.tints.partition_point(|t| (t.col as usize) < col);
+        let t_end = self.tints.partition_point(|t| (t.col as usize) <= col);
+        let base = self.base;
+        self.tints.splice(
+            t_start..t_end,
+            new_tints.iter().map(|&(y, filter)| PackedTint {
+                col: col as u16,
+                y: (y - base) as u16,
+                filter,
+            }),
+        );
+        self.update_bounds();
+        self.version = self.version.wrapping_add(1);
+        let (before, after) = (cell_colors(old, &old_tints), cell_colors(&new, &new_tints));
+        let differs = before
+            .keys()
+            .chain(after.keys())
+            .filter(|y| before.get(y) != after.get(y));
+        match differs.fold(None, |band: Option<(i64, i64)>, &y| {
+            Some(band.map_or((y, y), |(lo, hi)| (lo.min(y), hi.max(y))))
+        }) {
+            Some((lo, hi)) => Retrace::Changed { lo, hi },
+            None => Retrace::Unchanged,
+        }
+    }
+}
+
+/// The filter cells (absolute y and filter, ascending) of column `(x, z)` inside the cell
+/// intervals `cells` (ascending, as [`merged`] gives them), read with `layer`; `None` if a layer
+/// is missing.
+fn read_tints<'a>(
+    x: u32,
+    z: u32,
+    cells: &[(i64, i64)],
+    tables: &LightTables,
+    layer: &mut impl FnMut(i64) -> Option<LayerData<'a>>,
+) -> Option<Vec<(i64, [u8; 3])>> {
+    let mut out = Vec::new();
+    if !tables.any_filter() {
+        return Some(out);
+    }
+    let mut current: Option<(i64, LayerData<'a>)> = None;
+    for &(lo, hi) in cells {
+        for y in lo..=hi {
+            let cy = y >> CHUNK_SHIFT;
+            if current.as_ref().is_none_or(|(c, _)| *c != cy) {
+                let data = if (-MAX_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&cy) {
+                    layer(cy)?
+                } else {
+                    LayerData::Air
+                };
+                current = Some((cy, data));
+            }
+            let Some(chunk) = current.as_ref().and_then(|(_, d)| d.chunk()) else {
+                continue;
+            };
+            let s = chunk.get(LocalPos::new(x, (y - (cy << CHUNK_SHIFT)) as u32, z));
+            if tables.filters(s) && !tables.blocks_sky(s) {
+                out.push((y, tables.light_filter(s)));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The filtered sky of every cell of `beams` (one column, its filter cells `tints` ascending):
+/// per cell, the per-channel max over the beams that hold it.
+fn cell_colors(beams: &[Beam], tints: &[(i64, [u8; 3])]) -> BTreeMap<i64, u16> {
+    let mut out = BTreeMap::new();
+    for b in beams {
+        let mut c = WHITE_SKY;
+        let mut cell = |y: i64| {
+            if let Ok(i) = tints.binary_search_by_key(&y, |t| t.0) {
+                c = filter_sky(c, tints[i].1);
+            }
+            let e = out.entry(y).or_insert(c);
+            *e = boxel_voxel::LightValue(*e)
+                .max(boxel_voxel::LightValue(c))
+                .0;
+        };
+        if b.def.dir == BeamDir::Down {
+            (b.lo..=b.hi).rev().for_each(&mut cell);
+        } else {
+            (b.lo..=b.hi).for_each(&mut cell);
+        }
+    }
+    out
 }
 
 /// The far end of a beam whose cell `from` is clear, going toward `limit` (`from` included):
@@ -598,6 +842,45 @@ impl Pass {
         }
     }
 
+    /// Calls `f(column, filter)` for each filter cell of opacity 0 at local row `ly` (absolute
+    /// `y`) of `chunk` that lies in an open beam of its column.
+    #[expect(clippy::too_many_arguments, reason = "the row, its chunk and the pass")]
+    fn tints(
+        &self,
+        masks: &LightMasks<'_>,
+        chunk: &ChunkData,
+        tables: &LightTables,
+        ly: u32,
+        y: i64,
+        down: bool,
+        mut f: impl FnMut(usize, [u8; 3]),
+    ) {
+        let row = (ly as usize) << CHUNK_SHIFT;
+        for x in 0..32 {
+            let a = self.active[x];
+            if a == 0 {
+                continue;
+            }
+            let blockers = masks.opaque.row(row + x) | masks.partial.row(row + x);
+            let mut bits = masks.filter.row(row + x) & !blockers & a;
+            while bits != 0 {
+                let z = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let col = (x << CHUNK_SHIFT) | z;
+                // Inside the farthest open beam of the column.
+                let inside = if down {
+                    y >= self.far[col]
+                } else {
+                    y <= self.far[col]
+                };
+                if inside {
+                    let s = chunk.get(LocalPos::new(x as u32, ly, z as u32));
+                    f(col, tables.light_filter(s));
+                }
+            }
+        }
+    }
+
     /// Closes the open columns that meet a blocker in row `row` of `chunk`'s masks, at `y`.
     fn hit(&mut self, open: &mut [Open], masks: &LightMasks<'_>, row: usize, y: i64, down: bool) {
         for x in 0..32 {
@@ -629,12 +912,36 @@ pub fn build<'a>(
     window: RangeInclusive<i64>,
     planes: &[i64],
     tables: &LightTables,
+    layer: impl FnMut(i64) -> LayerData<'a>,
+) -> BeamTile {
+    build_with::<false>(window, planes, tables, layer)
+}
+
+/// [`build`] for colored sky (ADR 0064): the tile also keeps the filter cells (opacity 0) inside
+/// its beams and flags the beams that cross one, and keeps them through edits. The beams are
+/// those of [`build`]; it reads the same layers.
+pub fn build_colored<'a>(
+    window: RangeInclusive<i64>,
+    planes: &[i64],
+    tables: &LightTables,
+    layer: impl FnMut(i64) -> LayerData<'a>,
+) -> BeamTile {
+    build_with::<true>(window, planes, tables, layer)
+}
+
+fn build_with<'a, const COLORED: bool>(
+    window: RangeInclusive<i64>,
+    planes: &[i64],
+    tables: &LightTables,
     mut layer: impl FnMut(i64) -> LayerData<'a>,
 ) -> BeamTile {
     let mut tile = BeamTile::empty(window);
+    tile.colored = COLORED;
     if !tables.any_sky_source() {
         return tile;
     }
+    let filters = COLORED && tables.any_filter();
+    let mut tints: Vec<PackedTint> = Vec::new();
     let window = tile.window();
     let top = (tile.w_hi + REACH) >> CHUNK_SHIFT;
     let bottom = (tile.w_lo - REACH) >> CHUNK_SHIFT;
@@ -693,6 +1000,7 @@ pub fn build<'a>(
                 continue;
             }
             let masks = chunk.light_masks(tables);
+            let glass = filters && !masks.filter.is_empty();
             // The new sources in pass order: by y, down from the top for down beams.
             let mut next = if down { open.len() } else { first };
             for step in 0..32u32 {
@@ -705,6 +1013,16 @@ pub fn build<'a>(
                         y0 + i64::from(ly),
                         down,
                     );
+                    if glass {
+                        let y = y0 + i64::from(ly);
+                        pass.tints(&masks, chunk, tables, ly, y, down, |col, filter| {
+                            tints.push(PackedTint {
+                                col: col as u16,
+                                y: (y - tile.base) as u16,
+                                filter,
+                            });
+                        });
+                    }
                 }
                 // A source is clear, so it opens after its own row's blockers.
                 if down {
@@ -744,6 +1062,13 @@ pub fn build<'a>(
         })
         .collect();
     tile.set_beams(found);
+    if COLORED {
+        // A cell in a down beam and an up beam is met by both passes.
+        tints.sort_unstable();
+        tints.dedup();
+        tile.tints = tints;
+        tile.mark_tinted();
+    }
     tile
 }
 

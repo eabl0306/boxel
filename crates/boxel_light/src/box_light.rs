@@ -18,6 +18,16 @@
 //! above `T`, and the beam set is exact because its tiles are built from the world content
 //! ([`crate::beam_tile`]). A beam passes filters of opacity 0 and stays white, as the sky does.
 //!
+//! **Colored sky** (ADR 0064, [`LightInput::colored_sky`]): sky light is filtered exactly as
+//! block light, per channel. A direct voxel under filters (the tints of its column above `T`,
+//! or the filter cells of a beam) is a source at the filtered level of each channel, and stays
+//! open so a brighter neighbor can raise it; spread sky entering a filter voxel is filtered
+//! after its cost. `transmit` never raises a level, so every light still comes from a source
+//! at most 14 voxels away and the fixpoint is still unique. Only the boxes where a filter can
+//! tint the sky take this path (`colored_floods`): three sky floods, one per channel, next to
+//! the uncolored one, which gameplay reads (ADR 0064). Every other box runs the code of
+//! before.
+//!
 //! **Steps** ([`compute`]):
 //! 1. Emitters inside the box, from the chunks whose palette may emit (the others are skipped
 //!    without reading a voxel). Fast paths, from that and the tiles' bounds alone: no emitter
@@ -44,7 +54,9 @@
 //! result is the same at any position up to the world limit.
 use crate::SkyTile;
 use crate::beam_tile::BeamTile;
-use crate::padded::{PADDED, PaddedLight, new_full};
+use crate::padded::{
+    PADDED, PADDED_VOLUME, PaddedLight, WHITE_SKY, filter_sky, new_full, sky_is_gray,
+};
 use boxel_voxel::{
     BlockState, ChunkData, ChunkPos, LightMasks, LightTables, LightValue, LocalPos, MaskRows,
     transmit,
@@ -112,10 +124,14 @@ pub struct LightInput<'a> {
     pub beams: [Option<&'a BeamTile>; 9],
     /// Opacity and emission of each state (built from the registry the chunks use).
     pub tables: &'a LightTables,
+    /// Colored sky (ADR 0064, `WorldSettings::colored_sky`): light filters tint the sky light
+    /// too, and a box where one can gives [`PaddedLight::Colored`]. Off: the sky stays white
+    /// and every result is bit for bit the one of before.
+    pub colored_sky: bool,
 }
 
 /// How a box was computed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LightPath {
     /// No emitter and no direct sky in the box: uniformly dark, no flood.
     FastDark,
@@ -127,11 +143,38 @@ pub enum LightPath {
         sky_pops: u32,
         /// Voxels popped by the block floods (all channels).
         block_pops: u32,
+        /// `Some(pops)` if the box took the colored sky path (ADR 0064): the voxels popped by
+        /// its three sky floods.
+        colored_pops: Option<u32>,
     },
 }
 
-/// Per-worker scratch of [`compute`] (about 0.7 MiB). Reused across calls: its light array is
-/// all zero between calls.
+/// `colored_pops` only when the box took the colored path, so the output of every other box
+/// stays as before (goldens and logs print it).
+impl std::fmt::Debug for LightPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LightPath::FastDark => f.write_str("FastDark"),
+            LightPath::FastOpen => f.write_str("FastOpen"),
+            LightPath::Full {
+                sky_pops,
+                block_pops,
+                colored_pops,
+            } => {
+                let mut d = f.debug_struct("Full");
+                d.field("sky_pops", sky_pops)
+                    .field("block_pops", block_pops);
+                if let Some(pops) = colored_pops {
+                    d.field("colored_pops", pops);
+                }
+                d.finish()
+            }
+        }
+    }
+}
+
+/// Per-worker scratch of [`compute`] (about 0.7 MiB, and 0.7 MiB more from the first colored
+/// box). Reused across calls: its light arrays are all zero between calls.
 pub struct LightScratch {
     /// Light of the box (zero outside a call).
     light: Box<BoxLight>,
@@ -154,7 +197,11 @@ pub struct LightScratch {
     emitters: Vec<(u32, LightValue)>,
     /// Spare padded buffers (at most [`MAX_SPARES`]: the one `out` gives back and the one a
     /// uniform result did not keep), so alternating uniform and full results never allocate.
-    spares: Vec<Box<[u16; crate::PADDED_VOLUME]>>,
+    spares: Vec<Box<[u16; PADDED_VOLUME]>>,
+    /// A spare `sky_rgb` buffer of [`PaddedLight::Colored`].
+    rgb_spare: Option<Box<[u16; PADDED_VOLUME]>>,
+    /// The colored sky's scratch, made on the first colored box.
+    color: Option<Box<ColorScratch>>,
     /// Padded buffers allocated so far.
     #[cfg(test)]
     allocations: usize,
@@ -162,6 +209,44 @@ pub struct LightScratch {
 
 /// Spare padded buffers kept by [`LightScratch`].
 const MAX_SPARES: usize = 2;
+
+/// The colored sky's part of [`LightScratch`] (ADR 0064), about 0.7 MiB.
+struct ColorScratch {
+    /// Sky red, green and blue of the box in the block nibbles (zero outside a call): the
+    /// filtered level of the tinted direct voxels, then what the floods raise.
+    rgb: Box<BoxLight>,
+    /// Direct voxels with some sky channel below 15: sources at their filtered levels, open to
+    /// the three floods.
+    tinted: Box<BoxRows>,
+    /// Voxels the three floods may not enter: opaque, or direct and not tinted (white).
+    closed: Box<BoxRows>,
+    /// Tinted voxels a flood must start from: next to an open voxel that is not direct, or in
+    /// a column whose neighbors may be tinted otherwise.
+    boundary: Box<BoxRows>,
+    /// Rows of `rgb` with a non-zero value (to reset them).
+    touched: [u64; ROW_WORDS],
+    /// Per box column (`(bx << 6) | bz`), its tint going down the sweep of `tint_columns`.
+    cur: Box<[u16; ROWS]>,
+    /// Per `bx`, the columns (bit `bz`) whose tints the boundary must include.
+    edge: [u64; BOX],
+    /// Tints met inside the box: `(by << 24) | (column << 12) | tint`.
+    events: Vec<u32>,
+}
+
+impl ColorScratch {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            rgb: zeroed(),
+            tinted: zeroed(),
+            closed: zeroed(),
+            boundary: zeroed(),
+            touched: [0; ROW_WORDS],
+            cur: zeroed(),
+            edge: [0; BOX],
+            events: Vec::new(),
+        })
+    }
+}
 
 impl Default for LightScratch {
     fn default() -> Self {
@@ -197,20 +282,22 @@ impl LightScratch {
             buckets: Default::default(),
             emitters: Vec::new(),
             spares: Vec::with_capacity(MAX_SPARES),
+            rgb_spare: None,
+            color: None,
             #[cfg(test)]
             allocations: 0,
         }
     }
 
     /// Keeps `values` as a spare if there is room.
-    fn keep_spare(&mut self, values: Box<[u16; crate::PADDED_VOLUME]>) {
+    fn keep_spare(&mut self, values: Box<[u16; PADDED_VOLUME]>) {
         if self.spares.len() < MAX_SPARES {
             self.spares.push(values);
         }
     }
 
     /// A spare padded buffer, or a new one.
-    fn take_spare(&mut self) -> Box<[u16; crate::PADDED_VOLUME]> {
+    fn take_spare(&mut self) -> Box<[u16; PADDED_VOLUME]> {
         self.spares.pop().unwrap_or_else(|| {
             #[cfg(test)]
             {
@@ -261,9 +348,12 @@ fn classify(input: &LightInput<'_>, origin_y: i64) -> Sky {
             // Box top: origin + 31 + MARGIN. Padded bottom: origin - 1.
             if origin_y.saturating_add(31 + MARGIN) <= min {
                 Sky::Dark
-            } else if origin_y.saturating_sub(1) > max {
+            } else if origin_y.saturating_sub(1) > max
+                && !(input.colored_sky && tints_reach(tiles, origin_y.saturating_sub(1)))
+            {
                 Sky::Open
             } else {
+                // A padded chunk above every top but under a tint is direct, not white.
                 Sky::Mixed
             }
         }
@@ -274,6 +364,12 @@ fn classify(input: &LightInput<'_>, origin_y: i64) -> Sky {
     } else {
         sky
     }
+}
+
+/// True if some tint of `tiles` is at or above `y`: it filters direct sky at `y` or above.
+#[inline]
+fn tints_reach(tiles: &[&SkyTile; 9], y: i64) -> bool {
+    tiles.iter().any(|t| t.tint_max() >= y)
 }
 
 /// The box columns (`bx` or `bz`) in the chunk column at tile offset `d + 1` (`d` in `-1..=1`).
@@ -319,13 +415,16 @@ fn beams_cross(beams: &[Option<&BeamTile>; 9], box_y0: i64) -> bool {
 
 /// ORs the beam cells of `beams` in the box (bottom row `box_y0`) into `direct`, through
 /// `toggles` (overwritten): per box column, the beams merged into disjoint runs, each run
-/// toggling its first row and the row past its last, then one XOR sweep upwards.
+/// toggling its first row and the row past its last, then one XOR sweep upwards. With
+/// `skip_tinted`, the beams that cross a filter are left out (`add_tinted_beams` writes them).
+/// Returns true if some cell was added; `toggles` then holds the cells added.
 fn add_beams(
     beams: &[Option<&BeamTile>; 9],
     box_y0: i64,
     direct: &mut BoxRows,
     toggles: &mut BoxRows,
-) {
+    skip_tinted: bool,
+) -> bool {
     let top = BOX as i64 - 1;
     toggles.fill(0);
     let mut any = false;
@@ -354,6 +453,9 @@ fn add_beams(
                 let mut run: Option<(i64, i64)> = None;
                 // Sorted by `lo`, so clipped runs come in order and merge in one pass.
                 for b in tile.packed(col) {
+                    if skip_tinted && b.tinted() {
+                        continue;
+                    }
                     let lo = (i64::from(b.lo) + shift).max(0);
                     if lo > top {
                         break;
@@ -386,6 +488,7 @@ fn add_beams(
             *d |= t;
         }
     }
+    any
 }
 
 fn run(
@@ -426,6 +529,7 @@ fn floods(
     any_emission: u16,
 ) -> LightPath {
     let origin_y = input.origin.origin().y;
+    let box_y0 = origin_y - MARGIN;
     let tables = input.tables;
     let emits = !scratch.emitters.is_empty();
     let masks: [LightMasks<'_>; 27] = std::array::from_fn(|i| {
@@ -443,19 +547,51 @@ fn floods(
         (true, SkyInput::BelowFloor) if any_beams => Sky::Mixed,
         _ => sky,
     };
+    let filter_voxels = tables.any_filter() && masks.iter().any(|m| !m.filter.is_empty());
+    // Colored sky: only where a filter can tint some direct or spread sky of the box.
+    let colored = input.colored_sky
+        && tables.any_filter()
+        && sky == Sky::Mixed
+        && (filter_voxels
+            || matches!(&input.sky, SkyInput::Tiles(t) if tints_reach(t, box_y0))
+            || (any_beams && tinted_beams_cross(&input.beams, box_y0)));
+    if colored && scratch.color.is_none() {
+        scratch.color = Some(ColorScratch::new());
+    }
     let mut sky_pops = 0;
     match sky {
         Sky::Mixed => {
             match &input.sky {
                 SkyInput::Tiles(tiles) => {
-                    build_direct(tiles, origin_y - MARGIN, &mut scratch.direct);
+                    build_direct(tiles, box_y0, &mut scratch.direct);
                 }
                 SkyInput::BelowFloor => scratch.direct.fill(0),
             }
+            if let (true, Some(color)) = (colored, scratch.color.as_deref_mut()) {
+                match &input.sky {
+                    SkyInput::Tiles(tiles) => tint_columns(tiles, box_y0, &scratch.direct, color),
+                    SkyInput::BelowFloor => color.tinted.fill(0),
+                }
+                color.edge = [0; BOX];
+            }
             if any_beams {
                 // `closed` is free until the sky flood sets it.
-                let LightScratch { direct, closed, .. } = scratch;
-                add_beams(&input.beams, origin_y - MARGIN, direct, closed);
+                let LightScratch {
+                    direct,
+                    closed,
+                    color,
+                    ..
+                } = scratch;
+                let white = add_beams(&input.beams, box_y0, direct, closed, colored);
+                if let (true, Some(color)) = (colored, color.as_deref_mut()) {
+                    if white {
+                        // A white beam cell is white whatever the roof above it.
+                        for (t, &w) in color.tinted.iter_mut().zip(closed.iter()) {
+                            *t &= !w;
+                        }
+                    }
+                    add_tinted_beams(&input.beams, box_y0, direct, color);
+                }
             }
             sky_pops = if heavy {
                 sky_flood::<true>(scratch, &cost_of)
@@ -466,8 +602,8 @@ fn floods(
         Sky::Open => scratch.direct.fill(u64::MAX),
         Sky::Dark => scratch.direct.fill(0),
     }
-    let filters = emits && tables.any_filter() && masks.iter().any(|m| !m.filter.is_empty());
-    if filters {
+    let filters = emits && filter_voxels;
+    if filters || (colored && filter_voxels) {
         gather_rows(&masks.map(|m| m.filter), &mut scratch.special);
         if heavy {
             let LightScratch {
@@ -478,6 +614,7 @@ fn floods(
             }
         }
     }
+    let colored_pops = colored.then(|| colored_floods(input, scratch, heavy, filter_voxels));
     let block_pops = match (emits, filters, heavy) {
         (false, _, _) => 0,
         (true, true, _) => block_flood::<true>(any_emission, scratch, Special::Filter(input)),
@@ -486,26 +623,56 @@ fn floods(
             block_flood::<false>(any_emission, scratch, Special::Partial(input))
         }
     };
-    extract(scratch, out);
+    if colored {
+        extract_colored(scratch, out);
+    } else {
+        extract(scratch, out);
+    }
     // Reset the touched rows.
-    for (w, word) in scratch.touched.iter_mut().enumerate() {
-        let mut bits = std::mem::take(word);
-        while bits != 0 {
-            let row = (w << 6) | bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            scratch.light[row << 6..(row + 1) << 6].fill(0);
-        }
+    reset_rows(&mut scratch.light, &mut scratch.touched);
+    if let (true, Some(color)) = (colored, scratch.color.as_deref_mut()) {
+        reset_rows(&mut color.rgb, &mut color.touched);
     }
     LightPath::Full {
         sky_pops,
         block_pops,
+        colored_pops,
     }
 }
 
-/// `out = Uniform(v)`, keeping a `Full` buffer as a spare.
+/// Zeroes the rows of `light` marked in `touched`, and clears `touched`.
+fn reset_rows(light: &mut BoxLight, touched: &mut [u64; ROW_WORDS]) {
+    for (w, word) in touched.iter_mut().enumerate() {
+        let mut bits = std::mem::take(word);
+        while bits != 0 {
+            let row = (w << 6) | bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            light[row << 6..(row + 1) << 6].fill(0);
+        }
+    }
+}
+
+/// `out = Uniform(v)`, keeping its buffers as spares.
 fn set_uniform(out: &mut PaddedLight, scratch: &mut LightScratch, v: LightValue) {
-    if let PaddedLight::Full(values) = std::mem::replace(out, PaddedLight::Uniform(v)) {
-        scratch.keep_spare(values);
+    match std::mem::replace(out, PaddedLight::Uniform(v)) {
+        PaddedLight::Uniform(_) => {}
+        PaddedLight::Full(values) => scratch.keep_spare(values),
+        PaddedLight::Colored { light, sky_rgb } => {
+            scratch.keep_spare(light);
+            scratch.rgb_spare = Some(sky_rgb);
+        }
+    }
+}
+
+/// `out = Full(values)`, keeping its buffers as spares.
+fn set_full(out: &mut PaddedLight, scratch: &mut LightScratch, values: Box<[u16; PADDED_VOLUME]>) {
+    match std::mem::replace(out, PaddedLight::Full(values)) {
+        PaddedLight::Uniform(_) => {}
+        PaddedLight::Full(old) => scratch.keep_spare(old),
+        PaddedLight::Colored { light, sky_rgb } => {
+            scratch.keep_spare(light);
+            scratch.rgb_spare = Some(sky_rgb);
+        }
     }
 }
 
@@ -805,6 +972,12 @@ fn flood<const SPECIAL: bool>(
 /// result becomes `Uniform`.
 fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
     let mut values = scratch.take_spare();
+    fill_padded(scratch, &mut values);
+    finish(scratch, out, values);
+}
+
+/// The padded region of the box's light (direct voxels get sky 15).
+fn fill_padded(scratch: &LightScratch, values: &mut [u16; PADDED_VOLUME]) {
     for py in 0..PADDED {
         let by = py + PADDED_START;
         for px in 0..PADDED {
@@ -813,26 +986,406 @@ fn extract(scratch: &mut LightScratch, out: &mut PaddedLight) {
             let src = (r << 6) + PADDED_START;
             let dst = &mut values[(py * PADDED + px) * PADDED..][..PADDED];
             dst.copy_from_slice(&scratch.light[src..src + PADDED]);
-            let mut d = (scratch.direct[r] >> PADDED_START) & PADDED_ROW;
-            if d == PADDED_ROW {
-                for v in dst.iter_mut() {
-                    *v |= SKY_BITS;
-                }
-            } else {
-                while d != 0 {
-                    dst[d.trailing_zeros() as usize] |= SKY_BITS;
-                    d &= d - 1;
-                }
-            }
+            or_rows(
+                dst,
+                (scratch.direct[r] >> PADDED_START) & PADDED_ROW,
+                SKY_BITS,
+            );
         }
     }
+}
+
+/// `dst[i] |= value` for every bit `i` of `bits`.
+#[inline]
+fn or_rows(dst: &mut [u16], mut bits: u64, value: u16) {
+    if bits == PADDED_ROW {
+        for v in dst.iter_mut() {
+            *v |= value;
+        }
+    } else {
+        while bits != 0 {
+            dst[bits.trailing_zeros() as usize] |= value;
+            bits &= bits - 1;
+        }
+    }
+}
+
+/// `out` from the padded values: `Uniform` if they are all equal, `Full` otherwise.
+fn finish(scratch: &mut LightScratch, out: &mut PaddedLight, values: Box<[u16; PADDED_VOLUME]>) {
     let first = values[0];
     if values.iter().all(|&v| v == first) {
         scratch.keep_spare(values);
         set_uniform(out, scratch, LightValue(first));
-    } else if let PaddedLight::Full(old) = std::mem::replace(out, PaddedLight::Full(values)) {
-        scratch.keep_spare(old);
+    } else {
+        set_full(out, scratch, values);
     }
+}
+
+/// [`extract`] of a colored box: the light as there, and the sky's three channels (white direct
+/// voxels get 15 in each). `Colored` only if some padded voxel's sky channels differ from its
+/// uncolored sky; otherwise exactly what [`extract`] gives.
+fn extract_colored(scratch: &mut LightScratch, out: &mut PaddedLight) {
+    let mut values = scratch.take_spare();
+    fill_padded(scratch, &mut values);
+    let mut rgb = scratch.rgb_spare.take().unwrap_or_else(new_full);
+    let color = scratch.color.as_deref().expect("colored scratch");
+    for py in 0..PADDED {
+        let by = py + PADDED_START;
+        for px in 0..PADDED {
+            let bx = px + PADDED_START;
+            let r = (by << 6) | bx;
+            let src = (r << 6) + PADDED_START;
+            let dst = &mut rgb[(py * PADDED + px) * PADDED..][..PADDED];
+            dst.copy_from_slice(&color.rgb[src..src + PADDED]);
+            let white = scratch.direct[r] & !color.tinted[r];
+            or_rows(dst, (white >> PADDED_START) & PADDED_ROW, WHITE_SKY);
+        }
+    }
+    if sky_is_gray(&values[..], &rgb[..]) {
+        scratch.rgb_spare = Some(rgb);
+        finish(scratch, out, values);
+    } else {
+        match std::mem::replace(
+            out,
+            PaddedLight::Colored {
+                light: values,
+                sky_rgb: rgb,
+            },
+        ) {
+            PaddedLight::Uniform(_) => {}
+            PaddedLight::Full(old) => scratch.keep_spare(old),
+            PaddedLight::Colored { light, sky_rgb } => {
+                scratch.keep_spare(light);
+                scratch.rgb_spare = Some(sky_rgb);
+            }
+        }
+    }
+}
+
+/// Per-channel max of two colors.
+#[inline]
+fn max_color(a: u16, b: u16) -> u16 {
+    LightValue(a).max(LightValue(b)).0
+}
+
+/// The tinted direct voxels of the columns (ADR 0064): every column-direct voxel of the box
+/// under some tint of its column gets the filtered sky of its height in `color.rgb`, and its bit
+/// in `color.tinted` (every row of which is written). One sweep down the box: per column its
+/// tint above the box, then the tints met inside it, in height order.
+fn tint_columns(tiles: &[&SkyTile; 9], box_y0: i64, direct: &BoxRows, color: &mut ColorScratch) {
+    let top = box_y0 + BOX as i64 - 1;
+    // Columns (bit `bz` of word `bx`) whose current tint is not white.
+    let mut tinted_cols = [0u64; BOX];
+    color.events.clear();
+    for (bx, cols) in tinted_cols.iter_mut().enumerate() {
+        let (dx, lx) = split(bx);
+        for bz in 0..BOX {
+            let (dz, lz) = split(bz);
+            let col = (bx << 6) | bz;
+            let tints = tiles[tile_index(dx, dz)].tints_at((lx << 5) | lz);
+            color.cur[col] = WHITE_SKY;
+            if tints.is_empty() {
+                continue;
+            }
+            let mut c = WHITE_SKY;
+            let mut rest = tints;
+            // Highest first: those above the box tint the whole column inside it.
+            while let [t, tail @ ..] = rest
+                && t.y > top
+            {
+                c = filter_sky(c, t.filter);
+                rest = tail;
+            }
+            color.cur[col] = c;
+            if c != WHITE_SKY {
+                *cols |= 1 << bz;
+            }
+            for t in rest {
+                if t.y < box_y0 {
+                    break;
+                }
+                c = filter_sky(c, t.filter);
+                let by = (t.y - box_y0) as u32;
+                color
+                    .events
+                    .push((by << 24) | ((col as u32) << 12) | u32::from(c));
+            }
+        }
+    }
+    // Highest row first; one tint per voxel, so the order inside a row does not matter.
+    color.events.sort_unstable_by(|a, b| b.cmp(a));
+    let mut e = 0;
+    for by in (0..BOX).rev() {
+        while let Some(&ev) = color.events.get(e)
+            && (ev >> 24) as usize == by
+        {
+            let col = ((ev >> 12) & 0xFFF) as usize;
+            let c = (ev & 0xFFF) as u16;
+            color.cur[col] = c;
+            let (bx, bz) = (col >> 6, col & 63);
+            if c == WHITE_SKY {
+                tinted_cols[bx] &= !(1 << bz);
+            } else {
+                tinted_cols[bx] |= 1 << bz;
+            }
+            e += 1;
+        }
+        for (bx, &cols) in tinted_cols.iter().enumerate() {
+            let r = (by << 6) | bx;
+            let mut t = direct[r] & cols;
+            color.tinted[r] = t;
+            if t == 0 {
+                continue;
+            }
+            color.touched[r >> 6] |= 1 << (r & 63);
+            let cur = &color.cur[bx << 6..(bx + 1) << 6];
+            let dst = &mut color.rgb[r << 6..(r + 1) << 6];
+            while t != 0 {
+                let bz = t.trailing_zeros() as usize;
+                t &= t - 1;
+                dst[bz] = cur[bz];
+            }
+        }
+    }
+}
+
+/// True if some beam that crosses a filter has a cell in the box whose bottom row is `box_y0`
+/// (from the tiles' bounds).
+fn tinted_beams_cross(beams: &[Option<&BeamTile>; 9], box_y0: i64) -> bool {
+    let top = box_y0 + BOX as i64 - 1;
+    beams
+        .iter()
+        .flatten()
+        .any(|t| t.has_tints() && t.may_cross(box_y0, top))
+}
+
+/// Writes the cells of the beams that cross a filter (left out by `add_beams`) into `direct`,
+/// with their filtered sky (ADR 0064): a cell already white stays white, one already tinted
+/// takes the per-channel max. Their columns and the columns beside them go into `color.edge`.
+fn add_tinted_beams(
+    beams: &[Option<&BeamTile>; 9],
+    box_y0: i64,
+    direct: &mut BoxRows,
+    color: &mut ColorScratch,
+) {
+    let top = BOX as i64 - 1;
+    for (ti, tile) in beams.iter().enumerate() {
+        let Some(tile) = tile.filter(|t| t.has_tints() && t.may_cross(box_y0, box_y0 + top)) else {
+            continue;
+        };
+        let shift = tile.base() - box_y0;
+        for bx in box_span(ti / 3) {
+            for bz in box_span(ti % 3) {
+                let col = (split(bx).1 << 5) | split(bz).1;
+                let mut any = false;
+                for &b in tile.packed(col).iter().filter(|b| b.tinted()) {
+                    let (lo, hi) = (i64::from(b.lo) + shift, i64::from(b.hi) + shift);
+                    if lo > top || hi < 0 {
+                        continue;
+                    }
+                    tile.beam_colors(col, b, |cell, c| {
+                        let by = cell + shift;
+                        if !(0..=top).contains(&by) {
+                            return;
+                        }
+                        let r = ((by as usize) << 6) | bx;
+                        let bit = 1u64 << bz;
+                        let v = (r << 6) | bz;
+                        if direct[r] & bit != 0 && color.tinted[r] & bit == 0 {
+                            return;
+                        }
+                        let c = if color.tinted[r] & bit != 0 {
+                            max_color(color.rgb[v], c)
+                        } else {
+                            c
+                        };
+                        direct[r] |= bit;
+                        if c == WHITE_SKY {
+                            color.tinted[r] &= !bit;
+                        } else {
+                            color.tinted[r] |= bit;
+                            color.rgb[v] = c;
+                            color.touched[r >> 6] |= 1 << (r & 63);
+                        }
+                        any = true;
+                    });
+                }
+                if any {
+                    let bit = 1u64 << bz;
+                    let side = (bit << 1) | (bit >> 1) | bit;
+                    color.edge[bx] |= side;
+                    if bx > 0 {
+                        color.edge[bx - 1] |= bit;
+                    }
+                    if bx + 1 < BOX {
+                        color.edge[bx + 1] |= bit;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Marks in `color.edge` the box columns next to a column with other tints: there two tinted
+/// voxels side by side may differ, so the floods start from them. A column without tints needs
+/// no mark: its voxels are white (closed), opaque, or not direct, and a tinted voxel next to one
+/// that is not direct is in the boundary anyway.
+fn mark_tint_edges(tiles: &[&SkyTile; 9], color: &mut ColorScratch) {
+    let tints_of = |bx: usize, bz: usize| {
+        let (dx, lx) = split(bx);
+        let (dz, lz) = split(bz);
+        tiles[tile_index(dx, dz)].tints_at((lx << 5) | lz)
+    };
+    for bx in 0..BOX {
+        for bz in 0..BOX {
+            let here = tints_of(bx, bz);
+            if here.is_empty() {
+                continue;
+            }
+            let bit = 1u64 << bz;
+            let differs = |there: &[crate::Tint]| !there.is_empty() && there != here;
+            if bz + 1 < BOX && differs(tints_of(bx, bz + 1)) {
+                color.edge[bx] |= bit | (bit << 1);
+            }
+            if bx + 1 < BOX && differs(tints_of(bx + 1, bz)) {
+                color.edge[bx] |= bit;
+                color.edge[bx + 1] |= bit;
+            }
+        }
+    }
+}
+
+/// The three sky floods of a colored box (ADR 0064), on `color.rgb`, after the uncolored one.
+/// Sources: the white direct voxels (closed, 15) seed their open neighbors; the tinted ones hold
+/// their filtered level and are queued where a neighbor may need it (`boundary`). Filter voxels
+/// (and partial ones, with `heavy`) are priced one by one: the filter after the cost. Returns
+/// the voxels popped.
+fn colored_floods(
+    input: &LightInput<'_>,
+    scratch: &mut LightScratch,
+    heavy: bool,
+    filter_voxels: bool,
+) -> u32 {
+    let LightScratch {
+        opaque,
+        partial,
+        direct,
+        special,
+        buckets,
+        color,
+        ..
+    } = scratch;
+    let color = color.as_deref_mut().expect("colored scratch");
+    if let SkyInput::Tiles(tiles) = &input.sky {
+        mark_tint_edges(tiles, color);
+    }
+    let ColorScratch {
+        rgb,
+        tinted,
+        closed,
+        boundary,
+        touched,
+        edge,
+        ..
+    } = color;
+    for r in 0..ROWS {
+        closed[r] = opaque[r] | (direct[r] & !tinted[r]);
+    }
+    // Tinted voxels next to an open non-direct voxel, or in an edge column.
+    let not_direct = |r: usize| !opaque[r] & !direct[r];
+    for by in 0..BOX {
+        for (bx, &edge_x) in edge.iter().enumerate() {
+            let r = (by << 6) | bx;
+            let t = tinted[r];
+            if t == 0 {
+                boundary[r] = 0;
+                continue;
+            }
+            let n = not_direct(r);
+            let mut near = (n << 1) | (n >> 1) | edge_x;
+            if by > 0 {
+                near |= not_direct(r - BOX);
+            }
+            if by + 1 < BOX {
+                near |= not_direct(r + BOX);
+            }
+            if bx > 0 {
+                near |= not_direct(r - 1);
+            }
+            if bx + 1 < BOX {
+                near |= not_direct(r + 1);
+            }
+            boundary[r] = t & near;
+        }
+    }
+    // The rows each flood prices one by one.
+    let special_rows: &BoxRows = if filter_voxels { special } else { partial };
+    let priced = filter_voxels || heavy;
+    let mut pops = 0;
+    for (k, shift) in LightValue::BLOCK_SHIFTS.into_iter().enumerate() {
+        let step = |n: usize, level: u16| {
+            let s = state_at(input, n);
+            let cost = u16::from(input.tables.opacity(s).max(1));
+            transmit(level.saturating_sub(cost), input.tables.light_filter(s)[k])
+        };
+        // The tinted sources, at their filtered level.
+        for (r, &b) in boundary.iter().enumerate() {
+            let mut bits = b;
+            while bits != 0 {
+                let v = (r << 6) | bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let level = (rgb[v] >> shift) & 15;
+                if level > 1 {
+                    buckets[level as usize].push(v as u32);
+                }
+            }
+        }
+        // The open voxels next to a white direct one, from 15.
+        for by in 0..BOX {
+            for bx in 0..BOX {
+                let r = (by << 6) | bx;
+                let open = !closed[r];
+                if open == 0 {
+                    continue;
+                }
+                let white = |r: usize| direct[r] & !tinted[r];
+                let w = white(r);
+                let mut near = (w << 1) | (w >> 1);
+                if by > 0 {
+                    near |= white(r - BOX);
+                }
+                if by + 1 < BOX {
+                    near |= white(r + BOX);
+                }
+                if bx > 0 {
+                    near |= white(r - 1);
+                }
+                if bx + 1 < BOX {
+                    near |= white(r + 1);
+                }
+                let mut seeds = open & near;
+                while seeds != 0 {
+                    let bz = seeds.trailing_zeros() as usize;
+                    seeds &= seeds - 1;
+                    let v = (r << 6) | bz;
+                    let level = if priced && (special_rows[r] >> bz) & 1 != 0 {
+                        step(v, 15)
+                    } else {
+                        14
+                    };
+                    if level > (rgb[v] >> shift) & 15 {
+                        raise(rgb, touched, buckets, v, shift, level);
+                    }
+                }
+            }
+        }
+        pops += if priced {
+            flood::<true>(rgb, buckets, touched, closed, special_rows, shift, &step)
+        } else {
+            flood::<false>(rgb, buckets, touched, closed, special_rows, shift, &step)
+        };
+    }
+    pops
 }
 
 #[cfg(test)]
@@ -846,6 +1399,7 @@ mod tests {
             sky: SkyInput::Tiles([tile; 9]),
             beams: [None; 9],
             tables,
+            colored_sky: false,
         }
     }
 

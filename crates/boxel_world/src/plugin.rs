@@ -169,6 +169,11 @@ pub struct WorldSettings {
     /// radius later gets a light job, after the view's mesh jobs. Chunks that leave the radius
     /// drop their light. At most 32 (larger values are clamped).
     pub light_cache_radius: u32,
+    /// Colored sky (ADR 0064): light filters (colored glass, ADR 0060) tint the sky light too,
+    /// so a red pane lights a room red by day. Gameplay still reads the uncolored sky
+    /// (`ChunkMap::light_at`, the ticks). Off by default; the game turns it on. Read when the
+    /// world starts. Off, every light box is bit for bit the one of before.
+    pub colored_sky: bool,
     /// How long the finished meshes of one edit batch wait for the rest of the batch before
     /// they are published anyway (zero: no wait). A batch is published as soon as its last mesh
     /// arrives. If some are late, the meshes that arrived in frame `N` go out in the first frame
@@ -217,6 +222,7 @@ impl Default for WorldSettings {
             light: true,
             sky_walk_limit: DEFAULT_WALK_LIMIT,
             light_cache_radius: 8,
+            colored_sky: false,
             edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
             cave_culling: true,
             edge_walls: true,
@@ -533,7 +539,7 @@ impl Plugin for WorldPlugin {
             .insert_resource(content)
             .init_resource::<ChunkMap>()
             .init_resource::<RealmPlanes>()
-            .insert_resource(SkyMap::new(rule))
+            .insert_resource(SkyMap::new(rule).with_colored_sky(self.settings.colored_sky))
             .init_resource::<EditQueue>()
             .init_resource::<WorldStats>()
             .init_resource::<ViewerChunks>()

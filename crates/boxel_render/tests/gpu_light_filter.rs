@@ -215,6 +215,7 @@ fn mesh(registry: &BlockRegistry, wall: Wall) -> ChunkMesh {
         sky: SkyInput::BelowFloor,
         beams: [None; 9],
         tables: &tables,
+        colored_sky: false,
     };
     let mut light = PaddedLight::default();
     boxel_light::compute(&input, &mut LightScratch::new(), &mut light);

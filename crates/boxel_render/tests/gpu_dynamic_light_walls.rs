@@ -235,6 +235,7 @@ fn mesh(
         sky: SkyInput::BelowFloor,
         beams: [None; 9],
         tables: &tables,
+        colored_sky: false,
     };
     let mut padded = PaddedLight::default();
     boxel_light::compute(&input, &mut LightScratch::new(), &mut padded);

@@ -19,6 +19,11 @@
 //! | `beam_tile/build_generate` (the same column, every layer generated and decorated) | 22 to 60 us per layer, plus generation |
 //! | `light/point_cave` (ADR 0063: a torch in the air nearest the center of `box_cave_lamps_rgb`, added to its light) | none (part of a mesh job near the light) |
 //! | `light/point_surface` (a torch 2 blocks over the ground at the center of `box_surface`) | none |
+//! | `light/box_glass_roof` (ADR 0064: `box_surface` under a red glass roof over the chunk and 8 voxels around, colored sky on) | 150 us or less (the plan's; 431 us measured: light pours in from the open sides, ADR 0064) |
+//! | `light/box_glass_roof_clear` (the same roof of clear glass) | as `box_surface` |
+//! | `light/box_window` (a closed stone room lit through a blue window, colored sky on) | none (3 sky floods of a room) |
+//! | `light/box_window_clear` (the same window, clear) | none |
+//! | `sky_tile/walk_loaded_glass` (`walk_loaded` with a red glass roof over the column, colored walk) | none (2.3x of `walk_loaded` measured, once per column and edit) |
 //!
 //! The box benches run with the chunk masks cached (each chunk's masks are built once and
 //! shared by the 27 boxes that read it); `light/box_surface_cold_masks` builds them too.
@@ -27,11 +32,12 @@
 mod scenes;
 
 use boxel_demo::worldgen::OverworldGenerator;
+use boxel_light::box_light::chunk_index;
 use boxel_light::box_light::{MARGIN, tile_index};
-use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
+use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_colored, walk_floor};
 use boxel_light::{
-    BeamTile, LayerData, LightPath, LightScratch, PaddedLight, PointEmitter, PointScratch,
-    add_point_lights, beam_tile, compute,
+    BeamTile, LayerData, LightInput, LightPath, LightScratch, PaddedLight, PointEmitter,
+    PointScratch, SkyTile, Tint, add_point_lights, beam_tile, compute,
 };
 use boxel_voxel::{
     BeamDir, BlockPos, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, ChunkKey, ChunkPos,
@@ -250,7 +256,7 @@ fn nearest_air(n: &Neighborhood) -> BlockPos {
 fn over_ground(n: &Neighborhood) -> BlockPos {
     let o = n.origin.origin();
     for dy in [1, 0, -1] {
-        let chunk = &n.chunks[boxel_light::box_light::chunk_index(0, dy, 0)];
+        let chunk = &n.chunks[chunk_index(0, dy, 0)];
         if let Some(y) = (0..32)
             .rev()
             .find(|&y| !chunk.get(LocalPos::new(16, y, 16)).is_air())
@@ -481,5 +487,223 @@ fn bench_beams(c: &mut Criterion) {
     g_beam.finish();
 }
 
-criterion_group!(benches, bench, bench_beams);
+/// `n` with a roof of `glass` one voxel thick over the center chunk column and 8 voxels around
+/// it, 3 voxels above every top under it (or at the top of the 27 chunks), in the air voxels;
+/// the tiles get the roof voxels above their tops as tints (ADR 0064).
+fn roofed(n: &Neighborhood, glass: BlockState, tables: &LightTables) -> (Neighborhood, i64) {
+    let (ox, oy, oz) = (n.origin.x * 32, n.origin.y * 32, n.origin.z * 32);
+    let cols = |o: i64| o - 8..o + 40;
+    let top_of = |x: i64, z: i64| {
+        let (dx, dz) = ((x - ox).div_euclid(32), (z - oz).div_euclid(32));
+        let tile = &n.tiles[((dx + 1) * 3 + dz + 1) as usize];
+        tile.top(
+            (x - ox).rem_euclid(32) as u32,
+            (z - oz).rem_euclid(32) as u32,
+        )
+    };
+    let highest = cols(ox)
+        .flat_map(|x| cols(oz).map(move |z| (x, z)))
+        .map(|(x, z)| top_of(x, z))
+        .max()
+        .expect("columns");
+    let y = (highest + 3).min(oy + 63);
+    let mut chunks = n.chunks.clone();
+    let mut tints: Vec<Vec<(u32, u32, Tint)>> = vec![Vec::new(); 9];
+    let filter = tables.light_filter(glass);
+    for x in cols(ox) {
+        for z in cols(oz) {
+            let (dx, dy, dz) = (
+                (x - ox).div_euclid(32),
+                (y - oy).div_euclid(32),
+                (z - oz).div_euclid(32),
+            );
+            let chunk = &mut chunks[chunk_index(dx as i32, dy as i32, dz as i32)];
+            let (lx, ly, lz) = (
+                (x - ox).rem_euclid(32) as u32,
+                (y - oy).rem_euclid(32) as u32,
+                (z - oz).rem_euclid(32) as u32,
+            );
+            if !chunk.get(LocalPos::new(lx, ly, lz)).is_air() {
+                continue;
+            }
+            chunk.set(LocalPos::new(lx, ly, lz), glass);
+            if tables.filters(glass) && y > top_of(x, z) {
+                tints[((dx + 1) * 3 + dz + 1) as usize].push((lx, lz, Tint { y, filter }));
+            }
+        }
+    }
+    let tiles = n
+        .tiles
+        .iter()
+        .zip(tints)
+        .map(|(t, tints)| t.clone().with_tints(tints))
+        .collect();
+    let roofed = Neighborhood {
+        origin: n.origin,
+        chunks,
+        tiles,
+    };
+    (roofed, y)
+}
+
+/// A closed stone room on a stone ground around chunk (0, 0, 0), lit only through a window of
+/// `glass` (8 by 16 voxels) in its west wall; tops by brute force (no tints: the window is under
+/// the room's roof).
+fn window_room(registry: &BlockRegistry, tables: &LightTables, glass: BlockState) -> Neighborhood {
+    let stone = registry.by_name("boxel:stone").expect("stone");
+    let block = |x: i64, y: i64, z: i64| {
+        let shell = (2..=29).contains(&x) && (4..=24).contains(&y) && (2..=29).contains(&z);
+        let inside = (3..29).contains(&x) && (5..24).contains(&y) && (3..29).contains(&z);
+        if y < 4 {
+            stone
+        } else if x == 2 && (10..18).contains(&y) && (8..24).contains(&z) {
+            glass
+        } else if shell && !inside {
+            stone
+        } else {
+            BlockState::AIR
+        }
+    };
+    let mut chunks = Vec::with_capacity(27);
+    for dy in -1..=1i64 {
+        for dx in -1..=1i64 {
+            for dz in -1..=1i64 {
+                let mut c = ChunkData::uniform(BlockState::AIR);
+                for i in 0..CHUNK_VOLUME {
+                    let p = LocalPos::from_index(i);
+                    let (x, y, z) = (
+                        dx * 32 + i64::from(p.x()),
+                        dy * 32 + i64::from(p.y()),
+                        dz * 32 + i64::from(p.z()),
+                    );
+                    let s = block(x, y, z);
+                    if s != BlockState::AIR {
+                        c.set(p, s);
+                    }
+                }
+                chunks.push(c);
+            }
+        }
+    }
+    let tiles = (0..9)
+        .map(|i| {
+            let (dx, dz) = (i as i64 / 3 - 1, i as i64 % 3 - 1);
+            let tops: Vec<i64> = (0..1024)
+                .map(|c| {
+                    let (x, z) = (dx * 32 + (c >> 5), dz * 32 + (c & 31));
+                    (-32..64)
+                        .rev()
+                        .find(|&y| tables.blocks_sky(block(x, y, z)))
+                        .unwrap_or(i64::MIN)
+                })
+                .collect();
+            SkyTile::from_tops(tops.into_boxed_slice().try_into().unwrap(), i64::MIN)
+        })
+        .collect();
+    Neighborhood {
+        origin: ChunkPos::new(0, 0, 0),
+        chunks,
+        tiles,
+    }
+}
+
+/// Colored sky (ADR 0064): a glass roof over the surface box, a room lit through a window, each
+/// with its clear-glass twin, and the colored walk of a column under a glass roof.
+fn bench_colored(c: &mut Criterion) {
+    let g = OverworldGenerator::default();
+    let (registry, _, [_, red, blue], clear) = glass_registry();
+    let tables = LightTables::from_registry(&registry);
+    let mut scratch = LightScratch::new();
+    let mut out = PaddedLight::default();
+    let surface = Neighborhood::generate(
+        &g,
+        &registry,
+        &tables,
+        surface_origin(&g, &registry, &tables),
+    );
+    let (red_roof, roof_y) = roofed(&surface, red, &tables);
+    let (clear_roof, _) = roofed(&surface, clear, &tables);
+    let blue_room = window_room(&registry, &tables, blue);
+    let clear_room = window_room(&registry, &tables, clear);
+    fn colored<'a>(n: &'a Neighborhood, tables: &'a LightTables) -> LightInput<'a> {
+        LightInput {
+            colored_sky: true,
+            ..n.input(tables)
+        }
+    }
+    let mut g_light = c.benchmark_group("light");
+    g_light.measurement_time(Duration::from_secs(4));
+    for (name, n, tinted) in [
+        ("box_glass_roof", &red_roof, true),
+        ("box_glass_roof_clear", &clear_roof, false),
+        ("box_window", &blue_room, true),
+        ("box_window_clear", &clear_room, false),
+    ] {
+        let input = colored(n, &tables);
+        let path = compute(&input, &mut scratch, &mut out);
+        let took = matches!(path, LightPath::Full { colored_pops, .. } if colored_pops.is_some());
+        assert_eq!(took, tinted, "{name} took {path:?}");
+        assert_eq!(out.is_colored(), tinted, "{name}: the colored form");
+        eprintln!(
+            "{name}: chunk {:?}, roof y {roof_y}, {} tints, {path:?}",
+            n.origin,
+            n.tiles.iter().map(SkyTile::tint_count).sum::<usize>()
+        );
+        g_light.bench_function(name, |b| {
+            b.iter(|| compute(black_box(&input), &mut scratch, &mut out));
+        });
+    }
+    g_light.finish();
+
+    // The surface column loaded, with a red roof over every column above its top.
+    let (cx, cz) = (surface.origin.x, surface.origin.z);
+    let range = g.vertical_chunks();
+    let top = GeneratorTop::of(&range).voxel().expect("bounded top");
+    let floor = walk_floor(top, DEFAULT_WALK_LIMIT);
+    let center = &surface.tiles[tile_index(0, 0)];
+    let y = center.max() + 3;
+    assert!(y <= top, "the roof inside the generator's range");
+    let mut loaded: Vec<(i64, ChunkData)> = (-64..=top >> 5)
+        .rev()
+        .map(|cy| {
+            let key = ChunkKey::new(ChunkPos::new(cx, cy, cz));
+            (cy, g.generate(key, &registry))
+        })
+        .collect();
+    let layer = loaded
+        .iter_mut()
+        .find(|(cy, _)| *cy == y >> 5)
+        .map(|(_, c)| c)
+        .expect("the roof's layer");
+    for i in 0..1024u32 {
+        layer.set(LocalPos::new(i >> 5, (y & 31) as u32, i & 31), red);
+    }
+    let walked = walk_colored(top, floor, &tables, |cy| {
+        loaded
+            .iter()
+            .find(|(c, _)| *c == cy)
+            .map_or(LayerData::Air, |(_, c)| LayerData::Ref(c))
+    });
+    assert_eq!(walked.tint_count(), 1024);
+    eprintln!("walk_loaded_glass: roof y {y}, {} B", walked.heap_bytes());
+    let mut g_sky = c.benchmark_group("sky_tile");
+    g_sky.measurement_time(Duration::from_secs(4));
+    g_sky.bench_function("walk_loaded_glass", |b| {
+        b.iter_batched(
+            || loaded.clone(),
+            |chunks| {
+                walk_colored(top, floor, &tables, |cy| {
+                    chunks
+                        .iter()
+                        .find(|(y, _)| *y == cy)
+                        .map_or(LayerData::Air, |(_, c)| LayerData::Ref(c))
+                })
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    g_sky.finish();
+}
+
+criterion_group!(benches, bench, bench_beams, bench_colored);
 criterion_main!(benches);

@@ -267,7 +267,11 @@ pub fn open_world(world: &mut World, spec: WorldSpec) -> Result<WorldEpoch, Open
     }
     *world.resource_mut::<RealmPlanes>() = RealmPlanes::of(generator.realms());
     world.resource_mut::<WorldContent>().generator = generator;
-    world.resource_mut::<SkyMap>().rule = rule;
+    {
+        let mut sky = world.resource_mut::<SkyMap>();
+        sky.rule = rule;
+        sky.colored_sky = settings.colored_sky;
+    }
     {
         let mut jobs = world.resource_mut::<WorldJobs>();
         let now = jobs.clock_now();

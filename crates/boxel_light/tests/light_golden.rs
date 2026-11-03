@@ -82,6 +82,7 @@ fn dump(r: &BlockRegistry) -> String {
         sky: SkyInput::Tiles(std::array::from_fn(|i| &tiles[i])),
         beams: [None; 9],
         tables: &t,
+        colored_sky: false,
     };
     let mut out = PaddedLight::default();
     let path = compute(&input, &mut LightScratch::new(), &mut out);

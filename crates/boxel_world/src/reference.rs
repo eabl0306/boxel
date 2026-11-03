@@ -211,6 +211,7 @@ impl<'w> Reference<'w> {
             sky: SkyInput::Tiles(std::array::from_fn(|i| &*tiles[i])),
             beams: std::array::from_fn(|i| beams[i].as_deref()),
             tables: &self.content.light_tables,
+            colored_sky: false,
         };
         let mut out = PaddedLight::default();
         boxel_light::compute_full(&input, &mut self.scratch, &mut out);

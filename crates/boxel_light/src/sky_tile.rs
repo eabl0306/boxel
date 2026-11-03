@@ -23,11 +23,21 @@
 //!   there gets `T = i64::MIN`. Layers below the world limit (`-MAX_CHUNK_COORD`) are void too,
 //!   so a walk without a floor (`i64::MIN`) still ends.
 //!
+//! **Tints** (colored sky, ADR 0064): a tile walked with [`walk_colored`] also keeps, per column,
+//! the light filters above `T` (opacity 0 by the definition of `T`: colored glass), highest
+//! first ([`SkyTile::tints`]). Direct sky under them is filtered ([`crate::box_light`]). The
+//! tile of [`walk`] keeps none and is the tile of before; so is every tile of a world without
+//! glass above its tops (`tints` stays `None`). Edits keep them like the tops
+//! ([`SkyTile::raise`], [`SkyTile::rescan_column`], [`SkyTile::set_filter`]): an edited tile
+//! equals a fresh walk of the edited content.
+//!
 //! Every top of a walked tile is therefore either `i64::MIN` or at least the floor. A light box
 //! whose top is at or below every top of its 3x3 tiles has no direct sky; when no column of a
 //! world can reach the void within the limit (the overworld, or bounded generators whose
 //! columns are closed), that holds for every box below the floor.
-use boxel_voxel::{CHUNK_AREA, CHUNK_SHIFT, ChunkData, LightTables, LocalPos, MAX_CHUNK_COORD};
+use boxel_voxel::{
+    CHUNK_AREA, CHUNK_SHIFT, ChunkData, LightTables, LocalPos, MAX_CHUNK_COORD, MAX_LIGHT,
+};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -69,6 +79,66 @@ impl LayerData<'_> {
     }
 }
 
+/// A light filter above the sky top of its column (ADR 0064): its height and its filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tint {
+    /// Absolute y.
+    pub y: i64,
+    /// [`LightTables::light_filter`] of its state.
+    pub filter: [u8; 3],
+}
+
+/// The tints of a tile with at least one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TileTints {
+    /// Start of each column's tints in `entries`, indexed `(x << 5) | z`, then the end.
+    index: Box<[u32]>,
+    /// Every tint, by column, each column highest first.
+    entries: Vec<Tint>,
+    /// Highest tint.
+    max: i64,
+}
+
+impl TileTints {
+    /// From `(column, tint)` pairs in any column order, each column's tints highest first;
+    /// `None` if there are none.
+    fn from_found(found: Vec<(u16, Tint)>) -> Option<Box<Self>> {
+        if found.is_empty() {
+            return None;
+        }
+        let mut index = vec![0u32; TILE_AREA + 1];
+        for &(col, _) in &found {
+            index[col as usize + 1] += 1;
+        }
+        for i in 1..=TILE_AREA {
+            index[i] += index[i - 1];
+        }
+        // A counting sort by column, stable: each column keeps its order (highest first).
+        let mut next = index.clone();
+        let mut entries = vec![
+            Tint {
+                y: 0,
+                filter: [0; 3]
+            };
+            found.len()
+        ];
+        for (col, t) in found {
+            entries[next[col as usize] as usize] = t;
+            next[col as usize] += 1;
+        }
+        let max = entries.iter().map(|t| t.y).max().unwrap_or(i64::MIN);
+        Some(Box::new(Self {
+            index: index.into_boxed_slice(),
+            entries,
+            max,
+        }))
+    }
+
+    fn column(&self, col: usize) -> &[Tint] {
+        &self.entries[self.index[col] as usize..self.index[col + 1] as usize]
+    }
+}
+
 /// The sky tops of one chunk column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkyTile {
@@ -84,6 +154,11 @@ pub struct SkyTile {
     pub version: u32,
     /// True once an edit changed a top (the tile no longer follows the generator alone).
     pub edited: bool,
+    /// True if the tile keeps its tints (walked with [`walk_colored`], or
+    /// [`SkyTile::with_colored_sky`]).
+    colored: bool,
+    /// The tints, `None` when the tile has none (always, when not `colored`).
+    tints: Option<Box<TileTints>>,
 }
 
 /// Outcome of [`SkyTile::rescan_column`].
@@ -105,9 +180,105 @@ impl SkyTile {
             floor,
             version: 0,
             edited: false,
+            colored: false,
+            tints: None,
         };
         tile.update_bounds();
         tile
+    }
+    /// The same tile, keeping tints from now on (ADR 0064): [`SkyTile::set_filter`] records
+    /// them, and [`SkyTile::raise`] and [`SkyTile::rescan_column`] keep them.
+    pub fn with_colored_sky(mut self) -> Self {
+        self.colored = true;
+        self
+    }
+    /// The same tile keeping tints ([`SkyTile::with_colored_sky`]), with `tints` (local column
+    /// `(x, z)` and tint, any order) as its tints: those at or below their column's top, or
+    /// with filter `[15; 3]`, are dropped. For tiles built by hand (tests, references).
+    pub fn with_tints(mut self, tints: impl IntoIterator<Item = (u32, u32, Tint)>) -> Self {
+        let mut found: Vec<(u16, Tint)> = tints
+            .into_iter()
+            .map(|(x, z, t)| ((((x as usize) << CHUNK_SHIFT) | z as usize) as u16, t))
+            .filter(|&(col, t)| t.y > self.top[col as usize] && t.filter != [MAX_LIGHT; 3])
+            .collect();
+        found.sort_by_key(|&(col, t)| (col, std::cmp::Reverse(t.y)));
+        found.dedup_by_key(|&mut (col, t)| (col, t.y));
+        self.colored = true;
+        self.tints = TileTints::from_found(found);
+        self
+    }
+    /// True if the tile keeps its tints.
+    pub fn colored_sky(&self) -> bool {
+        self.colored
+    }
+    /// The tints of local column `(x, z)` (each in `0..32`), highest first: the light filters
+    /// above its top. Empty for a tile that does not keep them.
+    #[inline]
+    pub fn tints(&self, x: u32, z: u32) -> &[Tint] {
+        self.tints_at(((x as usize) << CHUNK_SHIFT) | z as usize)
+    }
+    /// [`SkyTile::tints`] of column `(x << 5) | z`.
+    #[inline]
+    pub(crate) fn tints_at(&self, col: usize) -> &[Tint] {
+        self.tints.as_ref().map_or(&[], |t| t.column(col))
+    }
+    /// The highest tint of the tile, `i64::MIN` without one.
+    #[inline]
+    pub fn tint_max(&self) -> i64 {
+        self.tints.as_ref().map_or(i64::MIN, |t| t.max)
+    }
+    /// The number of tints.
+    pub fn tint_count(&self) -> usize {
+        self.tints.as_ref().map_or(0, |t| t.entries.len())
+    }
+    /// Heap bytes of the tile: the tops, plus the tints' index and entries when it has some.
+    pub fn heap_bytes(&self) -> usize {
+        TILE_AREA * size_of::<i64>()
+            + self.tints.as_ref().map_or(0, |t| {
+                size_of::<TileTints>()
+                    + t.index.len() * size_of::<u32>()
+                    + t.entries.capacity() * size_of::<Tint>()
+            })
+    }
+    /// The voxel at `y` of column `(x, z)`, above its top, became a light filter `filter`
+    /// (`None`, or `[15; 3]`: no longer one). For a state of opacity 0: a blocker moves the
+    /// top ([`SkyTile::raise`]). Returns true if the tints changed; always false for a tile
+    /// that does not keep tints, or at or below the top.
+    pub fn set_filter(&mut self, x: u32, z: u32, y: i64, filter: Option<[u8; 3]>) -> bool {
+        let col = ((x as usize) << CHUNK_SHIFT) | z as usize;
+        if !self.colored || y <= self.top[col] {
+            return false;
+        }
+        let filter = filter.filter(|f| *f != [MAX_LIGHT; 3]);
+        let mut column = self.tints_at(col).to_vec();
+        // Highest first: the first entry at or below `y`.
+        let at = column.partition_point(|t| t.y > y);
+        let here = column.get(at).is_some_and(|t| t.y == y);
+        match (here, filter) {
+            (true, Some(f)) if column[at].filter == f => return false,
+            (true, Some(f)) => column[at].filter = f,
+            (true, None) => {
+                column.remove(at);
+            }
+            (false, Some(f)) => column.insert(at, Tint { y, filter: f }),
+            (false, None) => return false,
+        }
+        self.set_tints(col, column);
+        self.version = self.version.wrapping_add(1);
+        self.edited = true;
+        true
+    }
+    /// Replaces the tints of column `col`.
+    fn set_tints(&mut self, col: usize, column: Vec<Tint>) {
+        let mut found: Vec<(u16, Tint)> = Vec::new();
+        for c in 0..TILE_AREA {
+            if c == col {
+                found.extend(column.iter().map(|&t| (c as u16, t)));
+            } else {
+                found.extend(self.tints_at(c).iter().map(|&t| (c as u16, t)));
+            }
+        }
+        self.tints = TileTints::from_found(found);
     }
     /// Every column with top `t`.
     pub fn uniform(t: i64, floor: i64) -> Self {
@@ -142,6 +313,12 @@ impl SkyTile {
             return false;
         }
         self.set(i, y);
+        // Tints at or below the new top are no longer above it.
+        let tints = self.tints_at(i);
+        if tints.last().is_some_and(|t| t.y <= y) {
+            let keep = tints.iter().copied().filter(|t| t.y > y).collect();
+            self.set_tints(i, keep);
+        }
         true
     }
     /// The blocker at the top of column `(x, z)` was removed (or made clear): finds the next
@@ -152,6 +329,10 @@ impl SkyTile {
     ///
     /// A tile without a floor (`i64::MIN`, as built by hand) relies on `layer` to answer
     /// [`LayerData::Void`] or `None` below the content.
+    ///
+    /// A tile that keeps tints also collects the filters between the new top and the old one,
+    /// the old top's voxel included (it may have become glass), so it reads from the old top's
+    /// layer down.
     pub fn rescan_column<'a>(
         &mut self,
         x: u32,
@@ -160,6 +341,9 @@ impl SkyTile {
         tables: &LightTables,
         mut layer: impl FnMut(i64) -> Option<LayerData<'a>>,
     ) -> Rescan {
+        if self.colored {
+            return self.rescan_colored(x, z, from, tables, layer);
+        }
         let i = ((x as usize) << CHUNK_SHIFT) | z as usize;
         let mut cy = from >> CHUNK_SHIFT;
         let found = loop {
@@ -189,6 +373,71 @@ impl SkyTile {
             cy = next_layer(&data, cy);
         };
         self.set(i, found);
+        Rescan::Found(found)
+    }
+    /// [`SkyTile::rescan_column`] of a tile that keeps tints: one voxel at a time from the old
+    /// top down, blockers counted at `from` and below, filters above the floor and at or below
+    /// the old top collected.
+    fn rescan_colored<'a>(
+        &mut self,
+        x: u32,
+        z: u32,
+        from: i64,
+        tables: &LightTables,
+        mut layer: impl FnMut(i64) -> Option<LayerData<'a>>,
+    ) -> Rescan {
+        let i = ((x as usize) << CHUNK_SHIFT) | z as usize;
+        let old = self.top[i];
+        let start = from.max(old);
+        let mut found_tints: Vec<Tint> = Vec::new();
+        let mut cy = start >> CHUNK_SHIFT;
+        let found = loop {
+            let y0 = cy << CHUNK_SHIFT;
+            if y0 + 31 < self.floor {
+                break self.floor;
+            }
+            if cy < -MAX_CHUNK_COORD {
+                break i64::MIN;
+            }
+            let Some(data) = layer(cy) else {
+                return Rescan::Unresolved;
+            };
+            if matches!(data, LayerData::Void) {
+                break i64::MIN;
+            }
+            if let Some(chunk) = data.chunk() {
+                let hi = start.saturating_sub(y0).min(31);
+                let lo = self.floor.saturating_sub(y0).max(0);
+                let mut hit = None;
+                for ly in (lo..=hi).rev() {
+                    let y = y0 + ly;
+                    let s = chunk.get(LocalPos::new(x, ly as u32, z));
+                    if tables.blocks_sky(s) {
+                        if y <= from {
+                            hit = Some(y);
+                            break;
+                        }
+                    } else if y <= old && y > self.floor && tables.filters(s) {
+                        found_tints.push(Tint {
+                            y,
+                            filter: tables.light_filter(s),
+                        });
+                    }
+                }
+                if let Some(y) = hit {
+                    break y;
+                }
+            }
+            cy = next_layer(&data, cy);
+        };
+        // Below the floor nothing counts; a top at the floor keeps only the tints above it.
+        found_tints.retain(|t| t.y > found);
+        self.set(i, found);
+        if !found_tints.is_empty() {
+            let mut column = self.tints_at(i).to_vec();
+            column.extend(found_tints);
+            self.set_tints(i, column);
+        }
         Rescan::Found(found)
     }
     /// Sets one top, keeping the bounds, the version and the edited flag.
@@ -273,21 +522,49 @@ pub fn walk_floor(generator_top: i64, limit: u32) -> i64 {
 /// a voxel with opacity above 0 (`tables`), the walk passes the floor, or a layer is
 /// [`LayerData::Void`]. Voxels above `start` are not read (by contract they are air), so a
 /// start below the floor gives every column the floor. See the [module docs](self) for the
-/// rules.
+/// rules. The tile keeps no tints.
 pub fn walk<'a>(
+    start: i64,
+    floor: i64,
+    tables: &LightTables,
+    layer: impl FnMut(i64) -> LayerData<'a>,
+) -> SkyTile {
+    walk_with::<false>(start, floor, tables, layer)
+}
+
+/// [`walk`] for colored sky (ADR 0064): the tile also keeps, per column, the light filters it
+/// passes while the column is still open (above the column's top and the floor), and keeps
+/// them through edits. The tops are those of [`walk`]; it reads the same layers.
+pub fn walk_colored<'a>(
+    start: i64,
+    floor: i64,
+    tables: &LightTables,
+    layer: impl FnMut(i64) -> LayerData<'a>,
+) -> SkyTile {
+    walk_with::<true>(start, floor, tables, layer)
+}
+
+fn walk_with<'a, const COLORED: bool>(
     start: i64,
     floor: i64,
     tables: &LightTables,
     mut layer: impl FnMut(i64) -> LayerData<'a>,
 ) -> SkyTile {
+    let colored = |mut tile: SkyTile| {
+        tile.colored = COLORED;
+        tile
+    };
     if start < floor {
-        return SkyTile::uniform(floor, floor);
+        return colored(SkyTile::uniform(floor, floor));
     }
     let mut top = new_tops(floor);
     // Open columns: bit z of word x.
     let mut open = [u32::MAX; 32];
     let mut remaining = TILE_AREA as u32;
     let mut cy = start >> CHUNK_SHIFT;
+    // Tints found, by column, each column highest first.
+    let mut tints: Vec<(u16, Tint)> = Vec::new();
+    let filters = COLORED && tables.any_filter();
     'layers: while remaining > 0 {
         let y0 = cy << CHUNK_SHIFT;
         if y0 + 31 < floor {
@@ -319,15 +596,40 @@ pub fn walk<'a>(
                 }
                 break;
             }
+            if filters && tables.filters(s) {
+                // A layer of glass: every voxel of every open column, above the floor.
+                let filter = tables.light_filter(s);
+                for ly in (lo..=hi).rev().filter(|&ly| y0 + ly as i64 > floor) {
+                    for (x, bits) in open.iter().enumerate() {
+                        for_each_bit(*bits, |z| {
+                            let col = ((x << CHUNK_SHIFT) | z) as u16;
+                            let y = y0 + ly as i64;
+                            tints.push((col, Tint { y, filter }));
+                        });
+                    }
+                }
+            }
             cy -= 1;
             continue;
         }
         let masks = chunk.light_masks(tables);
+        let glass = filters && !masks.filter.is_empty();
         for ly in (lo..=hi).rev() {
             let y = y0 + ly as i64;
             let rows = ly << CHUNK_SHIFT;
             for (x, open_x) in open.iter_mut().enumerate() {
-                let hit = (masks.opaque.row(rows + x) | masks.partial.row(rows + x)) & *open_x;
+                let blockers = masks.opaque.row(rows + x) | masks.partial.row(rows + x);
+                if glass && y > floor {
+                    // Filters of opacity 0 in open columns: above the column's top.
+                    let found = masks.filter.row(rows + x) & !blockers & *open_x;
+                    for_each_bit(found, |z| {
+                        let s = chunk.get(LocalPos::new(x as u32, ly as u32, z as u32));
+                        let col = ((x << CHUNK_SHIFT) | z) as u16;
+                        let filter = tables.light_filter(s);
+                        tints.push((col, Tint { y, filter }));
+                    });
+                }
+                let hit = blockers & *open_x;
                 if hit != 0 {
                     for_each_bit(hit, |z| top[(x << CHUNK_SHIFT) | z] = y);
                     *open_x &= !hit;
@@ -340,7 +642,9 @@ pub fn walk<'a>(
         }
         cy -= 1;
     }
-    SkyTile::from_tops(top, floor)
+    let mut tile = colored(SkyTile::from_tops(top, floor));
+    tile.tints = TileTints::from_found(tints);
+    tile
 }
 
 /// The layer a walk or a rescan reads after layer `cy` held `data` (never below the first

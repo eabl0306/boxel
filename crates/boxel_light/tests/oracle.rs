@@ -4,7 +4,10 @@
 //! gets the padded light of the scalar global solver, bit for bit, with and without the fast
 //! paths, with and without light filters (ADR 0060), with and without sky sources and realm
 //! planes (ADR 0061). End to end on generated content: tiles from the walk feed the box and match
-//! the oracle with brute-force tops capped at the walk floor.
+//! the oracle with brute-force tops capped at the walk floor. Colored sky (ADR 0064): worlds with
+//! glass roofs, windows and panes (above and below the tops), with and without sources through
+//! the glass, give the oracle's uncolored light and its sky channels; hand scenes check the
+//! closed forms; without glass the switch changes nothing.
 mod common;
 
 use boxel_demo::worldgen::OverworldGenerator;
@@ -237,6 +240,7 @@ fn light_of(
         sky: SkyInput::Tiles(tiles),
         beams: [None; 9],
         tables,
+        colored_sky: false,
     };
     let mut out = PaddedLight::default();
     let path = compute(&input, &mut LightScratch::new(), &mut out);
@@ -438,6 +442,7 @@ fn a_cavern_roof_of_sources_lights_it_like_daylight() {
         sky: SkyInput::Tiles([&roof; 9]),
         beams: [None; 9],
         tables: &tables,
+        colored_sky: false,
     };
     let mut scratch = LightScratch::new();
     let mut out = PaddedLight::default();
@@ -711,6 +716,7 @@ fn walked_tiles_light_generated_content_exactly() {
                 sky: SkyInput::Tiles(refs),
                 beams: [None; 9],
                 tables: &tables,
+                colored_sky: false,
             };
             let want = oracle.padded(&solution, input.origin);
             let path = compute(&input, &mut scratch, &mut out);
@@ -727,4 +733,439 @@ fn walked_tiles_light_generated_content_exactly() {
         }
         assert!(sky_pops > 0, "limit {limit}: no sky flood");
     }
+}
+
+/// The colored results of a [`check_colored`] run.
+#[derive(Debug, Default)]
+struct ColoredRun {
+    paths: Vec<LightPath>,
+    /// Boxes that took the colored path.
+    colored_boxes: usize,
+    /// Results in the colored form.
+    colored_results: usize,
+}
+
+/// Checks every inner chunk of `world` with colored sky against the oracle: the uncolored light
+/// (what gameplay reads) against [`OracleWorld::solve`], the sky channels against
+/// [`OracleWorld::solve_colored`], with and without the fast paths. A result is colored exactly
+/// when some padded voxel's sky channels differ from its uncolored sky.
+fn check_colored(
+    world: &World,
+    tables: &LightTables,
+    beams: &[BeamTile],
+    planes: &[i64],
+) -> ColoredRun {
+    let mut oracle =
+        OracleWorld::from_chunks(world.min, [N; 3], &world.chunks, tables, world.tops.clone());
+    if beams.is_empty() {
+        oracle.sources.clear();
+    }
+    oracle.planes = planes.to_vec();
+    let light = oracle.solve();
+    let rgb = oracle.solve_colored();
+    let tiles = world.colored_tiles(tables);
+    let mut scratch = LightScratch::new();
+    let mut out = PaddedLight::default();
+    let mut run = ColoredRun::default();
+    for cy in 1..N - 1 {
+        for cx in 1..N - 1 {
+            for cz in 1..N - 1 {
+                let mut input = world.input_with(&tiles, beams, tables, (cx, cy, cz));
+                input.colored_sky = true;
+                let want = oracle.padded(&light, input.origin);
+                let want_rgb = oracle.padded(&rgb, input.origin);
+                let tinted = want.iter().zip(&want_rgb).any(|(l, c)| *c != [l.sky(); 3]);
+                for full in [false, true] {
+                    let path = if full {
+                        compute_full(&input, &mut scratch, &mut out)
+                    } else {
+                        compute(&input, &mut scratch, &mut out)
+                    };
+                    let at = format!("chunk {:?} ({path:?}, full {full})", input.origin);
+                    if let Some(m) = first_mismatch(&out, &want) {
+                        panic!("{at}: {m}");
+                    }
+                    let got_rgb = out.to_sky_rgb_vec();
+                    if let Some(i) = (0..want_rgb.len()).find(|&i| got_rgb[i] != want_rgb[i]) {
+                        let v = i as i64;
+                        let (y, x, z) = (v / (34 * 34) - 1, v / 34 % 34 - 1, v % 34 - 1);
+                        panic!(
+                            "{at}: sky rgb at local ({x}, {y}, {z}): got {:?}, want {:?}",
+                            got_rgb[i], want_rgb[i]
+                        );
+                    }
+                    assert_eq!(out.is_colored(), tinted, "{at}: the colored form");
+                    if !full {
+                        run.colored_boxes += usize::from(matches!(
+                            path,
+                            LightPath::Full {
+                                colored_pops: Some(_),
+                                ..
+                            }
+                        ));
+                        run.colored_results += usize::from(tinted);
+                        run.paths.push(path);
+                    }
+                }
+            }
+        }
+    }
+    run
+}
+
+/// A world of [`random_world`] with glass ([`World::add_glass`]) and, with `sources`, sky
+/// sources and realm planes as [`world_with_sources`], with its colored beam tiles and planes.
+fn colored_world(
+    seed: u64,
+    min: ChunkPos,
+    blocks: &Blocks,
+    tables: &LightTables,
+    sources: bool,
+) -> (World, Vec<BeamTile>, Vec<i64>) {
+    let mut world = random_world(seed, N, min, blocks, tables);
+    let mut rng = Rng::new(seed ^ 0x6c_a55e);
+    world.add_glass(&mut rng, blocks);
+    if !sources {
+        return (world, Vec::new(), Vec::new());
+    }
+    world.add_sources(&mut rng, blocks, tables);
+    let y0 = min.origin().y;
+    let mut planes: Vec<i64> = (0..rng.below(3))
+        .map(|_| y0 + rng.below((N * 32) as u64) as i64)
+        .collect();
+    planes.sort_unstable();
+    planes.dedup();
+    let beams = world.colored_beam_tiles(tables, &planes);
+    (world, beams, planes)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 10, ..ProptestConfig::default() })]
+
+    #[test]
+    fn colored_box_equals_global_solution(seed in any::<u64>(), heavy in any::<bool>(),
+                                          sources in any::<bool>(), far in 0usize..4) {
+        let (registry, blocks) = test_registry_full(heavy, true, sources);
+        let tables = LightTables::from_registry(&registry);
+        let min = [
+            ChunkPos::new(-2, -2, -2),
+            ChunkPos::new(1 << 26, -3, -(1 << 26)),
+            ChunkPos::new(-(1 << 35), 1 << 35, 7),
+            ChunkPos::new(5, -(1 << 50), 1 << 50),
+        ][far];
+        let (world, beams, planes) = colored_world(seed, min, &blocks, &tables, sources);
+        check_colored(&world, &tables, &beams, &planes);
+    }
+}
+
+/// Fixed colored worlds, so the regular run covers roofs, windows and tinted beams every time.
+#[test]
+fn fixed_colored_worlds_take_the_colored_path() {
+    let mut run = ColoredRun::default();
+    for (seed, heavy, sources) in [(51, false, false), (52, true, false), (53, false, true)] {
+        let (registry, blocks) = test_registry_full(heavy, true, sources);
+        let tables = LightTables::from_registry(&registry);
+        let (world, beams, planes) =
+            colored_world(seed, ChunkPos::new(-2, -2, -2), &blocks, &tables, sources);
+        let r = check_colored(&world, &tables, &beams, &planes);
+        run.colored_boxes += r.colored_boxes;
+        run.colored_results += r.colored_results;
+        run.paths.extend(r.paths);
+        if sources {
+            assert!(
+                beams.iter().any(BeamTile::has_tints),
+                "seed {seed}: no tinted beam"
+            );
+        }
+    }
+    assert!(run.colored_results > 0, "{run:?}");
+    assert!(run.colored_boxes >= run.colored_results, "{run:?}");
+}
+
+/// The switch changes nothing where no glass can tint the sky: a registry without filters, and
+/// one with filters but none placed, give the same light and paths with it on and off, and no
+/// box takes the colored path. Glass in the world with the switch off gives the light of before
+/// (white sky), whatever the tiles keep.
+#[test]
+fn without_glass_the_switch_changes_nothing() {
+    for (heavy, filters, sources) in [
+        (false, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        let (registry, blocks) = test_registry_full(heavy, filters, sources);
+        let tables = LightTables::from_registry(&registry);
+        // No filter placed.
+        let none = Blocks {
+            filters: None,
+            blue: None,
+            ..blocks
+        };
+        let mut world = random_world(61, N, ChunkPos::new(-2, -2, -2), &none, &tables);
+        world.add_sources(&mut Rng::new(62), &none, &tables);
+        let beams = world.colored_beam_tiles(&tables, &[]);
+        let plain_beams = world.beam_tiles(&tables, &[]);
+        let colored_tiles = world.colored_tiles(&tables);
+        let tiles = world.tiles();
+        let (mut scratch, mut out, mut base) = (
+            LightScratch::new(),
+            PaddedLight::default(),
+            PaddedLight::default(),
+        );
+        for cy in 1..N - 1 {
+            for cx in 1..N - 1 {
+                for cz in 1..N - 1 {
+                    let off = world.input_with(&tiles, &plain_beams, &tables, (cx, cy, cz));
+                    let want = compute(&off, &mut scratch, &mut base);
+                    let mut on = world.input_with(&colored_tiles, &beams, &tables, (cx, cy, cz));
+                    on.colored_sky = true;
+                    assert_eq!(compute(&on, &mut scratch, &mut out), want);
+                    assert_eq!(out, base);
+                }
+            }
+        }
+    }
+    // Glass placed, switch off: the colored tiles and beam tiles light as the plain ones.
+    let (registry, blocks) = test_registry_full(false, true, true);
+    let tables = LightTables::from_registry(&registry);
+    let (world, beams, planes) =
+        colored_world(63, ChunkPos::new(-2, -2, -2), &blocks, &tables, true);
+    let plain = world.beam_tiles(&tables, &planes);
+    let (colored_tiles, tiles) = (world.colored_tiles(&tables), world.tiles());
+    let (mut scratch, mut out, mut base) = (
+        LightScratch::new(),
+        PaddedLight::default(),
+        PaddedLight::default(),
+    );
+    for cy in 1..N - 1 {
+        for cx in 1..N - 1 {
+            for cz in 1..N - 1 {
+                let want = compute(
+                    &world.input_with(&tiles, &plain, &tables, (cx, cy, cz)),
+                    &mut scratch,
+                    &mut base,
+                );
+                let off = world.input_with(&colored_tiles, &beams, &tables, (cx, cy, cz));
+                assert_eq!(compute(&off, &mut scratch, &mut out), want);
+                assert_eq!(out, base);
+            }
+        }
+    }
+}
+
+/// The game's dye filters for the hand scenes: red, light blue and black glass, and clear glass.
+fn dye_registry() -> (boxel_voxel::BlockRegistry, [boxel_voxel::BlockState; 4]) {
+    use boxel_voxel::{BlockCollision, BlockDef, BlockModel, FaceTextures, RenderShape, TextureId};
+    let mut b = boxel_demo::blocks::builder();
+    let mut add = |name: &str, filter: Option<[u8; 3]>| {
+        let s = b
+            .add_block(BlockDef {
+                name: format!("test:{name}"),
+                shape: RenderShape::Translucent,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: FaceTextures::all(TextureId(0)),
+            })
+            .unwrap();
+        if let Some(f) = filter {
+            let block = b.block_by_name(&format!("test:{name}")).unwrap();
+            b.set_light_filter(block, f).unwrap();
+        }
+        s
+    };
+    let states = [
+        add("dye_red", Some([10, 3, 2])),
+        add("dye_light_blue", Some([3, 11, 13])),
+        add("dye_black", Some([2, 2, 2])),
+        add("clear", None),
+    ];
+    (b.build(), states)
+}
+
+/// The 9 tiles of a [`scene`] (by `tile_index`), from its blocks: tops by brute force (open
+/// columns `i64::MIN`), tints the filters of opacity 0 above them.
+fn scene_tiles(chunks: &[ChunkData], tables: &LightTables) -> Vec<SkyTile> {
+    (0..9)
+        .map(|ti| {
+            let (dx, dz) = (ti / 3, ti % 3);
+            let at = |cy: usize, x: u32, y: u32, z: u32| {
+                chunks[cy * 9 + dx * 3 + dz].get(LocalPos::new(x, y, z))
+            };
+            let mut tops = vec![i64::MIN; 1024];
+            let mut tints = Vec::new();
+            for x in 0..32u32 {
+                for z in 0..32u32 {
+                    let col = ((x << 5) | z) as usize;
+                    for y in (-32..64i64).rev() {
+                        let (cy, ly) = ((y + 32) as usize / 32, (y.rem_euclid(32)) as u32);
+                        let s = at(cy, x, ly, z);
+                        if tables.blocks_sky(s) {
+                            tops[col] = y;
+                            break;
+                        }
+                        if tables.filters(s) {
+                            let filter = tables.light_filter(s);
+                            tints.push((x, z, boxel_light::Tint { y, filter }));
+                        }
+                    }
+                }
+            }
+            SkyTile::from_tops(tops.into_boxed_slice().try_into().unwrap(), i64::MIN)
+                .with_tints(tints)
+        })
+        .collect()
+}
+
+/// The colored light of a [`scene`]'s center chunk, checked against the oracle, and with the
+/// switch off.
+fn colored_light_of(chunks: &[ChunkData], tables: &LightTables) -> (PaddedLight, PaddedLight) {
+    let tiles = scene_tiles(chunks, tables);
+    let refs: [Option<&ChunkData>; 27] = std::array::from_fn(|i| Some(&chunks[i]));
+    let mut input = LightInput {
+        origin: ChunkPos::new(0, 0, 0),
+        chunks: refs,
+        sky: SkyInput::Tiles(std::array::from_fn(|i| &tiles[i])),
+        beams: [None; 9],
+        tables,
+        colored_sky: true,
+    };
+    let (mut scratch, mut on, mut off) = (
+        LightScratch::new(),
+        PaddedLight::default(),
+        PaddedLight::default(),
+    );
+    compute(&input, &mut scratch, &mut on);
+    let tops: Vec<i64> = (0..96 * 96)
+        .map(|i| {
+            let (x, z) = (i / 96, i % 96);
+            tiles[(x / 32) * 3 + z / 32].top((x % 32) as u32, (z % 32) as u32)
+        })
+        .collect();
+    let oracle = OracleWorld::from_chunks(ChunkPos::new(-1, -1, -1), [3; 3], chunks, tables, tops);
+    let want = oracle.padded(&oracle.solve(), input.origin);
+    assert_eq!(first_mismatch(&on, &want), None);
+    assert_eq!(
+        on.to_sky_rgb_vec(),
+        oracle.padded(&oracle.solve_colored(), input.origin)
+    );
+    input.colored_sky = false;
+    compute(&input, &mut scratch, &mut off);
+    assert_eq!(
+        off.to_vec(),
+        on.to_vec(),
+        "gameplay reads the uncolored sky"
+    );
+    (on, off)
+}
+
+/// ADR 0064: under a roof of the game's red glass over a field, the direct sky is (13, 7, 6),
+/// the glass itself included, and white above it; the roof's edge gets white 14 from the open
+/// column beside it, fading into the tint; two roofs, red over light blue, give (5, 6, 5); black
+/// glass darkens all three channels to 6, which only the colored form can carry next to the
+/// uncolored 15; clear glass keeps the light of before. Gameplay reads 15 under every roof.
+#[test]
+fn a_glass_roof_tints_the_sky_under_it() {
+    let (registry, [red, blue, black, clear]) = dye_registry();
+    let tables = LightTables::from_registry(&registry);
+    let (_, b) = test_registry(false);
+    assert_eq!(registry.by_name("boxel:stone"), Some(b.stone));
+    // A stone ground below y = 0, a roof at y = 20 over the center chunk column, a second roof at
+    // y = 19 when `under` is some.
+    let roofed = |roof, under: Option<boxel_voxel::BlockState>| {
+        scene(&b, |x, y, z| {
+            let over = (0..32).contains(&x) && (0..32).contains(&z);
+            match y {
+                _ if y < 0 => b.stone,
+                20 if over => roof,
+                19 if over => under.unwrap_or(b.air),
+                _ => b.air,
+            }
+        })
+    };
+    let (light, off) = colored_light_of(&roofed(red, None), &tables);
+    assert!(light.is_colored());
+    assert_eq!(light.sky_rgb(16, 10, 16), [13, 7, 6]);
+    assert_eq!(light.sky_rgb(16, 20, 16), [13, 7, 6], "the glass itself");
+    assert_eq!(light.sky_rgb(16, 21, 16), [15; 3], "above the roof");
+    assert_eq!(
+        light.sky_rgb(0, 10, 16),
+        [14; 3],
+        "the edge, from the open column"
+    );
+    assert_eq!(light.sky_rgb(1, 10, 16), [13, 13, 13]);
+    assert_eq!(light.sky_rgb(3, 10, 16), [13, 11, 11]);
+    assert_eq!(light.sky_rgb(12, 10, 16), [13, 7, 6]);
+    assert_eq!(light.get(16, 10, 16), LightValue::FULL_SKY, "gameplay: 15");
+    assert_eq!(off.sky_rgb(16, 10, 16), [15; 3], "the switch off: white");
+
+    let (light, _) = colored_light_of(&roofed(red, Some(blue)), &tables);
+    assert_eq!(light.sky_rgb(16, 10, 16), [5, 6, 5]);
+    assert_eq!(light.sky_rgb(16, 19, 16), [5, 6, 5]);
+
+    let (light, _) = colored_light_of(&roofed(black, None), &tables);
+    assert!(
+        light.is_colored(),
+        "6 for the picture next to 15 for gameplay"
+    );
+    assert_eq!(light.sky_rgb(16, 10, 16), [6; 3]);
+    assert_eq!(light.get(16, 10, 16).sky(), 15);
+
+    let (light, off) = colored_light_of(&roofed(clear, None), &tables);
+    assert!(!light.is_colored());
+    assert_eq!(light, off);
+}
+
+/// ADR 0064: a sealed stone room with a light blue window facing the open sky, and no sky
+/// straight down into it, is lit through the window: (6, 13, 13) in the glass (14 enters), one
+/// less per voxel inside; gameplay reads the uncolored 13 behind it. A red pane of the plain
+/// test registry (opacity 0, red passing fully) keeps red at the uncolored level.
+#[test]
+fn a_window_lights_a_closed_room() {
+    let (registry, [_, blue, _, _]) = dye_registry();
+    let tables = LightTables::from_registry(&registry);
+    let (_, b) = test_registry(false);
+    let room = |window| {
+        scene(&b, |x, y, z| {
+            let shell = (4..=27).contains(&x) && (0..=20).contains(&y) && (4..=27).contains(&z);
+            let inside = (5..27).contains(&x) && (1..20).contains(&y) && (5..27).contains(&z);
+            match (x, y, z) {
+                _ if y < 0 => b.stone,
+                (4, 8..12, 12..16) => window,
+                _ if inside => b.air,
+                _ if shell => b.stone,
+                _ => b.air,
+            }
+        })
+    };
+    let (light, _) = colored_light_of(&room(blue), &tables);
+    assert_eq!(light.sky_rgb(3, 10, 14), [15; 3], "outside");
+    assert_eq!(light.sky_rgb(4, 10, 14), [6, 13, 13], "the window");
+    assert_eq!(light.sky_rgb(5, 10, 14), [5, 12, 12]);
+    assert_eq!(light.sky_rgb(8, 10, 14), [2, 9, 9]);
+    assert_eq!(light.get(5, 10, 14).sky(), 13, "gameplay");
+    assert_eq!(light.sky_rgb(20, 10, 14), [0; 3], "far: dark");
+
+    let (registry, b2) = test_registry_with(false, true);
+    let tables = LightTables::from_registry(&registry);
+    let [red, _] = b2.filters.unwrap();
+    let chunks = scene(&b2, |x, y, z| {
+        let shell = (4..=27).contains(&x) && (0..=20).contains(&y) && (4..=27).contains(&z);
+        let inside = (5..27).contains(&x) && (1..20).contains(&y) && (5..27).contains(&z);
+        match (x, y, z) {
+            _ if y < 0 => b2.stone,
+            (4, 8..12, 12..16) => red,
+            _ if inside => b2.air,
+            _ if shell => b2.stone,
+            _ => b2.air,
+        }
+    });
+    let (light, _) = colored_light_of(&chunks, &tables);
+    let behind = light.get(5, 10, 14).sky();
+    let scaled = |f: u8| (boxel_voxel::transmit(14, f) as u8).saturating_sub(1);
+    assert_eq!(
+        light.sky_rgb(5, 10, 14),
+        [behind, scaled(RED_FILTER[1]), scaled(RED_FILTER[2])]
+    );
 }

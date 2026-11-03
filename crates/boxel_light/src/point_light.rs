@@ -286,7 +286,8 @@ fn merge(rel: [i64; 3], shift: u32, scratch: &mut PointScratch, light: &mut Padd
     touched.clear();
 }
 
-/// The values of `light`, made `Full` first if it was uniform.
+/// The values of `light`, made `Full` first if it was uniform. Of a colored light (ADR 0064),
+/// its `light` values: a point light is block light and leaves the sky's channels alone.
 fn full_mut(light: &mut PaddedLight) -> &mut [u16; crate::PADDED_VOLUME] {
     if let PaddedLight::Uniform(v) = *light {
         let mut values = new_full();
@@ -294,7 +295,7 @@ fn full_mut(light: &mut PaddedLight) -> &mut [u16; crate::PADDED_VOLUME] {
         *light = PaddedLight::Full(values);
     }
     match light {
-        PaddedLight::Full(values) => values,
+        PaddedLight::Full(values) | PaddedLight::Colored { light: values, .. } => values,
         PaddedLight::Uniform(_) => unreachable!("made full above"),
     }
 }
