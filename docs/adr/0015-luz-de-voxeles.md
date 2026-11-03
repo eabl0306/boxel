@@ -3,8 +3,9 @@
 - Estado: aceptado (fases P0 a P6 hechas, y los arreglos de aspecto de la sección 12; P7,
   medir con la máquina libre, y P8, pendientes, salvo los filtros de color de P8: ADR 0060, y las
   luces dinámicas: ADR 0062).
-  Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061), y el
-  cielo de color las secciones 4 a 6 y 8 (ADR 0064).
+  Las fuentes de cielo y la luz por reino enmiendan las secciones 4, 5 y 8 (ADR 0061), el
+  cielo de color las secciones 4 a 6 y 8 (ADR 0064), y las sombras del sol la sección 11
+  (ADR 0065).
 - Fecha: 2026-10-06
 
 ## Contexto
@@ -444,6 +445,11 @@ La luz de bloque se ve igual al mediodía y a medianoche (lo verifica `gpu_terra
 AO desde ocupación en GPU en High y Mid si el gate G1 o las mediciones lo piden; cascadas de
 sombras del sol en High (profundidad con solo `geo`, el cielo horneado como máscara de
 exterior); luces dinámicas en el shader; vidrio teñido.
+
+**Sombras del sol (ADR 0065).** Aprobadas el 2026-11-03, por carriles. Son cascadas en High que
+solo oscurecen el término del cielo, hasta un 40 %; Mid y Low no cambian. La profundidad no sale
+de `geo` solo: las cajas, los planos y los fluidos inclinados leen su forma de `mat`, y el cutout
+necesita la capa de la textura, así que el paso de sombras lee el quad entero.
 
 ### 12. Arreglos de aspecto (2026-10-07)
 

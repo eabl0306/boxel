@@ -4,7 +4,8 @@ Issue #9 (light plan P8: "sun shadow cascades on High"). This is a design docume
 is built. Paths are relative to the repo root. Numbers marked "measured" come from
 `docs/rendimiento/` and the ADRs; the rest are estimates that each lane's measurement checks.
 
-**Status: proposal (2026-11-02).** Waiting for the owner's answers to sec. 9.
+**Status: approved (2026-11-03).** The owner accepted every recommendation of sec. 9 (sec. 10).
+Lane S0 is done: ADR 0065.
 
 **Verdict.** Build Option A, "voxel cascades": classic cascaded shadow maps drawn from the quad
 arena that is already on the GPU, with five voxel-specific choices that make them cheap and safe:

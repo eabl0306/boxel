@@ -437,7 +437,7 @@ Run section 7, then take the AO policy and cave-culling ordering decisions.
 ### P8. Later
 
 - GPU-occupancy AO on High and Mid, if G1 or P7 asks for it, or when held lights arrive.
-- Sun shadow cascades on High: geometry-only depth from the same arena, a second cull dispatch, and the sky level as the outdoor mask.
+- Sun shadow cascades on High: geometry-only depth from the same arena, a second cull dispatch, and the sky level as the outdoor mask. Approved as ADR 0065 (`docs/planes/sun-shadows-plan.md`): the shadow pass reads the whole quad, since box faces, planes and sloped fluids decode their shape from `mat` and cutout needs the texture layer.
 - Dynamic held and entity lights in the shader: done, up to 16 point lights in the `View`, max per channel with the baked light; worlds with them mesh with `AoPolicy::Baked` (ADR 0062).
 - Tinted glass filters: done, per-channel filters that scale block light brightness, sky stays white (ADR 0060).
 - Drop the CPU mesh copies and remesh on resync.
