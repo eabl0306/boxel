@@ -2,9 +2,9 @@
 
 - Estado: aceptado (issue #9, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
-  su sección 9. Se construye por carriles (sección 6 del plan). Hecho: el S0 (este ADR). Faltan el
-  S1 (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU), el S3 (los mapas
-  de sombra), el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
+  su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR) y el S1
+  (el gancho del sol en los shaders). Faltan el S2 (el sol y las cascadas en la CPU), el S3 (los
+  mapas de sombra), el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
   herramientas).
 - Fecha: 2026-11-03
 
@@ -209,6 +209,39 @@ frames, `Depth16Unorm` o 1024 en GPU integradas) solo si las medidas lo piden.
 
 Metas del S4: en la RTX como mucho +0,25 ms en el p50 y ningún frame nuevo sobre 6,94 ms; en la
 780M como mucho +0,8 ms en el p50.
+
+### 10. Carril S1: cómo quedó
+
+- `shaders/sun_off.wgsl` define `sun_factor(i: VsOut, sky_level: f32) -> f32` y devuelve 1,0. No
+  declara nada más: ningún global, struct, binding ni atributo.
+- `voxel_light` multiplica el término del cielo por `sun_factor(i, l.x)`. Un comentario ahí dice
+  dónde va el factor del camino teñido del C4.
+- Los 8 módulos que incluyen `common.wgsl` (`VoxelPull`, `VoxelInstanced`, `Cull`, `Lod`,
+  `LodPull`, `LodCull`, `Model` y `Cell`) llevan `sun_off.wgsl` justo después
+  (`SUN_OFF_WGSL`). Todos lo necesitan, aunque no sombreen: WGSL valida cada función del módulo.
+- `model_shade` (S5) y `lod_common.wgsl` no cambian: tienen su propia fórmula de luz.
+- Prueba nueva en `tests/naga.rs`: cada módulo con `common.wgsl` tiene `sun_off.wgsl`;
+  `sun_factor` es un solo `return` del literal 1,0 y no lee ningún global; `voxel_light` lo llama;
+  ningún módulo de vóxeles, celdas o modelos usa el grupo 3. Las pruebas de siempre (`View` de
+  1408 + 8192 B, un bloque uniform en Low, dos atributos de instancia) siguen pasando.
+- Las pruebas de GPU pasan sin cambios en los tres tiers.
+
+Para el S4: `sun_shadow.wgsl` tiene que definir la misma firma. El nivel llega sin la curva (0 a
+15, interpolado), así que `sky_level == 0.0` es la salida rápida de las cuevas. `VsOut` ya trae
+lo que pide la sección 6: `clip` para `fragment_position`, `view_dist`, `face` y el reino en
+`ao`.
+
+## Medidas
+
+Carril S1, `just perf-smoke surface` contra main (778e7bb), una corrida de 10 s por lado. No
+cambia ninguna malla ni código de CPU, así que no hay números de `headless_world` ni de criterion
+que mirar.
+
+| Caso | fps | p99 ms | Frames sobre 6,94 ms | Veredicto |
+|---|---:|---:|---:|---|
+| rtx/surface/r16/uncapped | 2017 -> 2036 (+1,0 %) | 1,24 -> 1,08 | 0 -> 0 | ok |
+
+p50 0,45 ms en los dos lados: el factor 1,0 no se nota.
 
 ## El juego
 

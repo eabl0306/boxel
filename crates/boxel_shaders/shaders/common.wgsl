@@ -1,4 +1,6 @@
 // boxel: shared voxel shader code (all tiers). Prepended to voxel_pull.wgsl, voxel_instanced.wgsl and cull.wgsl.
+// voxel_light calls sun_factor, which this file does not define: every module that includes it
+// also includes sun_off.wgsl (or, on High with sun shadows, sun_shadow.wgsl; ADR 0065).
 //
 // PackedQuad = vec2<u32>(geo, mat), 8 bytes, identical bytes on every tier.
 //   geo: x:5 | y:5 | z:5 | (w-1):5 | (h-1):5 | face:3 | flags:4 (bit 0 = FLAG_EMISSIVE, bits 1..3 =
@@ -660,7 +662,11 @@ fn voxel_light(i: VsOut, view: View) -> vec3<f32> {
     l = vec4(l.x, max(l.yzw, dynamic_levels(i)));
   }
   let env = realm_env(out_realm(i));
-  let sky = level_curve(l.x) * env.sky.rgb;
+  // Sun shadows (ADR 0065) scale the sky term only, by sun_factor in [1 - k, 1] (sun_off.wgsl or
+  // High's sun_shadow.wgsl), so they only darken and l.x == 0 (caves) stays unlit. The colored
+  // sky's tinted path (ADR 0064, lane C4) keeps this factor on each tinted sky channel, passing
+  // its brightest sky channel as the level.
+  let sky = level_curve(l.x) * env.sky.rgb * sun_factor(i, l.x);
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
   return max(max(sky, block), env.ambient.rgb);
 }

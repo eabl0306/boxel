@@ -625,6 +625,98 @@ fn low_tier_has_one_uniform_block_and_one_texture_sampler_pair() {
     assert_eq!((uniforms, textures, samplers), (1, 1, 1));
 }
 
+/// The sun hook (ADR 0065, lane S1): `voxel_light` multiplies its sky term by `sun_factor`, and
+/// every module that includes `common.wgsl` takes it from `sun_off.wgsl`, which returns the
+/// literal 1.0 and reads no global. So the hook adds no binding, `View` field or vertex attribute
+/// on any tier, and `x * 1.0 == x` keeps today's floats. Group 3 stays free in the voxel modules
+/// for High's shadow maps (lane S4).
+#[test]
+fn sun_off_returns_one_and_binds_nothing() {
+    use boxel_shaders::{COMMON_WGSL, SUN_OFF_WGSL};
+    // A function and nothing else: no global, struct, binding or attribute of its own.
+    for token in [
+        "var",
+        "@group",
+        "@binding",
+        "@location",
+        "@builtin",
+        "struct",
+        "const",
+    ] {
+        let code = SUN_OFF_WGSL
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<String>();
+        assert!(!code.contains(token), "sun_off.wgsl declares {token}");
+    }
+    let mut with_common = 0;
+    for id in ShaderModuleId::ALL {
+        let src = id.source();
+        let has_common = src.contains(COMMON_WGSL);
+        assert_eq!(src.contains(SUN_OFF_WGSL), has_common, "{}", id.label());
+        if !has_common {
+            continue;
+        }
+        with_common += 1;
+        let (module, info) = load(id);
+        let function = |name: &str| {
+            module
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{}: no {name}", id.label()))
+        };
+        let (sun, sun_fn) = function("sun_factor");
+        match sun_fn.body.iter().collect::<Vec<_>>()[..] {
+            [naga::Statement::Return { value: Some(v) }] => assert!(
+                matches!(
+                    sun_fn.expressions[*v],
+                    naga::Expression::Literal(naga::Literal::F32(1.0))
+                ),
+                "{}: sun_factor returns {:?}",
+                id.label(),
+                sun_fn.expressions[*v]
+            ),
+            ref body => panic!("{}: sun_factor body {body:?}", id.label()),
+        }
+        for (g, _) in module.global_variables.iter() {
+            assert!(
+                info[sun][g].is_empty(),
+                "{}: sun_factor reads a global",
+                id.label()
+            );
+        }
+        let (_, light_fn) = function("voxel_light");
+        assert!(
+            light_fn
+                .body
+                .iter()
+                .any(|s| matches!(s, naga::Statement::Call { function, .. } if *function == sun)),
+            "{}: voxel_light does not call sun_factor",
+            id.label()
+        );
+        if matches!(
+            id,
+            ShaderModuleId::VoxelPull
+                | ShaderModuleId::VoxelInstanced
+                | ShaderModuleId::Model
+                | ShaderModuleId::Cell
+        ) {
+            for (_, g) in module.global_variables.iter() {
+                assert_ne!(
+                    g.binding.as_ref().map(|b| b.group),
+                    Some(3),
+                    "{}: group 3",
+                    id.label()
+                );
+            }
+        }
+    }
+    // Every module that shades or culls voxels: VoxelPull, VoxelInstanced, Cull, Lod, LodPull,
+    // LodCull, Model, Cell.
+    assert_eq!(with_common, 8);
+}
+
 /// The overlay and the block outline (ADR 0026) run on every tier, the Low one included: no
 /// global resources at all (no uniform, texture, sampler or storage buffer), everything comes
 /// in vertex attributes.

@@ -1,8 +1,8 @@
 //! boxel's WGSL shaders (embedded with `include_str!`) and the `#[repr(C)]` mirrors of every GPU
-//! struct they read. Composition is plain concatenation: `common.wgsl` is prepended to the voxel
-//! modules. Every module is validated by naga in `cargo test` (WGSL front-end + GLSL 330 /
-//! ES 300 / 430 / ES 310 back-ends where the tier can run on GL), and every mirror struct has a
-//! layout test against naga's layouter (`tests/naga.rs`).
+//! struct they read. Composition is plain concatenation: `common.wgsl` and `sun_off.wgsl` are
+//! prepended to the voxel modules. Every module is validated by naga in `cargo test` (WGSL
+//! front-end + GLSL 330 / ES 300 / 430 / ES 310 back-ends where the tier can run on GL), and every
+//! mirror struct has a layout test against naga's layouter (`tests/naga.rs`).
 //!
 //! Shader rules (frozen, tested): no `@builtin(instance_index)`, `@builtin(draw_index)`,
 //! `@builtin(num_workgroups)`; `@builtin(vertex_index)` only with zero base vertex/first vertex;
@@ -14,6 +14,10 @@ pub mod gpu;
 
 /// `common.wgsl`: `PackedQuad` decoding, View/ChunkGpu structs, shading helpers.
 pub const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
+/// `sun_off.wgsl`: `sun_factor` without sun shadows, exactly 1.0 (ADR 0065). It follows
+/// `common.wgsl` in every module that includes it, since `voxel_light` calls it. It adds no
+/// binding, `View` field or vertex attribute.
+pub const SUN_OFF_WGSL: &str = include_str!("../shaders/sun_off.wgsl");
 /// `voxel_pull.wgsl`: High/Mid vertex pulling (`vs_pull`, `fs_opaque`).
 pub const VOXEL_PULL_WGSL: &str = include_str!("../shaders/voxel_pull.wgsl");
 /// `voxel_instanced.wgsl`: Low instanced quads (`vs_instanced`, `fs_opaque`).
@@ -65,11 +69,11 @@ pub enum Stage {
 /// A composed shader module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShaderModuleId {
-    /// common + `voxel_pull` (tiers High, Mid).
+    /// common + `sun_off` + `voxel_pull` (tiers High, Mid).
     VoxelPull,
-    /// common + `voxel_instanced` (tier Low).
+    /// common + `sun_off` + `voxel_instanced` (tier Low).
     VoxelInstanced,
-    /// common + cull (tier High).
+    /// common + `sun_off` + cull (tier High).
     Cull,
     /// blit (all tiers).
     Blit,
@@ -79,37 +83,47 @@ pub enum ShaderModuleId {
     Outline,
     /// fog march and composite (all tiers, only with the fog plugin).
     Fog,
-    /// common + `lod_common` + lod: far LOD nodes, instanced (all tiers, only with the LOD
-    /// plugin).
+    /// common + `sun_off` + `lod_common` + lod: far LOD nodes, instanced (all tiers, only with
+    /// the LOD plugin).
     Lod,
-    /// common + `lod_common` + `lod_pull`: far LOD nodes drawn from the GPU cull's lists (tier
-    /// High, only with the LOD plugin).
+    /// common + `sun_off` + `lod_common` + `lod_pull`: far LOD nodes drawn from the GPU cull's
+    /// lists (tier High, only with the LOD plugin).
     LodPull,
-    /// common + `lod_cull`: GPU culling of the far LOD nodes (tier High, only with the LOD
-    /// plugin).
+    /// common + `sun_off` + `lod_cull`: GPU culling of the far LOD nodes (tier High, only with
+    /// the LOD plugin).
     LodCull,
     /// `lod_hiz`: the depth pyramid of the far LOD's cull (tier High, only with the LOD plugin).
     LodHiz,
     /// The game UI's paint list (all tiers, only with `boxel_render`'s feature `ui` and a
     /// non-empty paint list).
     Ui,
-    /// common + model: entity models (all tiers, only once a model instance is drawn).
+    /// common + `sun_off` + model: entity models (all tiers, only once a model instance is drawn).
     Model,
-    /// common + cell: cell quads (all tiers, only once a chunk mesh has some, ADR 0050).
+    /// common + `sun_off` + cell: cell quads (all tiers, only once a chunk mesh has some,
+    /// ADR 0050).
     Cell,
 }
 
-static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_PULL_WGSL}"));
+// `common.wgsl` and the sun factor without shadows: what every voxel module starts with.
+fn common_sun_off(rest: &[&str]) -> String {
+    let mut src = format!("{COMMON_WGSL}\n{SUN_OFF_WGSL}");
+    for part in rest {
+        src.push('\n');
+        src.push_str(part);
+    }
+    src
+}
+
+static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[VOXEL_PULL_WGSL]));
 static VOXEL_INSTANCED: LazyLock<String> =
-    LazyLock::new(|| format!("{COMMON_WGSL}\n{VOXEL_INSTANCED_WGSL}"));
-static CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CULL_WGSL}"));
-static LOD: LazyLock<String> =
-    LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_COMMON_WGSL}\n{LOD_WGSL}"));
+    LazyLock::new(|| common_sun_off(&[VOXEL_INSTANCED_WGSL]));
+static CULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[CULL_WGSL]));
+static LOD: LazyLock<String> = LazyLock::new(|| common_sun_off(&[LOD_COMMON_WGSL, LOD_WGSL]));
 static LOD_PULL: LazyLock<String> =
-    LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_COMMON_WGSL}\n{LOD_PULL_WGSL}"));
-static LOD_CULL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{LOD_CULL_WGSL}"));
-static MODEL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{MODEL_WGSL}"));
-static CELL: LazyLock<String> = LazyLock::new(|| format!("{COMMON_WGSL}\n{CELL_WGSL}"));
+    LazyLock::new(|| common_sun_off(&[LOD_COMMON_WGSL, LOD_PULL_WGSL]));
+static LOD_CULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[LOD_CULL_WGSL]));
+static MODEL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[MODEL_WGSL]));
+static CELL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[CELL_WGSL]));
 
 impl ShaderModuleId {
     /// All modules.
