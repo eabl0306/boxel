@@ -2,8 +2,8 @@
 
 - Estado: aceptado (issue #9, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
-  su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR) y el S1
-  (el gancho del sol en los shaders). Faltan el S2 (el sol y las cascadas en la CPU), el S3 (los
+  su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR), el S1
+  (el gancho del sol en los shaders) y el S2 (el sol y las cascadas en la CPU). Faltan el S3 (los
   mapas de sombra), el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
   herramientas).
 - Fecha: 2026-11-03
@@ -231,6 +231,35 @@ Para el S4: `sun_shadow.wgsl` tiene que definir la misma firma. El nivel llega s
 lo que pide la sección 6: `clip` para `fragment_position`, `view_dist`, `face` y el reino en
 `ao`.
 
+### 11. Carril S2: cómo quedó
+
+Solo CPU: ningún shader, buffer ni pase cambia, y los tres tiers dibujan lo mismo que antes.
+
+- `boxel_world::SunPath` (inclinación 30 grados), en `DaylightPlugin`. `SunPath::step` da el paso
+  del sol desde los ticks, exacto: 7200 pasos al día, uno cada 10 2/3 ticks.
+- `RealmLight::sun` y `RealmLight::has_sun`.
+- `RenderSettings::sun_shadows` (`SunShadowSettings`): apagadas, 0,4, 160 bloques, 3 cascadas de
+  2048. Un cambio inválido se registra y quedan las últimas válidas. `applies(tier, device_type)`
+  dice si un renderer las dibuja: solo High, y en GPU integradas solo con `on_integrated`.
+- `SceneLight::sun` (`SceneSun`): la dirección, `k` por reino y el reino de la cámara. El extract
+  lo llena mientras las sombras están prendidas. `k` ya trae el desvanecido junto al horizonte.
+- `boxel_render::shadow::shadow_cascades` da las cascadas de un frame, o nada si `k` del reino de
+  la cámara es 0. Cada `Cascade` trae la matriz y los 6 planos relativos a la cámara, el tramo de
+  distancias que sirve, el tamaño del texel y una clave entera (centro en texels y profundidad en
+  pasos de 8 bloques) que fija la caja en el mundo. Con 3 cascadas los cortes son los del plan
+  (0, 20, 56 y 160; cada una empieza un 10 % antes del final de la anterior).
+- La caja sube hacia el sol hasta `ShadowView::casters_top` (el tope de los chunks cargados, que
+  pone el S3), con un tope de 512 bloques más allá de la esfera.
+- `bucket_mask` da las caras que dan sombra: las que miran lejos del sol. Las de canto no.
+- Pruebas (proptest): la cascada contiene su tramo del frustum y los casters de encima con
+  cualquier orientación, fov y aspecto; al moverse, un punto del mundo queda en el mismo lugar
+  dentro de su texel; girar no cambia el tamaño; a 2^31, 2^35, 2^40 y el límite del mundo las
+  cascadas salen iguales bit a bit.
+
+Para el S3: las cascadas cambian en cada frame en que cambia el origen de render (son relativas a
+la cámara), pero la caja en el mundo solo cambia con su clave, el ancla o el paso del sol. Las
+estructuras para la GPU (`ShadowUniform`) las define el S3 junto con su WGSL.
+
 ## Medidas
 
 Carril S1, `just perf-smoke surface` contra main (778e7bb), una corrida de 10 s por lado. No
@@ -242,6 +271,9 @@ que mirar.
 | rtx/surface/r16/uncapped | 2017 -> 2036 (+1,0 %) | 1,24 -> 1,08 | 0 -> 0 | ok |
 
 p50 0,45 ms en los dos lados: el factor 1,0 no se nota.
+
+Carril S2: no cambia nada en la GPU, así que no hay `perf-smoke`. Una prueba unitaria mide las
+cascadas: 4 cascadas tardan unos 0,3 µs por frame.
 
 ## El juego
 
