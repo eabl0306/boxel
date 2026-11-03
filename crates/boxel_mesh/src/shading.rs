@@ -15,7 +15,10 @@
 
 #[cfg(test)]
 use crate::packed::palette_corners;
-use crate::packed::{LightQuantization, MAX_PALETTE_ENTRIES, PaletteEntry, palette_entry};
+use crate::packed::{
+    ColoredLight, LightQuantization, MAX_PALETTE_ENTRIES, PaletteEntry, pack_tinted_entry,
+    palette_entry,
+};
 use boxel_voxel::LightValue;
 
 /// AO of a corner that nothing occludes.
@@ -134,8 +137,9 @@ pub fn corner_light(cells: &[u16; 9], nb9: u32, k: usize) -> LightValue {
 }
 
 /// The 4 corner lights of a face (each one [`corner_light`]), with every cell spread once. With
-/// no opaque cell every corner is the mean of its 2x2 block of cells.
-#[inline]
+/// no opaque cell every corner is the mean of its 2x2 block of cells. Always inlined: the hot
+/// path of every chunk keeps it in its loop, as before the colored path called it too.
+#[inline(always)]
 pub fn face_corner_lights(cells: &[u16; 9], nb9: u32) -> [LightValue; 4] {
     let s = cells.map(spread);
     if nb9 == 0 {
@@ -183,6 +187,34 @@ const fn pack_corners(corners: [LightValue; 4]) -> u64 {
         | (corners[1].0 as u64) << 16
         | (corners[2].0 as u64) << 32
         | (corners[3].0 as u64) << 48
+}
+
+/// The 4 colored corner lights as 96 bits: the low 16 bits of each corner's
+/// [`ColoredLight::bits`] (corner `k` at bit `16k`) and their top 8 bits (corner `k` at `8k`).
+#[inline]
+const fn pack_colored_corners(corners: [ColoredLight; 4]) -> (u64, u32) {
+    let mut low = 0u64;
+    let mut high = 0u32;
+    let mut k = 0;
+    while k < 4 {
+        let bits = corners[k].bits();
+        low |= ((bits & 0xFFFF) as u64) << (16 * k);
+        high |= (bits >> 16) << (8 * k);
+        k += 1;
+    }
+    (low, high)
+}
+
+/// The final index of a palette index `stored` while meshing under colored sky
+/// ([`LightPalette::index_colored`]), once the palette has `tinted` tinted entries: normal
+/// entries move up by `tinted`, tinted ones count up from 0.
+#[inline]
+pub(crate) const fn colored_index(stored: u16, tinted: usize) -> u16 {
+    if (stored as usize) < MAX_PALETTE_ENTRIES - tinted {
+        stored + tinted as u16
+    } else {
+        (MAX_PALETTE_ENTRIES - 1) as u16 - stored
+    }
 }
 
 /// One slot of a [`StampMap`]: key, value and the generation that wrote it, in one place so a
@@ -283,10 +315,18 @@ impl StampMap {
 
 /// A chunk's light palette under construction: distinct 4-corner lights in first-seen order, at
 /// most [`MAX_PALETTE_ENTRIES`].
+///
+/// Under colored sky (ADR 0064, [`LightPalette::index_colored`]) it fills two parts: the normal
+/// entries ([`LightPalette::entries`]) and the tinted ones ([`LightPalette::tinted`], with their
+/// exact parts), sharing the limit. Tinted entries go first in the mesh, which only knows how
+/// many there are at the end, so while meshing they take indices down from 4095 and normal ones
+/// up from 0 (the mesher moves them to their final place).
 #[derive(Clone, Debug)]
 pub struct LightPalette {
     map: StampMap,
     entries: Vec<PaletteEntry>,
+    tinted: Vec<PaletteEntry>,
+    tinted_exact: Vec<PaletteEntry>,
 }
 
 impl Default for LightPalette {
@@ -301,12 +341,16 @@ impl LightPalette {
         Self {
             map: StampMap::with_capacity_pow2(2 * MAX_PALETTE_ENTRIES),
             entries: Vec::new(),
+            tinted: Vec::new(),
+            tinted_exact: Vec::new(),
         }
     }
     /// Empties it, keeping its memory.
     pub fn clear(&mut self) {
         self.map.clear();
         self.entries.clear();
+        self.tinted.clear();
+        self.tinted_exact.clear();
     }
     /// The index of `corners`, added if new; `Err` when it is new and the palette is full.
     #[inline]
@@ -322,17 +366,51 @@ impl LightPalette {
         })?;
         Ok(index as u16)
     }
-    /// Entries in index order.
+    /// The index of colored `corners` (ADR 0064), added if new; `Err` when it is new and the
+    /// palette is full. Corners whose sky is gray at all 4 corners get a normal entry (the sky
+    /// level in the sky nibble), at the index it will keep plus the tinted count; the others a
+    /// tinted entry ([`pack_tinted_entry`]), at 4095 minus its position among the tinted ones.
+    /// The mesher moves both to their final index. Do not mix with [`LightPalette::index`] between
+    /// two clears.
+    #[inline]
+    pub fn index_colored(&mut self, corners: [ColoredLight; 4]) -> Result<u16, PaletteFull> {
+        let (low, high) = pack_colored_corners(corners);
+        let (entries, tinted, exact) =
+            (&mut self.entries, &mut self.tinted, &mut self.tinted_exact);
+        let index = self.map.get_or_insert([low, u64::from(high)], |len| {
+            if len >= MAX_PALETTE_ENTRIES {
+                Err(PaletteFull)
+            } else if corners.iter().all(|c| c.is_gray()) {
+                entries.push(palette_entry(corners.map(ColoredLight::to_value)));
+                Ok(entries.len() as u32 - 1)
+            } else {
+                let (entry, part) = pack_tinted_entry(corners);
+                tinted.push(entry);
+                exact.push(part);
+                Ok((MAX_PALETTE_ENTRIES - tinted.len()) as u32)
+            }
+        })?;
+        Ok(index as u16)
+    }
+    /// Entries in index order (under colored sky, the normal ones).
     pub fn entries(&self) -> &[PaletteEntry] {
         &self.entries
     }
-    /// Number of entries.
+    /// The tinted entries in first-seen order (empty without colored sky).
+    pub fn tinted(&self) -> &[PaletteEntry] {
+        &self.tinted
+    }
+    /// The exact part of each tinted entry ([`pack_tinted_entry`]).
+    pub fn tinted_exact(&self) -> &[PaletteEntry] {
+        &self.tinted_exact
+    }
+    /// Number of entries (both parts).
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.tinted.len()
     }
     /// No entry yet.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 }
 
@@ -399,6 +477,43 @@ impl KeyTable {
             pack_corners(corners),
             u64::from(material) | u64::from(ao) << 16 | u64::from(surface) << 24,
         ];
+        self.id_of(key, material, surface, ao, || palette.index(corners))
+    }
+    /// [`KeyTable::id`] of a face with colored corner lights (ADR 0064), added to `palette` with
+    /// [`LightPalette::index_colored`]: the key holds all 96 bits of the corners, so two faces
+    /// merge only when their sky and block light are equal at every corner. Do not mix with
+    /// [`KeyTable::id`] between two clears.
+    #[inline]
+    pub fn id_colored(
+        &mut self,
+        material: u16,
+        surface: bool,
+        ao: u8,
+        corners: [ColoredLight; 4],
+        palette: &mut LightPalette,
+    ) -> Result<u32, PaletteFull> {
+        let (low, high) = pack_colored_corners(corners);
+        let key = [
+            low,
+            u64::from(material)
+                | u64::from(ao) << 16
+                | u64::from(surface) << 24
+                | u64::from(high) << 32,
+        ];
+        self.id_of(key, material, surface, ao, || {
+            palette.index_colored(corners)
+        })
+    }
+    /// The id of `key`, added if new with the palette index `light` gives.
+    #[inline]
+    fn id_of(
+        &mut self,
+        key: [u64; 2],
+        material: u16,
+        surface: bool,
+        ao: u8,
+        light: impl FnOnce() -> Result<u16, PaletteFull>,
+    ) -> Result<u32, PaletteFull> {
         if let Some((last, id)) = self.last
             && last == key
         {
@@ -406,7 +521,7 @@ impl KeyTable {
         }
         let keys = &mut self.keys;
         let id = self.map.get_or_insert(key, |len| {
-            let light = palette.index(corners)?;
+            let light = light()?;
             keys.push(FaceKey {
                 material,
                 surface,
@@ -448,6 +563,29 @@ impl FaceShading {
     /// are all dark gets AO open (what [`crate::AoPolicy::BakedLitOnly`] stores).
     pub fn quantized(self, level: LightQuantization, elide: bool) -> Self {
         let light = level.apply(self.light);
+        let dark = light.iter().all(|c| c.is_dark());
+        Self {
+            ao: if elide && dark { AO_OPEN_BYTE } else { self.ao },
+            light,
+        }
+    }
+}
+
+/// [`FaceShading`] under colored sky (ADR 0064): the AO byte and the colored light of the 4
+/// corners.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColoredFaceShading {
+    /// AO byte (corner `k` at bits `2k`, 3 = open).
+    pub ao: u8,
+    /// Corner lights.
+    pub light: [ColoredLight; 4],
+}
+
+impl ColoredFaceShading {
+    /// This shading with its light at `level` ([`LightQuantization::apply_colored`]); with
+    /// `elide`, a face whose quantized corners are all dark in all six channels gets AO open.
+    pub fn quantized(self, level: LightQuantization, elide: bool) -> Self {
+        let light = level.apply_colored(self.light);
         let dark = light.iter().all(|c| c.is_dark());
         Self {
             ao: if elide && dark { AO_OPEN_BYTE } else { self.ao },

@@ -670,3 +670,52 @@ fn double_slabs_mesh_like_stone_cubes() {
         .count();
     assert_eq!((cubes, quads.len() - cubes), (6, 5));
 }
+
+/// Colored sky (ADR 0064) on the per-block path and the edge walls: with dark block light, a
+/// colored sky meshes every shape like a plain light that holds the sky's channels in its block
+/// channels. The same quads, faces and merges, one palette entry per corner set, though the
+/// tinted entries moved to the front; each quad's sky corners are the twin's block corners.
+#[test]
+fn shapes_under_colored_sky_mesh_like_their_plain_twin() {
+    let table = table();
+    let fills = [Fill::Noise, Fill::Boxes, Fill::Terrain, Fill::Lattice];
+    let mut tinted = 0;
+    for seed in 0..24u64 {
+        let fill = fills[seed as usize % fills.len()];
+        let padded = random_padded(&table, fill, seed, 20 + (seed as u32 * 7) % 60, &ALL);
+        let Some(boxel_light::PaddedLight::Full(values)) =
+            random_light(common::LightFill::Smooth, seed)
+        else {
+            panic!("a full light");
+        };
+        let mut sky = values.clone();
+        sky.iter_mut().for_each(|v| *v &= LightValue::BLOCK_MASK);
+        let mut dark = values;
+        dark.fill(0);
+        let twin = boxel_light::PaddedLight::Full(sky.clone());
+        let colored = boxel_light::PaddedLight::Colored {
+            light: dark,
+            sky_rgb: sky,
+        };
+        for policy in [AoPolicy::Baked, AoPolicy::BakedLitOnly] {
+            let options = MeshOptions::with_ao(policy).with_walls();
+            let mut got = ChunkMesh::default();
+            let mut want = ChunkMesh::default();
+            let mut mesher = Mesher::new();
+            mesher.mesh(&padded, Some(&colored), &table, options, &mut got);
+            mesher.mesh(&padded, Some(&twin), &table, options, &mut want);
+            let unlit = |m: &ChunkMesh| -> Vec<PackedQuad> {
+                m.quads.iter().map(|q| q.with_light_index(0)).collect()
+            };
+            assert_eq!(unlit(&got), unlit(&want), "seed {seed}");
+            assert_eq!(got.palette.len(), want.palette.len(), "seed {seed}");
+            for (&g, &w) in got.quads.iter().zip(&want.quads) {
+                let sky = got.exact_corner_colors(g).map(|c| c.sky);
+                let block = want.corner_light(w).map(|c| c.0 & LightValue::BLOCK_MASK);
+                assert_eq!(sky, block, "seed {seed}: {g:?} against {w:?}");
+            }
+            tinted += usize::from(got.tinted_entries != 0);
+        }
+    }
+    assert!(tinted > 12, "the scenes have tinted entries: {tinted}");
+}

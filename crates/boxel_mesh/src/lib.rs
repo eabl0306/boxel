@@ -7,7 +7,9 @@
 //! Light and ambient occlusion are baked per quad corner (ADR 0015): each quad carries an AO
 //! byte and the index of its 4 corner lights in the chunk's light palette
 //! ([`ChunkMesh::palette`]). Both are part of the merge key, and both only depend on the vertex,
-//! so a merged quad is exact. [`AoPolicy`] says which faces get AO. A block that emits light
+//! so a merged quad is exact. [`AoPolicy`] says which faces get AO. Under colored sky
+//! (ADR 0064) a face whose sky has unequal channels gets a tinted entry instead
+//! ([`pack_tinted_entry`], [`ChunkMesh::tinted_entries`]). A block that emits light
 //! without being drawn full bright is lit flat by its own light, as in Minecraft (ADR 0036,
 //! [`MaterialTable::lit_emission`]).
 //!
@@ -26,16 +28,17 @@ pub mod shading;
 pub use fluid::{FLAT as FLUID_FLAT, fluid_flow, reference_fluid_heights};
 pub use mesher::{
     AoPolicy, MaterialTable, MeshInput, MeshOptions, Mesher, reference_box_face_shading_at,
-    reference_face_shading, reference_face_shading_at, reference_lit_emitter_shading,
-    reference_visible_faces,
+    reference_colored_face_shading, reference_colored_face_shading_at, reference_face_shading,
+    reference_face_shading_at, reference_lit_emitter_shading, reference_visible_faces,
 };
 pub use packed::{
-    ChunkMesh, FULL_SKY_ENTRY, LightQuantization, LitCellQuad, MAX_PALETTE_ENTRIES, PackedQuad,
-    PaletteEntry, layout, pack_model_box, pack_plane_entry, pack_table_entry, palette_corners,
-    palette_entry, quad_model_box, unpack_model_box, unpack_plane_entry,
+    ChunkMesh, ColoredLight, FULL_SKY_ENTRY, LightQuantization, LitCellQuad, MAX_PALETTE_ENTRIES,
+    PackedQuad, PaletteEntry, layout, pack_model_box, pack_plane_entry, pack_table_entry,
+    pack_tinted_entry, palette_corners, palette_entry, quad_model_box, tinted_corners,
+    tinted_exact_corners, unpack_model_box, unpack_plane_entry,
 };
 pub use padded::{PADDED, PADDED_AREA, PADDED_VOLUME, PaddedChunk, VoxelClass};
-pub use shading::FaceShading;
+pub use shading::{ColoredFaceShading, FaceShading};
 
 /// Number of buckets per chunk mesh (frozen layout).
 pub const BUCKET_COUNT: usize = 8;

@@ -165,6 +165,24 @@ pub mod layout {
     pub const MAT_LIGHT_SHIFT: u32 = 20;
     /// Mask of the light palette index (after the shift).
     pub const MAT_LIGHT_MASK: u32 = 0xFFF;
+    /// Bits of one corner of a tinted palette entry ([`pack_tinted_entry`](crate::pack_tinted_entry),
+    /// ADR 0064): red, green and blue, 4 bits each, in the block nibbles of a `LightValue`
+    /// (red at 8, green at 4, blue at 0). Corner `2j + i` sits at bit `TINT_CORNER_BITS * i`
+    /// of word `j`.
+    pub const TINT_CORNER_BITS: u32 = 12;
+    /// Mask of one tinted corner, or of the flat value.
+    pub const TINT_CORNER_MASK: u32 = 0xFFF;
+    /// Shift, in both words of a tinted entry, of its flat part: the top 8 bits of the flat
+    /// value (red and green) in word 0, its low 4 bits (blue) in word 1.
+    pub const TINT_FLAT_SHIFT: u32 = 24;
+    /// Bit of word 1 of a tinted entry: set when its corners are block light and its flat value
+    /// is the sky ([`TINT_BLOCK_CORNERS`]), clear when its corners are the sky's.
+    pub const TINT_TAG_BIT: u32 = 28;
+    /// Tag of a tinted entry whose corners are the sky's red, green and blue and whose flat
+    /// value is the block light.
+    pub const TINT_SKY_CORNERS: u32 = 0;
+    /// Tag of a tinted entry whose corners are the block light and whose flat value is the sky.
+    pub const TINT_BLOCK_CORNERS: u32 = 1;
 }
 
 /// Most entries of one chunk's light palette (the 12-bit index of [`PackedQuad`]).
@@ -195,6 +213,185 @@ pub const fn palette_corners(entry: PaletteEntry) -> [LightValue; 4] {
 
 /// Palette entry of open sky everywhere (what a mesh without light uses).
 pub const FULL_SKY_ENTRY: PaletteEntry = palette_entry([LightValue::FULL_SKY; 4]);
+
+/// The light of a point with colored sky (ADR 0064): the sky's red, green and blue and the block
+/// light's, each three channels of 4 bits in the block nibbles of a [`LightValue`] (red at 8,
+/// green at 4, blue at 0; the `sky_rgb` layout of `boxel_light::PaddedLight::Colored`). The sky
+/// is the one the picture shows, not the uncolored level gameplay reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColoredLight {
+    /// Sky red, green and blue (`0x0RGB`).
+    pub sky: u16,
+    /// Block red, green and blue (`0x0RGB`).
+    pub block: u16,
+}
+
+impl ColoredLight {
+    /// Sky and block light from their channels.
+    pub const fn new(sky: [u8; 3], block: [u8; 3]) -> Self {
+        Self {
+            sky: LightValue::from_rgb(sky).0,
+            block: LightValue::from_rgb(block).0,
+        }
+    }
+    /// A light without tint: `v`'s sky level in all three sky channels.
+    pub const fn from_value(v: LightValue) -> Self {
+        let s = v.sky() as u16;
+        Self {
+            sky: s << 8 | s << 4 | s,
+            block: v.0 & LightValue::BLOCK_MASK,
+        }
+    }
+    /// The sky's channels.
+    pub const fn sky_rgb(self) -> [u8; 3] {
+        LightValue(self.sky).rgb()
+    }
+    /// The block light's channels.
+    pub const fn block_rgb(self) -> [u8; 3] {
+        LightValue(self.block).rgb()
+    }
+    /// True if the three sky channels are equal (no tint; [`ColoredLight::to_value`] is exact).
+    pub const fn is_gray(self) -> bool {
+        let [r, g, b] = self.sky_rgb();
+        r == g && g == b
+    }
+    /// The [`LightValue`] with the sky's brightest channel as its sky level: exact for a gray
+    /// light, the tint dropped otherwise.
+    pub const fn to_value(self) -> LightValue {
+        let [r, g, b] = self.sky_rgb();
+        let max = if r > g { r } else { g };
+        let max = if max > b { max } else { b };
+        LightValue((max as u16) << LightValue::SKY_SHIFT | (self.block & LightValue::BLOCK_MASK))
+    }
+    /// True if all six channels are 0.
+    pub const fn is_dark(self) -> bool {
+        self.sky & LightValue::BLOCK_MASK == 0 && self.block & LightValue::BLOCK_MASK == 0
+    }
+    /// Per channel maximum of both.
+    pub const fn max(self, other: Self) -> Self {
+        Self {
+            sky: LightValue(self.sky).max(LightValue(other.sky)).0 & LightValue::BLOCK_MASK,
+            block: LightValue(self.block).max(LightValue(other.block)).0 & LightValue::BLOCK_MASK,
+        }
+    }
+    /// The 24 bits of the light: block in bits 0 to 11, sky in 12 to 23.
+    pub const fn bits(self) -> u32 {
+        (self.block as u32 & layout::TINT_CORNER_MASK)
+            | (self.sky as u32 & layout::TINT_CORNER_MASK) << 12
+    }
+}
+
+/// Sum over the three channels of the spread (max minus min) of 4 corners in the `0x0RGB` layout.
+const fn rgb_spread(c: [u16; 4]) -> u16 {
+    let mut total = 0;
+    let mut shift = 0;
+    while shift < 12 {
+        let (mut lo, mut hi) = (15, 0);
+        let mut k = 0;
+        while k < 4 {
+            let v = (c[k] >> shift) & 15;
+            lo = if v < lo { v } else { lo };
+            hi = if v > hi { v } else { hi };
+            k += 1;
+        }
+        total += hi - lo;
+        shift += 4;
+    }
+    total
+}
+
+/// Per channel rounded mean `(sum + 2) / 4` of 4 corners in the `0x0RGB` layout (the rounding
+/// of [`LightQuantization::Flat`]).
+const fn rgb_mean(c: [u16; 4]) -> u16 {
+    let mut mean = 0;
+    let mut shift = 0;
+    while shift < 12 {
+        let sum = ((c[0] >> shift) & 15)
+            + ((c[1] >> shift) & 15)
+            + ((c[2] >> shift) & 15)
+            + ((c[3] >> shift) & 15);
+        mean |= ((sum + 2) / 4) << shift;
+        shift += 4;
+    }
+    mean
+}
+
+/// The tinted palette entry of the 4 colored corner lights of a face (ADR 0064) and its exact
+/// part, `(entry, exact)`.
+///
+/// `entry` is what every tier reads: the 4 corners of one kind of light (sky or block) and the
+/// other kind flat across the face, the rounded per-channel mean of its corners. The kind whose
+/// corners differ more (sum over the channels of max minus min) keeps them; ties go to the sky.
+/// So the entry is exact whenever one kind is flat across the face. Layout
+/// ([`layout::TINT_CORNER_BITS`]): word 0 = `c0 | c1 << 12 | (flat >> 4) << 24`, word 1 =
+/// `c2 | c3 << 12 | (flat & 15) << 24 | tag << 28` ([`layout::TINT_TAG_BIT`]); bits 29 to 31 of
+/// word 1 are 0.
+///
+/// `exact` holds the 4 corners of the kind `entry` keeps flat, `c0 | c1 << 12` and
+/// `c2 | c3 << 12` (bits 24 to 31 are 0): with it a face is exact ([`tinted_exact_corners`]).
+/// Only the High tier reads it (owner decision 1 of ADR 0064).
+pub fn pack_tinted_entry(corners: [ColoredLight; 4]) -> (PaletteEntry, PaletteEntry) {
+    use layout::*;
+    let mask = TINT_CORNER_MASK as u16;
+    let sky = corners.map(|c| c.sky & mask);
+    let block = corners.map(|c| c.block & mask);
+    let block_corners = rgb_spread(block) > rgb_spread(sky);
+    let (kept, flat, tag) = if block_corners {
+        (block, sky, TINT_BLOCK_CORNERS)
+    } else {
+        (sky, block, TINT_SKY_CORNERS)
+    };
+    let mean = u32::from(rgb_mean(flat));
+    let pair = |a: u16, b: u16| u32::from(a) | u32::from(b) << TINT_CORNER_BITS;
+    let entry = [
+        pair(kept[0], kept[1]) | (mean >> 4) << TINT_FLAT_SHIFT,
+        pair(kept[2], kept[3]) | (mean & 15) << TINT_FLAT_SHIFT | tag << TINT_TAG_BIT,
+    ];
+    let exact = [pair(flat[0], flat[1]), pair(flat[2], flat[3])];
+    (entry, exact)
+}
+
+/// The 4 corners of a tinted entry's kept kind (or of its exact part), its flat value and
+/// whether the corners are block light.
+fn split_tinted(entry: PaletteEntry) -> ([u16; 4], u16, bool) {
+    use layout::*;
+    let corner = |k: usize| {
+        ((entry[k >> 1] >> (TINT_CORNER_BITS * (k as u32 & 1))) & TINT_CORNER_MASK) as u16
+    };
+    let flat = ((entry[0] >> TINT_FLAT_SHIFT) << 4 | (entry[1] >> TINT_FLAT_SHIFT) & 15) as u16;
+    let block_corners = (entry[1] >> TINT_TAG_BIT) & 1 == TINT_BLOCK_CORNERS;
+    (std::array::from_fn(corner), flat, block_corners)
+}
+
+/// The colored light of a corner from its kept kind and its other kind.
+fn tinted_corner(kept: u16, other: u16, block_corners: bool) -> ColoredLight {
+    if block_corners {
+        ColoredLight {
+            sky: other,
+            block: kept,
+        }
+    } else {
+        ColoredLight {
+            sky: kept,
+            block: other,
+        }
+    }
+}
+
+/// The 4 corner lights of a tinted entry ([`pack_tinted_entry`]) as the Low and Mid tiers draw
+/// them: the kept kind per corner, the other kind flat.
+pub fn tinted_corners(entry: PaletteEntry) -> [ColoredLight; 4] {
+    let (kept, flat, block_corners) = split_tinted(entry);
+    kept.map(|k| tinted_corner(k, flat, block_corners))
+}
+
+/// The exact 4 corner lights of a tinted entry and its exact part ([`pack_tinted_entry`]), as
+/// the High tier draws them.
+pub fn tinted_exact_corners(entry: PaletteEntry, exact: PaletteEntry) -> [ColoredLight; 4] {
+    let (kept, _, block_corners) = split_tinted(entry);
+    let (other, _, _) = split_tinted(exact);
+    std::array::from_fn(|k| tinted_corner(kept[k], other[k], block_corners))
+}
 
 /// One greedy quad, 8 bytes, identical on every tier (storage buffer element in High/Mid,
 /// instance-step `Uint32x2` vertex attribute in Low).
@@ -631,6 +828,24 @@ impl LightQuantization {
             }
         }
     }
+
+    /// Colored `corners` (ADR 0064) at this level: [`LightQuantization::Block3`] cuts the block
+    /// channels as in [`LightQuantization::apply`] and keeps the sky; [`LightQuantization::Flat`]
+    /// drops the tint (each corner's sky becomes its brightest channel,
+    /// [`ColoredLight::to_value`]) and then applies, so every corner comes back gray and a flat
+    /// palette still fits.
+    pub fn apply_colored(self, corners: [ColoredLight; 4]) -> [ColoredLight; 4] {
+        match self {
+            Self::Exact => corners,
+            Self::Block3 => corners.map(|c| ColoredLight {
+                block: c.block & 0x0EEE,
+                ..c
+            }),
+            Self::Flat => self
+                .apply(corners.map(ColoredLight::to_value))
+                .map(ColoredLight::from_value),
+        }
+    }
 }
 
 /// A quad a cell draws from its data (ADR 0050), placed in its chunk: its corners are in
@@ -639,7 +854,9 @@ impl LightQuantization {
 pub struct LitCellQuad {
     /// The quad, its corners in the chunk.
     pub quad: CellQuad,
-    /// The light of its cell (open sky in a mesh without light).
+    /// The light of its cell (open sky in a mesh without light). Under colored sky (ADR 0064)
+    /// its sky level is the brightest sky channel, and the channels are in
+    /// [`ChunkMesh::cell_sky_rgb`].
     pub light: LightValue,
 }
 
@@ -652,8 +869,18 @@ pub struct ChunkMesh {
     /// Quads per bucket (`0..6` = opaque `Face` order, `6` = cutout, `7` = translucent).
     pub bucket_counts: [u32; BUCKET_COUNT],
     /// Light palette (at most [`MAX_PALETTE_ENTRIES`] entries, first-seen order); every quad's
-    /// [`PackedQuad::light_index`] is an index into it.
+    /// [`PackedQuad::light_index`] is an index into it. Under colored sky (ADR 0064) the first
+    /// [`ChunkMesh::tinted_entries`] are tinted entries ([`pack_tinted_entry`]) and the rest
+    /// normal ones ([`palette_entry`]), each part in first-seen order.
     pub palette: Vec<PaletteEntry>,
+    /// How many entries at the start of the palette are tinted (`0..=4096`): their sky has
+    /// unequal channels at some corner. 0 in every mesh without colored sky, which is then
+    /// byte-identical to a mesh from before ADR 0064.
+    pub tinted_entries: u32,
+    /// The exact part of each tinted entry ([`pack_tinted_entry`]), `tinted_entries` of them:
+    /// the corners of the kind the entry keeps flat. Only the High tier reads it, to draw every
+    /// face exactly (owner decision 1 of ADR 0064); Low and Mid draw the entries alone.
+    pub tinted_exact: Vec<PaletteEntry>,
     /// How the palette was quantized.
     pub light_quantization: LightQuantization,
     /// The quads its cells draw from their data (ADR 0050), in local index order of the cells.
@@ -661,6 +888,10 @@ pub struct ChunkMesh {
     /// block that draws cell quads draws block quads of its own too, so a mesh with cell quads
     /// is never [`ChunkMesh::is_empty`].
     pub cell_quads: Vec<LitCellQuad>,
+    /// Empty, or the sky's red, green and blue of each cell quad (`0x0RGB`, ADR 0064), in the
+    /// order of [`ChunkMesh::cell_quads`]: set when the mesh had colored sky and some cell quad's
+    /// sky has unequal channels.
+    pub cell_sky_rgb: Vec<u16>,
     /// [`ChunkMesh::compute_hash`] of the content (the mesher sets it; equal meshes have equal
     /// hashes, so a remesh that changed nothing can be skipped).
     pub hash: u64,
@@ -719,23 +950,51 @@ impl ChunkMesh {
                 .count() as u32
         })
     }
-    /// The 4 corner lights of `quad` (open sky if its index is outside the palette).
+    /// The 4 corner lights of `quad` (open sky if its index is outside the palette). A tinted
+    /// entry gives [`ChunkMesh::corner_colors`] without its tint ([`ColoredLight::to_value`]).
     pub fn corner_light(&self, quad: PackedQuad) -> [LightValue; 4] {
+        let i = quad.light_index() as usize;
+        if i < self.tinted_entries as usize {
+            return self.corner_colors(quad).map(ColoredLight::to_value);
+        }
         self.palette
-            .get(quad.light_index() as usize)
+            .get(i)
             .map_or([LightValue::FULL_SKY; 4], |&e| palette_corners(e))
+    }
+    /// The 4 colored corner lights of `quad` as the Low and Mid tiers draw them (ADR 0064): a
+    /// tinted entry with its flat kind flat ([`tinted_corners`]), a normal one without tint.
+    pub fn corner_colors(&self, quad: PackedQuad) -> [ColoredLight; 4] {
+        let i = quad.light_index() as usize;
+        if i < self.tinted_entries as usize {
+            return tinted_corners(self.palette[i]);
+        }
+        self.corner_light(quad).map(ColoredLight::from_value)
+    }
+    /// The 4 colored corner lights of `quad` as the High tier draws them: every entry exact
+    /// ([`tinted_exact_corners`]).
+    pub fn exact_corner_colors(&self, quad: PackedQuad) -> [ColoredLight; 4] {
+        let i = quad.light_index() as usize;
+        if i < self.tinted_entries as usize {
+            return tinted_exact_corners(self.palette[i], self.tinted_exact[i]);
+        }
+        self.corner_light(quad).map(ColoredLight::from_value)
     }
     /// Clears, keeping capacity.
     pub fn clear(&mut self) {
         self.quads.clear();
         self.bucket_counts = [0; BUCKET_COUNT];
         self.palette.clear();
+        self.tinted_entries = 0;
+        self.tinted_exact.clear();
         self.light_quantization = LightQuantization::Exact;
         self.cell_quads.clear();
+        self.cell_sky_rgb.clear();
         self.hash = 0;
     }
     /// foldhash with a fixed seed over the quads, the bucket counts, the palette and the cell
-    /// quads (only when there are some: a mesh without them hashes as before ADR 0050).
+    /// quads (only when there are some: a mesh without them hashes as before ADR 0050), then the
+    /// tinted entries and the cell quads' sky (only when there are some: a mesh without colored
+    /// sky hashes as before ADR 0064).
     pub fn compute_hash(&self) -> u64 {
         use std::hash::Hash as _;
         let mut h = foldhash::fast::FixedState::with_seed(Self::HASH_SEED).build_hasher();
@@ -744,6 +1003,13 @@ impl ChunkMesh {
         h.write(bytemuck::cast_slice(&self.palette));
         if !self.cell_quads.is_empty() {
             self.cell_quads.hash(&mut h);
+        }
+        if self.tinted_entries != 0 {
+            h.write_u32(self.tinted_entries);
+            h.write(bytemuck::cast_slice(&self.tinted_exact));
+        }
+        if !self.cell_sky_rgb.is_empty() {
+            h.write(bytemuck::cast_slice(&self.cell_sky_rgb));
         }
         h.finish()
     }

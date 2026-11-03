@@ -1,9 +1,9 @@
 use crate::fluid::{FluidScratch, emit_sloped, find_sloped};
 use crate::greedy::Greedy;
-use crate::packed::{LightQuantization, layout, palette_entry};
+use crate::packed::{ColoredLight, LightQuantization, layout, palette_entry};
 use crate::shading::{
-    AO_OPEN_BYTE, AO_TABLE, FaceKey, FaceShading, KeyTable, LightPalette, PaletteFull, corner_ao,
-    face_corner_lights, neighborhood8,
+    AO_OPEN_BYTE, AO_TABLE, ColoredFaceShading, FaceKey, FaceShading, KeyTable, LightPalette,
+    PaletteFull, colored_index, corner_ao, face_corner_lights, neighborhood8,
 };
 use crate::{
     BUCKET_COUNT, CUTOUT_BUCKET, ChunkMesh, LitCellQuad, PADDED, PADDED_AREA, PADDED_VOLUME,
@@ -906,13 +906,35 @@ fn emit_cell_quads(
         scratch.clear();
         f(data, scratch);
         let [x, y, z] = [p.x(), p.y(), p.z()].map(|c| c as i32);
-        let light = input.light.map_or(LightValue::FULL_SKY, |l| l.get(x, y, z));
         let at = [x, y, z].map(|c| c as f32);
+        let light = match input.light {
+            None => LightValue::FULL_SKY,
+            // Colored sky (ADR 0064): the picture's sky, its brightest channel in the value.
+            Some(l @ PaddedLight::Colored { .. }) => {
+                let colored = ColoredLight {
+                    sky: LightValue::from_rgb(l.sky_rgb(x, y, z)).0,
+                    block: l.get(x, y, z).0 & LightValue::BLOCK_MASK,
+                };
+                let n = scratch.len();
+                out.cell_sky_rgb.extend(std::iter::repeat_n(colored.sky, n));
+                colored.to_value()
+            }
+            Some(l) => l.get(x, y, z),
+        };
         out.cell_quads
             .extend(scratch.drain(..).map(|q| LitCellQuad {
                 quad: q.moved(at),
                 light,
             }));
+    }
+    if out.cell_sky_rgb.len() != out.cell_quads.len()
+        || out
+            .cell_sky_rgb
+            .iter()
+            .all(|&sky| ColoredLight { sky, block: 0 }.is_gray())
+    {
+        // No colored sky, or none of it tinted: the quads' values say it all.
+        out.cell_sky_rgb.clear();
     }
     if !out.cell_quads.is_empty() {
         out.hash = out.compute_hash();
@@ -1199,6 +1221,9 @@ enum KeyKind {
     MaterialAo,
     /// A [`KeyTable`] id.
     Table,
+    /// A [`KeyTable`] id under colored sky (ADR 0064), whose palette index becomes final with
+    /// [`colored_index`] for a palette of this many tinted entries.
+    Colored(usize),
 }
 
 /// [`Mesher::mesh`] body. Borrows only the scratch, so `mesh_chunk` can pass the mesher's own
@@ -1224,8 +1249,12 @@ fn mesh_into(
         None => Err(LightValue::FULL_SKY),
         Some(PaddedLight::Uniform(v)) => Err(*v),
         Some(PaddedLight::Full(values)) => Ok(&**values),
-        // Colored sky (ADR 0064): the mesh takes the uncolored light until it carries tints.
         Some(PaddedLight::Colored { light, .. }) => Ok(&**light),
+    };
+    // Colored sky (ADR 0064): the picture's sky comes from here, the block light from `full`.
+    let sky_rgb = match light {
+        Some(PaddedLight::Colored { sky_rgb, .. }) => Some(&**sky_rgb),
+        _ => None,
     };
     let mut expanded = None;
     let full = match full {
@@ -1308,18 +1337,51 @@ fn mesh_into(
                 s.greedy.clear();
                 s.palette.clear();
                 s.key_table.clear();
-                let meshed = if glow {
-                    mesh_lit::<true>(s, padded, values, materials, options, elide, level)
-                } else {
-                    mesh_lit::<false>(s, padded, values, materials, options, elide, level)
+                let plain = Plain(values);
+                let meshed = match sky_rgb {
+                    None if glow => {
+                        mesh_lit::<_, true>(s, padded, plain, materials, options, elide, level)
+                    }
+                    None => {
+                        mesh_lit::<_, false>(s, padded, plain, materials, options, elide, level)
+                    }
+                    Some(sky) => {
+                        let colored = Colored { light: values, sky };
+                        if glow {
+                            mesh_lit::<_, true>(
+                                s, padded, colored, materials, options, elide, level,
+                            )
+                        } else {
+                            mesh_lit::<_, false>(
+                                s, padded, colored, materials, options, elide, level,
+                            )
+                        }
+                    }
                 };
                 if meshed.is_ok() {
                     out.light_quantization = level;
                     break;
                 }
             }
-            out.palette.extend_from_slice(s.palette.entries());
-            KeyKind::Table
+            if sky_rgb.is_some() {
+                // Tinted entries first, then the normal ones; the per-block quads move to their
+                // final indices here, the greedy ones as `assemble` decodes them.
+                let tinted = s.palette.tinted().len();
+                out.palette.extend_from_slice(s.palette.tinted());
+                out.palette.extend_from_slice(s.palette.entries());
+                out.tinted_entries = tinted as u32;
+                out.tinted_exact.extend_from_slice(s.palette.tinted_exact());
+                if tinted != 0 {
+                    for (_, quad) in &mut s.specials {
+                        let index = colored_index(quad.light_index(), tinted);
+                        *quad = quad.with_light_index(index);
+                    }
+                }
+                KeyKind::Colored(tinted)
+            } else {
+                out.palette.extend_from_slice(s.palette.entries());
+                KeyKind::Table
+            }
         }
     };
     let (greedy, specials) = (&s.greedy, &s.specials);
@@ -1337,6 +1399,13 @@ fn mesh_into(
             light: 0,
         }),
         KeyKind::Table => assemble(greedy, specials, materials, out, |k| s.key_table.key(k)),
+        KeyKind::Colored(tinted) => assemble(greedy, specials, materials, out, |k| {
+            let key = s.key_table.key(k);
+            FaceKey {
+                light: colored_index(key.light, tinted),
+                ..key
+            }
+        }),
     }
     out.hash = out.compute_hash();
     if expanded.is_some() {
@@ -1344,14 +1413,194 @@ fn mesh_into(
     }
 }
 
+/// The full light a mesh reads ([`mesh_lit`]): plain ([`Plain`]) or with colored sky
+/// ([`Colored`], ADR 0064). Each gives the shading of a face and adds it to the key table and
+/// the palette its own way; [`Plain`] is the path of every chunk without colored sky.
+trait LightView: Copy {
+    /// The light of a face's 4 corners.
+    type Corners: Copy;
+    /// AO byte and corner lights of a unit face (see [`lit_shading`]).
+    fn lit(
+        self,
+        front: usize,
+        face: usize,
+        nb9: u32,
+        ao: AoPolicy,
+        elide: bool,
+        level: LightQuantization,
+    ) -> (u8, Self::Corners);
+    /// AO byte and corner lights of a face of a lit emitter (see [`flat_shading`]).
+    fn flat(
+        self,
+        cell: usize,
+        emission: LightValue,
+        level: LightQuantization,
+    ) -> (u8, Self::Corners);
+    /// The corner lights of a cross: the light of its own cell.
+    fn cross(self, cell: usize, level: LightQuantization) -> Self::Corners;
+    /// [`KeyTable::id`] of the face.
+    fn id(
+        table: &mut KeyTable,
+        material: u16,
+        surface: bool,
+        ao: u8,
+        corners: Self::Corners,
+        palette: &mut LightPalette,
+    ) -> Result<u32, PaletteFull>;
+    /// [`LightPalette::index`] of the corners.
+    fn index(palette: &mut LightPalette, corners: Self::Corners) -> Result<u16, PaletteFull>;
+}
+
+/// A `Full` padded light.
+#[derive(Clone, Copy)]
+struct Plain<'a>(&'a [u16; PADDED_VOLUME]);
+
+impl LightView for Plain<'_> {
+    type Corners = [LightValue; 4];
+    #[inline]
+    fn lit(
+        self,
+        front: usize,
+        face: usize,
+        nb9: u32,
+        ao: AoPolicy,
+        elide: bool,
+        level: LightQuantization,
+    ) -> (u8, [LightValue; 4]) {
+        lit_shading(self.0, front, face, nb9, ao, elide, level)
+    }
+    #[inline]
+    fn flat(
+        self,
+        cell: usize,
+        emission: LightValue,
+        level: LightQuantization,
+    ) -> (u8, [LightValue; 4]) {
+        flat_shading(self.0, cell, emission, level)
+    }
+    #[inline]
+    fn cross(self, cell: usize, level: LightQuantization) -> [LightValue; 4] {
+        level.apply([LightValue(self.0[cell]); 4])
+    }
+    #[inline]
+    fn id(
+        table: &mut KeyTable,
+        material: u16,
+        surface: bool,
+        ao: u8,
+        corners: [LightValue; 4],
+        palette: &mut LightPalette,
+    ) -> Result<u32, PaletteFull> {
+        table.id(material, surface, ao, corners, palette)
+    }
+    #[inline]
+    fn index(palette: &mut LightPalette, corners: [LightValue; 4]) -> Result<u16, PaletteFull> {
+        palette.index(corners)
+    }
+}
+
+/// A `Colored` padded light (ADR 0064): `light` gives the block channels (its sky nibble is the
+/// uncolored sky gameplay reads, which the picture does not use) and `sky` the sky's red, green
+/// and blue.
+#[derive(Clone, Copy)]
+struct Colored<'a> {
+    light: &'a [u16; PADDED_VOLUME],
+    sky: &'a [u16; PADDED_VOLUME],
+}
+
+impl Colored<'_> {
+    /// The colored light of padded voxel `i`.
+    #[inline]
+    fn at(self, i: usize) -> ColoredLight {
+        ColoredLight {
+            sky: self.sky[i] & LightValue::BLOCK_MASK,
+            block: self.light[i] & LightValue::BLOCK_MASK,
+        }
+    }
+}
+
+impl LightView for Colored<'_> {
+    type Corners = [ColoredLight; 4];
+    /// [`lit_shading`] per kind of light: the corners of the block channels and of the sky's
+    /// channels, with the same rounding; a face is dark when all six are 0 at its corners.
+    #[inline]
+    fn lit(
+        self,
+        front: usize,
+        face: usize,
+        nb9: u32,
+        ao: AoPolicy,
+        elide: bool,
+        level: LightQuantization,
+    ) -> (u8, [ColoredLight; 4]) {
+        let (su, sv) = LIGHT_STRIDES[face];
+        let ao = match ao {
+            AoPolicy::Off => AO_OPEN_BYTE,
+            AoPolicy::Baked | AoPolicy::BakedLitOnly => AO_TABLE[neighborhood8(nb9)],
+        };
+        let corner = front - sv - su;
+        let index = |c: usize| corner + (c / 3) * sv + (c % 3) * su;
+        let corners_of = |values: &[u16; PADDED_VOLUME]| {
+            let cells: [u16; 9] =
+                std::array::from_fn(|c| values[index(c)] & LightValue::BLOCK_MASK);
+            if cells.iter().all(|&c| c == cells[4]) {
+                [LightValue(cells[4]); 4]
+            } else {
+                face_corner_lights(&cells, nb9)
+            }
+        };
+        let (block, sky) = (corners_of(self.light), corners_of(self.sky));
+        let corners = level.apply_colored(std::array::from_fn(|k| ColoredLight {
+            sky: sky[k].0,
+            block: block[k].0,
+        }));
+        let ao = if elide && corners.iter().all(|c| c.is_dark()) {
+            AO_OPEN_BYTE
+        } else {
+            ao
+        };
+        (ao, corners)
+    }
+    #[inline]
+    fn flat(
+        self,
+        cell: usize,
+        emission: LightValue,
+        level: LightQuantization,
+    ) -> (u8, [ColoredLight; 4]) {
+        let flat = self.at(cell).max(ColoredLight::from_value(emission));
+        (AO_OPEN_BYTE, level.apply_colored([flat; 4]))
+    }
+    #[inline]
+    fn cross(self, cell: usize, level: LightQuantization) -> [ColoredLight; 4] {
+        level.apply_colored([self.at(cell); 4])
+    }
+    #[inline]
+    fn id(
+        table: &mut KeyTable,
+        material: u16,
+        surface: bool,
+        ao: u8,
+        corners: [ColoredLight; 4],
+        palette: &mut LightPalette,
+    ) -> Result<u32, PaletteFull> {
+        table.id_colored(material, surface, ao, corners, palette)
+    }
+    #[inline]
+    fn index(palette: &mut LightPalette, corners: [ColoredLight; 4]) -> Result<u16, PaletteFull> {
+        palette.index_colored(corners)
+    }
+}
+
 /// Fills the keys and merges every face under full light at quantization `level`, then adds the
-/// quads of the non-cube blocks and, with `options.walls`, the edge walls. `Err` when the palette overflows (the caller tries the next
-/// level). With `GLOW` (the chunk may hold a lit emitter), the faces of the lit emitters are
-/// flat ([`flat_shading`]); without it no face asks, so the hot path stays as it was.
-fn mesh_lit<const GLOW: bool>(
+/// quads of the non-cube blocks and, with `options.walls`, the edge walls. `Err` when the
+/// palette overflows (the caller tries the next level). With `GLOW` (the chunk may hold a lit
+/// emitter), the faces of the lit emitters are flat ([`flat_shading`]); without it no face asks,
+/// so the hot path stays as it was.
+fn mesh_lit<V: LightView, const GLOW: bool>(
     s: &mut Scratch,
     padded: &PaddedChunk,
-    light: &[u16; PADDED_VOLUME],
+    light: V,
     materials: &MaterialTable,
     options: MeshOptions,
     elide: bool,
@@ -1373,11 +1622,11 @@ fn mesh_lit<const GLOW: bool>(
                 LightValue::DARK
             };
             let (ao, corners) = if GLOW && !emission.is_dark() {
-                flat_shading(light, front, emission, level)
+                light.flat(front, emission, level)
             } else {
-                lit_shading(light, front, face, nb9, ao, elide, level)
+                light.lit(front, face, nb9, ao, elide, level)
             };
-            keys[i] = table.id(material, surface, ao, corners, palette)?;
+            keys[i] = V::id(table, material, surface, ao, corners, palette)?;
             Ok(())
         })?;
         s.greedy.merge_face(face, &s.keys);
@@ -1390,12 +1639,12 @@ fn mesh_lit<const GLOW: bool>(
             LightValue::DARK
         };
         let (ao, corners) = match nb9 {
-            _ if GLOW && !emission.is_dark() => flat_shading(light, cell, emission, level),
-            Some(nb9) => lit_shading(light, cell, face.index(), nb9, ao, elide, level),
+            _ if GLOW && !emission.is_dark() => light.flat(cell, emission, level),
+            Some(nb9) => light.lit(cell, face.index(), nb9, ao, elide, level),
             // A cross: the light of its own cell, AO open.
-            None => (AO_OPEN_BYTE, level.apply([LightValue(light[cell]); 4])),
+            None => (AO_OPEN_BYTE, light.cross(cell, level)),
         };
-        Ok((ao, palette.index(corners)?))
+        Ok((ao, V::index(palette, corners)?))
     };
     emit_specials(padded, materials, &mut s.specials, &mut shade)?;
     emit_sloped(
@@ -2070,7 +2319,7 @@ fn assemble(
                 packed = packed.with_shape(code);
             }
             if cfg!(debug_assertions) {
-                debug_check_merged(packed, out.corner_light(packed));
+                debug_check_merged(packed, out.exact_corner_colors(packed));
             }
             out.quads[cursor[bucket]] = packed;
             cursor[bucket] += 1;
@@ -2099,7 +2348,7 @@ fn to_packed(quad: u64, face: Face, layer: u16, key: FaceKey) -> PackedQuad {
 /// Debug check that a merged quad's AO and corner lights are constant along every axis it
 /// spans more than one voxel on, so interpolating its 4 corners gives exactly what its unit
 /// faces would (holds because both only depend on the vertex).
-fn debug_check_merged(quad: PackedQuad, light: [LightValue; 4]) {
+fn debug_check_merged(quad: PackedQuad, light: [ColoredLight; 4]) {
     let ao = |k| quad.ao(k);
     if quad.w() > 1 {
         debug_assert!(
@@ -2181,7 +2430,9 @@ pub fn reference_visible_faces(padded: &PaddedChunk) -> BTreeSet<([u32; 3], Face
 ///   are 0 with [`AoPolicy::BakedLitOnly`].
 ///
 /// A face of a lit emitter ([`MaterialTable::lit_emission`]) is shaded flat instead
-/// ([`reference_lit_emitter_shading`]); this oracle knows no materials.
+/// ([`reference_lit_emitter_shading`]); this oracle knows no materials. Under colored sky
+/// (ADR 0064) it reads [`PaddedLight::get`], the uncolored sky: the picture's light is
+/// [`reference_colored_face_shading`].
 pub fn reference_face_shading(
     padded: &PaddedChunk,
     light: Option<&PaddedLight>,
@@ -2245,6 +2496,89 @@ pub fn reference_lit_emitter_shading(
         ao: AO_OPEN_BYTE,
         light: [at.max(emission); 4],
     }
+}
+
+/// [`reference_face_shading`] of the picture under colored sky (ADR 0064): the same faces, AO
+/// and corner rules, each corner the rounded per-channel mean of six channels, the sky's red,
+/// green and blue ([`PaddedLight::sky_rgb`]) and the block light's. A face is dark for
+/// [`AoPolicy::BakedLitOnly`] when all six are 0 at its 4 corners. On a light without colored
+/// sky the sky is gray and the corners equal [`reference_face_shading`]'s
+/// ([`ColoredLight::from_value`]).
+pub fn reference_colored_face_shading(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+) -> BTreeMap<([u32; 3], Face), ColoredFaceShading> {
+    reference_visible_faces(padded)
+        .into_iter()
+        .map(|(p, face)| {
+            (
+                (p, face),
+                reference_colored_face_shading_at(padded, light, policy, p, face),
+            )
+        })
+        .collect()
+}
+
+/// [`reference_colored_face_shading`] of one unit face: `face` of voxel `p` (inner 32^3),
+/// whether it is visible or not.
+pub fn reference_colored_face_shading_at(
+    padded: &PaddedChunk,
+    light: Option<&PaddedLight>,
+    policy: AoPolicy,
+    p: [u32; 3],
+    face: Face,
+) -> ColoredFaceShading {
+    let n = face.normal().to_array();
+    let front: [i32; 3] = std::array::from_fn(|a| p[a] as i32 + n[a]);
+    let light_at = |p: [i32; 3]| match light {
+        None => [15; 6],
+        Some(l) => {
+            let [r, g, b] = l.sky_rgb(p[0], p[1], p[2]);
+            let [br, bg, bb] = l.get(p[0], p[1], p[2]).rgb();
+            [r, g, b, br, bg, bb]
+        }
+    };
+    let opaque = |p: [i32; 3]| class_from_masks(padded, p[0], p[1], p[2]) == VoxelClass::Opaque;
+    let (_, ua, va) = face.axes();
+    let cell = |du: i32, dv: i32| {
+        let mut c = front;
+        c[ua] += du;
+        c[va] += dv;
+        c
+    };
+    let mut ao = 0u8;
+    let mut corners = [ColoredLight::default(); 4];
+    for (k, corner) in corners.iter_mut().enumerate() {
+        let su = if k & 1 == 1 { 1 } else { -1 };
+        let sv = if k >> 1 == 1 { 1 } else { -1 };
+        let (side_u, side_v, diagonal) = (cell(su, 0), cell(0, sv), cell(su, sv));
+        let (ou, ov, od) = (opaque(side_u), opaque(side_v), opaque(diagonal));
+        ao |= corner_ao(ou, ov, od) << (2 * k);
+        let mut kept = vec![light_at(front)];
+        if !ou {
+            kept.push(light_at(side_u));
+        }
+        if !ov {
+            kept.push(light_at(side_v));
+        }
+        if !od && !(ou && ov) {
+            kept.push(light_at(diagonal));
+        }
+        let count = kept.len() as u16;
+        let mean: [u8; 6] = std::array::from_fn(|c| {
+            let sum: u16 = kept.iter().map(|l| u16::from(l[c])).sum();
+            ((sum + count / 2) / count) as u8
+        });
+        *corner = ColoredLight::new([mean[0], mean[1], mean[2]], [mean[3], mean[4], mean[5]]);
+    }
+    let dark = corners.iter().all(|c| c.is_dark());
+    let ao = match policy {
+        AoPolicy::Off => AO_OPEN_BYTE,
+        AoPolicy::BakedLitOnly if dark => AO_OPEN_BYTE,
+        AoPolicy::Baked | AoPolicy::BakedLitOnly => ao,
+    };
+    ColoredFaceShading { ao, light: corners }
 }
 
 /// AO and corner lights of a face of direction `face` whose front layer is the one through

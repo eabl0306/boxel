@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #11, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/colored-sky-plan.md`) el 2026-11-02, con sus respuestas a las preguntas abiertas
   (sección 11 del plan). Se construye por carriles (sección 7 del plan). Hechos: el C0 (este ADR),
-  el C1 (la luz, en `boxel_light`) y el C2 (el mundo, en `boxel_world`). Faltan el C3 (malla), el
-  C4 (render y shaders) y el C5 (depuración, demo y herramientas).
+  el C1 (la luz, en `boxel_light`), el C2 (el mundo, en `boxel_world`) y el C3 (la malla, en
+  `boxel_mesh`). Faltan el C4 (render y shaders) y el C5 (depuración, demo y herramientas).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -154,7 +154,7 @@ de color queda idéntico byte a byte y no paga nada.
   celdas cuyo color cambió.
 - Una fuente no puede tener filtro (`set_sky_source` lo rechaza), así que todo rayo sale blanco.
 
-### 8. Malla y GPU (carriles C3 y C4, por construir)
+### 8. Malla y GPU (carril C3 hecho, sección 11; C4 por construir)
 
 - La entrada de la paleta sigue en `[u32; 2]`. Un chunk teñido tiene entradas normales (las de
   hoy) y teñidas: 4 esquinas de un tipo de luz (cielo o bloque, 3 canales), el otro tipo plano para
@@ -223,6 +223,45 @@ Para la imagen y F3 está `ChunkLight::sky_rgb` (el futuro `ChunkMap::sky_rgb_at
 - Límite: con `SkyRule::Open` (un generador que no declara su techo) no hay tiles, así que el
   vidrio no tiñe el cielo.
 
+### 11. Carril C3: cómo quedó
+
+- **Entrada teñida**, en `[u32; 2]`: palabra 0 = `c0 | c1 << 12 | (plano >> 4) << 24`, palabra 1 =
+  `c2 | c3 << 12 | (plano & 15) << 24 | etiqueta << 28`. Cada esquina y el valor plano son rojo,
+  verde y azul en el orden de los nibbles de bloque de un `LightValue`. Etiqueta 0: esquinas de
+  cielo y bloque plano; 1: al revés. Los bits 29 a 31 quedan en 0 (`layout::TINT_*`).
+- **Caras exactas en High sin buffer nuevo en Low**: `ChunkMesh::tinted_exact` trae, por entrada
+  teñida, las 4 esquinas del tipo que la entrada deja plano (8 B, mismo formato de esquinas). Solo
+  High lo lee. La paleta se deduplica por las esquinas exactas (96 bits), así los índices de los
+  quads sirven en los tres tiers; Low y Mid pueden ver dos entradas iguales.
+- Mientras se malla, las teñidas toman índices desde 4095 hacia abajo y las normales desde 0. Al
+  final, si hay teñidas, una pasada suma `t` a las normales y da vuelta las teñidas. Con `t = 0`
+  no se toca nada.
+- Una entrada normal de un chunk teñido lleva el cielo de la imagen (6 bajo vidrio negro), no el
+  del gameplay. Un `Colored` cuyo cielo es igual al sin teñir en todo vóxel da la malla de antes
+  byte a byte (hay prueba).
+- **Celdas**: `LitCellQuad` no cambia, para no romper `boxel_render`. Su `light` lleva como cielo
+  el canal más brillante, y `ChunkMesh::cell_sky_rgb` (vacío si ninguna celda está teñida) los tres
+  canales, en el orden de `cell_quads`. El C4 puede pasarlo a `LitCellQuad` cuando toque el render.
+- `corner_light` de una entrada teñida da el canal más brillante; `corner_colors` da lo que dibujan
+  Low y Mid, y `exact_corner_colors` lo que dibuja High. El oráculo es
+  `reference_colored_face_shading`.
+- La escena `roofed` de los benches de luz pasó a `boxel_light/benches/scenes`, para usarla
+  también en los de malla.
+
+Para el C4:
+
+- **High**: subir `tinted_exact` al arena justo después de la paleta (`arena_len` suma `t`) y leer
+  `light_base + light_len + i` para un quad con índice `i < t`. `t` va en `ChunkGpu.flags` bits 7
+  a 19.
+- **Mid**: `t` en `ChunkGpu.flags` como High; no necesita `tinted_exact`.
+- **Low**: `t` en `ChunkImmediate.origin.w`; la expansión copia las entradas tal cual.
+- **Shader**: índice `< t` es teñida. Decodificar con la etiqueta (bit 28 de la palabra 1),
+  interpolar las esquinas del tipo que las tiene y usar el plano tal cual (Low y Mid), o
+  interpolar también las esquinas de `tinted_exact` (High). Un bit plano por quad que diga
+  "teñida" no puede ir en `VsOut::ao` (sección 8).
+- **Celdas**: `CellVertex` suma el `u32` de `cell_sky_rgb` (o el cielo gris de `light` si está
+  vacío).
+
 ## Medidas
 
 Carril C1, criterion `light` y `sky_tile`, una corrida por lado contra main (47013e0), una detrás
@@ -255,6 +294,19 @@ Nuevos, solo en la rama, con `colored_sky` prendido:
 - `walk_loaded_glass` no llega a la meta de 1,1 veces: las máscaras de las capas con vidrio
   suman el pase de filtros (ADR 0060) y cada tinte lee su estado. Pasa una vez por columna y
   edición, no por caja.
+
+Carril C3, criterion `gather_mesh`, una corrida por lado contra main (efb7b76):
+
+| Bench | main | rama | Diferencia |
+|---|---:|---:|---|
+| `gather_mesh/cave_lit` | 118,4 µs | 119,9 µs | +1,3 %, ruido |
+| `gather_mesh/surface` | 164,1 µs | 166,2 µs | +1,3 %, ruido |
+| `gather_mesh/glass_roof` (la escena de `light/box_glass_roof`, 85 de 86 entradas teñidas) | | 220,8 µs | +27 % sobre su gemelo |
+| `gather_mesh/glass_roof_clear` (el mismo techo de vidrio común) | | 174,1 µs | |
+
+La meta del plan para `glass_roof` era +40 % o menos. Sin vidrio, el camino de siempre queda
+igual porque `face_corner_lights` se fuerza inline: el camino de color también la llama, y sin
+eso el compilador la sacaba del bucle caliente (+3 a +5 % en `mesh/surface`).
 
 ## El juego
 

@@ -165,6 +165,39 @@ fn a_cell_quad_takes_its_cell_light() {
     assert!(mesh.cell_quads.iter().all(|q| q.light == lamp));
 }
 
+/// Colored sky (ADR 0064): a cell quad under tinted sky has its cell's sky channels in
+/// `cell_sky_rgb` and their brightest in its light; under gray sky, `cell_sky_rgb` stays empty
+/// and the light holds the picture's sky level.
+#[test]
+fn a_cell_quad_under_colored_sky_takes_its_cell_sky() {
+    let (registry, frames) = registry(true);
+    let chunk = chunk(&registry, frames, true);
+    let filled = |v: u16| -> Box<[u16; boxel_mesh::PADDED_VOLUME]> {
+        vec![v; boxel_mesh::PADDED_VOLUME]
+            .into_boxed_slice()
+            .try_into()
+            .expect("PADDED_VOLUME")
+    };
+    let colored = |sky: u16| PaddedLight::Colored {
+        light: filled(0xF012),
+        sky_rgb: filled(sky),
+    };
+    let red = mesh(&registry, &chunk, Some(&colored(0x0D76)));
+    assert_eq!(red.cell_quads.len(), 2);
+    assert!(red.cell_quads.iter().all(|q| q.light == LightValue(0xD012)));
+    assert_eq!(red.cell_sky_rgb, [0x0D76; 2]);
+    assert_eq!(red.hash, red.compute_hash());
+    let black = mesh(&registry, &chunk, Some(&colored(0x0666)));
+    assert!(black.cell_sky_rgb.is_empty());
+    assert!(
+        black
+            .cell_quads
+            .iter()
+            .all(|q| q.light == LightValue(0x6012))
+    );
+    assert_ne!(red.hash, black.hash);
+}
+
 #[test]
 fn without_a_rule_or_without_data_the_mesh_is_unchanged() {
     let (plain, frames) = registry(false);

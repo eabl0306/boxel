@@ -12,6 +12,7 @@
 //! | `gather_mesh/cave` (dark uniform light, AO on lit faces only) | 1.1x of 91.5 us or less |
 //! | `gather_mesh/cave_lit` (lamps, light computed beforehand) | 160 us or less |
 //! | `gather_mesh/surface` (sky light and AO keys, light computed beforehand) | 150 us or less |
+//! | `gather_mesh/glass_roof` (ADR 0064: the surface under a red glass roof, colored sky) | 1.4x of `gather_mesh/glass_roof_clear` (the same roof of clear glass) or less |
 //!
 //! The other `mesh/*`, `gather/*` and `gather_mesh/terrain_*` benches keep the M0 setup (AO
 //! off, no light) to compare with earlier runs; `mesh/terrain_baked` adds AO to every face.
@@ -23,7 +24,7 @@
 
 use boxel_demo::rules::{Kind, Kinds};
 use boxel_demo::worldgen::OverworldGenerator;
-use boxel_light::{LightScratch, PaddedLight, compute};
+use boxel_light::{LightInput, LightScratch, PaddedLight, compute};
 use boxel_mesh::{AoPolicy, ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher, PaddedChunk};
 use boxel_voxel::{
     BlockRegistry, BlockState, CHUNK_SIZE, ChunkData, ChunkKey, ChunkPos, Face, LightTables,
@@ -329,6 +330,45 @@ fn bench(c: &mut Criterion) {
         });
         c.bench_function(&format!("gather_mesh/{name}"), |bench| {
             bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), table, options)));
+        });
+    }
+
+    // ADR 0064: the surface chunk under a red glass roof over it and 8 voxels around (the scene
+    // of `light/box_glass_roof`), lit with colored sky, against the same roof of clear glass.
+    let (glass_blocks, _, [_, red, _], clear) = scenes::glass_registry();
+    let glass_table = MaterialTable::from_registry(&glass_blocks);
+    let glass_tables = LightTables::from_registry(&glass_blocks);
+    let open = Neighborhood::generate(
+        &overworld,
+        &glass_blocks,
+        &glass_tables,
+        scenes::surface_origin(&overworld, &glass_blocks, &glass_tables),
+    );
+    for (name, glass, tinted) in [
+        ("glass_roof", red, true),
+        ("glass_roof_clear", clear, false),
+    ] {
+        let (roofed, _) = scenes::roofed(&open, glass, &glass_tables);
+        let mut light = PaddedLight::default();
+        let light_input = LightInput {
+            colored_sky: true,
+            ..roofed.input(&glass_tables)
+        };
+        compute(&light_input, &mut LightScratch::new(), &mut light);
+        assert_eq!(light.is_colored(), tinted, "{name}: the colored form");
+        let scene = Scene::from_neighborhood(&roofed);
+        let input = scene.lit(Some(&light));
+        let mesh = mesher.mesh_chunk(&input, &glass_table, LIT_ONLY);
+        assert_eq!(mesh.tinted_entries > 0, tinted, "{name}: tinted entries");
+        eprintln!(
+            "scene {name}: {} quads, palette {} ({} tinted, {:?})",
+            mesh.total_quads(),
+            mesh.palette.len(),
+            mesh.tinted_entries,
+            mesh.light_quantization
+        );
+        c.bench_function(&format!("gather_mesh/{name}"), |bench| {
+            bench.iter(|| black_box(mesher.mesh_chunk(black_box(&input), &glass_table, LIT_ONLY)));
         });
     }
 

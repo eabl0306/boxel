@@ -1,13 +1,13 @@
 //! Bench scenes shared by the light benches and the mesher's (`boxel_mesh/benches/mesh.rs`
 //! includes this file): neighborhoods of 27 overworld chunks and 9 sky tiles, the surface chunk
 //! near the origin with trees and a cave entrance, and a cave lit by colored lamps (also with
-//! each lamp in glass, colored or clear).
+//! each lamp in glass, colored or clear), and a glass roof over a neighborhood (ADR 0064).
 #![allow(dead_code, reason = "each bench uses a subset of the scenes")]
 
 use boxel_demo::worldgen::OverworldGenerator;
-use boxel_light::box_light::tile_index;
+use boxel_light::box_light::{chunk_index, tile_index};
 use boxel_light::sky_tile::{DEFAULT_WALK_LIMIT, GeneratorTop, walk, walk_floor};
-use boxel_light::{LayerData, LightInput, SkyInput, SkyTile};
+use boxel_light::{LayerData, LightInput, SkyInput, SkyTile, Tint};
 use boxel_voxel::{
     BlockCollision, BlockDef, BlockModel, BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData,
     ChunkKey, ChunkPos, FaceTextures, LightTables, LocalPos, RenderShape, TextureId,
@@ -325,4 +325,63 @@ pub fn glass_cave(
         tiles: cave.tiles.clone(),
     };
     (n, placed)
+}
+
+/// `n` with a roof of `glass` one voxel thick over the center chunk column and 8 voxels around
+/// it, 3 voxels above every top under it (or at the top of the 27 chunks), in the air voxels;
+/// the tiles get the roof voxels above their tops as tints (ADR 0064).
+pub fn roofed(n: &Neighborhood, glass: BlockState, tables: &LightTables) -> (Neighborhood, i64) {
+    let (ox, oy, oz) = (n.origin.x * 32, n.origin.y * 32, n.origin.z * 32);
+    let cols = |o: i64| o - 8..o + 40;
+    let top_of = |x: i64, z: i64| {
+        let (dx, dz) = ((x - ox).div_euclid(32), (z - oz).div_euclid(32));
+        let tile = &n.tiles[((dx + 1) * 3 + dz + 1) as usize];
+        tile.top(
+            (x - ox).rem_euclid(32) as u32,
+            (z - oz).rem_euclid(32) as u32,
+        )
+    };
+    let highest = cols(ox)
+        .flat_map(|x| cols(oz).map(move |z| (x, z)))
+        .map(|(x, z)| top_of(x, z))
+        .max()
+        .expect("columns");
+    let y = (highest + 3).min(oy + 63);
+    let mut chunks = n.chunks.clone();
+    let mut tints: Vec<Vec<(u32, u32, Tint)>> = vec![Vec::new(); 9];
+    let filter = tables.light_filter(glass);
+    for x in cols(ox) {
+        for z in cols(oz) {
+            let (dx, dy, dz) = (
+                (x - ox).div_euclid(32),
+                (y - oy).div_euclid(32),
+                (z - oz).div_euclid(32),
+            );
+            let chunk = &mut chunks[chunk_index(dx as i32, dy as i32, dz as i32)];
+            let (lx, ly, lz) = (
+                (x - ox).rem_euclid(32) as u32,
+                (y - oy).rem_euclid(32) as u32,
+                (z - oz).rem_euclid(32) as u32,
+            );
+            if !chunk.get(LocalPos::new(lx, ly, lz)).is_air() {
+                continue;
+            }
+            chunk.set(LocalPos::new(lx, ly, lz), glass);
+            if tables.filters(glass) && y > top_of(x, z) {
+                tints[((dx + 1) * 3 + dz + 1) as usize].push((lx, lz, Tint { y, filter }));
+            }
+        }
+    }
+    let tiles = n
+        .tiles
+        .iter()
+        .zip(tints)
+        .map(|(t, tints)| t.clone().with_tints(tints))
+        .collect();
+    let roofed = Neighborhood {
+        origin: n.origin,
+        chunks,
+        tiles,
+    };
+    (roofed, y)
 }
