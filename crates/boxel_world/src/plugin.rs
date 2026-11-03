@@ -1,3 +1,4 @@
+use crate::dynamic_light::{BakedLights, bake_dynamic_lights};
 use crate::interest::Viewer;
 use crate::jobs::{JobExecutor, TaskPoolExecutor};
 use crate::lifecycle::{
@@ -147,8 +148,9 @@ pub struct WorldSettings {
     /// Which faces the mesher bakes ambient occlusion into (ADR 0015). The default,
     /// `BakedLitOnly`, skips faces whose 4 corners are dark (most cave faces). A change applies
     /// to the meshes built after it. With `light` off every face counts as lit, so every face
-    /// gets AO unless this is `AoPolicy::Off`. An app with dynamic lights (ADR 0062) sets
-    /// `Baked`: they light dark faces too.
+    /// gets AO unless this is `AoPolicy::Off`. The dynamic lights the world bakes
+    /// ([`WorldSettings::baked_lights`], ADR 0063) are in the light the meshes are built with, so
+    /// the faces they light get AO with the default too.
     pub ao_policy: AoPolicy,
     /// Voxel light (ADR 0015): sky light from per-column sky tops plus RGB block light, baked
     /// into each mesh by its job. Off: meshes see open sky everywhere and no sky tops are
@@ -192,6 +194,12 @@ pub struct WorldSettings {
     /// draws only while that chunk is not drawn, so a cave by the edge of what is drawn keeps
     /// its outer wall. A change applies to the meshes built after it. Default on.
     pub edge_walls: bool,
+    /// How many dynamic lights (`crate::DynamicLight`) the world bakes into the light of the
+    /// meshes near them, the nearest a viewer first (ADR 0063): they light as an emitter placed
+    /// at their voxel, around walls and never through them, and each move to another voxel
+    /// remeshes the chunks it reaches (up to 8 per light). The others are left to the renderer
+    /// ([`crate::BakedLights`]). 0: none. Read every frame. Default 8.
+    pub baked_lights: usize,
 }
 
 impl Default for WorldSettings {
@@ -212,6 +220,7 @@ impl Default for WorldSettings {
             edit_batch_hold: Self::DEFAULT_EDIT_BATCH_HOLD,
             cave_culling: true,
             edge_walls: true,
+            baked_lights: 8,
         }
     }
 }
@@ -531,6 +540,7 @@ impl Plugin for WorldPlugin {
             .init_resource::<ChunkVisibility>()
             .init_resource::<IdleWanted>()
             .init_resource::<ResyncCursor>()
+            .init_resource::<BakedLights>()
             .insert_resource(jobs)
             .add_message::<ChunkMeshEvent>()
             .add_message::<ChunkMeshResync>()
@@ -560,7 +570,14 @@ impl Plugin for WorldPlugin {
                     )
                         .chain()
                         .in_set(WorldSystems::Interest),
-                    apply_edits.in_set(WorldSystems::Edits),
+                    // The lights' transforms are read as `track_viewers` reads the viewers': a
+                    // light moved after it is baked in the next frame.
+                    (
+                        apply_edits,
+                        bake_dynamic_lights.run_if(world_open).ambiguous_with_all(),
+                    )
+                        .chain()
+                        .in_set(WorldSystems::Edits),
                     run_jobs.in_set(WorldSystems::Dispatch),
                     (publish_meshes, publish_data_changes, want_idle)
                         .chain()
@@ -654,6 +671,7 @@ fn add_lifecycle(app: &mut App, closed: bool) {
         .world_resource::<ViewerChunks>(|v| v.0.is_empty())
         .world_resource::<WorldStats>(|s| *s == WorldStats::default())
         .world_resource::<EditQueue>(EditQueue::is_empty)
+        .world_resource::<BakedLights>(|b| *b == BakedLights::default())
         .world_message::<ChunkMeshEvent>()
         .world_message::<ChunkMeshResync>()
         .world_message::<BlockChanged>()
@@ -677,9 +695,10 @@ fn teardown_streaming(
     mut stats: ResMut<WorldStats>,
     mut edits: ResMut<EditQueue>,
     (mut content, mut planes): (ResMut<WorldContent>, ResMut<RealmPlanes>),
-    mut garbage: ResMut<WorldGarbage>,
+    (mut garbage, mut baked): (ResMut<WorldGarbage>, ResMut<BakedLights>),
     board: Option<ResMut<DiagnosticsBoard>>,
 ) {
+    *baked = BakedLights::default();
     garbage.push(map.take_all());
     garbage.push(sky.take_all());
     garbage.push(jobs.reset_world());

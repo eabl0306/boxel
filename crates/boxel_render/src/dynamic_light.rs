@@ -2,6 +2,10 @@
 //! not a block. The fragment shaders add it to the baked block light, so a light that moves
 //! never relights or remeshes a chunk.
 //!
+//! The world bakes the lights nearest its viewers into the meshes near them instead (ADR 0063,
+//! `boxel_world::BakedLights`): they go around walls and give AO as placed lights do. The shaders
+//! draw the rest; models take every light, baked or not, at their probe.
+//!
 //! A light has a level per block light channel (`0..=15`, as a block's emission) and gives
 //! `level - d` at Manhattan distance `d`, as a block emitter's light falls off in open air; it
 //! mixes with the baked light by the brightest per channel, as block light does. So a torch in
@@ -9,17 +13,20 @@
 //! as far as they face it (no flood fill on the GPU).
 //!
 //! [`DynamicLight`] on an entity with a `Transform` makes it shine; the render plugin keeps the
-//! [`MAX_DYNAMIC_LIGHTS`] nearest the camera each frame ([`SceneLight::dynamic`]). Models lit at
-//! a probe (ADR 0040) take it on the CPU, at their probe.
+//! [`MAX_DYNAMIC_LIGHTS`] nearest the camera each frame that the world does not bake
+//! ([`SceneLight::dynamic`]). Models lit at a probe (ADR 0040) take every light on the CPU, at
+//! their probe.
 //!
 //! [`SceneLight::dynamic`]: crate::SceneLight::dynamic
 
 use crate::plugin::ExtractedFrame;
 use boxel_ecs::prelude::*;
-use boxel_math::{DVec3, I64Vec3, Vec3};
+use boxel_math::{DVec3, I64Vec3};
 use boxel_shaders::gpu::DynamicLightGpu;
 use boxel_transform::Transform;
 use boxel_voxel::LightValue;
+use boxel_world::BakedLights;
+pub use boxel_world::DynamicLight;
 
 /// Dynamic lights a frame draws (`boxel_shaders::gpu::MAX_DYNAMIC_LIGHTS`): the nearest the
 /// camera.
@@ -27,20 +34,6 @@ pub const MAX_DYNAMIC_LIGHTS: usize = boxel_shaders::gpu::MAX_DYNAMIC_LIGHTS;
 
 /// Light levels per channel go up to this (a block's emission).
 const MAX_LEVEL: u8 = 15;
-
-/// Makes its entity a moving light (ADR 0062): it shines from the entity's `Transform`
-/// translation plus `offset`, with `emission` per block light channel. An emission of 0 on every
-/// channel shines nothing (and costs nothing), so a game can keep the component and change it.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-#[require(Transform)]
-pub struct DynamicLight {
-    /// Level per block light channel (red, green, blue), `0..=15` (more is 15): a block's
-    /// emission (a torch is `[14, 11, 6]` in the game's colors).
-    pub emission: [u8; 3],
-    /// Where it shines from, relative to the translation (not turned with the entity): the eye
-    /// of a player whose translation is its feet.
-    pub offset: Vec3,
-}
 
 /// One dynamic light of a frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -172,24 +165,37 @@ pub(crate) fn nearest(
 
 /// `RenderSystems::Extract`, after `extract` (which found the camera and wrote the frame's
 /// scene light) and before the models' extract (which lights the models with them): the
-/// frame's dynamic lights.
+/// frame's dynamic lights, all of them for the models ([`ExtractedFrame::model_lights`]), the
+/// ones the world does not bake (`boxel_world::BakedLights`, ADR 0063) for the shaders.
 pub(crate) fn extract_dynamic_lights(
     mut frame: ResMut<ExtractedFrame>,
     lights: Query<(Entity, &DynamicLight, &Transform)>,
+    baked: Option<Res<BakedLights>>,
 ) {
     let eye = frame.camera_eye();
-    frame.light.dynamic = nearest(
-        lights.iter().map(|(entity, light, transform)| {
-            (
-                entity.to_bits(),
-                PointLight {
-                    position: transform.translation + light.offset.as_dvec3(),
-                    emission: light.emission,
-                },
-            )
-        }),
-        eye,
-    );
+    let point = |(entity, light, transform): (Entity, &DynamicLight, &Transform)| {
+        let position = light.position(transform);
+        (
+            entity,
+            PointLight {
+                position,
+                emission: light.emission,
+            },
+        )
+    };
+    let baked = baked.as_deref().filter(|b| !b.is_empty());
+    frame.model_lights = nearest(lights.iter().map(point).map(|(e, l)| (e.to_bits(), l)), eye);
+    frame.light.dynamic = match baked {
+        None => frame.model_lights,
+        Some(baked) => nearest(
+            lights
+                .iter()
+                .map(point)
+                .filter(|(e, _)| !baked.contains(*e))
+                .map(|(e, l)| (e.to_bits(), l)),
+            eye,
+        ),
+    };
 }
 
 #[cfg(test)]

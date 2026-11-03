@@ -4,12 +4,16 @@
 //! (which holds the edits) and the generator alone: no cached tile, light or mask, no
 //! incremental update, no fast path of the world (every box gets its 9 tiles, even under the
 //! walk floor, and its 9 beam tiles, without the gate). A settled world's meshes must equal
-//! these. Slow: every tile is a fresh walk, every beam tile a fresh build for one box.
+//! these, with the dynamic lights the world bakes given to [`Reference::with_points`] (ADR 0063).
+//! Slow: every tile is a fresh walk, every beam tile a fresh build for one box.
 use crate::beams::box_rows;
 use crate::sky::{SkyRule, may_block};
 use crate::{ChunkMap, ChunkSlot, DataState, SkyMap, WorldContent};
 use boxel_light::sky_tile::walk;
-use boxel_light::{BeamTile, LayerData, LightInput, LightScratch, PaddedLight, SkyInput, SkyTile};
+use boxel_light::{
+    BeamTile, LayerData, LightInput, LightScratch, PaddedLight, PointEmitter, PointScratch,
+    SkyInput, SkyTile,
+};
 use boxel_mesh::{ChunkMesh, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{CHUNK_SHIFT, ChunkData, ChunkKey, ChunkPos, LocalPos, NEIGHBOR_OFFSETS};
 use std::collections::{BTreeMap, HashMap};
@@ -26,6 +30,7 @@ pub struct Reference<'w> {
     generated: HashMap<ChunkPos, Arc<ChunkData>>,
     mesher: Mesher,
     scratch: LightScratch,
+    points: Vec<PointEmitter>,
 }
 
 impl<'w> Reference<'w> {
@@ -40,7 +45,15 @@ impl<'w> Reference<'w> {
             generated: HashMap::new(),
             mesher: Mesher::new(),
             scratch: LightScratch::new(),
+            points: Vec::new(),
         }
+    }
+
+    /// The same reference with the dynamic lights `points` baked into its meshes (ADR 0063):
+    /// [`Reference::mesh`] shows their light, [`Reference::light`] stays the blocks' own.
+    pub fn with_points(mut self, points: &[PointEmitter]) -> Self {
+        self.points = points.to_vec();
+        self
     }
 
     /// The sky tile of chunk column `(cx, cz)`, walked from scratch: from the generator's top
@@ -173,6 +186,12 @@ impl<'w> Reference<'w> {
     /// other chunk is air, as the world meshes it), its 9 tiles and 9 beam tiles from scratch.
     /// `None` with light off.
     pub fn light(&mut self, pos: ChunkPos) -> Option<PaddedLight> {
+        self.light_with(pos, false)
+    }
+
+    /// [`Reference::light`], with the dynamic lights of [`Reference::with_points`] when
+    /// `points`.
+    fn light_with(&mut self, pos: ChunkPos, points: bool) -> Option<PaddedLight> {
         if self.sky.rule == SkyRule::Off {
             return None;
         }
@@ -195,12 +214,17 @@ impl<'w> Reference<'w> {
         };
         let mut out = PaddedLight::default();
         boxel_light::compute_full(&input, &mut self.scratch, &mut out);
+        if points {
+            let mut scratch = PointScratch::new();
+            boxel_light::add_point_lights(&input, &self.points, &mut scratch, &mut out);
+        }
         Some(out)
     }
 
-    /// The mesh of the chunk at `pos` (its data must be `Ready`), with [`Reference::light`].
+    /// The mesh of the chunk at `pos` (its data must be `Ready`), with [`Reference::light`] and
+    /// the dynamic lights of [`Reference::with_points`].
     pub fn mesh(&mut self, pos: ChunkPos, options: MeshOptions) -> ChunkMesh {
-        let light = self.light(pos);
+        let light = self.light_with(pos, true);
         let chunks = self.chunks(pos);
         let center = chunks[13].as_deref().expect("the chunk's data is Ready");
         let input = MeshInput {

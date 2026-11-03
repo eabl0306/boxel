@@ -37,8 +37,8 @@ use crate::{
 use boxel_app::IdleWork;
 use boxel_ecs::prelude::*;
 use boxel_light::{
-    BeamTile, ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight, Rescan,
-    Retrace, SkyInput, SkyTile,
+    BeamTile, ChunkLight, LayerData, LightInput, LightPath, LightScratch, PaddedLight,
+    PointEmitter, PointScratch, Rescan, Retrace, SkyInput, SkyTile,
 };
 use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
 use boxel_voxel::{
@@ -161,6 +161,8 @@ pub(crate) enum JobMessage {
         faces: Option<ChunkFaceInfo>,
         /// The light box had a beam tile with beams.
         beams: bool,
+        /// Dynamic lights baked into the mesh's light (ADR 0063).
+        points: usize,
     },
     /// A light job finished.
     Lit {
@@ -321,8 +323,10 @@ thread_local! {
     /// One mesher per worker thread (~0.6 MiB of scratch, reused across jobs).
     static MESHER: RefCell<Mesher> = RefCell::new(Mesher::new());
     /// One light scratch per worker thread (~0.7 MiB, reused across jobs) and the padded light
-    /// of the last job.
-    static LIGHT: RefCell<(LightScratch, PaddedLight)> = RefCell::default();
+    /// of the last job; the scratch of the dynamic lights (ADR 0063, made by the first job that
+    /// has one) and the last job's light with them.
+    static LIGHT: RefCell<(LightScratch, PaddedLight, Option<Box<PointScratch>>, PaddedLight)> =
+        RefCell::default();
 }
 
 /// The light part of a mesh job, captured on the main thread.
@@ -335,16 +339,21 @@ struct LightJob {
     beams: [Option<Arc<BeamTile>>; 9],
     /// Keep the chunk's light for gameplay.
     keep: bool,
+    /// The dynamic lights that may reach the chunk (ADR 0063): its mesh shows their light, its
+    /// kept light does not (ticks read the light of the blocks alone, ADR 0059).
+    points: Vec<PointEmitter>,
 }
 
 /// Computes the light of `pos` from its 27 chunks (center at 13) into this thread's scratch and
-/// runs `f` on it. A panic inside resets the scratch (its light array must be zero between
-/// calls).
+/// runs `f` on it: the light the mesh shows (with the job's dynamic lights, ADR 0063), the
+/// light of the blocks alone (what the world keeps), how the box was computed and how many
+/// dynamic lights reached it. A panic inside resets the scratch (its light array must be zero
+/// between calls).
 fn with_light<R>(
     job: &LightJob,
     pos: ChunkPos,
     chunks: [Option<&ChunkData>; 27],
-    f: impl FnOnce(&PaddedLight, LightPath) -> R,
+    f: impl FnOnce(&PaddedLight, &PaddedLight, LightPath, usize) -> R,
 ) -> R {
     /// Resets the thread's scratch unless disarmed (a panic unwound through it).
     struct Reset(bool);
@@ -356,7 +365,7 @@ fn with_light<R>(
         }
     }
     let mut reset = Reset(true);
-    let out = LIGHT.with_borrow_mut(|(scratch, padded)| {
+    let out = LIGHT.with_borrow_mut(|(scratch, padded, point_scratch, lit)| {
         let tiles = job.tiles.as_ref().map(|t| std::array::from_fn(|i| &*t[i]));
         let input = LightInput {
             origin: pos,
@@ -366,7 +375,13 @@ fn with_light<R>(
             tables: &job.tables,
         };
         let path = boxel_light::compute(&input, scratch, padded);
-        f(padded, path)
+        if job.points.is_empty() {
+            return f(padded, padded, path, 0);
+        }
+        lit.clone_from(padded);
+        let point_scratch = point_scratch.get_or_insert_with(Box::default);
+        let points = boxel_light::add_point_lights(&input, &job.points, point_scratch, lit);
+        f(lit, padded, path, points)
     });
     reset.0 = false;
     out
@@ -671,6 +686,10 @@ pub(crate) struct WorldJobs {
     light_counts: WorldStats,
     /// Viewer chunks (by viewer id) and light cache radius of the last light cache plan.
     light_plan: Option<(Vec<(u64, ChunkPos)>, u32)>,
+    /// The dynamic lights baked into the light of the meshes near them (ADR 0063), by id.
+    pub(crate) point_lights: Vec<point_lights::BakedLight>,
+    /// What the dynamic lights cost so far (`crate::BakedLights`).
+    pub(crate) point_counts: point_lights::PointCounts,
     /// Positions whose distance to the viewers may have crossed the light cache radius since
     /// the last plan: their slot fills or drops its cached light.
     light_backlog: Vec<ChunkPos>,
@@ -738,6 +757,8 @@ impl WorldJobs {
             light_counts: WorldStats::default(),
             light_plan: None,
             light_backlog: Vec::new(),
+            point_lights: Vec::new(),
+            point_counts: point_lights::PointCounts::default(),
             #[cfg(test)]
             mesh_jobs: std::collections::HashMap::new(),
             pending: VecDeque::new(),
@@ -792,6 +813,7 @@ impl WorldJobs {
             && self.pending.is_empty()
             && self.batch_pending.is_empty()
             && self.batches.is_empty()
+            && self.point_lights.is_empty()
             && self.scheduler.queued() == 0
             && self.scheduler.in_flight() == 0
             && self.rx.is_empty()
@@ -2103,6 +2125,14 @@ impl WorldJobs {
                     0
                 };
                 box_chunks(p, reach, &mut remesh);
+                // The floods of the dynamic lights around it go through it (ADR 0063).
+                if light_on
+                    && !self.point_lights.is_empty()
+                    && (tables.opacity(old) != tables.opacity(state)
+                        || tables.light_filter(old) != tables.light_filter(state))
+                {
+                    self.point_light_edit(p, &mut remesh);
+                }
                 changes.push((id, local, old, state));
             }
         }
@@ -2713,6 +2743,7 @@ impl WorldJobs {
                     tiles,
                     beams,
                     keep: self.planner.priority(pos) <= self.light_cache_sq,
+                    points: self.points_for(pos),
                 })
             }
         };
@@ -2759,6 +2790,7 @@ impl WorldJobs {
                         path: None,
                         faces,
                         beams: false,
+                        points: 0,
                     };
                 };
                 // The 27 chunks in `boxel_light::box_light::chunk_index` order: the
@@ -2768,11 +2800,11 @@ impl WorldJobs {
                     i if i < 13 => near[i],
                     i => near[i - 1],
                 });
-                with_light(&light, pos, chunks, |padded, path| {
+                with_light(&light, pos, chunks, |lit, blocks, path, points| {
                     let input = MeshInput {
                         center: &center,
                         neighbors: near,
-                        light: Some(padded),
+                        light: Some(lit),
                     };
                     let mesh = mesh_fn(&input, &materials, options);
                     JobMessage::Meshed {
@@ -2780,10 +2812,11 @@ impl WorldJobs {
                         data_version,
                         epoch,
                         mesh,
-                        light: light.keep.then(|| ChunkLight::from_padded(padded)),
+                        light: light.keep.then(|| ChunkLight::from_padded(blocks)),
                         path: Some(path),
                         faces,
                         beams: has_beams,
+                        points,
                     }
                 })
             },
@@ -3017,6 +3050,7 @@ impl WorldJobs {
             tiles,
             beams,
             keep: true,
+            points: Vec::new(),
         };
         cx.map.slots[id].set_light_job(true);
         spawn_job(
@@ -3032,7 +3066,7 @@ impl WorldJobs {
                     i if i < 13 => neighbors[i].as_deref(),
                     i => neighbors[i - 1].as_deref(),
                 });
-                with_light(&light, pos, chunks, |padded, _| JobMessage::Lit {
+                with_light(&light, pos, chunks, |_, padded, _, _| JobMessage::Lit {
                     id,
                     data_version,
                     epoch,
@@ -3371,9 +3405,11 @@ impl WorldJobs {
                     path,
                     faces,
                     beams,
+                    points,
                 } => {
                     self.auto_cap.observe_job(busy);
                     self.light_counts.light_beam_boxes += usize::from(beams);
+                    self.point_counts.boxes += usize::from(points > 0);
                     match path {
                         Some(LightPath::Full { .. }) => self.light_counts.light_full += 1,
                         Some(LightPath::FastDark | LightPath::FastOpen) => {
@@ -3837,7 +3873,7 @@ fn band_chunks(
 }
 
 /// The chunks whose padded region meets the voxels within `r` of `p` (a box), into `out`.
-fn box_chunks(p: BlockPos, r: u8, out: &mut BTreeSet<ChunkPos>) {
+pub(crate) fn box_chunks(p: BlockPos, r: u8, out: &mut BTreeSet<ChunkPos>) {
     let r = i64::from(r);
     for cy in padded_chunks(p.y - r, p.y + r) {
         for cx in padded_chunks(p.x - r, p.x + r) {
@@ -4068,5 +4104,6 @@ fn is_enclosed_opaque<'a>(
 }
 
 mod block_data;
+mod point_lights;
 #[cfg(test)]
 mod tests;

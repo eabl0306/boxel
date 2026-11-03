@@ -133,7 +133,8 @@ pub struct SceneLight {
     /// shade. [`SceneRealms::default`]: one realm, lit by `sky` and `ambient`.
     pub realms: SceneRealms,
     /// The dynamic point lights of the frame (ADR 0062): block light that moves, added in the
-    /// shaders by the brightest per channel. Empty by default.
+    /// shaders by the brightest per channel. Empty by default. The plugin leaves out the ones the
+    /// world bakes into its meshes (ADR 0063).
     pub dynamic: DynamicLights,
 }
 

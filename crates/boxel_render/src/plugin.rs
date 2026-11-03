@@ -762,6 +762,9 @@ pub(crate) struct ExtractedFrame {
     sky_color: [f32; 4],
     /// Scene light of this frame.
     pub(crate) light: SceneLight,
+    /// Every dynamic light of this frame, baked by the world or not (`light.dynamic` holds the
+    /// ones the shaders draw): the models take them at their probe (ADR 0062, 0063).
+    pub(crate) model_lights: DynamicLights,
     /// Seconds of the fluid animation ([`ViewParams::fluid_time`]).
     fluid_time: f32,
     /// Game ticks of the texture animations ([`ViewParams::texture_tick`]).

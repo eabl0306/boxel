@@ -19,6 +19,8 @@
 //!    (edges and corners included, for AO), every chunk the light change can reach (up to 8 per
 //!    voxel, sized from the cached light) and the chunks around a column whose sky top moved;
 //!    their `epoch` is bumped. [`BlockUses`] says what using a block does (a gate opens).
+//!    Then the dynamic lights ([`DynamicLight`], ADR 0063): the ones that moved to another
+//!    voxel remesh the chunks they reach, as another edit batch ([`BakedLights`]).
 //! 3. `Dispatch`: collect finished jobs, then pop jobs by priority while in-flight < cap and run
 //!    them on the `AsyncComputeTaskPool` through a [`jobs::JobExecutor`] (stale priorities that
 //!    may come first are refreshed on the way, so jobs start nearest first); repeated while
@@ -75,6 +77,7 @@ pub(crate) struct NoSpan;
 
 mod beams;
 mod daylight;
+mod dynamic_light;
 pub mod fluid;
 mod interest;
 mod map;
@@ -99,6 +102,7 @@ pub use daylight::{
     RealmDaylight, RealmLight, RealmLighting, RealmPlanes, SUNRISE_HOUR, SkyKey, TICKS_PER_SECOND,
     TimeOfDay,
 };
+pub use dynamic_light::{BakedLights, DynamicLight};
 pub use fluid::FluidPlugin;
 pub(crate) use map::CachedLight;
 pub use map::{ChunkId, ChunkMap, ChunkSlot, DataState, Interest, MeshState, WorldStats};

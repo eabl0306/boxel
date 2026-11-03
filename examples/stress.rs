@@ -130,7 +130,7 @@ use boxel::world::jobs::{JobExecutor, TaskPoolExecutor};
 use boxel::world::lifecycle::WorldLifecycleSystems;
 use boxel::world::lod::LodStats;
 use boxel::world::{
-    ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
+    BakedLights, ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
 };
 use boxel::worldgen::lod::LodSource;
 use boxel_demo::worldgen::LitCaves;
@@ -214,7 +214,10 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
                       world with dynamic lights meshes with, ADR 0062) or lit-only (faces with
                       some light; the world's default)
   --held-light R,G,B  a dynamic light at the camera with this emission per channel (0 to 15, a
-                      torch is 14,11,6; ADR 0062), as a held torch
+                      torch is 14,11,6; ADR 0062), as a held torch; the output says how many
+                      chunks it remeshed while measuring
+  --baked-lights N    dynamic lights the world bakes into its meshes (default 8, ADR 0063); 0:
+                      all in the shaders (ADR 0062)
   --cave-culling on|off  skip the chunks the camera cannot see through open space (default on;
                       --no-cave-culling is off)
   --idle-work on|off  the world's work between frames under --fps-limit (default on, ADR 0023);
@@ -354,6 +357,8 @@ struct Options {
     ao: Option<AoPolicy>,
     /// `--held-light`: a dynamic light at the camera with this emission (ADR 0062).
     held_light: Option<[u8; 3]>,
+    /// `--baked-lights`: the world's `baked_lights` (`None`: its default; ADR 0063).
+    baked_lights: Option<usize>,
     /// `--cave-culling`: on (the default) or off.
     cave_culling: bool,
     /// `--idle-work`: the world's work between frames on (the default) or off.
@@ -440,6 +445,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         light: true,
         ao: None,
         held_light: None,
+        baked_lights: None,
         cave_culling: true,
         idle_work: true,
         no_distance_fog: false,
@@ -649,6 +655,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--light" => o.light = on_off(flag, &value()?)?,
             "--ao" => o.ao = Some(ao_policy(flag, &value()?)?),
             "--held-light" => o.held_light = Some(emission(flag, &value()?)?),
+            "--baked-lights" => {
+                let v = value()?;
+                let n = v
+                    .parse()
+                    .map_err(|_| format!("{flag}: {v:?} is not a count"))?;
+                o.baked_lights = Some(n);
+            }
             "--cave-culling" => o.cave_culling = on_off(flag, &value()?)?,
             "--no-cave-culling" => o.cave_culling = false,
             "--cave" => o.cave = true,
@@ -999,6 +1012,8 @@ struct Bench {
     presented_at_start: u64,
     /// `translucent_sorts` when the measurement started.
     sorts_at_start: u32,
+    /// `BakedLights` when the measurement started.
+    baked_at_start: BakedLights,
     /// `--screenshot`.
     shot: Shot,
     exiting: bool,
@@ -1273,6 +1288,7 @@ fn drive(
     pacing: Option<Res<FramePacingInfo>>,
     lod: Option<Res<LodStats>>,
     switches: Option<Res<switch::SwitchTrack>>,
+    baked: Option<Res<BakedLights>>,
 ) {
     if bench.exiting {
         return;
@@ -1340,6 +1356,7 @@ fn drive(
             bench.phase = Phase::Measuring { start: now };
             bench.presented_at_start = info.frames_presented;
             bench.sorts_at_start = info.translucent_sorts;
+            bench.baked_at_start = baked.as_deref().cloned().unwrap_or_default();
             bench.info.load_start = load_average();
             bench.info.unix_time = unix_time();
             println!(
@@ -1357,6 +1374,18 @@ fn drive(
                     "stress: {} translucent buckets re-sorted while measuring",
                     info.translucent_sorts - bench.sorts_at_start
                 );
+                if let (Some(baked), true) = (baked.as_deref(), bench.options.held_light.is_some())
+                {
+                    let (start, s) = (&bench.baked_at_start, bench.options.duration.as_secs_f64());
+                    let remeshes = baked.remeshes - start.remeshes;
+                    println!(
+                        "stress: baked lights while measuring: {} moves, {remeshes} chunks \
+                         remeshed ({:.1} per second), {} mesh jobs with a light",
+                        baked.moves - start.moves,
+                        remeshes as f64 / s,
+                        baked.boxes - start.boxes,
+                    );
+                }
                 bench.phase = Phase::CatchUp {
                     since: now,
                     streak: 0,
@@ -1659,6 +1688,9 @@ fn world_settings(
     if let Some(ao) = options.ao {
         settings.ao_policy = ao;
     }
+    if let Some(n) = options.baked_lights {
+        settings.baked_lights = n;
+    }
     if !options.light {
         settings.light = false;
         settings.ao_policy = AoPolicy::Off;
@@ -1774,6 +1806,7 @@ fn add_bench(app: &mut App, options: Options, info: RunInfo, recorder: Recorder,
             info,
             presented_at_start: 0,
             sorts_at_start: 0,
+            baked_at_start: BakedLights::default(),
             shot: Shot::NotAsked,
             exiting: false,
             options,
@@ -2201,19 +2234,26 @@ mod tests {
     }
 
     /// `--ao` sets the world's AO policy (`--light off` still turns it off), `--held-light` takes
-    /// three levels up to 15.
+    /// three levels up to 15, `--baked-lights` the world's count.
     #[test]
     fn ao_and_held_light_parse() {
         let o = options(&["--ao", "baked", "--held-light", "14,11,6"]);
         assert_eq!(world_settings(&o, None).ao_policy, AoPolicy::Baked);
         assert_eq!(o.held_light, Some([14, 11, 6]));
         assert_eq!(options(&[]).held_light, None);
+        let shaders = options(&["--baked-lights", "0"]);
+        assert_eq!(world_settings(&shaders, None).baked_lights, 0);
+        assert_eq!(
+            world_settings(&options(&[]), None).baked_lights,
+            WorldSettings::default().baked_lights
+        );
         let off = options(&["--ao", "baked", "--light", "off"]);
         assert_eq!(world_settings(&off, None).ao_policy, AoPolicy::Off);
         for bad in [
             &["--ao", "on"][..],
             &["--held-light", "16,0,0"],
             &["--held-light", "1,2"],
+            &["--baked-lights", "-1"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

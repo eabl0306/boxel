@@ -30,9 +30,10 @@ pub enum AoPolicy {
     Baked,
     /// AO on every face with some light at one of its corners. A face whose 4 corner lights are
     /// all 0 keeps AO open and merges as with `Off`: almost all cave geometry is dark, and AO
-    /// there is invisible at the default ambient floor. Not for worlds with dynamic lights
-    /// (`boxel_render::DynamicLight`, ADR 0062): they light dark faces without remeshing them,
-    /// and those would show no AO; such worlds mesh with `Baked`.
+    /// there is invisible at the default ambient floor. The dynamic lights a world bakes
+    /// (`boxel_world::DynamicLight`, ADR 0063) are in the light it meshes with, so the faces
+    /// they light get AO; the ones a renderer draws in its shaders (ADR 0062) light dark faces
+    /// without remeshing them, and those show no AO.
     #[default]
     BakedLitOnly,
 }

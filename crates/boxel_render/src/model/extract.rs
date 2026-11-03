@@ -41,8 +41,8 @@ fn realm_at(realms: &SceneRealms, at: DVec3) -> ModelRealm {
 /// view layer is lit at its eye, and the frame's realms are known, and after the dynamic
 /// lights' extract). Each takes the realm of the block its light comes from (of its
 /// translation, or the eye, with a fixed light). An instance lit at a probe takes the frame's
-/// dynamic lights there too (ADR 0062), by the brightest per channel; a fixed light stays as it
-/// is. Sorted by entity, so the renderer's draw order and posing cache see the same list every
+/// dynamic lights there too (ADR 0062), baked by the world or not (ADR 0063), by the brightest
+/// per channel; a fixed light stays as it is. Sorted by entity, so the renderer's draw order and posing cache see the same list every
 /// frame.
 pub(crate) fn extract_models(
     mut frame: ResMut<ExtractedFrame>,
@@ -71,7 +71,7 @@ pub(crate) fn extract_models(
         };
         let light = match (instance.light, probe) {
             (ModelLight::Fixed(light), _) => light,
-            (ModelLight::Probe(_), Some(at)) => frame.light.dynamic.lit(light_at(chunks, at), at),
+            (ModelLight::Probe(_), Some(at)) => frame.model_lights.lit(light_at(chunks, at), at),
             (ModelLight::Probe(_), None) => LightValue::FULL_SKY,
         };
         let realm = probe.map_or_else(ModelRealm::default, |at| realm_at(&frame.light.realms, at));

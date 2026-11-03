@@ -263,6 +263,7 @@ impl<G: WorldGenerator> WorldGenerator for Offset<G> {
 }
 
 mod beams;
+mod dynamic;
 
 fn overworld() -> OverworldGenerator {
     OverworldGenerator::default()
