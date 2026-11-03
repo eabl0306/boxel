@@ -570,6 +570,8 @@ pub(crate) struct BucketDraw {
     pub quad_start: u32,
     /// Quads (never 0, never above `MAX_QUADS_PER_BUCKET`).
     pub count: u32,
+    /// The chunk's tinted light palette entries (ADR 0064; Low passes them as immediates).
+    pub tinted: u16,
 }
 
 /// Result of the CPU culling (reused every frame).
@@ -648,6 +650,7 @@ impl CpuCull {
                         page,
                         quad_start: start,
                         count: drawn.min(MAX_QUADS_PER_BUCKET),
+                        tinted: record.tinted,
                     });
                 }
                 start += n;
@@ -660,6 +663,7 @@ impl CpuCull {
                     page,
                     quad_start: start,
                     count: n.min(MAX_QUADS_PER_BUCKET),
+                    tinted: record.tinted,
                 });
             }
         }
@@ -706,6 +710,7 @@ pub(crate) fn translucent_draws(
                 page: record.alloc.page,
                 quad_start: start,
                 count: record.counts[TRANSLUCENT_BUCKET].min(MAX_QUADS_PER_BUCKET),
+                tinted: record.tinted,
             },
         ));
     }
@@ -833,6 +838,7 @@ mod tests {
                 light_len: 1,
                 walls: [0; 6],
                 neighbors: 0,
+                tinted: 0,
             });
         }
         table
@@ -854,6 +860,7 @@ mod tests {
                 light_len: 1,
                 walls: [0; 6],
                 neighbors: 0,
+                tinted: 0,
             });
         }
         table

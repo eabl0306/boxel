@@ -105,6 +105,7 @@ impl Figure {
             origin: FEET,
             scale: 1.0,
             light,
+            sky_rgb: None,
             realm: boxel::render::model::ModelRealm::default(),
         }
     }

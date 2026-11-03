@@ -17,7 +17,7 @@
 //! copies, a test sink replays them over byte models of the pages.
 use crate::arena::{ArenaAlloc, ArenaAllocator, QUAD_BYTES};
 use crate::chunk_table::{ChunkRecord, ChunkTable};
-use crate::upload::{Uploads, arena_len, light_entries};
+use crate::upload::{Uploads, arena_len, light_entries, tinted_parts};
 use boxel_gfx::Tier;
 use boxel_math::I64Vec3;
 use boxel_mesh::{BUCKET_COUNT, ChunkMesh, TRANSLUCENT_BUCKET};
@@ -892,6 +892,7 @@ pub(crate) fn upsert_resident(
         light_len: light_entries(mesh),
         walls: wall_counts(mesh, &counts),
         neighbors: 0,
+        tinted: tinted_parts(mesh).len() as u16,
     };
     let inserted = chunks.insert(record);
     // `slot_for` succeeded above, so this cannot fail
@@ -2296,6 +2297,7 @@ mod tests {
             want.extend_from_slice(bytemuck::cast_slice(crate::upload::uploaded_palette(
                 &e.mesh,
             )));
+            want.extend_from_slice(bytemuck::cast_slice(tinted_parts(&e.mesh)));
             let at = r.alloc.alloc.offset as usize * QUAD_BYTES as usize;
             let range = at..at + want.len();
             let model = &sink.buffers[&MemTarget::Page(r.alloc.page)];

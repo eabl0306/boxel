@@ -4,8 +4,10 @@
 //! creates (and later frees) a staging buffer per call, a few microseconds each, and crossing a
 //! chunk border changes a few hundred chunks.
 //!
-//! A chunk's range in its page (`crate::memory`) holds its quads and then its light palette
-//! (ADR 0015), which High and Mid read at `ChunkGpu::light_base`. Low has no storage buffers:
+//! A chunk's range in its page (`crate::memory`) holds its quads, then its light palette
+//! (ADR 0015), which High and Mid read at `ChunkGpu::light_base`, then the exact parts of its
+//! tinted entries (ADR 0064; none without colored sky), which only High reads. The range is the
+//! same on every tier, so the memory accounting does not depend on it. Low has no storage buffers:
 //! there each quad's palette entry is written, expanded, at the quad's own offset in a light page
 //! parallel to the page (its second instance attribute).
 //!
@@ -63,10 +65,24 @@ pub(crate) fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
     }
 }
 
-/// Page entries (8 bytes each) a chunk mesh takes: its quads plus its light palette (at least
-/// one entry). [`RenderStats::arena_used_quads`](crate::RenderStats) counts these.
+/// The exact parts of the tinted entries a mesh is drawn with (ADR 0064): the first
+/// [`ChunkMesh::tinted_entries`] of [`ChunkMesh::tinted_exact`]. None without colored sky, and
+/// none for a malformed mesh (more tinted entries than its palette or its exact parts hold),
+/// which is then drawn without tint. Their count is the chunk's `ChunkRecord::tinted`.
+pub(crate) fn tinted_parts(mesh: &ChunkMesh) -> &[PaletteEntry] {
+    let t = mesh.tinted_entries as usize;
+    if t <= mesh.palette.len() && t <= mesh.tinted_exact.len() {
+        &mesh.tinted_exact[..t]
+    } else {
+        &[]
+    }
+}
+
+/// Page entries (8 bytes each) a chunk mesh takes: its quads, its light palette (at least one
+/// entry) and the exact parts of its tinted entries (ADR 0064, only with colored sky).
+/// [`RenderStats::arena_used_quads`](crate::RenderStats) counts these.
 pub fn arena_len(mesh: &ChunkMesh) -> u32 {
-    mesh.total_quads() + light_entries(mesh)
+    mesh.total_quads() + light_entries(mesh) + tinted_parts(mesh).len() as u32
 }
 
 impl PendingMesh {
@@ -74,7 +90,7 @@ impl PendingMesh {
         &self.mesh.quads
     }
 
-    /// Arena entries: the quads, then the light palette.
+    /// Arena entries: the quads, the light palette, the exact parts of the tinted entries.
     fn len(&self) -> u32 {
         arena_len(&self.mesh)
     }
@@ -361,10 +377,16 @@ impl Uploads {
                                 offset: at,
                                 data: quads,
                             });
+                            let palette: &[u8] = bytemuck::cast_slice(uploaded_palette(&mesh.mesh));
                             put(MemOp::Write {
                                 target,
                                 offset: at + quads.len() as u64,
-                                data: bytemuck::cast_slice(uploaded_palette(&mesh.mesh)),
+                                data: palette,
+                            });
+                            put(MemOp::Write {
+                                target,
+                                offset: at + (quads.len() + palette.len()) as u64,
+                                data: bytemuck::cast_slice(tinted_parts(&mesh.mesh)),
                             });
                         }
                     }
@@ -538,11 +560,13 @@ impl CopySink for GpuSink<'_> {
 }
 
 /// Sets `out` to what the Low light page holds over `mesh`'s range: the palette entry of each
-/// quad (open sky for an index outside the palette), then the palette itself (never drawn; it
-/// only keeps the range the same size as in the page).
+/// quad (open sky for an index outside the palette), then the palette itself and the exact
+/// parts of its tinted entries (never drawn; they only keep the range the same size as in the
+/// page).
 pub(crate) fn expand_light(mesh: &ChunkMesh, out: &mut Vec<PaletteEntry>) {
     quad_light(mesh, &mesh.quads, out);
     out.extend_from_slice(uploaded_palette(mesh));
+    out.extend_from_slice(tinted_parts(mesh));
 }
 
 /// Sets `out` to the palette entry of each of `quads` (from `mesh`), open sky for an index
@@ -699,6 +723,55 @@ mod tests {
         assert_eq!((light_entries(&bare), arena_len(&bare)), (1, 4));
         expand_light(&bare, &mut low);
         assert_eq!(low, [FULL_SKY_ENTRY; 4]);
+    }
+
+    /// ADR 0064: the exact parts of the tinted entries follow the palette, on every tier (Low's
+    /// light page keeps them too, never drawn); a mesh whose count is past its palette or its
+    /// exact parts is drawn without tint.
+    #[test]
+    fn tinted_meshes_take_their_exact_parts_after_the_palette() {
+        let quads = vec![
+            PackedQuad::default().with_light_index(1),
+            PackedQuad::default().with_light_index(2),
+        ];
+        let (tinted, exact) = ([0x0100_0123, 0x1000_0456], [0x0000_0789, 0x0000_0abc]);
+        let other = [0x0200_0321, 0x0300_0654];
+        let mesh = ChunkMesh {
+            quads,
+            palette: vec![tinted, other, FULL_SKY_ENTRY],
+            tinted_entries: 2,
+            tinted_exact: vec![exact, [1, 2]],
+            ..ChunkMesh::default()
+        };
+        assert_eq!(tinted_parts(&mesh), [exact, [1, 2]]);
+        assert_eq!((light_entries(&mesh), arena_len(&mesh)), (3, 7));
+        let mut low = Vec::new();
+        expand_light(&mesh, &mut low);
+        assert_eq!(
+            low,
+            [
+                other,
+                FULL_SKY_ENTRY,
+                tinted,
+                other,
+                FULL_SKY_ENTRY,
+                exact,
+                [1, 2]
+            ]
+        );
+        for malformed in [
+            ChunkMesh {
+                tinted_entries: 4,
+                ..mesh.clone()
+            },
+            ChunkMesh {
+                tinted_exact: vec![exact],
+                ..mesh.clone()
+            },
+        ] {
+            assert!(tinted_parts(&malformed).is_empty());
+            assert_eq!(arena_len(&malformed), 5);
+        }
     }
 
     #[test]

@@ -23,6 +23,17 @@ fn light_at(chunks: Option<&ChunkMap>, at: DVec3) -> LightValue {
         .unwrap_or(LightValue::FULL_SKY)
 }
 
+/// The sky's red, green and blue at `at` where colored glass tinted them (ADR 0064): `None` where
+/// they are `light`'s sky level three times (no tint, or no light there).
+fn sky_rgb_at(chunks: Option<&ChunkMap>, at: DVec3, light: LightValue) -> Option<[u8; 3]> {
+    if !at.is_finite() {
+        return None;
+    }
+    chunks
+        .and_then(|map| map.sky_rgb_at(BlockPos::from_world(at)))
+        .filter(|&rgb| rgb != [light.sky(); 3])
+}
+
 /// The realm of the block at `at` (realm 0 where it is not finite).
 fn realm_at(realms: &SceneRealms, at: DVec3) -> ModelRealm {
     if !at.is_finite() {
@@ -42,7 +53,8 @@ fn realm_at(realms: &SceneRealms, at: DVec3) -> ModelRealm {
 /// lights' extract). Each takes the realm of the block its light comes from (of its
 /// translation, or the eye, with a fixed light). An instance lit at a probe takes the frame's
 /// dynamic lights there too (ADR 0062), baked by the world or not (ADR 0063), by the brightest
-/// per channel; a fixed light stays as it is. Sorted by entity, so the renderer's draw order and posing cache see the same list every
+/// per channel, and its sky tinted by colored glass there (ADR 0064, the picture's sky: its
+/// light keeps the uncolored level gameplay reads); a fixed light stays as it is. Sorted by entity, so the renderer's draw order and posing cache see the same list every
 /// frame.
 pub(crate) fn extract_models(
     mut frame: ResMut<ExtractedFrame>,
@@ -69,10 +81,14 @@ pub(crate) fn extract_models(
             ModelLayer::World => Some(transform.translation + offset),
             ModelLayer::View => eye.map(|eye| eye + offset),
         };
-        let light = match (instance.light, probe) {
-            (ModelLight::Fixed(light), _) => light,
-            (ModelLight::Probe(_), Some(at)) => frame.model_lights.lit(light_at(chunks, at), at),
-            (ModelLight::Probe(_), None) => LightValue::FULL_SKY,
+        let (light, sky_rgb) = match (instance.light, probe) {
+            (ModelLight::Fixed(light), _) => (light, None),
+            (ModelLight::Probe(_), Some(at)) => {
+                let light = light_at(chunks, at);
+                let sky_rgb = sky_rgb_at(chunks, at, light);
+                (frame.model_lights.lit(light, at), sky_rgb)
+            }
+            (ModelLight::Probe(_), None) => (LightValue::FULL_SKY, None),
         };
         let realm = probe.map_or_else(ModelRealm::default, |at| realm_at(&frame.light.realms, at));
         frame.models.push(ModelDraw {
@@ -86,6 +102,7 @@ pub(crate) fn extract_models(
             origin: instance.origin,
             scale: instance.scale,
             light,
+            sky_rgb,
             realm,
         });
     }

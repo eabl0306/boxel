@@ -63,6 +63,7 @@ fn draws(model: &Arc<Model>, texture: &ModelTexture, n: u64, phase: f32) -> Vec<
                 origin: Vec3::new(0.0, 24.0, 0.0),
                 scale: 0.9375,
                 light: LightValue::FULL_SKY,
+                sky_rgb: None,
                 realm: boxel_render::model::ModelRealm::default(),
             }
         })

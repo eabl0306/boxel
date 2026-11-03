@@ -2,7 +2,8 @@
 // Per-draw data = DrawRef (chunk_slot, quad_start) read as an INSTANCE-STEP vertex attribute at
 // location 0; the draw sets first_instance = DrawRef index, instance_count = 1, base_vertex = 0.
 // Group 2 binds the page of the drawn chunk: quad_start and ChunkGpu::light_base are page-local.
-// The light palette entry of each quad is read from the same page at ChunkGpu::light_base.
+// The light palette entry of each quad is read from the same page at ChunkGpu::light_base; on
+// High the exact part of a tinted entry (ADR 0064) right after the palette.
 @group(0) @binding(0) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(1) var block_sampler: sampler;
 @group(1) @binding(0) var<uniform> view: View;
@@ -17,20 +18,30 @@ fn vs_pull(@builtin(vertex_index) vi: u32, @location(0) draw: vec2<u32>) -> VsOu
   // the palette (only a malformed mesh) reads open sky, as on Low, never another chunk's data.
   let li = (q.y >> MAT_LIGHT_SHIFT) & MAT_LIGHT_MASK;
   let lw = select(FULL_SKY_LIGHT, quads[ch.light_base + min(li, ch.light_len - 1u)], li < ch.light_len);
-  return finish_vertex(decode_quad(q, lw, vi & 3u), ch.origin, view);
+  var o = finish_vertex(decode_quad(q, lw, vi & 3u), ch.origin, view);
+  // A tinted entry (ADR 0064): the other kind's corners, exact where the chunk has them (High),
+  // flat otherwise (Mid). The first entries are the tinted ones, so li < t <= light_len.
+  if (li < ((ch.flags >> CHUNK_TINTED_SHIFT) & CHUNK_TINTED_MASK)) {
+    var other = tint_flat_corners(lw);
+    if ((ch.flags & CHUNK_TINT_EXACT) != 0u) {
+      other = quads[ch.light_base + ch.light_len + li];
+    }
+    o = with_tint(o, other);
+  }
+  return o;
 }
 
 // Opaque buckets (pipeline with cull_mode Back): no discard, early-Z stays on.
 @fragment
 fn fs_opaque(i: VsOut) -> @location(0) vec4<f32> {
-  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  let albedo = textureSample(block_textures, block_sampler, i.uv, out_layer(i));
   return shade_fragment(albedo, i, view);
 }
 
 // Cutout bucket (pipeline with cull_mode None): alpha test.
 @fragment
 fn fs_cutout(i: VsOut) -> @location(0) vec4<f32> {
-  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  let albedo = textureSample(block_textures, block_sampler, i.uv, out_layer(i));
   if (!alpha_test_passes(albedo)) { discard; }
   return shade_fragment(albedo, i, view);
 }
@@ -40,7 +51,7 @@ fn fs_cutout(i: VsOut) -> @location(0) vec4<f32> {
 // Fully clear texels (the inside of glass) are dropped.
 @fragment
 fn fs_translucent(i: VsOut) -> @location(0) vec4<f32> {
-  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  let albedo = textureSample(block_textures, block_sampler, i.uv, out_layer(i));
   if (albedo.a <= 0.0) { discard; }
   return vec4(shade_fragment(albedo, i, view).rgb, albedo.a);
 }
@@ -51,7 +62,7 @@ fn fs_translucent(i: VsOut) -> @location(0) vec4<f32> {
 // through, like Minecraft's cutout glass.
 @fragment
 fn fs_translucent_depth(i: VsOut) -> @location(0) vec4<f32> {
-  let albedo = textureSample(block_textures, block_sampler, i.uv, i.layer);
+  let albedo = textureSample(block_textures, block_sampler, i.uv, out_layer(i));
   if (albedo.a < 0.1) { discard; }
   return vec4(0.0);
 }

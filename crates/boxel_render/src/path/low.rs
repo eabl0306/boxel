@@ -116,15 +116,15 @@ fn bind_page(pass: &mut wgpu::RenderPass<'_>, page: &PageGpu) {
     }
 }
 
-/// Draws `list` (one pipeline, its page bound), setting the chunk origin immediates for its first
-/// draw and whenever the chunk changes (a pipeline change clears them; consecutive buckets of one
+/// Draws `list` (one pipeline, its page bound), setting the chunk origin and tinted entry count
+/// immediates for its first draw and whenever the chunk changes (a pipeline change clears them; consecutive buckets of one
 /// chunk share them).
 fn draw_run(pass: &mut wgpu::RenderPass<'_>, list: &[BucketDraw]) -> u32 {
     let mut current = None;
     for d in list {
         if current != Some(d.slot) {
             let origin = ChunkImmediate {
-                origin: [d.origin.x, d.origin.y, d.origin.z, 0],
+                origin: [d.origin.x, d.origin.y, d.origin.z, i32::from(d.tinted)],
             };
             pass.set_immediates(0, bytemuck::bytes_of(&origin));
             current = Some(d.slot);

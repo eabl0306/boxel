@@ -54,6 +54,9 @@ pub(crate) struct ChunkRecord {
     /// close (at `origin` minus 32 along `f`'s normal): those walls are left out. The table keeps
     /// it ([`ChunkTable::insert`] sets it from the table, whatever the caller gave).
     pub neighbors: u8,
+    /// The tinted entries at the start of its light palette (ADR 0064, `0..=4096`;
+    /// `crate::upload::tinted_parts`), each with its exact part after the palette.
+    pub tinted: u16,
 }
 
 /// Chunk origin offsets along each face's normal, in face bucket order (`Face::ALL`): the chunk
@@ -96,11 +99,14 @@ impl ChunkRecord {
                 | u32::from(walls).min(1024) << ChunkGpu::WALL_SHIFT;
         }
         let live = if live { ChunkGpu::FLAG_LIVE } else { 0 };
+        let tinted = u32::from(self.tinted).min(ChunkGpu::TINTED_MASK);
         ChunkGpu {
             origin: self.gpu_origin().to_array(),
             quad_base: self.alloc.alloc.offset,
             counts,
-            flags: live | u32::from(self.neighbors) << ChunkGpu::NEIGHBOR_SHIFT,
+            flags: live
+                | u32::from(self.neighbors) << ChunkGpu::NEIGHBOR_SHIFT
+                | tinted << ChunkGpu::TINTED_SHIFT,
             light_base: self.light_base,
             light_len: self.light_len,
             page: u32::from(self.alloc.page),
@@ -147,6 +153,9 @@ pub(crate) struct ChunkTable {
     touched: Vec<u32>,
     /// One bit per slot, set while the slot is in `touched`.
     touched_bits: Vec<u64>,
+    /// Tinted entries are drawn exactly (High, owner decision 1 of ADR 0064): the GPU entries of
+    /// chunks with some are flagged [`ChunkGpu::FLAG_TINT_EXACT`].
+    exact_tints: bool,
 }
 
 impl ChunkTable {
@@ -169,7 +178,15 @@ impl ChunkTable {
             version: 0,
             touched: Vec::new(),
             touched_bits: vec![0; capacity.div_ceil(64) as usize],
+            exact_tints: false,
         }
+    }
+
+    /// The table with its tinted chunks drawn exactly, or not (the default): the High tier's
+    /// (ADR 0064). Mid draws the same entries with the other kind of light flat, as Low.
+    pub fn with_exact_tints(mut self, exact: bool) -> Self {
+        self.exact_tints = exact;
+        self
     }
 
     /// Changes with every clear and window move (see [`ChunkTable::take_touched`] for the
@@ -467,9 +484,14 @@ impl ChunkTable {
             && origin.z.abs_diff(c.z) < GPU_WINDOW
     }
 
-    /// The GPU entry of `record`: live only inside the window.
+    /// The GPU entry of `record`: live only inside the window, its tinted entries exact on a
+    /// table [`ChunkTable::with_exact_tints`].
     pub fn gpu_entry(&self, record: &ChunkRecord) -> ChunkGpu {
-        record.gpu(self.in_window(record.origin))
+        let mut entry = record.gpu(self.in_window(record.origin));
+        if self.exact_tints && record.tinted > 0 {
+            entry.flags |= ChunkGpu::FLAG_TINT_EXACT;
+        }
+        entry
     }
 
     /// Re-centers the window on `render_origin` when that is more than [`GPU_WINDOW_SLACK`] from
@@ -577,6 +599,7 @@ mod tests {
             light_len: 1,
             walls: [0; 6],
             neighbors: 0,
+            tinted: 0,
         }
     }
 
@@ -999,6 +1022,7 @@ mod tests {
             counts: [5, 5, 5, 5, 5, 5, 1, 0],
             walls: [1, 2, 3, 4, 5, 0],
             neighbors: 0b11_1111,
+            tinted: 0,
             ..record(arena, id)
         };
         let center = I64Vec3::new(-64, 32, 96);

@@ -12,7 +12,7 @@
 //! `light: ao=MODE palette_p50=N p99=N max=N requantized=N arena_entries=N`: the AO policy
 //! (`--ao`), the light palette entries of the non-empty meshes, how many of them overflowed the
 //! palette and were requantized, and the renderer arena entries they take (quads plus palettes,
-//! at least one palette entry per mesh); and `sky: light=on|off full=N fast=N columns=N
+//! at least one palette entry per mesh, plus the exact parts of tinted entries); and `sky: light=on|off full=N fast=N columns=N
 //! walked=N walks=N private_generations=N cache_mib=X sky_mib=X`: the light boxes that ran the floods or took a
 //! fast path (dark, open sky or under the walk floor), the chunk columns with a sky tile slot
 //! and with a walked tile, the walks run and the chunks they generated because they were not
@@ -943,6 +943,11 @@ fn light_line(map: &ChunkMap, ao: AoPolicy) -> String {
         entries.push(mesh.palette.len());
         requantized += usize::from(mesh.light_quantization != LightQuantization::Exact);
         arena += u64::from(mesh.total_quads()) + mesh.palette.len().max(1) as u64;
+        // The exact parts of the tinted entries (ADR 0064), unless the mesh is malformed.
+        let tinted = mesh.tinted_entries as usize;
+        if tinted <= mesh.palette.len() && tinted <= mesh.tinted_exact.len() {
+            arena += tinted as u64;
+        }
     }
     entries.sort_unstable();
     let at = |q: usize| {

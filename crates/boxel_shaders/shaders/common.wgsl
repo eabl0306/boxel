@@ -23,6 +23,18 @@
 // attribute. The fragment interpolates the 4 corners bilinearly at the quad-local (s, t), the
 // same on every tier.
 //
+// Colored sky (ADR 0064): the first t entries of a chunk's palette are tinted (t in
+// ChunkGpu::flags on High and Mid, in ChunkImmediate::origin.w on Low; 0 without colored sky).
+// A tinted entry (boxel_mesh::layout::TINT_*) is vec2<u32>(c0 | c1 << 12 | (flat >> 4) << 24,
+// c2 | c3 << 12 | (flat & 15) << 24 | tag << 28): the 4 corners of one kind of light (tag 0: the
+// sky's red, green and blue; tag 1: the block light's) and the other kind flat, each 12 bits of
+// red:4 | green:4 | blue:4. The vertex puts the other kind's 4 corners (High: the exact ones,
+// ChunkMesh::tinted_exact, after the palette; Mid and Low: the flat value 4 times) and a tinted
+// bit in the free high bits of VsOut::face and VsOut::layer (with_tint), so the fragment has
+// one tinted path on every tier and no varying more: a varying costs every fragment (ADR 0062;
+// a flat vec2<u32> here cost 17 to 21 % of the fps on the RTX). A quad whose index is not below
+// t reads its entry as before, and those bits stay 0.
+//
 // RULES (enforced by boxel_shaders tests):
 //  - never use @builtin(instance_index), @builtin(draw_index), @builtin(num_workgroups);
 //    per-draw data arrives through the DrawRef instance-step vertex attribute or immediates.
@@ -123,6 +135,22 @@ const REALM_LAST: u32 = 8u;
 // reach the quad from AO_DYNAMIC_SHIFT (16 bits).
 const MAX_DYNAMIC_LIGHTS: u32 = 16u;
 const AO_DYNAMIC_SHIFT: u32 = 16u;
+// Tinted palette entries (ADR 0064; boxel_mesh::layout::TINT_*) and their count in
+// ChunkGpu::flags (boxel_shaders::gpu::ChunkGpu::TINTED_SHIFT, TINTED_MASK, FLAG_TINT_EXACT).
+const TINT_CORNER_BITS: u32 = 12u;
+const TINT_CORNER_MASK: u32 = 0xFFFu;
+const TINT_FLAT_SHIFT: u32 = 24u;
+const TINT_TAG_BIT: u32 = 28u;
+const CHUNK_TINTED_SHIFT: u32 = 7u;
+const CHUNK_TINTED_MASK: u32 = 0x1FFFu;
+const CHUNK_TINT_EXACT: u32 = 0x100000u;
+// A tinted quad in VsOut (with_tint): VsOut::face bit 31 is set, bits 3..27 hold the other
+// kind's corners 0 and 1 (24 bits) and bits 27..31 the low 4 bits of corners 2 and 3, whose
+// other 20 bits are VsOut::layer bits 12..32. Below them, the face (3 bits) and the layer.
+const TINT_QUAD: u32 = 0x80000000u;
+const TINT_FACE_SHIFT: u32 = 3u;
+const TINT_FACE_LOW_SHIFT: u32 = 27u;
+const TINT_LAYER_SHIFT: u32 = 12u;
 
 // One realm's light (ADR 0015 and 0039; boxel_shaders::gpu::RealmEnvGpu): its sky light (rgb),
 // its ambient floor (rgb) and its 6 face shade factors, in the w of the first two and in the
@@ -174,8 +202,8 @@ struct ChunkGpu {                  // 64 bytes, mirrors boxel_shaders::gpu::Chun
 struct VsOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) uv: vec2<f32>,
-  @location(1) @interpolate(flat) layer: u32,
-  @location(2) @interpolate(flat) face: u32,
+  @location(1) @interpolate(flat) layer: u32,       // the texture layer (bits 0..12, out_layer), then a tinted quad's corners (with_tint)
+  @location(2) @interpolate(flat) face: u32,        // the face (bits 0..3, out_face), then a tinted quad's corners and TINT_QUAD (with_tint)
   @location(3) view_dist: f32,
   @location(4) st: vec2<f32>,                       // quad-local (s, t): corner k sits at (k & 1, k >> 1)
   @location(5) @interpolate(flat) light: vec2<u32>, // the quad's light palette entry (4 corner lights)
@@ -531,6 +559,35 @@ fn dynamic_mask(lo: vec3<f32>, hi: vec3<f32>) -> u32 {
   return mask;
 }
 
+// The flat value of tinted entry `entry` at its 4 corners, as tinted_exact stores corners: what
+// Mid and Low draw for the kind of light the entry keeps flat (owner decision 1 of ADR 0064).
+fn tint_flat_corners(entry: vec2<u32>) -> vec2<u32> {
+  let flat = ((entry.x >> TINT_FLAT_SHIFT) << 4u) | ((entry.y >> TINT_FLAT_SHIFT) & 15u);
+  let pair = flat | (flat << TINT_CORNER_BITS);
+  return vec2(pair, pair);
+}
+
+// `o` of a quad whose entry is tinted, with the 4 corners of the kind its entry keeps flat
+// (c0 | c1 << 12, c2 | c3 << 12: exact on High, tint_flat_corners elsewhere) in the high bits
+// of its face and layer (TINT_QUAD).
+fn with_tint(o: VsOut, other: vec2<u32>) -> VsOut {
+  var t = o;
+  t.face = o.face | TINT_QUAD | (other.x << TINT_FACE_SHIFT) | ((other.y & 15u) << TINT_FACE_LOW_SHIFT);
+  t.layer = o.layer | ((other.y >> 4u) << TINT_LAYER_SHIFT);
+  return t;
+}
+
+// The face (0..6) and texture layer of a fragment, without a tinted quad's bits (with_tint).
+fn out_face(i: VsOut) -> u32 { return i.face & 7u; }
+fn out_layer(i: VsOut) -> u32 { return i.layer & MAT_LAYER_MASK; }
+
+// The 4 corners a tinted quad's vertex put in its face and layer (with_tint).
+fn tint_other(i: VsOut) -> vec2<u32> {
+  let x = (i.face >> TINT_FACE_SHIFT) & 0xFFFFFFu;
+  let y = ((i.face >> TINT_FACE_LOW_SHIFT) & 15u) | ((i.layer >> TINT_LAYER_SHIFT) << 4u);
+  return vec2(x, y);
+}
+
 fn finish_vertex(d: Decoded, chunk_origin: vec3<i32>, view: View) -> VsOut {
   // wrapping i32 subtraction first: exact for any world position (see the top), then small floats
   let rel = vec3<f32>(chunk_origin - view.render_origin.xyz) + d.local;
@@ -638,7 +695,7 @@ fn fragment_position(frag: vec4<f32>) -> vec3<f32> {
 fn dynamic_levels(i: VsOut) -> vec3<f32> {
   let mask = i.ao >> AO_DYNAMIC_SHIFT;
   let cross = ((i.ao >> 9u) & GEO_SHAPE_MASK) == SHAPE_CROSS;
-  let n = select(face_normal(i.face), vec3(0.0), cross);
+  let n = select(face_normal(out_face(i)), vec3(0.0), cross);
   let pos = fragment_position(i.clip);
   let front = pos + 0.5 * n;
   var level = vec3(0.0);
@@ -652,20 +709,52 @@ fn dynamic_levels(i: VsOut) -> vec3<f32> {
   return level;
 }
 
+// Red, green and blue (0..15) of corner k of 4 tinted corners (c0 | c1 << 12, c2 | c3 << 12).
+fn tint_corner(words: vec2<u32>, k: u32) -> vec4<f32> {
+  let c = (select(words.x, words.y, k >= 2u) >> (TINT_CORNER_BITS * (k & 1u))) & TINT_CORNER_MASK;
+  return vec4<f32>((vec4(c) >> vec4(8u, 4u, 0u, 12u)) & vec4(15u, 15u, 15u, 0u));
+}
+
+// voxel_light of a quad with a tinted entry (ADR 0064): both kinds of light interpolated per
+// channel at (s, t), the corners of the entry's kind from `light`, the other kind's from the
+// quad's face and layer (tint_other).
+// Then as voxel_light, with the sky per channel: each sky channel through the curve times its
+// realm's sky color, so the tint follows day and night like the open sky, and the sun factor
+// on all three, its level the brightest sky channel (ADR 0065).
+fn tinted_light(i: VsOut, view: View) -> vec3<f32> {
+  let kept = bilinear(tint_corner(i.light, 0u), tint_corner(i.light, 1u), tint_corner(i.light, 2u), tint_corner(i.light, 3u), i.st).xyz;
+  let words = tint_other(i);
+  let other = bilinear(tint_corner(words, 0u), tint_corner(words, 1u), tint_corner(words, 2u), tint_corner(words, 3u), i.st).xyz;
+  let sky_kept = ((i.light.y >> TINT_TAG_BIT) & 1u) == 0u;
+  let s = select(other, kept, sky_kept);
+  var b = select(kept, other, sky_kept);
+  if ((i.ao >> AO_DYNAMIC_SHIFT) != 0u) {
+    b = max(b, dynamic_levels(i));
+  }
+  let env = realm_env(out_realm(i));
+  let level = max(s.x, max(s.y, s.z));
+  let sky = vec3(level_curve(s.x), level_curve(s.y), level_curve(s.z)) * env.sky.rgb * sun_factor(i, level);
+  let block = vec3(level_curve(b.x), level_curve(b.y), level_curve(b.z)) * view.light_params.y;
+  return max(max(sky, block), env.ambient.rgb);
+}
+
 // The light reaching a fragment: the 4 corner lights interpolated per channel at (s, t), the
 // block channels raised to the dynamic lights' levels (the brightest per channel, as block light
 // mixes), each channel through the brightness curve, then the brightest of sky light (times its
-// realm's sky color), block light (times its gain) and its realm's ambient floor.
+// realm's sky color), block light (times its gain) and its realm's ambient floor. A quad with a
+// tinted entry takes tinted_light (one flat branch per quad, on a bit of its face).
 fn voxel_light(i: VsOut, view: View) -> vec3<f32> {
+  if ((i.face & TINT_QUAD) != 0u) {
+    return tinted_light(i, view);
+  }
   var l = bilinear(corner_light(i.light, 0u), corner_light(i.light, 1u), corner_light(i.light, 2u), corner_light(i.light, 3u), i.st);
   if ((i.ao >> AO_DYNAMIC_SHIFT) != 0u) {
     l = vec4(l.x, max(l.yzw, dynamic_levels(i)));
   }
   let env = realm_env(out_realm(i));
   // Sun shadows (ADR 0065) scale the sky term only, by sun_factor in [1 - k, 1] (sun_off.wgsl or
-  // High's sun_shadow.wgsl), so they only darken and l.x == 0 (caves) stays unlit. The colored
-  // sky's tinted path (ADR 0064, lane C4) keeps this factor on each tinted sky channel, passing
-  // its brightest sky channel as the level.
+  // High's sun_shadow.wgsl), so they only darken and l.x == 0 (caves) stays unlit. tinted_light
+  // keeps this factor on each tinted sky channel, passing its brightest sky channel as the level.
   let sky = level_curve(l.x) * env.sky.rgb * sun_factor(i, l.x);
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
   return max(max(sky, block), env.ambient.rgb);
@@ -687,7 +776,7 @@ fn ao_factor(i: VsOut, view: View) -> f32 {
 fn shade_fragment(albedo: vec4<f32>, i: VsOut, view: View) -> vec4<f32> {
   var lit = albedo.rgb;
   if (((i.ao >> 8u) & FLAG_EMISSIVE) == 0u) {
-    lit = albedo.rgb * (face_shade(i.face, out_realm(i)) * ao_factor(i, view)) * voxel_light(i, view);
+    lit = albedo.rgb * (face_shade(out_face(i), out_realm(i)) * ao_factor(i, view)) * voxel_light(i, view);
   }
   let fog = clamp((i.view_dist - view.fog_params.x) / max(view.fog_params.y - view.fog_params.x, 1.0), 0.0, 1.0);
   return vec4(mix(lit, view.fog_color.rgb, fog), 1.0);

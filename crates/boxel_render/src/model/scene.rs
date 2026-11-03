@@ -270,6 +270,13 @@ fn pose_instance(
             draw.texture.height() as f32 / th as f32,
         ],
         light: draw.light.0,
+        sky: match draw.sky_rgb {
+            Some(rgb) => boxel_voxel::LightValue::from_rgb(rgb.map(|c| c.min(15))).0,
+            None => {
+                let s = draw.light.sky() as u16;
+                s << 8 | s << 4 | s
+            }
+        },
         realm: draw.realm,
     };
     pose_vertices(&draw.model, &draw.pose, &frame, parts, out);
@@ -315,8 +322,26 @@ mod tests {
             origin: Vec3::ZERO,
             scale: 1.0,
             light: LightValue::FULL_SKY,
+            sky_rgb: None,
             realm: ModelRealm::default(),
         }
+    }
+
+    /// ADR 0064: an instance's sky reaches its vertices: the tinted channels where colored glass
+    /// tinted it, its light's sky level three times without tint. A new tint poses it again.
+    #[test]
+    fn an_instance_carries_its_sky() {
+        let (m, t) = (model(), texture());
+        let mut draws = vec![draw(1, &m, &t, DVec3::new(10.5, 64.0, -3.25))];
+        draws[0].light = LightValue::new(9, 0, 0, 0);
+        let mut scene = ModelScene::default();
+        let origin = I64Vec3::new(8, 65, -2);
+        assert!(scene.update(&draws, origin, Vec3::splat(0.5), Quat::IDENTITY));
+        assert!(scene.vertices().iter().all(|v| v.sky == 0x999));
+        draws[0].sky_rgb = Some([13, 7, 6]);
+        assert!(scene.update(&draws, origin, Vec3::splat(0.5), Quat::IDENTITY));
+        assert_eq!(scene.last_posed(), 1);
+        assert!(scene.vertices().iter().all(|v| v.sky == 0xD76));
     }
 
     #[test]

@@ -1332,6 +1332,7 @@ mod tests {
                 light_len: 1,
                 walls: [0; 6],
                 neighbors: 0,
+                tinted: 0,
             });
         }
         table

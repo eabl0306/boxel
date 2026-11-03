@@ -565,6 +565,9 @@ pub struct ModelDraw {
     pub scale: f32,
     /// Its light this frame.
     pub light: LightValue,
+    /// The sky's red, green and blue at its light's cell, when colored glass tinted it (ADR
+    /// 0064): each sky channel lights it in place of `light`'s sky level. `None`: no tint.
+    pub sky_rgb: Option<[u8; 3]>,
     /// The realm it is lit in.
     pub realm: ModelRealm,
 }
@@ -601,6 +604,7 @@ impl PartialEq for ModelDraw {
             && self.origin == other.origin
             && self.scale == other.scale
             && self.light == other.light
+            && self.sky_rgb == other.sky_rgb
             && self.realm == other.realm
             && self.pose == other.pose
     }

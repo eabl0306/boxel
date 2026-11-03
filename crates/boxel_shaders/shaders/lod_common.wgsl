@@ -46,7 +46,7 @@ const LOD_OUT_DARK_SHIFT: u32 = 28u;
 
 // What the vertex stage hands the fragment: a LOD quad is an opaque cube face lit as open sky
 // with AO open, so only its face, texture and flags and the distance for the fog are needed (6
-// values where the terrain's VsOut has 14: the vertex stage is what LOD costs).
+// values where the terrain's VsOut has 16: the vertex stage is what LOD costs).
 struct LodOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) @interpolate(flat) bits: u32,

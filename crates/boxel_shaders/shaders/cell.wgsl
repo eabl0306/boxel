@@ -13,8 +13,10 @@
 //   data.x = image layer (12 bits) | face (3 bits) << 12 | full bright (1 bit) << 15 | the
 //            cell's LightValue << 16
 //   data.y = tint, sRGB 0xRRGGBB | opacity (8 bits, translucent quads only) << 24
+//   sky    = the sky's red, green and blue at the cell (0x0RGB, ADR 0064): the LightValue's sky
+//            level three times where the sky has no tint
 // fs_cell is a cutout terrain fragment: alpha test, then shade_fragment with the quad's face,
-// its cell's light at the 4 corners, AO open, its chunk's realm (realm planes are chunk
+// its cell's light at the 4 corners (its sky per channel where it is tinted), AO open, its chunk's realm (realm planes are chunk
 // aligned, so the chunk's realm is its cell's) and the dynamic lights near it (ADR 0062). fs_cell_translucent (ADR 0055, its pipeline
 // blends and writes depth) shades the same way and gives the image's alpha times the opacity,
 // dropping texels of alpha under a tenth as Minecraft's translucent item shader does.
@@ -41,8 +43,12 @@ struct CellOut {
   @location(0) uv: vec2<f32>,
   @location(1) @interpolate(flat) data: vec2<u32>,
   @location(2) view_dist: f32,
-  @location(3) @interpolate(flat) realm: u32,      // the realm of the quad's chunk (realm_at), then the dynamic lights that may reach it from bit 16 (AO_DYNAMIC_SHIFT)
+  @location(3) @interpolate(flat) realm: u32,      // the realm of the quad's chunk (realm_at), the sky's red, green and blue from bit 4 (CELL_SKY_SHIFT), then the dynamic lights that may reach it from bit 16 (AO_DYNAMIC_SHIFT)
 };
+
+// Where CellOut::realm keeps the cell's sky red, green and blue (12 bits, between the realm and
+// the dynamic lights).
+const CELL_SKY_SHIFT: u32 = 4u;
 
 // A cell quad's corners are within about a block of each other, so the dynamic lights within
 // this many blocks of the reach of one corner hold every light of the quad.
@@ -60,6 +66,7 @@ fn vs_cell(
   @location(1) pos: vec3<f32>,
   @location(2) uv: vec2<f32>,
   @location(3) data: vec2<u32>,
+  @location(4) sky: u32,
 ) -> CellOut {
   let rel = cell_rel(origin, pos);
   var o: CellOut;
@@ -67,7 +74,7 @@ fn vs_cell(
   o.uv = uv;
   o.data = data;
   o.view_dist = length(rel - view.camera_rel.xyz);
-  o.realm = realm_at(origin.y - view.render_origin.y);
+  o.realm = realm_at(origin.y - view.render_origin.y) | ((sky & TINT_CORNER_MASK) << CELL_SKY_SHIFT);
   if (view.dynamic_count.x != 0u) {
     let lights = dynamic_mask(rel - vec3(CELL_DYNAMIC_MARGIN), rel + vec3(CELL_DYNAMIC_MARGIN));
     o.realm = o.realm | (lights << AO_DYNAMIC_SHIFT);
@@ -112,6 +119,7 @@ fn vs_cell_pattern(
   @location(1) pos: vec3<f32>,
   @location(2) uv: vec2<f32>,
   @location(3) data: vec2<u32>,
+  @location(4) sky: u32,
 ) -> CellOut {
   let rel = cell_rel(origin, pos);
   var o: CellOut;
@@ -141,16 +149,25 @@ fn cell_display(c: vec3<f32>) -> vec3<f32> {
   return select(high, low, c <= vec3(0.0031308));
 }
 
-// The quad's texel `albedo` shaded as a terrain fragment: tint, face, the cell's light, fog.
+// The quad's texel `albedo` shaded as a terrain fragment: tint, face, the cell's light, fog. A
+// cell whose sky is not its light's sky level three times (ADR 0064) is shaded as a tinted
+// entry with its sky at the 4 corners and its block light flat (with_tint); the rest as before.
 fn cell_shade(albedo: vec4<f32>, i: CellOut) -> vec4<f32> {
   let tint = vec3<f32>((vec3(i.data.y) >> vec3(16u, 8u, 0u)) & vec3(255u)) / 255.0;
   let light = i.data.x >> CELL_LIGHT_SHIFT;
-  let corners = light | (light << 16u);
+  var corners = light | (light << 16u);
   var v: VsOut;
   v.clip = i.clip;
   v.uv = i.uv;
   v.layer = 0u;
   v.face = (i.data.x >> CELL_FACE_SHIFT) & 7u;
+  let sky = (i.realm >> CELL_SKY_SHIFT) & TINT_CORNER_MASK;
+  let level = (light >> LIGHT_SKY_SHIFT) & 15u;
+  if (sky != (level | (level << 4u) | (level << 8u))) {
+    corners = sky | (sky << TINT_CORNER_BITS);
+    let block = light & TINT_CORNER_MASK;
+    v = with_tint(v, vec2(block | (block << TINT_CORNER_BITS), block | (block << TINT_CORNER_BITS)));
+  }
   v.view_dist = i.view_dist;
   v.st = vec2(0.0);
   v.light = vec2(corners, corners);

@@ -10,6 +10,8 @@
 //          never shows a neighbor's column at its edge
 //   data = the instance's light (a LightValue: sky:4 | red:4 | green:4 | blue:4) | the face's
 //          shade (0..255, 255 = 1) << 16 | the instance's realm (4 bits) << 24
+//   sky  = the sky's red, green and blue at the instance (0x0RGB, ADR 0064), what lights it:
+//          the light's sky level three times where the sky has no tint
 // The fragment lights the skin as the terrain is lit (the brightness curve, the sky color of the
 // time of day and the ambient floor of the instance's realm, the block light gain), without AO,
 // then fades it into the fog. The face's shade is the CPU's (it takes the realm's into account).
@@ -26,6 +28,7 @@ struct ModelOut {
   @location(1) @interpolate(flat) rect: vec4<u32>,
   @location(2) @interpolate(flat) data: u32,
   @location(3) view_dist: f32,
+  @location(4) @interpolate(flat) sky: u32,
 };
 
 @vertex
@@ -34,12 +37,14 @@ fn vs_model(
   @location(1) uv: vec2<f32>,
   @location(2) rect: vec4<u32>,
   @location(3) data: u32,
+  @location(4) sky: u32,
 ) -> ModelOut {
   var o: ModelOut;
   o.clip = view.view_proj * vec4(pos, 1.0);
   o.uv = uv;
   o.rect = rect;
   o.data = data;
+  o.sky = sky;
   o.view_dist = length(pos - view.camera_rel.xyz);
   return o;
 }
@@ -53,11 +58,15 @@ fn model_texel(i: ModelOut) -> vec4<f32> {
 }
 
 // albedo * face shade * light, then the distance fog (`shade_fragment` of the terrain, with one
-// light for the whole instance and no AO).
+// light for the whole instance and no AO). The sky is lit per channel from `sky` (ADR 0064),
+// each through the curve, as the terrain's tinted_light: without tint all three are the light's
+// sky level, and the floats are those of curve(sky level) * sky color. Sun shadows (ADR 0065,
+// lane S5) will scale the sky term by their factor here.
 fn model_shade(albedo: vec3<f32>, i: ModelOut) -> vec4<f32> {
   let l = vec4<f32>((vec4(i.data) >> vec4(LIGHT_SKY_SHIFT, LIGHT_RED_SHIFT, LIGHT_GREEN_SHIFT, LIGHT_BLUE_SHIFT)) & vec4(15u));
   let env = realm_env((i.data >> MODEL_REALM_SHIFT) & 15u);
-  let sky = level_curve(l.x) * env.sky.rgb;
+  let rgb = vec3<f32>((vec3(i.sky) >> vec3(8u, 4u, 0u)) & vec3(15u));
+  let sky = vec3(level_curve(rgb.x), level_curve(rgb.y), level_curve(rgb.z)) * env.sky.rgb;
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
   let light = max(max(sky, block), env.ambient.rgb);
   let shade = f32((i.data >> 16u) & 255u) / 255.0;

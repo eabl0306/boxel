@@ -823,7 +823,8 @@ impl VoxelRenderer {
             pages,
             layout,
             growth,
-            chunks: ChunkTable::new(slots),
+            // High draws tinted faces exactly, Mid and Low with one kind flat (ADR 0064).
+            chunks: ChunkTable::new(slots).with_exact_tints(tier == Tier::High),
             chunk_buffer,
             copies: Vec::new(),
             probe: Vec::new(),
@@ -2312,6 +2313,7 @@ mod tests {
                 light_len: 1,
                 walls: [0; 6],
                 neighbors: 0,
+                tinted: 0,
             });
         };
         // A closed world seen from chunk (0, 0, 0): its 6 neighbors are visible, the rest of

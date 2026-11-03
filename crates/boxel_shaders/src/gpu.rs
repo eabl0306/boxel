@@ -228,7 +228,9 @@ pub struct ChunkGpu {
     pub counts: [u32; 8],
     /// Bit 0 = [`ChunkGpu::FLAG_LIVE`]; bit `1 + f` ([`ChunkGpu::NEIGHBOR_SHIFT`]) set while
     /// the chunk across the border the walls of face bucket `f` close is resident: the cull
-    /// leaves those walls out.
+    /// leaves those walls out. From [`ChunkGpu::TINTED_SHIFT`], the tinted entries at the start
+    /// of its light palette (ADR 0064), and [`ChunkGpu::FLAG_TINT_EXACT`]. The cull reads bits
+    /// 0 to 6 only.
     pub flags: u32,
     /// First entry of the chunk's light palette in its page (`quad_base` + total quads): High
     /// and Mid read a quad's 4 corner lights at `light_base` + its palette index.
@@ -254,7 +256,24 @@ impl ChunkGpu {
     pub const WALL_SHIFT: u32 = Self::COUNT_BITS;
     /// Where the neighbor bits start in [`ChunkGpu::flags`] (6 bits, face bucket order).
     pub const NEIGHBOR_SHIFT: u32 = 1;
+    /// Where the count of tinted light palette entries (`boxel_mesh::ChunkMesh::tinted_entries`,
+    /// ADR 0064) starts in [`ChunkGpu::flags`]: a quad whose palette index is below it reads a
+    /// tinted entry. 0 in a chunk without colored sky, whose entry is then as before.
+    pub const TINTED_SHIFT: u32 = 7;
+    /// Mask of the tinted entry count (after the shift): 13 bits, `0..=4096`.
+    pub const TINTED_MASK: u32 = 0x1FFF;
+    /// `flags` bit: the exact part of each tinted entry (`boxel_mesh::ChunkMesh::tinted_exact`)
+    /// follows the light palette, at `light_base + light_len + index`, and the tinted faces are
+    /// drawn exactly. Only High sets it (owner decision 1 of ADR 0064): Mid draws the same
+    /// entries with the other kind of light flat, as Low does.
+    pub const FLAG_TINT_EXACT: u32 = 1 << 20;
 }
+
+const _: () = assert!(
+    ChunkGpu::TINTED_MASK as usize >= 4096
+        && ChunkGpu::TINTED_SHIFT >= ChunkGpu::NEIGHBOR_SHIFT + 6
+        && ChunkGpu::FLAG_TINT_EXACT == 1 << (ChunkGpu::TINTED_SHIFT + 13)
+);
 
 /// Per-draw reference read as an instance-step `Uint32x2` vertex attribute (location 0) by
 /// `vs_pull`: which chunk slot and which first quad. 8 bytes.
@@ -271,7 +290,8 @@ pub struct DrawRef {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct ChunkImmediate {
-    /// xyz = world voxel origin (low 32 bits, like [`ChunkGpu::origin`]), w = 0.
+    /// xyz = world voxel origin (low 32 bits, like [`ChunkGpu::origin`]), w = the tinted entries
+    /// at the start of the chunk's light palette (ADR 0064; 0 without colored sky).
     pub origin: [i32; 4],
 }
 
@@ -487,8 +507,8 @@ const _: () = assert!(lod::SEGMENT_DRAWS <= bindings::MAX_DRAWS_PER_LIST);
 const _: () = assert!(size_of::<LodNodeGpu>() == 64);
 
 /// One vertex of a posed entity model (`model.wgsl`, ADR 0040): 32 bytes in one vertex-step
-/// buffer, attributes `Float32x3`, `Float32x2`, `Uint16x4` and `Uint32` at locations 0 to 3
-/// ([`model::ATTRIBUTE_OFFSETS`]). The CPU writes the positions already posed and relative to the
+/// buffer, attributes `Float32x3`, `Float32x2`, `Uint16x4`, `Uint32` and `Uint32` at locations 0
+/// to 4 ([`model::ATTRIBUTE_OFFSETS`]). The CPU writes the positions already posed and relative to the
 /// render origin, so every tier draws the same bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -504,6 +524,9 @@ pub struct ModelVertex {
     /// (`0..=255`, 255 = 1) at [`model::SHADE_SHIFT`] and the instance's realm (4 bits, the
     /// `View`'s realm entry its light takes) at [`model::REALM_SHIFT`].
     pub data: u32,
+    /// The sky's red, green and blue at the instance (`0x0RGB`, ADR 0064): the sky level of
+    /// `data`'s light three times where the sky has no tint.
+    pub sky: u32,
 }
 
 /// Constants of the entity model pipeline (`model.wgsl`, ADR 0040).
@@ -515,19 +538,20 @@ pub mod model {
     /// Group of the skin texture (binding 0, `texture_2d<f32>` read with `textureLoad`). The
     /// `View` uniform stays in [`super::bindings::GROUP_VIEW`].
     pub const GROUP_SKIN: u32 = 0;
-    /// Byte offsets of the four attributes of [`super::ModelVertex`].
-    pub const ATTRIBUTE_OFFSETS: [u64; 4] = [0, 12, 20, 28];
+    /// Byte offsets of the five attributes of [`super::ModelVertex`].
+    pub const ATTRIBUTE_OFFSETS: [u64; 5] = [0, 12, 20, 28, 32];
 }
 
-const _: () = assert!(size_of::<ModelVertex>() == 32);
+const _: () = assert!(size_of::<ModelVertex>() == 36);
 const _: () = assert!(std::mem::offset_of!(ModelVertex, uv) as u64 == model::ATTRIBUTE_OFFSETS[1]);
 const _: () =
     assert!(std::mem::offset_of!(ModelVertex, rect) as u64 == model::ATTRIBUTE_OFFSETS[2]);
 const _: () =
     assert!(std::mem::offset_of!(ModelVertex, data) as u64 == model::ATTRIBUTE_OFFSETS[3]);
+const _: () = assert!(std::mem::offset_of!(ModelVertex, sky) as u64 == model::ATTRIBUTE_OFFSETS[4]);
 
-/// One vertex of a cell quad (`cell.wgsl`, ADR 0050): 40 bytes in one vertex-step buffer,
-/// attributes `Sint32x3`, `Float32x3`, `Float32x2` and `Uint32x2` at locations 0 to 3
+/// One vertex of a cell quad (`cell.wgsl`, ADR 0050): 44 bytes in one vertex-step buffer,
+/// attributes `Sint32x3`, `Float32x3`, `Float32x2`, `Uint32x2` and `Uint32` at locations 0 to 4
 /// ([`cell::ATTRIBUTE_OFFSETS`]). The CPU writes them once per chunk mesh: the shader subtracts
 /// the render origin from the chunk's, as the terrain does, so a camera move uploads nothing.
 #[repr(C)]
@@ -543,6 +567,9 @@ pub struct CellVertex {
     /// ([`cell::FULL_BRIGHT`]) and the cell's light ([`cell::LIGHT_SHIFT`]); `[1]`: the tint,
     /// sRGB `0xRRGGBB`, and a translucent quad's opacity ([`cell::OPACITY_SHIFT`]).
     pub data: [u32; 2],
+    /// The sky's red, green and blue at the cell (`0x0RGB`, ADR 0064): the sky level of the
+    /// cell's light three times where the sky has no tint.
+    pub sky: u32,
 }
 
 /// Constants of the cell quad pipeline (`cell.wgsl`, ADR 0050).
@@ -563,14 +590,15 @@ pub mod cell {
     /// Group of the cell texture array (binding 0) and its sampler (binding 1). The `View`
     /// uniform stays in [`super::bindings::GROUP_VIEW`].
     pub const GROUP_TEXTURES: u32 = 0;
-    /// Byte offsets of the four attributes of [`super::CellVertex`].
-    pub const ATTRIBUTE_OFFSETS: [u64; 4] = [0, 12, 24, 32];
+    /// Byte offsets of the five attributes of [`super::CellVertex`].
+    pub const ATTRIBUTE_OFFSETS: [u64; 5] = [0, 12, 24, 32, 40];
 }
 
-const _: () = assert!(size_of::<CellVertex>() == 40);
+const _: () = assert!(size_of::<CellVertex>() == 44);
 const _: () = assert!(std::mem::offset_of!(CellVertex, pos) as u64 == cell::ATTRIBUTE_OFFSETS[1]);
 const _: () = assert!(std::mem::offset_of!(CellVertex, uv) as u64 == cell::ATTRIBUTE_OFFSETS[2]);
 const _: () = assert!(std::mem::offset_of!(CellVertex, data) as u64 == cell::ATTRIBUTE_OFFSETS[3]);
+const _: () = assert!(std::mem::offset_of!(CellVertex, sky) as u64 == cell::ATTRIBUTE_OFFSETS[4]);
 
 /// Matches `wgpu::util::DrawIndexedIndirectArgs` and WGSL `DrawArgs` (20 bytes, tightly packed).
 #[repr(C)]

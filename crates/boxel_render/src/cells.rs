@@ -168,8 +168,16 @@ fn texture_group(
     })
 }
 
-/// The 6 vertices of `q` (two triangles) in a chunk whose GPU origin is `origin`.
-pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6] {
+/// The sky's red, green and blue of a cell quad without tint (`0x0RGB`): its light's sky level
+/// in all three channels.
+const fn gray_sky(light: LightValue) -> u16 {
+    let s = light.sky() as u16;
+    s << 8 | s << 4 | s
+}
+
+/// The 6 vertices of `q` (two triangles) in a chunk whose GPU origin is `origin`, its sky's
+/// red, green and blue `sky` (`0x0RGB`, ADR 0064; [`gray_sky`] of its light without tint).
+pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad, sky: u16) -> [CellVertex; 6] {
     let c = &q.quad;
     let data0 = (u32::from(c.image) & cell::LAYER_MASK)
         | (c.face as u32) << cell::FACE_SHIFT
@@ -187,6 +195,7 @@ pub(crate) fn quad_vertices(origin: [i32; 3], q: &LitCellQuad) -> [CellVertex; 6
         pos: c.corners[k],
         uv: c.uv[k],
         data,
+        sky: u32::from(sky),
     })
 }
 
@@ -333,9 +342,10 @@ impl QuadList {
         self.sort.clear();
     }
 
-    /// Appends `q` (corners from `origin`, whose GPU origin is `gpu`), with its sort entry.
-    fn push(&mut self, origin: I64Vec3, gpu: [i32; 3], q: &LitCellQuad) {
-        self.vertices.extend(quad_vertices(gpu, q));
+    /// Appends `q` (corners from `origin`, whose GPU origin is `gpu`, its sky `sky`), with its
+    /// sort entry.
+    fn push(&mut self, origin: I64Vec3, gpu: [i32; 3], q: &LitCellQuad, sky: u16) {
+        self.vertices.extend(quad_vertices(gpu, q, sky));
         if q.quad.blend.is_translucent() && !is_pattern(&q.quad) {
             self.sort.push(SortQuad::new(origin, &q.quad));
         }
@@ -485,7 +495,9 @@ const fn list_of(source: CellImage) -> usize {
 }
 
 /// The vertices of every chunk of `store` in `lists`, each quad in the list of its blend and
-/// texture array ([`Lists::list`]), each chunk's run of a list recorded with its origin.
+/// texture array ([`Lists::list`]), each chunk's run of a list recorded with its origin. Each
+/// quad takes its sky from [`ChunkMesh::cell_sky_rgb`] (ADR 0064), or without tint where that is
+/// empty (or, malformed, shorter than the quads).
 fn fill(lists: &mut Lists, store: &CellStore) {
     lists.clear();
     for (origin, mesh) in store.chunks.values() {
@@ -494,8 +506,12 @@ fn fill(lists: &mut Lists, store: &CellStore) {
             .map(|l| l.vertices.len() as u32)
             .collect::<Vec<_>>();
         let gpu = wrap_to_i32(*origin).to_array();
-        for q in &mesh.cell_quads {
-            lists.list(&q.quad).push(*origin, gpu, q);
+        for (k, q) in mesh.cell_quads.iter().enumerate() {
+            let sky = mesh
+                .cell_sky_rgb
+                .get(k)
+                .map_or_else(|| gray_sky(q.light), |&rgb| rgb & 0xFFF);
+            lists.list(&q.quad).push(*origin, gpu, q, sky);
         }
         for (list, start) in lists.all_mut().zip(starts) {
             let end = list.vertices.len() as u32;
@@ -507,7 +523,8 @@ fn fill(lists: &mut Lists, store: &CellStore) {
 }
 
 /// The vertices of the moving quads `quads` (each with its light) in `lists`, each quad in the
-/// list of its blend and texture array, placed from its cell.
+/// list of its blend and texture array, placed from its cell. Their sky has no tint (ADR 0064:
+/// the moving quads take their cell's uncolored light).
 fn fill_moving(lists: &mut Lists, quads: &[(MovingCellQuad, LightValue)]) {
     lists.clear();
     for &(moving, light) in quads {
@@ -518,7 +535,7 @@ fn fill_moving(lists: &mut Lists, quads: &[(MovingCellQuad, LightValue)]) {
         };
         lists
             .list(&moving.quad)
-            .push(cell, wrap_to_i32(cell).to_array(), &lit);
+            .push(cell, wrap_to_i32(cell).to_array(), &lit, gray_sky(light));
     }
 }
 
@@ -629,7 +646,7 @@ impl CellPass {
             bind_group_layouts: &groups,
             immediate_size: 0,
         });
-        let [o0, o1, o2, o3] = cell::ATTRIBUTE_OFFSETS;
+        let [o0, o1, o2, o3, o4] = cell::ATTRIBUTE_OFFSETS;
         let attribute = |format, offset, shader_location| wgpu::VertexAttribute {
             format,
             offset,
@@ -640,6 +657,7 @@ impl CellPass {
             attribute(wgpu::VertexFormat::Float32x3, o1, 1),
             attribute(wgpu::VertexFormat::Float32x2, o2, 2),
             attribute(wgpu::VertexFormat::Uint32x2, o3, 3),
+            attribute(wgpu::VertexFormat::Uint32, o4, 4),
         ];
         let build = |label: &str,
                      (vertex, fragment): (&str, &str),
@@ -1175,17 +1193,51 @@ mod tests {
     #[test]
     fn a_quad_is_two_triangles_with_its_data_packed() {
         let m = mesh(1);
-        let v = quad_vertices([1, -2, 3], &m.cell_quads[0]);
+        let v = quad_vertices([1, -2, 3], &m.cell_quads[0], 0x123);
         assert_eq!(
             v.map(|v| v.pos),
             TRIANGLES.map(|k| m.cell_quads[0].quad.corners[k])
         );
-        assert!(v.iter().all(|v| v.origin == [1, -2, 3]));
+        assert!(v.iter().all(|v| v.origin == [1, -2, 3] && v.sky == 0x123));
         let face = Face::NegZ as u32;
         assert_eq!(
             v[0].data,
             [5 | face << 12 | 0x8000 | 0xABCD << 16, 0x01_02_03]
         );
+    }
+
+    /// ADR 0064: a cell quad takes its sky's channels from the mesh, or its light's sky level
+    /// three times where the mesh has none (no tint, or a moving quad).
+    #[test]
+    fn cell_quads_take_their_sky_from_the_mesh() {
+        let sky = |lists: &Lists| -> Vec<u32> {
+            lists
+                .all()
+                .flat_map(|l| l.vertices.iter().map(|v| v.sky))
+                .collect()
+        };
+        let mut store = CellStore::default();
+        store.upsert(1, I64Vec3::ZERO, &mesh(2));
+        let mut lists = Lists::default();
+        fill(&mut lists, &store);
+        assert_eq!(
+            sky(&lists),
+            [0xAAA; 12],
+            "no tint: sky 10 (0xABCD) three times"
+        );
+        let mut tinted = (*mesh(2)).clone();
+        tinted.cell_sky_rgb = vec![0xA76, 0x5AA];
+        store.upsert(1, I64Vec3::ZERO, &Arc::new(tinted));
+        fill(&mut lists, &store);
+        let want: Vec<u32> = [0xA76; 6].into_iter().chain([0x5AA; 6]).collect();
+        assert_eq!(sky(&lists), want);
+        let quad = mesh(1).cell_quads[0].quad;
+        let moving = MovingCellQuad {
+            cell: BlockPos::new(0, 0, 0),
+            quad,
+        };
+        fill_moving(&mut lists, &[(moving, LightValue(0x7123))]);
+        assert_eq!(sky(&lists), [0x777; 6]);
     }
 
     #[test]

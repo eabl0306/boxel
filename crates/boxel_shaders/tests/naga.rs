@@ -412,6 +412,104 @@ fn wgsl_light_nibbles_match_light_value() {
     assert_eq!(entry, [0x5678_1234, 0xdef0_9abc]);
 }
 
+/// Colored sky (ADR 0064): the tinted entry layout is `boxel_mesh`'s, the tinted entry count and
+/// the exact flag sit in `ChunkGpu::flags` where the mirror puts them (above the cull's bits),
+/// and a tinted quad's corners and bit fit the free bits of `VsOut::face` and `VsOut::layer`:
+/// `VsOut::ao` is full (its bits 16 to 31 are the dynamic lights of ADR 0062), and a varying of
+/// its own cost 17 to 21 % of the fps.
+#[test]
+fn wgsl_tint_layout_matches_boxel_mesh_and_the_chunk_mirror() {
+    use boxel_mesh::layout as l;
+    use boxel_shaders::gpu::MAX_DYNAMIC_LIGHTS;
+    for id in [
+        ShaderModuleId::VoxelPull,
+        ShaderModuleId::VoxelInstanced,
+        ShaderModuleId::Cell,
+    ] {
+        let (module, _) = load(id);
+        for (name, v) in [
+            ("TINT_CORNER_BITS", l::TINT_CORNER_BITS),
+            ("TINT_CORNER_MASK", l::TINT_CORNER_MASK),
+            ("TINT_FLAT_SHIFT", l::TINT_FLAT_SHIFT),
+            ("TINT_TAG_BIT", l::TINT_TAG_BIT),
+            ("CHUNK_TINTED_SHIFT", ChunkGpu::TINTED_SHIFT),
+            ("CHUNK_TINTED_MASK", ChunkGpu::TINTED_MASK),
+            ("CHUNK_TINT_EXACT", ChunkGpu::FLAG_TINT_EXACT),
+        ] {
+            assert_eq!(const_u32(&module, name), v, "{id:?} {name}");
+        }
+        assert_eq!(const_u32(&module, "TINT_QUAD"), 1 << 31, "{id:?}");
+        assert_eq!(
+            const_u32(&module, "AO_DYNAMIC_SHIFT") as usize + MAX_DYNAMIC_LIGHTS,
+            32
+        );
+    }
+    assert_eq!(l::TINT_SKY_CORNERS, 0);
+    const {
+        assert!(
+            2 * l::TINT_CORNER_BITS < 31,
+            "the corners stay below TINT_QUAD"
+        );
+    };
+    // A tinted entry round trips through the shader's decode: corners, flat value and tag.
+    let corners = [
+        boxel_mesh::ColoredLight::new([13, 7, 6], [1, 2, 3]),
+        boxel_mesh::ColoredLight::new([12, 6, 5], [4, 5, 6]),
+        boxel_mesh::ColoredLight::new([11, 5, 4], [7, 8, 9]),
+        boxel_mesh::ColoredLight::new([10, 4, 3], [10, 11, 12]),
+    ];
+    let (entry, exact) = boxel_mesh::pack_tinted_entry(corners);
+    let corner = |w: [u32; 2], k: usize| {
+        (w[k >> 1] >> (l::TINT_CORNER_BITS * (k as u32 & 1))) & l::TINT_CORNER_MASK
+    };
+    let block_corners = (entry[1] >> l::TINT_TAG_BIT) & 1 == l::TINT_BLOCK_CORNERS;
+    for (k, c) in corners.iter().enumerate() {
+        let (kept, other) = if block_corners {
+            (c.block, c.sky)
+        } else {
+            (c.sky, c.block)
+        };
+        assert_eq!(
+            (corner(entry, k), corner(exact, k)),
+            (u32::from(kept), u32::from(other))
+        );
+    }
+    // The count starts right after the bits the cull reads (live and neighbors, masked).
+    assert_eq!(ChunkGpu::NEIGHBOR_SHIFT + 6, ChunkGpu::TINTED_SHIFT);
+    // No varying more (a varying costs every fragment): the tint rides in the free bits of
+    // VsOut::face (above the 3 of the face) and VsOut::layer (above the 12 of the layer), which
+    // hold 24 + 4 and 20 bits of the other kind's corners and the tinted bit, without overlap.
+    let (module, _) = load(ShaderModuleId::VoxelPull);
+    let (face, low, layer) = (
+        const_u32(&module, "TINT_FACE_SHIFT"),
+        const_u32(&module, "TINT_FACE_LOW_SHIFT"),
+        const_u32(&module, "TINT_LAYER_SHIFT"),
+    );
+    assert_eq!((face, low, layer), (3, 27, 12));
+    assert_eq!(face + 2 * l::TINT_CORNER_BITS, low);
+    assert_eq!(low + 4, 31, "the tinted bit is the face's last");
+    assert_eq!(l::MAT_LAYER_MASK + 1, 1 << layer);
+    assert_eq!(layer + (2 * l::TINT_CORNER_BITS - 4), 32);
+    for id in [ShaderModuleId::VoxelPull, ShaderModuleId::VoxelInstanced] {
+        let (module, _) = load(id);
+        let fs = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == "fs_opaque")
+            .expect("fs_opaque");
+        let naga::TypeInner::Struct { members, .. } =
+            &module.types[fs.function.arguments[0].ty].inner
+        else {
+            panic!("fs_opaque takes VsOut");
+        };
+        assert_eq!(
+            members.len(),
+            8,
+            "{id:?}: the position and 7 varyings, as before ADR 0064"
+        );
+    }
+}
+
 #[test]
 fn cull_clamps_to_the_index_buffer_of_boxel_mesh() {
     let (module, _) = load(ShaderModuleId::Cull);
@@ -809,9 +907,9 @@ fn ui_binds_one_texture_and_nothing_else() {
 
 /// The entity model pipeline (ADR 0040) runs on every tier, the Low one on GL included: one
 /// uniform block (the View) and one texture read with `textureLoad` (the skin), no sampler,
-/// storage buffer or immediates; the vertex is four attributes of one vertex-step buffer, of the
-/// types `ModelVertex` gives them, and the face's rectangle and the light reach the fragment
-/// flat.
+/// storage buffer or immediates; the vertex is five attributes of one vertex-step buffer, of the
+/// types `ModelVertex` gives them (36 bytes, the sky's red, green and blue last, ADR 0064), and
+/// the face's rectangle, the light and the sky reach the fragment flat.
 #[test]
 fn model_binds_one_uniform_block_and_one_texture() {
     let id = ShaderModuleId::Model;
@@ -903,9 +1001,11 @@ fn model_binds_one_uniform_block_and_one_texture() {
                 }
             ),
             (3, naga::TypeInner::Scalar(uint)),
+            (4, naga::TypeInner::Scalar(uint)),
         ]
     );
-    // The face's rectangle and the light are flat in every fragment entry point.
+    assert_eq!(size_of::<boxel_shaders::gpu::ModelVertex>(), 36);
+    // The face's rectangle, the light and the sky are flat in every fragment entry point.
     for name in ["fs_model_opaque", "fs_model_cutout"] {
         let fs = module
             .entry_points
@@ -928,7 +1028,7 @@ fn model_binds_one_uniform_block_and_one_texture() {
                 _ => None,
             })
             .collect();
-        assert_eq!(flat, [1, 2], "{name}");
+        assert_eq!(flat, [1, 2, 4], "{name}");
     }
     assert_eq!(const_u32(&module, "LIGHT_SKY_SHIFT"), 12);
     assert_eq!(boxel_shaders::gpu::model::SHADE_SHIFT, 16);
@@ -1564,8 +1664,9 @@ fn lod_seams_are_drawn_where_a_seam_can_show() {
 /// The cell quad pipelines (ADR 0050, the translucent one of ADR 0055, the pattern one of ADR
 /// 0056) run on every tier, the Low one on GL included: one uniform block (the View) and one
 /// texture/sampler pair (the cell, block or pattern texture array) per entry point, no storage
-/// buffer or immediates; the vertex is the four attributes `CellVertex` gives, the data reaches
-/// the fragment flat, and the shader's bit layout is `boxel_shaders::gpu::cell`'s.
+/// buffer or immediates; the vertex is the five attributes `CellVertex` gives (44 bytes, the sky's
+/// red, green and blue last, ADR 0064), the data reaches the fragment flat, and the shader's bit
+/// layout is `boxel_shaders::gpu::cell`'s.
 #[test]
 fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
     use boxel_shaders::gpu::cell;
@@ -1625,32 +1726,37 @@ fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
             ("vs_cell_pattern", (1, 0, 0))
         ]
     );
-    let vs = module
-        .entry_points
-        .iter()
-        .find(|e| e.name == "vs_cell")
-        .expect("vs_cell");
-    let attributes: Vec<_> = vs
-        .function
-        .arguments
-        .iter()
-        .filter_map(|arg| match arg.binding {
-            Some(naga::Binding::Location { location, .. }) => {
-                Some((location, module.types[arg.ty].inner.clone()))
-            }
-            _ => None,
-        })
-        .collect();
     let vector = |size, scalar| naga::TypeInner::Vector { size, scalar };
-    assert_eq!(
-        attributes,
-        [
-            (0, vector(naga::VectorSize::Tri, naga::Scalar::I32)),
-            (1, vector(naga::VectorSize::Tri, naga::Scalar::F32)),
-            (2, vector(naga::VectorSize::Bi, naga::Scalar::F32)),
-            (3, vector(naga::VectorSize::Bi, naga::Scalar::U32)),
-        ]
-    );
+    for name in ["vs_cell", "vs_cell_pattern"] {
+        let vs = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == name)
+            .expect(name);
+        let attributes: Vec<_> = vs
+            .function
+            .arguments
+            .iter()
+            .filter_map(|arg| match arg.binding {
+                Some(naga::Binding::Location { location, .. }) => {
+                    Some((location, module.types[arg.ty].inner.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attributes,
+            [
+                (0, vector(naga::VectorSize::Tri, naga::Scalar::I32)),
+                (1, vector(naga::VectorSize::Tri, naga::Scalar::F32)),
+                (2, vector(naga::VectorSize::Bi, naga::Scalar::F32)),
+                (3, vector(naga::VectorSize::Bi, naga::Scalar::U32)),
+                (4, naga::TypeInner::Scalar(naga::Scalar::U32)),
+            ],
+            "{name}"
+        );
+    }
+    assert_eq!(size_of::<boxel_shaders::gpu::CellVertex>(), 44);
     let fs = module
         .entry_points
         .iter()
@@ -1684,5 +1790,11 @@ fn cell_binds_one_uniform_block_and_one_texture_with_its_sampler() {
     assert_eq!(
         const_u32(&module, "PATTERN_LAYERS_MAX"),
         cell::PATTERN_LAYERS_MAX
+    );
+    // The cell's sky (12 bits, ADR 0064) sits between its realm (4 bits) and the dynamic lights.
+    assert_eq!(const_u32(&module, "CELL_SKY_SHIFT"), 4);
+    assert_eq!(
+        const_u32(&module, "CELL_SKY_SHIFT") + 12,
+        const_u32(&module, "AO_DYNAMIC_SHIFT")
     );
 }

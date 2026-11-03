@@ -165,6 +165,9 @@ pub(crate) struct InstanceFrame {
     pub texel_scale: [f32; 2],
     /// The instance's light (`LightValue` bits).
     pub light: u16,
+    /// The sky's red, green and blue at the instance (`0x0RGB`, ADR 0064; the sky level of
+    /// `light` three times without tint).
+    pub sky: u16,
     /// The realm it is lit in.
     pub realm: super::ModelRealm,
 }
@@ -212,6 +215,7 @@ pub(crate) fn pose_vertices(
                         uv: [uv[0] * su, uv[1] * sv],
                         rect,
                         data,
+                        sky: u32::from(frame.sky),
                     });
                 }
             }
@@ -481,6 +485,7 @@ mod tests {
             to_space: model_to_local(Vec3::ZERO, 1.0),
             texel_scale: [1.0, 1.0],
             light: 0x0F00,
+            sky: 0x5A7,
             realm: crate::model::ModelRealm {
                 index: 5,
                 face_shade: flat,
@@ -499,6 +504,7 @@ mod tests {
             assert_eq!(v.data >> REALM_SHIFT, 5);
             assert_eq!((v.data >> SHADE_SHIFT) & 255, 255);
             assert_eq!(v.data & 0xFFFF, 0x0F00);
+            assert_eq!(v.sky, 0x5A7);
         }
     }
 
@@ -513,6 +519,7 @@ mod tests {
                 * model_to_local(Vec3::new(0.0, 12.0, 0.0), 16.0),
             texel_scale: [2.0, 2.0],
             light: 0xF000,
+            sky: 0xFFF,
             realm: crate::model::ModelRealm::default(),
         };
         let mut out = [Vec::new(), Vec::new()];

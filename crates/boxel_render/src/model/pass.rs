@@ -68,7 +68,7 @@ impl ModelPass {
             bind_group_layouts: &groups,
             immediate_size: 0,
         });
-        let [o0, o1, o2, o3] = model::ATTRIBUTE_OFFSETS;
+        let [o0, o1, o2, o3, o4] = model::ATTRIBUTE_OFFSETS;
         let attributes = [
             wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Float32x3,
@@ -89,6 +89,11 @@ impl ModelPass {
                 format: wgpu::VertexFormat::Uint32,
                 offset: o3,
                 shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: o4,
+                shader_location: 4,
             },
         ];
         let build = |label: &str, entry: &str, cull_mode: Option<wgpu::Face>| {
