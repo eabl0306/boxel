@@ -116,7 +116,8 @@ just perf-check                        # más de una hora
 
 Corre una matriz fija (`python3 tools/perf/perf.py cases` la lista): RTX y 780M; superficie,
 cueva abierta (ruta y quieta), bosque y bajada; con tope 144 y sin tope; radio 16, más una cueva
-y una superficie en radio 32 en la RTX. Hace 3 corridas intercaladas de 20 s por caso contra el
+y una superficie en radio 32 en la RTX, y el vuelo de superficie a las 15:00 con sombras del sol
+(`shadows`, ADR 0065) en la RTX. Hace 3 corridas intercaladas de 20 s por caso contra el
 binario guardado de la ronda anterior (`bench-results/control/last`, o el tag `perf-control-N`
 más alto si ese archivo se perdió), sin recompilarlo, y mira el estado de la NVIDIA (solo
 lectura). Escribe `docs/rendimiento/control-AAAA-MM-DD.md`. La primera ronda no tiene contra qué

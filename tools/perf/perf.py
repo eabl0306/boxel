@@ -89,7 +89,9 @@ MATRIX = [Case(gpu, scenario, 16, cap)
           for gpu in ('rtx', '780m')
           for scenario in ('surface', 'cave-path', 'cave-static', 'forest', 'dive')
           for cap in (144, 0)] + [Case('rtx', 'cave-path', 32, 144),
-                                  Case('rtx', 'surface', 32, 144)]
+                                  Case('rtx', 'surface', 32, 144)] + [
+    # Sun shadows (ADR 0065), on the RTX only: integrated GPUs keep them off.
+    Case('rtx', 'shadows', 16, cap) for cap in (144, 0)]
 # perf.py edits: runs per cap, their seconds (one scripted edit a second), the caps and the case.
 EDITS_RUNS = 3
 EDITS_S = 30

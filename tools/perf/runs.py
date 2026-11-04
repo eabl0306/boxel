@@ -53,6 +53,7 @@ RADIUS_STEPS = r'^\s*--radius-steps\s'
 SWITCH_SCENARIO = r'--scenario \S*\bswitch\b'
 SKY_SOURCES_FLAG = r'^\s*--sky-sources\s'
 STAINED_GLASS_FLAG = r'^\s*--stained-glass\s'
+SUN_SHADOWS_FLAG = r'^\s*--sun-shadows\s'
 # A binary whose --help has this grows chunk memory (ADR 0035); older ones had a fixed arena.
 GROWS = r'^\s*--chunk-memory\s'
 
@@ -94,6 +95,11 @@ SCENARIOS = {
                             'invernadero de vidrio de color, quieto', (STAINED_GLASS_FLAG,)),
     'glass-house-clear': Scenario('static', (*OVERWORLD, '--clear-glass'),
                                   'invernadero de vidrio común, quieto', (STAINED_GLASS_FLAG,)),
+    # Sun shadows on High (ADR 0065): the surface flight at 15:00 with the maps and the terrain
+    # receiving them. Compare it with surface (noon, no shadows): the difference is the cost of
+    # the shadows and of a lower sun.
+    'shadows': Scenario('fly', (*OVERWORLD, '--speed', '64', '--time', '15:00', '--sun-shadows'),
+                        'superficie, vuelo a 64, 15:00 con sombras del sol', (SUN_SHADOWS_FLAG,)),
     # Chunk memory growing (ADR 0035): settled at radius 8, radius 32 one second into the
     # measurement, from the default floor like every case.
     'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),

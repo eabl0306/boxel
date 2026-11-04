@@ -396,6 +396,29 @@ class CaseTest(unittest.TestCase):
             self.assertTrue(runs.supports(glass, Case(scenario='glass-house-clear')))
             self.assertTrue(runs.supports(glass, Case(scenario='surface-static')))
 
+    def test_the_shadows_case_is_the_surface_flight_at_three_with_sun_shadows(self):
+        case = runs.parse_case('rtx/shadows/r16')
+        args = case.args(10)
+        surface = runs.parse_case('rtx/surface/r16').args(10)
+        self.assertEqual(args[args.index('--scenario') + 1], 'fly')
+        self.assertEqual(args[args.index('--time') + 1], '15:00')
+        self.assertIn('--sun-shadows', args)
+        # the surface flight plus the clock and the shadows
+        rest = [a for a in args if a not in ('--time', '15:00', '--sun-shadows')]
+        self.assertEqual(rest, surface)
+        self.assertEqual(case.label, 'superficie, vuelo a 64, 15:00 con sombras del sol, sin tope')
+        # the control round tracks it on the RTX, with and without the cap
+        self.assertIn(Case('rtx', 'shadows', 16, 144), perf.MATRIX)
+        self.assertIn(Case('rtx', 'shadows', 16, 0), perf.MATRIX)
+        self.assertFalse([c for c in perf.MATRIX if c.scenario == 'shadows' and c.gpu != 'rtx'])
+        with tempfile.TemporaryDirectory() as d:
+            # a binary from before the shadows lacks the case; one with --sun-shadows has it
+            self.assertFalse(runs.supports(fake_binary(d, 'old', HELP),
+                                           Case(scenario='shadows')))
+            sun = fake_binary(d, 'sun', HELP + '  --sun-shadows       sun shadows on High\n')
+            self.assertTrue(runs.supports(sun, Case(scenario='shadows')))
+            self.assertTrue(runs.supports(sun, Case(scenario='surface')))
+
     def test_the_switch_case_flies_the_surface_and_changes_worlds(self):
         case = runs.parse_case('780m/switch/r16')
         args = case.args(10)
