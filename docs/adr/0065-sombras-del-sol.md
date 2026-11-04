@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #9, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
   su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR), el S1
-  (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU) y el S3 (los mapas
-  de sombra). Faltan el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
+  (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU), el S3 (los mapas
+  de sombra) y el S4 (los receptores). Faltan el S5 (celdas y modelos) y el S6 (depuración, demo y
   herramientas).
 - Fecha: 2026-11-03
 
@@ -311,6 +311,49 @@ matriz, el texel, el tramo de distancias, la dirección del sol, la distancia de
 reino de la cámara y 32 bytes libres al final de cada entrada. Falta `k` por reino, que hoy no
 está en el uniform.
 
+### 13. Carril S4: cómo quedó
+
+Desde el S4 las sombras se ven: en High, de día, el cielo baja hasta un 40 % donde no llega el sol.
+
+- `sun_shadow.wgsl` define `sun_factor` con la firma del S1 y el grupo 3: los mapas como
+  `texture_depth_2d_array`, un sampler de comparación (`LessEqual`, lineal: un PCF 2x2) y el
+  uniform entero. Hace lo de la sección 6: sale con 1 si `k` es 0, sin cielo, en otro reino o
+  más allá de la distancia; si no, la rampa en `N . L` (`smoothstep` de 0 a 0,1), la posición
+  con `fragment_position` (sin varying nuevo), 1,5 texels por la normal, la cascada por la
+  distancia exacta, la banda del 10 % y el desvanecido. Un punto fuera de la caja de su cascada
+  cuenta como al sol.
+- `VoxelPullShadowed` es `VoxelPull` con `shadow_common.wgsl` y `sun_shadow.wgsl` en lugar de
+  `sun_off.wgsl`; el resto del texto es el mismo (lo prueba `naga.rs`). Es solo de High
+  (`ShaderModuleId::high_only`).
+- **Distinto de lo que pedía el S3**: `k` no va como 9 floats por reino. Solo se sombrea el reino
+  de la cámara, así que basta su `k`, en el relleno libre de la entrada 0 (`receive.x`). El
+  uniform sigue en 1 KiB.
+- El cambio de pipelines: `VoxelPipelines::shadowed` (opaco, cutout y translúcido) se arma la
+  primera vez que las sombras se prenden y queda. `ShadowPass::receivers` da el grupo 3 solo en
+  un frame que dibujó sus mapas; ese frame High dibuja con los pipelines con sombras, y todos
+  los demás (apagadas, de noche, fuerza 0, reino sin sol, sin chunks con cielo) con los de hoy.
+  La profundidad del agua para la niebla no sombrea nada y sigue con su pipeline.
+- `voxel_world --sun-shadows` las prende, también en GPU integradas; F11 las prende y apaga.
+
+Pruebas, `gpu_sun_shadows.rs` parte 2, en la RTX, la 780M y llvmpipe:
+
+- **Nunca más claro** en todas las escenas.
+- **El oráculo**: por píxel, un rayo desde el ojo da la superficie y su cara, y un rayo exacto
+  hacia el sol dice sombra o sol. Se compara con el cociente entre la imagen con sombras y sin
+  ellas. Pilar a las 12, 15 y 17, una pared con ventana bajo un alero (desde el sur y desde el
+  norte) y la sombra de un pilar sobre un estanque. Fallan como mucho 51 de 27.738 píxeles
+  juzgados (0,2 %), todos junto a bordes. Distinto del plan: la superficie sale de un rayo en la
+  CPU, no de leer la profundidad.
+- **Hojas**: dan menos píxeles en sombra que la misma copa de piedra.
+- **Iguales byte a byte**: dentro de una cueva cerrada, a medianoche, con fuerza 0, en un reino
+  sin sol, con la cámara en otro reino que todo lo que ve y más allá de la distancia.
+- **Coordenadas lejanas**: a 2^31, 2^40 y junto al límite, la misma imagen; con un
+  desplazamiento que no es múltiplo de 1024 cambian 76 a 82 píxeles de 57.600.
+- Mid y Low con sombras prendidas, iguales byte a byte (la prueba del S3).
+- Las pruebas ahora suben la tabla de cajas: antes la losa de la escena no se dibujaba.
+
+Quedan para el S5 las celdas y los modelos: hoy ni dan ni reciben sombra.
+
 ## Medidas
 
 Carril S1, `just perf-smoke surface` contra main (778e7bb), una corrida de 10 s por lado. No
@@ -344,6 +387,29 @@ cascadas, 24 multi-draws en r16 y 42 en r32, sin cubetas perdidas; los recursos 
 
 Con las sombras apagadas: `rtx/surface/r16/uncapped` 2002 -> 1953 fps (-2,5 %), p50 0,45 ->
 0,46 ms, p99 1,10 -> 1,20 ms (una primera corrida dio -7,4 %; repetida, dentro del ruido).
+
+Carril S4, `just perf-smoke` contra main (da1046e), con `--sun-shadows` solo en el lado nuevo:
+el costo total de las sombras (cull, mapas y receptores) contra no tenerlas. No cambia el mundo
+ni el mallador. El smoke sale con 1 porque los fps caen más del 15 %, pero las metas del S4 son
+en ms de p50.
+
+| Caso | fps | p50 ms | p99 ms | Frames sobre 6,94 ms | Meta |
+|---|---:|---:|---:|---:|---|
+| rtx/surface/r16/uncapped | 1842 -> 1501 (-18,5 %) | 0,49 -> 0,59 | 1,60 -> 1,86 | 0 -> 0 | cumple |
+| rtx/forest/r16/uncapped | 3436 -> 2367 (-31,1 %) | 0,26 -> 0,38 | 0,70 -> 0,89 | 0 -> 0 | cumple |
+| rtx/surface/r32/uncapped | 703 -> 622 (-11,5 %) | 1,27 -> 1,34 | 3,53 -> 4,09 | 1 -> 0 | cumple |
+| rtx/surface/r16/uncapped, 17:00 | 1836 -> 1413 (-23,0 %) | 0,50 -> 0,63 | 1,62 -> 1,93 | 0 -> 0 | cumple |
+| rtx/forest/r16/uncapped, 17:00 | 3436 -> 2119 (-38,3 %) | 0,26 -> 0,43 | 0,70 -> 0,98 | 0 -> 0 | cumple |
+| 780m/surface/r16/uncapped | 579 -> 323 (-44,2 %) | 1,51 -> 2,87 | 4,33 -> 7,15 | 1 -> 62 | no cumple |
+
+En la RTX las sombras cuestan entre 0,07 y 0,17 ms de p50 (meta: 0,25), y a las 17:00 lo más.
+Los receptores suman unos 0,02 a 0,04 ms a lo que medía el S3. En la 780M cuestan 1,36 ms (meta:
+0,8), casi todo de los pases de profundidad (1,25 ms en el S3), y hay frames sobre 6,94 ms. Allí
+siguen apagadas por defecto. La primera palanca del S7 sería mapas de 1024 en GPU integradas
+(`resolution` ya es un ajuste): un cuarto de relleno en los pases.
+
+Con las sombras apagadas: `rtx/surface/r16/uncapped` 2012 -> 1983 fps (-1,5 %), p50 0,45 -> 0,46
+ms, p99 1,08 -> 1,11 ms: en ruido.
 
 ## El juego
 
