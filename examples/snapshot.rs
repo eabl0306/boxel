@@ -34,6 +34,14 @@
 //! turns off the fade into the sky at the edge (`RenderSettings::distance_fog`, F10 in
 //! `voxel_world`).
 //!
+//! `--sun-shadows` draws the sun shadows (ADR 0065, High only, integrated GPUs too) and adds
+//! the shadow maps' cascades and draws and the sun's elevation to each `shot:` line;
+//! `--shadows-off-too` also saves each shot without them next to it (`NAME-off.png`).
+//! `--preset NAME` is a scene for the owner's review of the shadows ([`PRESETS`]: noon, 17:00, a
+//! forest, a house with a window, a cave mouth and a lake): its world, camera, edits and shots,
+//! with shadows on and off; `--out DIR` puts relative shot paths there, and the other flags
+//! change the preset (a `--shot` replaces its shots).
+//!
 //! Exit codes: 0 success, 1 usage error, 2 no usable GPU, or rendering or saving failed, 4 the
 //! world did not settle within the timeout. Set `RUST_LOG` for more logging (default filter `warn`).
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
@@ -53,8 +61,8 @@ mod world;
 
 use boxel::camera::{Camera, CameraView};
 use boxel::gfx::{
-    CLI_HELP, GpuPreferences, RgbaImage, init_headless, read_texture_rgba8, run_in_error_scopes,
-    submit_and_wait, wgpu,
+    CLI_HELP, GpuPreferences, RgbaImage, Tier, init_headless, read_texture_rgba8,
+    run_in_error_scopes, submit_and_wait, wgpu,
 };
 use boxel::log::LogPlugin;
 use boxel::mesh::{AoPolicy, ChunkMesh};
@@ -63,15 +71,16 @@ use boxel::render::fog::{FogInput, FogResolution};
 use boxel::render::lod::{LodInput, LodOp};
 use boxel::render::{
     BlockOutline, ChunkOp, DistanceFog, FLUID_TIME_PERIOD, Outline, RenderSettings, RendererConfig,
-    Resync, SceneLight, TextureSource, TranslucentSort, ViewParams, VoxelRenderer,
-    block_outline_edges, light_curve, load_block_textures, texture_tick,
+    Resync, SceneLight, SceneSun, SunShadowSettings, TextureSource, TranslucentSort, ViewParams,
+    VoxelRenderer, block_outline_edges, light_curve, load_block_textures, texture_tick,
 };
 use boxel::voxel::{BlockRegistry, LightValue, MAX_BLOCK_COORD};
 use boxel::world::lod::{LodOps, LodStats, LodWorldPlugin};
 use boxel::world::persist::{PersistPlugin, WorldStore};
 use boxel::world::{
-    BlockTickSettings, BlockTicks, DaylightCurve, FluidPlugin, WorldContent, WorldStats,
+    BlockTickSettings, BlockTicks, DaylightCurve, FluidPlugin, SunPath, WorldContent, WorldStats,
 };
+use boxel_demo::worldgen::SunScene;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
@@ -120,6 +129,14 @@ usage: snapshot --camera X,Y,Z,YAW,PITCH --shot HH:MM=PATH [--shot ...] [options
   --fog-tick N         ticks of the fog clock (64 a second) in the shots: where the wind has
                        taken the cells (default 0)
   --lod-tint           with --lod: tint each LOD level (F9 in voxel_world)
+  --sun-shadows        sun shadows (High only, integrated GPUs too); each shot line gives the
+                       cascades and draws of the maps and the sun's elevation
+  --shadows-off-too    with --sun-shadows: also save each shot without them (PATH-off.png)
+  --preset NAME        a sun shadow scene for review, on High with shadows on and off: noon,
+                       evening (17:00), forest, house, cave-mouth or lake; its world, camera,
+                       edits and shots (NAME-HHMM.png), which other flags change (--shot
+                       replaces its shots)
+  --out DIR            save the shots given with relative paths under DIR
   --timeout S          wall-clock limit for loading the world, in seconds (default 300)
   --help               this text";
 
@@ -208,6 +225,153 @@ struct Options {
     lod_tint: bool,
     /// `--no-distance-fog`: `RenderSettings::distance_fog` off.
     no_distance_fog: bool,
+    /// `--sun-shadows`.
+    sun_shadows: bool,
+    /// `--shadows-off-too`: each shot also without the shadows.
+    shadows_off_too: bool,
+    /// `--preset`.
+    preset: Option<&'static str>,
+}
+
+/// The flat world's top block (grass), where the [`SunScene`]s of the presets stand.
+const FLAT_GROUND: i64 = 63;
+
+/// Where a preset looks from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PresetView {
+    /// A camera (`--camera`) in its world as generated.
+    Camera([f64; 5]),
+    /// A demo scene built with `--fill` edits on the flat world, at the origin column, and its
+    /// camera.
+    Scene(SunScene),
+}
+
+/// A scene for the owner's review of the sun shadows (`--preset`, ADR 0065).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Preset {
+    name: &'static str,
+    world: World,
+    view: PresetView,
+    /// Clock hours of its shots.
+    hours: &'static [f64],
+}
+
+/// The presets: the overworld's hills and trees at noon and at 17:00 from the same camera, the
+/// forest at 15:00, and the demo's three shadow scenes ([`SunScene`]).
+const PRESETS: [Preset; 6] = [
+    Preset {
+        name: "noon",
+        world: World::Overworld,
+        view: PresetView::Camera(OVERWORLD_VIEW),
+        hours: &[12.0],
+    },
+    Preset {
+        name: "evening",
+        world: World::Overworld,
+        view: PresetView::Camera(OVERWORLD_VIEW),
+        hours: &[17.0],
+    },
+    Preset {
+        name: "forest",
+        world: World::Forest,
+        view: PresetView::Camera(FOREST_VIEW),
+        hours: &[15.0],
+    },
+    Preset {
+        name: "house",
+        world: World::Flat,
+        view: PresetView::Scene(SunScene::House),
+        hours: &[12.0, 16.0],
+    },
+    Preset {
+        name: "cave-mouth",
+        world: World::Flat,
+        view: PresetView::Scene(SunScene::CaveMouth),
+        hours: &[15.0, 17.0],
+    },
+    Preset {
+        name: "lake",
+        world: World::Flat,
+        view: PresetView::Scene(SunScene::Lake),
+        hours: &[12.0, 15.0],
+    },
+];
+
+/// The camera of the `noon` and `evening` presets: over the overworld's hills and trees.
+const OVERWORLD_VIEW: [f64; 5] = [16.5, 100.0, 16.5, 135.0, -22.0];
+/// The camera of the `forest` preset: among the forest's trees.
+const FOREST_VIEW: [f64; 5] = [16.5, 90.0, 16.5, 135.0, -20.0];
+
+impl Preset {
+    /// The preset named `name`.
+    fn named(name: &str) -> Result<&'static Preset, String> {
+        PRESETS.iter().find(|p| p.name == name).ok_or_else(|| {
+            let names: Vec<_> = PRESETS.iter().map(|p| p.name).collect();
+            format!("--preset: {name:?} is not {}", names.join(", "))
+        })
+    }
+
+    /// Sets `o` to the preset: its world, camera, edits and shots, with shadows on and off.
+    fn apply(&self, o: &mut Options) {
+        o.world = WorldChoice::with_world(self.world);
+        o.camera = match self.view {
+            PresetView::Camera(camera) => camera,
+            PresetView::Scene(scene) => scene.camera(Self::ground()),
+        };
+        if let PresetView::Scene(scene) = self.view {
+            o.edits
+                .extend(scene.boxes(Self::ground()).into_iter().map(|b| {
+                    let corner = |p: BlockPos| I64Vec3::new(p.x, p.y, p.z);
+                    (
+                        b.block.to_string(),
+                        Edit::Fill(corner(b.min), corner(b.max)),
+                    )
+                }));
+        }
+        o.shots = self
+            .hours
+            .iter()
+            .map(|&h| {
+                let clock = TimeOfDay::at_clock(h).clock_text().replace(':', "");
+                (h, PathBuf::from(format!("{}-{clock}.png", self.name)))
+            })
+            .collect();
+        o.sun_shadows = true;
+        o.shadows_off_too = true;
+        o.preset = Some(self.name);
+    }
+
+    /// The ground of the scenes: the flat world's top block at the origin column.
+    fn ground() -> BlockPos {
+        BlockPos::new(0, FLAT_GROUND, 0)
+    }
+}
+
+/// The value of the first `--preset` in `args`, if any.
+fn preset_arg(args: &[String]) -> Result<Option<&str>, String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some(name) = arg.strip_prefix("--preset=") {
+            return Ok(Some(name));
+        }
+        if arg == "--preset" {
+            return it
+                .next()
+                .map(|n| Some(n.as_str()))
+                .ok_or_else(|| "--preset needs a value".to_string());
+        }
+    }
+    Ok(None)
+}
+
+/// The path of the shadow-free twin of a shot: `a/noon.png` gives `a/noon-off.png`.
+fn off_path(path: &std::path::Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-off.{}", ext.to_string_lossy()),
+        None => format!("{stem}-off"),
+    };
+    path.with_file_name(name)
 }
 
 /// `Ok(None)` for `--help`.
@@ -241,7 +405,16 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         lod: lod::LodPreset::Off,
         lod_tint: false,
         no_distance_fog: false,
+        sun_shadows: false,
+        shadows_off_too: false,
+        preset: None,
     };
+    // The preset first: the other flags change it.
+    if let Some(name) = preset_arg(args)? {
+        Preset::named(name)?.apply(&mut o);
+    }
+    let mut preset_shots = o.preset.is_some();
+    let mut out: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -266,6 +439,9 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
                     .split_once('=')
                     .filter(|(_, p)| !p.is_empty())
                     .ok_or_else(|| format!("{flag}: {v:?} is not HH:MM=PATH"))?;
+                if std::mem::take(&mut preset_shots) {
+                    o.shots.clear();
+                }
                 o.shots
                     .push((clock::parse_clock(flag, time)?, PathBuf::from(path)));
             }
@@ -322,6 +498,13 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--lod-tint" => o.lod_tint = true,
             "--no-distance-fog" => o.no_distance_fog = true,
+            "--sun-shadows" => o.sun_shadows = true,
+            "--shadows-off-too" => o.shadows_off_too = true,
+            // Applied before the other flags.
+            "--preset" => {
+                value()?;
+            }
+            "--out" => out = Some(PathBuf::from(value()?)),
             "--fixed-height" => o.fixed_height = true,
             "--fog-res" => o.fog_res = fog::parse_resolution(flag, &value()?)?,
             "--fog-steps" => o.fog_steps = fog::parse_steps(flag, &value()?)?,
@@ -368,6 +551,16 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
     }
     if o.shots.is_empty() {
         return Err("at least one --shot is required".to_string());
+    }
+    if o.shadows_off_too && !o.sun_shadows {
+        return Err("--shadows-off-too needs --sun-shadows".to_string());
+    }
+    if let Some(dir) = out {
+        for (_, path) in &mut o.shots {
+            if path.is_relative() {
+                *path = dir.join(&*path);
+            }
+        }
     }
     o.world.validate(o.fixed_height)?;
     if o.lod_tint && o.lod == lod::LodPreset::Off {
@@ -757,6 +950,9 @@ fn run(
     }
     let gpu = init_headless(&prefs).map_err(|e| gpu_err(e.to_string()))?;
     println!("gpu: {}", gpu.summary_line());
+    if let Some(name) = o.preset {
+        println!("preset: {name}");
+    }
 
     // Block textures (a resource pack is read here, before the world).
     let registry = Arc::new(boxel_demo::blocks::registry());
@@ -1075,10 +1271,46 @@ fn run(
     let view = CameraView::compute(&camera, &transform, size.x as f32 / size.y as f32);
     let settings = RenderSettings {
         distance_fog,
+        // `--sun-shadows`: as `voxel_world --sun-shadows`, integrated GPUs too.
+        sun_shadows: SunShadowSettings {
+            enabled: o.sun_shadows,
+            on_integrated: true,
+            ..SunShadowSettings::default()
+        },
         ..RenderSettings::default()
     };
-    for (hours, path) in &o.shots {
-        let (sky_color, light) = scene_light(*hours, &settings);
+    if o.sun_shadows && gpu.tier != Tier::High {
+        eprintln!(
+            "snapshot: warning: --sun-shadows: tier {} draws no sun shadows (High only)",
+            gpu.tier
+        );
+    }
+    // Each shot, then with `--shadows-off-too` its twin without shadows.
+    let shots = o.shots.iter().flat_map(|(hours, path)| {
+        let off = o.shadows_off_too.then(|| (*hours, off_path(path), false));
+        std::iter::once((*hours, path.clone(), o.sun_shadows)).chain(off)
+    });
+    for (hours, path, shadows) in shots {
+        let (sky_color, mut light) = scene_light(hours, &settings);
+        let shadow_settings = SunShadowSettings {
+            enabled: shadows,
+            ..settings.sun_shadows
+        };
+        renderer.set_sun_shadows(&gpu.device, &shadow_settings);
+        // The sun of the render extract: the default path at the clock, every realm with it.
+        let time = TimeOfDay::at_clock(hours);
+        let sun = SunPath::default().direction(&time);
+        if shadows {
+            let realm = light
+                .realms
+                .realm_of(transform.translation.y.floor() as i64);
+            light.sun = Some(SceneSun::new(
+                sun,
+                shadow_settings.strength,
+                |_| true,
+                realm,
+            ));
+        }
         let params = ViewParams {
             light,
             fluid_time: (o.fluid_time % FLUID_TIME_PERIOD) as f32,
@@ -1092,19 +1324,34 @@ fn run(
             std::fs::create_dir_all(dir).map_err(|e| gpu_err(format!("{}: {e}", dir.display())))?;
         }
         image
-            .save_png(path)
+            .save_png(&path)
             .map_err(|e| gpu_err(format!("{}: {e}", path.display())))?;
         let [r, g, b] = light.sky;
+        let stats = renderer.stats();
+        // Only with `--sun-shadows`: the line stays as it was without it.
+        let shadow_text = if o.sun_shadows {
+            let s = stats.shadows;
+            format!(
+                " shadows={} cascades={} shadow_draws={} sun={:.1}deg",
+                if shadows { "on" } else { "off" },
+                s.cascades,
+                s.draws,
+                sun.y.clamp(-1.0, 1.0).asin().to_degrees()
+            )
+        } else {
+            String::new()
+        };
         println!(
             "shot: {} {} sky_light={r:.3},{g:.3},{b:.3} ambient={:.3} mean={:.1} chunks={} \
-             fog={fog_label} fog_layers={} lod={lod_label} lod_draws={} distance_fog={}",
-            TimeOfDay::at_clock(*hours).clock_text(),
+             fog={fog_label} fog_layers={} lod={lod_label} lod_draws={} distance_fog={}\
+             {shadow_text}",
+            time.clock_text(),
             path.display(),
             light.ambient,
             mean_brightness(&image),
-            renderer.stats().chunks,
-            renderer.stats().fog_layers,
-            renderer.stats().lod_draws,
+            stats.chunks,
+            stats.fog_layers,
+            stats.lod_draws,
             if settings.distance_fog.enabled {
                 "on"
             } else {
@@ -1222,6 +1469,94 @@ mod tests {
         assert_eq!(o.world.label(), "overworld/mc");
         assert!(o.light);
         assert_eq!(parse(&["--help"]), Ok(None));
+    }
+
+    #[test]
+    fn sun_shadow_flags() {
+        let o = parse(&BASE).expect("valid").expect("not help");
+        assert!(!o.sun_shadows && !o.shadows_off_too, "off unless asked");
+        let mut args = BASE.to_vec();
+        args.extend(["--sun-shadows", "--shadows-off-too", "--out", "shots"]);
+        let o = parse(&args).expect("valid").expect("not help");
+        assert!(o.sun_shadows && o.shadows_off_too);
+        assert_eq!(o.shots, vec![(12.0, PathBuf::from("shots/a/noon.png"))]);
+        assert_eq!(
+            off_path(&o.shots[0].1),
+            PathBuf::from("shots/a/noon-off.png")
+        );
+        let mut bad = BASE.to_vec();
+        bad.push("--shadows-off-too");
+        assert!(parse(&bad).unwrap_err().contains("--sun-shadows"));
+        let usage = usage();
+        for flag in ["--sun-shadows", "--shadows-off-too", "--preset", "--out"] {
+            assert!(usage.contains(flag), "{flag}");
+        }
+    }
+
+    #[test]
+    fn presets_build_with_shadows_on_and_off() {
+        let registry = boxel_demo::blocks::registry();
+        let map = ChunkMap::default();
+        assert_eq!(
+            PRESETS.map(|p| p.name),
+            ["noon", "evening", "forest", "house", "cave-mouth", "lake"]
+        );
+        for preset in &PRESETS {
+            let o = parse(&["--preset", preset.name])
+                .expect("valid")
+                .expect("not help");
+            assert_eq!(o.preset, Some(preset.name));
+            assert!(o.sun_shadows && o.shadows_off_too, "{}", preset.name);
+            assert_eq!(o.world, WorldChoice::with_world(preset.world));
+            assert!(!o.shots.is_empty());
+            for (hours, path) in &o.shots {
+                let clock = TimeOfDay::at_clock(*hours).clock_text().replace(':', "");
+                assert_eq!(*path, PathBuf::from(format!("{}-{clock}.png", preset.name)));
+            }
+            // Every edit names a demo block (the scenes are fills, which need no world).
+            let (cells, skipped) = edit_cells(&o.edits, &registry, &map).expect("demo blocks");
+            assert_eq!(skipped, 0);
+            match preset.view {
+                PresetView::Camera(camera) => {
+                    assert!(o.edits.is_empty());
+                    assert_eq!(o.camera, camera);
+                }
+                PresetView::Scene(scene) => {
+                    assert_eq!(o.world.world, World::Flat);
+                    assert!(!cells.is_empty());
+                    assert_eq!(o.camera, scene.camera(Preset::ground()));
+                }
+            }
+        }
+        // The other flags change a preset: the camera, more edits, its shots replaced, a
+        // folder for them.
+        let o = parse(&[
+            "--preset=house",
+            "--camera",
+            "1,70,2,0,0",
+            "--place",
+            "lamp_red@0,66,0",
+            "--shot",
+            "09:00=morning.png",
+            "--shot",
+            "10:00=later.png",
+            "--out",
+            "/tmp/s6",
+        ])
+        .expect("valid")
+        .expect("not help");
+        assert_eq!(o.camera, [1.0, 70.0, 2.0, 0.0, 0.0]);
+        let scene = SunScene::House.boxes(Preset::ground()).len();
+        assert_eq!(o.edits.len(), scene + 1);
+        assert_eq!(
+            o.shots,
+            vec![
+                (9.0, PathBuf::from("/tmp/s6/morning.png")),
+                (10.0, PathBuf::from("/tmp/s6/later.png"))
+            ]
+        );
+        assert!(parse(&["--preset", "castle"]).unwrap_err().contains("lake"));
+        assert!(parse(&["--preset"]).is_err());
     }
 
     #[test]
