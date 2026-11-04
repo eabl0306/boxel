@@ -668,8 +668,10 @@ impl Report {
     fn never_brighter(&mut self, what: &str, on: &RgbaImage, off: &RgbaImage) {
         let brighter = on
             .data
-            .chunks_exact(4)
-            .zip(off.data.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(off.data.as_chunks::<4>().0)
             .filter(|(a, b)| a[..3].iter().zip(&b[..3]).any(|(x, y)| x > y))
             .count();
         if brighter > 0 {
@@ -964,9 +966,9 @@ const POND_WATER: [Solid; 1] = [Solid::new([8.0, 3.0, 8.0], [24.0, 3.875, 20.0])
 /// [`OVERHANG_SCENE`]'s chunk.
 fn overhang(b: &Blocks) -> ChunkData {
     chunk(|x, y, z| match (x, y, z) {
-        (4..28, 2..4, 4..28) => b.stone,
+        // The window first: the wall's arm would take it.
         (15..17, 7..9, 14) => BlockState::AIR,
-        (8..24, 4..11, 14) | (8..24, 11, 14..20) => b.stone,
+        (4..28, 2..4, 4..28) | (8..24, 4..11, 14) | (8..24, 11, 14..20) => b.stone,
         _ => BlockState::AIR,
     })
 }
@@ -1379,9 +1381,11 @@ fn check_receivers(
         report.never_brighter(&format!("{label}_tree"), &on, &off);
         Ok(on
             .data
-            .chunks_exact(4)
-            .zip(off.data.chunks_exact(4))
-            .filter(|(a, b)| measured(a, b) == Some(Some(Sun::Shadow)))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(off.data.as_chunks::<4>().0)
+            .filter(|(a, b)| measured(&a[..], &b[..]) == Some(Some(Sun::Shadow)))
             .count())
     };
     let leafy = shadowed(&s.leafy)?;
