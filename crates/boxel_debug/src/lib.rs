@@ -8,7 +8,8 @@
 //! limit with the vsync state and present mode (and `paced by the display` when the runner
 //! follows the monitor, `boxel_window::FramePacingInfo`), the GPU (adapter, backend, tier, device class,
 //! driver), the camera (position, chunk, facing), the voxel light (sky and RGB levels) at the
-//! eye and at the [`CrosshairTarget`], the time of day (`boxel_world::TimeOfDay`) and the chunk
+//! eye and at the [`CrosshairTarget`] (at the eye also the sky's color when a light filter
+//! tinted it, ADR 0064), the time of day (`boxel_world::TimeOfDay`) and the chunk
 //! counters of `boxel_world::WorldStats` plus the GPU-side chunk and draw call counts of
 //! `boxel_render::RenderInfo`. Missing resources (no world, no renderer yet) just hide their
 //! lines.
@@ -147,16 +148,37 @@ pub struct CrosshairTarget(pub Option<BlockPos>);
 pub struct LightProbe {
     /// Light of the voxel holding the eye.
     pub eye: Option<LightValue>,
+    /// The sky `[red, green, blue]` of the voxel holding the eye (`ChunkMap::sky_rgb_at`):
+    /// tinted by the light filters it went through with colored sky (ADR 0064), else its sky
+    /// level three times. Shown only when tinted.
+    pub eye_sky_rgb: Option<[u8; 3]>,
     /// The crosshair target and its light.
     pub target: Option<(BlockPos, Option<LightValue>)>,
 }
 
-/// `sky 15 rgb 14 11 6`, or `-` when unknown.
-fn light_text(light: Option<LightValue>) -> String {
+impl LightProbe {
+    /// The light of `map` at the voxel holding `eye` and at `target`.
+    pub fn at(map: &ChunkMap, eye: Option<DVec3>, target: Option<BlockPos>) -> Self {
+        let eye = eye.map(BlockPos::from_world);
+        Self {
+            eye: eye.and_then(|p| map.light_at(p)),
+            eye_sky_rgb: eye.and_then(|p| map.sky_rgb_at(p)),
+            target: target.map(|pos| (pos, map.light_at(pos))),
+        }
+    }
+}
+
+/// `sky 15 rgb 14 11 6`, or `-` when unknown; with `tinted sky 13 7 6` after it when the sky
+/// `sky_rgb` is not the sky level three times.
+fn light_text(light: Option<LightValue>, sky_rgb: Option<[u8; 3]>) -> String {
     match light {
         Some(l) => {
             let [r, g, b] = l.rgb();
-            format!("sky {} rgb {r} {g} {b}", l.sky())
+            let mut text = format!("sky {} rgb {r} {g} {b}", l.sky());
+            if let Some([r, g, b]) = sky_rgb.filter(|&c| c != [l.sky(); 3]) {
+                let _ = write!(text, "  tinted sky {r} {g} {b}");
+            }
+            text
         }
         None => "-".to_string(),
     }
@@ -534,14 +556,17 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
         ));
     }
     if let Some(light) = &inputs.light {
-        lines.push(format!("Light eye {}", light_text(light.eye)));
+        lines.push(format!(
+            "Light eye {}",
+            light_text(light.eye, light.eye_sky_rgb)
+        ));
         if let Some((pos, value)) = light.target {
             lines.push(format!(
                 "      target {} {} {}  {}",
                 pos.x,
                 pos.y,
                 pos.z,
-                light_text(value)
+                light_text(value, None)
             ));
         }
     }
@@ -678,10 +703,9 @@ fn build_overlay(
         (Some(sky), Some(pos)) if sources => Some(SourceProbe::at(sky, pos)),
         _ => None,
     };
-    let light = map.as_deref().map(|map| LightProbe {
-        eye: camera.and_then(|(eye, _)| map.light_at(BlockPos::from_world(eye))),
-        target: target.map(|pos| (pos, map.light_at(pos))),
-    });
+    let light = map
+        .as_deref()
+        .map(|map| LightProbe::at(map, camera.map(|(eye, _)| eye), target));
     let inputs = OverlayInputs {
         frames: (window.fps(), window.average(), window.worst()),
         presented_fps: render.is_some().then(|| presented.fps()),
@@ -853,6 +877,8 @@ mod tests {
         let inputs = OverlayInputs {
             light: Some(LightProbe {
                 eye: Some(LightValue::new(15, 0, 0, 0)),
+                // Not tinted: the sky level three times shows nothing more.
+                eye_sky_rgb: Some([15; 3]),
                 target: Some((
                     BlockPos::new(-3, 64, 1 << 40),
                     Some(LightValue::new(9, 14, 11, 6)),
@@ -880,6 +906,20 @@ mod tests {
         assert!(lines.contains(&"Light eye -".to_string()), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("target")), "{lines:?}");
         assert!(lines.contains(&"Time 18:30  day 0  paused".to_string()));
+        // Under red glass with colored sky (ADR 0064): gameplay's sky, then the tinted one.
+        let inputs = OverlayInputs {
+            light: Some(LightProbe {
+                eye: Some(LightValue::new(15, 2, 0, 0)),
+                eye_sky_rgb: Some([13, 7, 6]),
+                target: None,
+            }),
+            ..OverlayInputs::default()
+        };
+        let lines = overlay_lines(&inputs);
+        assert!(
+            lines.contains(&"Light eye sky 15 rgb 2 0 0  tinted sky 13 7 6".to_string()),
+            "{lines:?}"
+        );
         time.paused = false;
         time.speed = 60;
         let inputs = OverlayInputs {
@@ -934,8 +974,8 @@ mod tests {
         };
         let inputs = OverlayInputs {
             light: Some(LightProbe {
-                eye: None,
                 target: Some((BlockPos::new(3, 20, -2), None)),
+                ..LightProbe::default()
             }),
             realm: Some(below),
             source: Some(SourceProbe::Beam(BlockPos::new(3, 74, -2), beam)),
