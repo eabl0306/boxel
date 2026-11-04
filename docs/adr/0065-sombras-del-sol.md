@@ -4,8 +4,8 @@
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
   su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR), el S1
   (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU), el S3 (los mapas
-  de sombra), el S4 (los receptores) y el S5 (celdas y modelos). Falta el S6 (depuración, demo y
-  herramientas).
+  de sombra), el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
+  herramientas). El S7 solo si las medidas lo piden.
 - Fecha: 2026-11-03
 
 ## Contexto
@@ -409,6 +409,35 @@ Pruebas, `gpu_sun_shadows.rs` parte 3, en la RTX, la 780M y llvmpipe:
 - En Mid y Low, con la figura y el cartel en la escena, la imagen con sombras prendidas es igual
   byte a byte a la de sin ellas.
 
+### 15. Carril S6: cómo quedó
+
+Herramientas para ver y medir las sombras. No cambia el render.
+
+- **Línea en F3.** Con `RenderSettings::sun_shadows` prendidas, `boxel_debug` muestra
+  `Shadows 3 cascades  24 draws  sun 38 deg  53 MiB` (y `dropped N` si una lista se llenó),
+  justo debajo de `GPU chunks`. El sol sale de `SunPath` y el reloj, como en el extract.
+  `Shadows none drawn` es un frame sin nada que sombrear (de noche, sin cielo, un reino sin sol);
+  `Shadows off here` es un renderer que no las dibuja (Mid, Low, una GPU integrada sin
+  `on_integrated`). Con las sombras apagadas no hay línea, como las otras líneas opcionales.
+- **Escenas en la demo.** `boxel_demo::worldgen::SunScene`: una casa con ventanas al sur y al
+  oeste, la boca de una cueva abierta al oeste y un estanque con dos árboles en la orilla. Son
+  cajas de bloques sobre el suelo plano y una cámara.
+- **`snapshot --sun-shadows`**, también en GPU integradas, con un aviso si el tier no es High.
+  Cada línea `shot:` suma las cascadas, los draws y la altura del sol. `--shadows-off-too` guarda
+  también la foto sin sombras (`NOMBRE-off.png`), para comparar.
+- **`snapshot --preset NOMBRE`** para revisar: `noon` y `evening` (12:00 y 17:00, la misma cámara
+  sobre el overworld), `forest` (15:00), `house` (12:00 y 16:00), `cave-mouth` (15:00 y 17:00) y
+  `lake` (12:00 y 15:00). Cada una pone el mundo, la cámara, las ediciones y las fotos
+  (`NOMBRE-HHMM.png`, con y sin sombras). `--out DIR` elige la carpeta; los demás flags cambian el
+  preset.
+- **Caso `shadows` en `tools/perf`**: el vuelo de superficie a las 15:00 con `--sun-shadows`. Entra
+  en la ronda de control en la RTX, con tope 144 y sin tope. En la 780M no, porque ahí vienen
+  apagadas.
+
+Distinto del plan: la casa tiene dos ventanas. Por una ventana al sur la mancha de sol en el piso
+mide siempre 0,58 bloques por bloque de alto (la inclinación de 30 grados), así que casi no se
+ve; la del oeste crece durante la tarde.
+
 ## Medidas
 
 Carril S1, `just perf-smoke surface` contra main (778e7bb), una corrida de 10 s por lado. No
@@ -483,6 +512,17 @@ Con 50 figuras las sombras cuestan 0,17 ms de p50 (meta del S4: 0,25), y de eso 
 0,02 ms: que las figuras den y reciban sombra. Sin modelos el costo de las sombras es el del S4
 (0,49 -> 0,59 allí también) y con sombras en los dos lados los vóxeles no se mueven. Las filas
 con un lado sin sombras salen con 1 porque los fps caen más del 15 %, como en el S4.
+
+Carril S6, `just perf-smoke shadows` contra main (a035828): main ya tiene `--sun-shadows` y
+`--time`, así que mide los dos lados. No cambia el render: 1447 -> 1441 fps (-0,4 %), p50 0,62 ms
+en los dos, p99 1,89 -> 1,91 ms, ok. El caso contra `surface` con el mismo binario (las sombras y
+el sol de las 15:00 solo en el lado nuevo):
+
+| Caso | fps | p50 ms | p99 ms | Frames sobre 6,94 ms |
+|---|---:|---:|---:|---:|
+| rtx/surface/r16/uncapped a `shadows` | 2014 -> 1441 (-28,5 %) | 0,45 -> 0,62 | 1,11 -> 1,90 | 0 -> 0 |
+
+El smoke sale con 1 por los fps, como en el S4. Son 0,17 ms de p50, dentro de la meta de 0,25.
 
 ## El juego
 
