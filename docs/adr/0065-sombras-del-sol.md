@@ -326,6 +326,25 @@ p50 0,45 ms en los dos lados: el factor 1,0 no se nota.
 Carril S2: no cambia nada en la GPU, así que no hay `perf-smoke`. Una prueba unitaria mide las
 cascadas: 4 cascadas tardan unos 0,3 µs por frame.
 
+Carril S3, `just perf-smoke` contra main (7817f35), con `--sun-shadows` solo en el lado nuevo:
+mide el cull y los tres pases de profundidad, sin receptores. No cambia el mundo ni el mallador,
+así que `headless_world` da los mismos quads y chunks.
+
+| Caso | fps | p50 ms | p99 ms | Frames sobre 6,94 ms | Veredicto |
+|---|---:|---:|---:|---:|---|
+| rtx/surface/r16/uncapped | 1878 -> 1612 (-14,2 %) | 0,48 -> 0,56 | 1,57 -> 1,74 | 0 -> 0 | ok |
+| rtx/surface/r32/uncapped | 703 -> 640 (-8,9 %) | 1,28 -> 1,32 | 3,58 -> 4,07 | 0 -> 0 | ok |
+| 780m/surface/r16/uncapped | 590 -> 344 (-41,8 %) | 1,49 -> 2,73 | 3,93 -> 6,96 | 1 -> 36 | peor |
+
+En la RTX los pases cuestan unos 0,08 ms de p50 en r16 y entre 0,04 y 0,14 ms en r32 (p50 y
+media): lo que estimaba el plan, igual en los dos radios. En la 780M cuestan unos 1,25 ms, el
+doble de lo estimado y más que la meta del S4 (+0,8 ms con receptores). Allí las sombras vienen
+apagadas (decisión 1); si se quieren prender, hacen falta las palancas del S7. Cada frame dibujó 3
+cascadas, 24 multi-draws en r16 y 42 en r32, sin cubetas perdidas; los recursos ocupan 53 MiB.
+
+Con las sombras apagadas: `rtx/surface/r16/uncapped` 2002 -> 1953 fps (-2,5 %), p50 0,45 ->
+0,46 ms, p99 1,10 -> 1,20 ms (una primera corrida dio -7,4 %; repetida, dentro del ruido).
+
 ## El juego
 
 - Prende `sun_shadows.enabled`. En GPU integradas solo si el jugador lo pide.
