@@ -2,10 +2,10 @@
 
 - Estado: aceptado (issue #11, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/colored-sky-plan.md`) el 2026-11-02, con sus respuestas a las preguntas abiertas
-  (sección 11 del plan). Se construye por carriles (sección 7 del plan). Hechos: el C0 (este ADR),
-  el C1 (la luz, en `boxel_light`), el C2 (el mundo, en `boxel_world`), el C3 (la malla, en
-  `boxel_mesh`) y el C4 (render y shaders, sección 12). Falta el C5 (depuración, demo y
-  herramientas).
+  (sección 11 del plan). Se construyó por carriles (sección 7 del plan): el C0 (este ADR), el C1
+  (la luz, en `boxel_light`), el C2 (el mundo, en `boxel_world`), el C3 (la malla, en
+  `boxel_mesh`), el C4 (render y shaders, sección 12) y el C5 (depuración, demo y herramientas,
+  sección 13). Todos hechos.
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -317,6 +317,29 @@ Para el C5 y las sombras:
 - El S5 multiplica el `sky` de `model_shade` por su factor. Las celdas pasan por `shade_fragment`,
   así que toman el factor solas.
 
+### 13. Carril C5: cómo quedó
+
+- **Vidrios de color en la demo.** `boxel_demo` no tenía filtros, así que el C5 suma tres:
+  `boxel:red_stained_glass`, `boxel:light_blue_stained_glass` y `boxel:black_stained_glass`, con
+  los filtros de la tabla de la sección 1 y una textura propia. Van después de todos los bloques
+  y capas (`add_stained_glass`, `registry_with_stained_glass`), como la fuente de cielo: ningún id
+  se mueve y los demás demos siguen sin filtros.
+- **La escena**: `boxel_demo::worldgen::GlassHouse`, sobre el suelo. Un invernadero cerrado de
+  piedra bajo un techo rojo, con una claraboya negra, una lámpara blanca colgada del techo y un
+  cantero de amapolas, y al lado un cuarto cerrado que solo recibe luz por una ventana celeste de 3
+  por 3. El invernadero no tiene puerta: por una puerta entra cielo blanco de costado y se come el
+  tinte de media sala.
+- `GlassHouseWorld` mete la escena en los chunks de cualquier generador (para `headless_world`,
+  `stress` y el caso de perf), con un gemelo de vidrio común (`Glass::Clear`).
+- **F3**: la línea `Light eye` suma `tinted sky R G B` cuando el cielo del ojo está teñido
+  (`ChunkMap::sky_rgb_at`). El cielo del gameplay sigue en `sky`. `LightProbe::at` arma la sonda.
+- **`voxel_world --stained-glass`** prende `colored_sky`, arma la escena con ediciones alrededor
+  del inicio y pone la cámara en el invernadero; `--glass-view window` la pone en el cuarto.
+- **`headless_world` y `stress`**: `--stained-glass` y `--clear-glass` (el gemelo). `headless_world`
+  imprime siempre la línea `colored:`.
+- **`tools/perf`**: casos `glass-house` y `glass-house-clear`, `surface-static` con la escena y la
+  cámara en el invernadero.
+
 ## Medidas
 
 Carril C1, criterion `light` y `sky_tile`, una corrida por lado contra main (47013e0), una detrás
@@ -378,11 +401,32 @@ byte salvo 2 a 4 de `gpu_lod` (`seam_high` de High en la 780M y en llvmpipe, un 
 niveles, distintos en cada corrida: el solape de orden de dibujo de High que ya cambia entre
 corridas de main, ADR 0062).
 
+Carril C5, la escena de vidrio en el overworld (`headless_world --world overworld --caves mc
+--view-distance 16 --stained-glass`, piso en y = 87):
+
+```
+colored: sky=on boxes=37 padded=4 chunk_light=4 meshes=4 tinted_entries=483 flattened=97
+```
+
+37 cajas toman el camino de color y 4 salen teñidas: los 4 chunks que toca la escena. Con
+`--clear-glass` todo da 0, y los quads son casi los mismos (5 024 087 contra 5 024 175).
+
+`just perf-smoke` (RTX, radio 16, sin tope). `surface-static` contra main (0262de3), sin vidrio:
+1925 a 1927 fps (+0,1 %), p99 1,11 a 1,14 ms, ok. `glass-house` no existe en main, así que se mide
+contra su gemelo `glass-house-clear` con el mismo binario (la cámara en el invernadero, la pantalla
+casi llena de caras teñidas, en High):
+
+| Caso | fps | p99 ms | Frames sobre 6,94 ms | Veredicto |
+|---|---:|---:|---:|---|
+| `glass-house-clear` a `glass-house` | 1924 a 1847 (-4,0 %) | 1,12 a 1,18 | 0 a 0 | ok |
+
+El costo del tinte, con la escena entera a la vista, es 4 % de los fps.
+
 ## El juego
 
 - `ModelDraw` tiene un campo nuevo, `sky_rgb`: el juego que arma draws a mano pone `None`.
 - Nada nuevo que registrar: los 16 vidrios de color y sus paneles ya tienen el filtro de ADR 0060,
-  y el cielo lo sigue.
+  y el cielo lo sigue. Los tres de la demo (sección 13) son un ejemplo de cómo se registran.
 - El juego prende `colored_sky`.
 - No le pone filtro al agua ni a las hojas: cada océano o bosque tomaría el camino de color.
 
