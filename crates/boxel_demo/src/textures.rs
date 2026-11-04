@@ -39,6 +39,9 @@ pub enum Pattern {
     Bark,
     /// Glass: a clear inside (alpha 0) with a light frame and a few streaks (translucent).
     Glass,
+    /// Stained glass: noise of the base color, a darker opaque frame and a tinted inside
+    /// (translucent).
+    StainedGlass,
     /// Noise with a constant alpha (water; translucent).
     Liquid {
         /// Alpha of every texel.
@@ -159,6 +162,21 @@ fn synthesize(
                     *texel = [250, 252, 255, 120];
                 } else {
                     texel[3] = if frame { 200 } else { 24 };
+                }
+            }
+        }
+        Pattern::StainedGlass => {
+            // A darker frame, almost opaque, around an inside that shows the color but lets
+            // the view through.
+            for (i, texel) in texels.iter_mut().enumerate() {
+                let (x, y) = (i % size, i / size);
+                if x == 0 || y == 0 || x == size - 1 || y == size - 1 {
+                    for c in &mut texel[..3] {
+                        *c = (u16::from(*c) * 7 / 10) as u8;
+                    }
+                    texel[3] = 230;
+                } else {
+                    texel[3] = 120;
                 }
             }
         }

@@ -36,7 +36,10 @@
 //! Not in [`registry`]: the sky source of ADR 0061, `boxel:sky_source` ([`add_sky_source`],
 //! [`registry_with_sky_source`]), which only the sky source demos add after the other blocks. A
 //! registry with a source makes the world count its beam tiles, so the other demos stay
-//! without one.
+//! without one. Nor the stained glasses of ADR 0060 and 0064 ([`STAINED_GLASS`],
+//! [`add_stained_glass`], [`registry_with_stained_glass`]), which only the glass scene adds,
+//! with their layers, after the other blocks: a registry with light filters scans the palettes
+//! of every chunk for them.
 //!
 //! The texture layers, in this order: 0 stone to 20 poppy (stone, dirt, grass top, grass side,
 //! sand, gravel, snow, bedrock, log side, log top, leaves, water, planks, the 4 lamps, lava,
@@ -160,6 +163,78 @@ pub fn add_sky_source(b: &mut BlockRegistryBuilder) -> BlockState {
 pub fn registry_with_sky_source() -> BlockRegistry {
     let mut b = builder();
     add_sky_source(&mut b);
+    b.build()
+}
+
+/// One demo stained glass (ADR 0060, 0064): a clear cube that lets light and sky through and
+/// tints both with its filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StainedGlass {
+    /// Block (and texture) name, `"boxel:red_stained_glass"`.
+    pub name: &'static str,
+    /// Light filter: red, green, blue, each `0..=15` (Minecraft's dye color in fifteenths, the
+    /// table of ADR 0060).
+    pub filter: [u8; 3],
+    /// Texture color (sRGB).
+    pub color: [u8; 3],
+}
+
+/// The stained glasses of the glass scene ([`add_stained_glass`]), in state order.
+pub const STAINED_GLASS: [StainedGlass; 3] = [
+    StainedGlass {
+        name: "boxel:red_stained_glass",
+        filter: [10, 3, 2],
+        color: [176, 46, 38],
+    },
+    StainedGlass {
+        name: "boxel:light_blue_stained_glass",
+        filter: [3, 11, 13],
+        color: [58, 179, 218],
+    },
+    StainedGlass {
+        name: "boxel:black_stained_glass",
+        filter: [2, 2, 2],
+        color: [29, 29, 33],
+    },
+];
+
+/// Adds the [`STAINED_GLASS`] blocks and their layers to `b` (after every other block and
+/// layer, so no other state or layer moves) and returns their states in that order. Each is
+/// what a game's stained glass is: a Translucent solid cube with light opacity 0 and a light
+/// filter. With `WorldSettings::colored_sky` on the sky under it takes its color too.
+pub fn add_stained_glass(b: &mut BlockRegistryBuilder) -> [BlockState; 3] {
+    STAINED_GLASS.map(|glass| {
+        let texture = b
+            .add_texture(textures::spec(
+                glass.name,
+                glass.color,
+                6,
+                Pattern::StainedGlass,
+            ))
+            .expect("demo stained glass texture");
+        let state = b
+            .add_block(BlockDef {
+                name: glass.name.to_string(),
+                shape: RenderShape::Translucent,
+                model: BlockModel::CUBE,
+                collision: BlockCollision::Full,
+                emission: [0; 3],
+                light_opacity: 0,
+                textures: FaceTextures::all(texture),
+            })
+            .expect("demo stained glass");
+        let block = b.block_by_name(glass.name).expect("just added");
+        b.set_light_filter(block, glass.filter)
+            .expect("demo stained glass");
+        state
+    })
+}
+
+/// The demo registry with the [`STAINED_GLASS`] after its blocks: every other state and layer
+/// keeps its id.
+pub fn registry_with_stained_glass() -> BlockRegistry {
+    let mut b = builder();
+    add_stained_glass(&mut b);
     b.build()
 }
 

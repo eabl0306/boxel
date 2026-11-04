@@ -12,7 +12,8 @@
 //! level of detail (ADR 0031): each answers for coarse cells from its heights, sea and trees,
 //! reading its fields on every call.
 //!
-//! [`LitCaves`] wraps any of them with sky sources under its cave roofs (ADR 0061).
+//! [`LitCaves`] wraps any of them with sky sources under its cave roofs (ADR 0061), and
+//! [`GlassHouseWorld`] with the glass scene of the colored sky ([`GlassHouse`], ADR 0064).
 //!
 //! The blocks they place are settings too: [`BlockNames`] in [`TerrainSettings::names`] and
 //! [`OverworldSettings::names`], the demo's `boxel:` names by default. A game with its own
@@ -21,6 +22,7 @@
 //! its registry lacks.
 
 mod forest;
+pub mod glass_house;
 mod lit_caves;
 mod lod;
 mod names;
@@ -31,6 +33,7 @@ mod terrain;
 mod trees;
 
 pub use forest::ForestGenerator;
+pub use glass_house::{Glass, GlassHouse, GlassHouseWorld, GlassView};
 pub use lit_caves::LitCaves;
 pub use names::{BlockNames, MissingBlocks};
 pub use overworld::{
