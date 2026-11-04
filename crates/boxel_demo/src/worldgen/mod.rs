@@ -14,6 +14,8 @@
 //!
 //! [`LitCaves`] wraps any of them with sky sources under its cave roofs (ADR 0061), and
 //! [`GlassHouseWorld`] with the glass scene of the colored sky ([`GlassHouse`], ADR 0064).
+//! [`SunScene`] gives the small scenes of the sun shadows (ADR 0065) as boxes of blocks on flat
+//! ground.
 //!
 //! The blocks they place are settings too: [`BlockNames`] in [`TerrainSettings::names`] and
 //! [`OverworldSettings::names`], the demo's `boxel:` names by default. A game with its own
@@ -29,6 +31,7 @@ mod names;
 pub mod overworld;
 mod plants;
 mod sea;
+pub mod sun_scenes;
 mod terrain;
 mod trees;
 
@@ -41,6 +44,7 @@ pub use overworld::{
 };
 pub use plants::{PlantBlocks, PlantKind, Plants};
 pub use sea::Sea;
+pub use sun_scenes::{SceneBox, SunScene};
 pub use terrain::{TerrainGenerator, TerrainSettings};
 pub use trees::{Tree, TreeBlock, Trees};
 
