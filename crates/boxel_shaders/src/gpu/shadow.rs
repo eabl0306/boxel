@@ -28,6 +28,21 @@ pub const STATE_SIZE: u64 = STATE_DROPPED_OFFSET + 16;
 /// The shadow draws' group of one cascade's [`ShadowCascadeGpu`] (dynamic offset
 /// `CASCADE_STRIDE * c`); groups 0 to 2 are the voxel pipelines' (materials, view, geometry).
 pub const GROUP_CASCADE: u32 = 3;
+/// Group 3 of High's shadowed voxel pipelines (`VoxelPullShadowed`, `sun_shadow.wgsl`): the
+/// maps (binding [`RECEIVE_MAPS`]), their comparison sampler ([`RECEIVE_SAMPLER`]) and the
+/// whole shadow uniform ([`RECEIVE_UNIFORM`], [`UNIFORM_SIZE`] bytes), all for the fragment
+/// stage. Groups 0 to 2 are the voxel pipelines'.
+pub const GROUP_RECEIVE: u32 = 3;
+/// The maps' binding in [`GROUP_RECEIVE`]: a `Depth32Float` 2D array, one layer per cascade.
+pub const RECEIVE_MAPS: u32 = 0;
+/// The comparison sampler's binding in [`GROUP_RECEIVE`] (`LessEqual`, linear: 2x2 PCF).
+pub const RECEIVE_SAMPLER: u32 = 1;
+/// The shadow uniform's binding in [`GROUP_RECEIVE`] (every cascade).
+pub const RECEIVE_UNIFORM: u32 = 2;
+/// The receivers' blend band between cascades and their fade at the end of the shadows, as a
+/// fraction of where a cascade (or the shadows) end: `SUN_BLEND` in `sun_shadow.wgsl`, the
+/// renderer's `CASCADE_BLEND`.
+pub const RECEIVE_BLEND: f32 = 0.1;
 
 /// One cascade of the shadow uniform (`ShadowCascade` in `shadow_common.wgsl`, 256 bytes). The
 /// cull reads every entry; the frame's shared fields (`counts`, `light`, `band`) are written the
@@ -52,8 +67,11 @@ pub struct ShadowCascadeGpu {
     /// x and y = the camera realm's voxels `[x, y)` in `y` relative to the render origin
     /// (saturated to `i32`), z = the camera realm, w = 0.
     pub band: [i32; 4],
+    /// x = the camera realm's shadow strength `k`, read by the receivers (`sun_shadow.wgsl`):
+    /// no other realm is shadowed, so no other realm's `k` is needed. y to w = 0.
+    pub receive: [f32; 4],
     /// Up to [`CASCADE_STRIDE`].
-    pub pad: [[u32; 4]; 2],
+    pub pad: [u32; 4],
 }
 
 const _: () = assert!(size_of::<ShadowCascadeGpu>() as u64 == CASCADE_STRIDE);

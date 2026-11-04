@@ -750,7 +750,8 @@ fn sun_off_returns_one_and_binds_nothing() {
     let mut with_common = 0;
     for id in ShaderModuleId::ALL {
         let src = id.source();
-        let has_common = src.contains(COMMON_WGSL);
+        // High's shadowed voxels take sun_shadow.wgsl instead (lane S4, checked below).
+        let has_common = src.contains(COMMON_WGSL) && id != ShaderModuleId::VoxelPullShadowed;
         assert_eq!(src.contains(SUN_OFF_WGSL), has_common, "{}", id.label());
         if !has_common {
             continue;
@@ -815,6 +816,147 @@ fn sun_off_returns_one_and_binds_nothing() {
     assert_eq!(with_common, 10);
 }
 
+/// The receivers (ADR 0065, lane S4): `VoxelPullShadowed` is `VoxelPull` with `sun_shadow.wgsl`
+/// (after `shadow_common.wgsl`) in place of `sun_off.wgsl`, and nothing else differs: the same
+/// entry points, `VsOut` and groups 0 to 2, plus group 3 (the maps, a comparison sampler and the
+/// whole shadow uniform, for the fragment stage). It is High only, and no other module holds
+/// `sun_shadow.wgsl`, so Mid and Low see none of it.
+#[test]
+fn shadowed_voxels_differ_from_voxel_pull_only_in_the_sun_factor() {
+    use boxel_shaders::gpu::shadow::{
+        GROUP_RECEIVE, RECEIVE_BLEND, RECEIVE_MAPS, RECEIVE_SAMPLER, RECEIVE_UNIFORM, UNIFORM_SIZE,
+    };
+    use boxel_shaders::{COMMON_WGSL, SHADOW_COMMON_WGSL, SUN_OFF_WGSL, SUN_SHADOW_WGSL};
+    let plain = ShaderModuleId::VoxelPull;
+    let shadowed = ShaderModuleId::VoxelPullShadowed;
+    assert_eq!(
+        shadowed.source(),
+        plain.source().replacen(
+            SUN_OFF_WGSL,
+            &format!("{SHADOW_COMMON_WGSL}\n{SUN_SHADOW_WGSL}"),
+            1
+        )
+    );
+    assert!(shadowed.source().starts_with(COMMON_WGSL));
+    for id in ShaderModuleId::ALL {
+        assert_eq!(
+            id.source().contains(SUN_SHADOW_WGSL),
+            id == shadowed,
+            "{}",
+            id.label()
+        );
+    }
+    assert_eq!(shadowed.entry_points(), plain.entry_points());
+    assert_eq!(shadowed.min_gl(), plain.min_gl());
+    assert!(shadowed.high_only() && !shadowed.uses_immediates());
+    for id in [
+        ShaderModuleId::VoxelPull,
+        ShaderModuleId::VoxelInstanced,
+        ShaderModuleId::Model,
+        ShaderModuleId::Cell,
+        ShaderModuleId::Lod,
+        ShaderModuleId::Blit,
+    ] {
+        assert!(!id.high_only(), "{}", id.label());
+    }
+    for id in [
+        ShaderModuleId::Cull,
+        ShaderModuleId::ShadowCull,
+        ShaderModuleId::Shadow,
+    ] {
+        assert!(id.high_only(), "{}", id.label());
+    }
+    let (module, info) = load(shadowed);
+    let (pull, _) = load(plain);
+    assert_eq!(
+        struct_layout(&module, "VsOut"),
+        struct_layout(&pull, "VsOut")
+    );
+    assert_eq!(const_f32(&module, "SUN_BLEND"), RECEIVE_BLEND);
+    // Group 3: what the renderer's layout holds; groups 0 to 2 as in VoxelPull.
+    let bindings = |m: &naga::Module| -> Vec<(u32, u32, String)> {
+        let mut b: Vec<_> = m
+            .global_variables
+            .iter()
+            .filter_map(|(_, g)| {
+                let r = g.binding.as_ref()?;
+                let kind = match &m.types[g.ty].inner {
+                    naga::TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    } => format!("image {dim:?} {arrayed} {class:?}"),
+                    naga::TypeInner::Sampler { comparison } => format!("sampler {comparison}"),
+                    _ => format!("{:?}", g.space),
+                };
+                Some((r.group, r.binding, kind))
+            })
+            .collect();
+        b.sort();
+        b
+    };
+    let ours = bindings(&module);
+    let theirs = bindings(&pull);
+    let (low, receive): (Vec<_>, Vec<_>) = ours.into_iter().partition(|b| b.0 < GROUP_RECEIVE);
+    assert_eq!(low, theirs);
+    assert_eq!(
+        receive,
+        [
+            (
+                GROUP_RECEIVE,
+                RECEIVE_MAPS,
+                "image D2 true Depth { multi: false }".to_string()
+            ),
+            (GROUP_RECEIVE, RECEIVE_SAMPLER, "sampler true".to_string()),
+            (GROUP_RECEIVE, RECEIVE_UNIFORM, "Uniform".to_string()),
+        ]
+    );
+    let (_, uniform) = module
+        .global_variables
+        .iter()
+        .find(|(_, g)| g.name.as_deref() == Some("shadow"))
+        .expect("shadow uniform");
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).expect("layout");
+    assert_eq!(u64::from(layouter[uniform.ty].size), UNIFORM_SIZE);
+    // sun_factor reads the maps, and only from the fragment stage.
+    let (sun, _) = module
+        .functions
+        .iter()
+        .find(|(_, f)| f.name.as_deref() == Some("sun_factor"))
+        .expect("sun_factor");
+    let (maps, _) = module
+        .global_variables
+        .iter()
+        .find(|(_, g)| g.name.as_deref() == Some("sun_maps"))
+        .expect("sun_maps");
+    let (visibility, _) = module
+        .functions
+        .iter()
+        .find(|(_, f)| f.name.as_deref() == Some("sun_visibility"))
+        .expect("sun_visibility");
+    assert!(!info[visibility][maps].is_empty());
+    assert!(!info[sun][uniform_handle(&module)].is_empty());
+    for (index, ep) in module.entry_points.iter().enumerate() {
+        let reads = !info.get_entry_point(index)[maps].is_empty();
+        assert_eq!(
+            reads,
+            ep.stage == naga::ShaderStage::Fragment && ep.name != "fs_translucent_depth",
+            "{}",
+            ep.name
+        );
+    }
+}
+
+fn uniform_handle(module: &naga::Module) -> naga::Handle<naga::GlobalVariable> {
+    module
+        .global_variables
+        .iter()
+        .find(|(_, g)| g.name.as_deref() == Some("shadow"))
+        .map(|(h, _)| h)
+        .expect("shadow uniform")
+}
+
 /// The sun shadow modules (ADR 0065, lane S3) are High only and reach no other module: no other
 /// module holds their text, and they need GL 4.3 (storage buffers), no immediates. Their mirrors
 /// and constants match the Rust side.
@@ -825,7 +967,11 @@ fn sun_shadow_modules_are_high_only_and_match_their_mirrors() {
     };
     use boxel_shaders::{SHADOW_COMMON_WGSL, SHADOW_CULL_WGSL, SHADOW_WGSL};
     use std::mem::{offset_of, size_of};
-    let shadow_modules = [ShaderModuleId::ShadowCull, ShaderModuleId::Shadow];
+    let shadow_modules = [
+        ShaderModuleId::ShadowCull,
+        ShaderModuleId::Shadow,
+        ShaderModuleId::VoxelPullShadowed,
+    ];
     for id in ShaderModuleId::ALL {
         let src = id.source();
         let shadowed = shadow_modules.contains(&id);
@@ -836,10 +982,12 @@ fn sun_shadow_modules_are_high_only_and_match_their_mirrors() {
     for id in shadow_modules {
         assert_eq!(id.min_gl(), (4, 3), "{}", id.label());
         assert!(!id.uses_immediates(), "{}", id.label());
+        assert!(id.high_only(), "{}", id.label());
     }
     let (cull, _) = load(ShaderModuleId::ShadowCull);
     let (shadow, _) = load(ShaderModuleId::Shadow);
-    for module in [&cull, &shadow] {
+    let (receivers, _) = load(ShaderModuleId::VoxelPullShadowed);
+    for module in [&cull, &shadow, &receivers] {
         let (size, offsets) = struct_layout(module, "ShadowCascade");
         assert_eq!(u64::from(size), CASCADE_STRIDE);
         assert_eq!(size_of::<ShadowCascadeGpu>() as u64, CASCADE_STRIDE);
@@ -850,6 +998,7 @@ fn sun_shadow_modules_are_high_only_and_match_their_mirrors() {
             offset_of!(ShadowCascadeGpu, light),
             offset_of!(ShadowCascadeGpu, counts),
             offset_of!(ShadowCascadeGpu, band),
+            offset_of!(ShadowCascadeGpu, receive),
             offset_of!(ShadowCascadeGpu, pad),
         ];
         assert_eq!(offsets, rust.map(|o| o as u32));

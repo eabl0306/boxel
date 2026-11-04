@@ -100,6 +100,13 @@ pub(crate) trait TierPath {
     /// The tier's voxel pipelines (the fog builds and drops its depth pipeline there).
     fn voxel_mut(&mut self) -> &mut VoxelPipelines;
 
+    /// High: this frame's sun shadow receivers (ADR 0065): with `Some` (the receivers' group 3,
+    /// set only in a frame that drew its maps) the solid and translucent buckets are drawn with
+    /// the shadowed pipelines, if they exist; with `None`, with today's. Mid and Low ignore it.
+    fn set_sun_receivers(&mut self, receivers: Option<wgpu::BindGroup>) {
+        let _ = receivers;
+    }
+
     /// The page changes of this frame's translucent list ([`page_switches`]).
     fn translucent_page_switches(&self) -> u32;
 
@@ -222,8 +229,23 @@ pub(crate) struct VoxelPipelines {
     /// bucket 7 again after its color, writing depth and no color, so the fog march ends at the
     /// nearest translucent surface (ADR 0058).
     pub fog_depth: Option<wgpu::RenderPipeline>,
+    /// High's twins of `opaque`, `cutout` and `translucent` that receive sun shadows, built the
+    /// first time shadows are on ([`VoxelPipelines::set_shadowed`], ADR 0065).
+    pub shadowed: Option<ShadowedVoxels>,
     /// What builds them.
     builder: VoxelBuilder,
+}
+
+/// High's voxel pipelines that receive sun shadows (`VoxelPullShadowed`, ADR 0065): the same
+/// draws as today's, with the receivers' group 3 ([`crate::shadow::receive_layout`]). The fog's
+/// depth draw shades nothing, so it keeps today's pipeline.
+pub(crate) struct ShadowedVoxels {
+    /// `fs_opaque`.
+    pub opaque: wgpu::RenderPipeline,
+    /// `fs_cutout`.
+    pub cutout: wgpu::RenderPipeline,
+    /// `fs_translucent`.
+    pub translucent: wgpu::RenderPipeline,
 }
 
 /// The shared state of a tier's voxel pipelines: its module, layout and vertex input.
@@ -245,6 +267,69 @@ struct VoxelDraw {
 }
 
 impl VoxelBuilder {
+    /// High's builder of the shadowed pipelines: `VoxelPullShadowed`, groups 0 to 2 of
+    /// `groups` and the receivers' `receive` as group 3.
+    fn shadowed(
+        device: &wgpu::Device,
+        groups: &crate::shadow::VoxelGroups<'_>,
+        receive: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let id = ShaderModuleId::VoxelPullShadowed;
+        debug_assert_eq!(boxel_shaders::gpu::shadow::GROUP_RECEIVE, 3);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(id.label()),
+            bind_group_layouts: &[
+                Some(groups.materials),
+                Some(groups.view),
+                Some(groups.geometry),
+                Some(receive),
+            ],
+            immediate_size: 0,
+        });
+        Self {
+            tier: Tier::High,
+            module: create_module(device, id),
+            layout,
+            vertex_entry: "vs_pull",
+            topology: wgpu::PrimitiveTopology::TriangleList,
+        }
+    }
+
+    /// The opaque, cutout and translucent pipelines of this builder.
+    fn solid_set(&self, device: &wgpu::Device, prefix: &str) -> [wgpu::RenderPipeline; 3] {
+        let solid = |fragment_entry, cull_mode| VoxelDraw {
+            fragment_entry,
+            cull_mode,
+            blend: None,
+            depth_write: true,
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+        [
+            self.build(
+                device,
+                &format!("{prefix} opaque"),
+                solid("fs_opaque", Some(wgpu::Face::Back)),
+            ),
+            self.build(
+                device,
+                &format!("{prefix} cutout"),
+                solid("fs_cutout", None),
+            ),
+            // Blended quads test depth but do not write it: the ones behind still show.
+            self.build(
+                device,
+                &format!("{prefix} translucent"),
+                VoxelDraw {
+                    fragment_entry: "fs_translucent",
+                    cull_mode: None,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    depth_write: false,
+                    write_mask: wgpu::ColorWrites::ALL,
+                },
+            ),
+        ]
+    }
+
     fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
         let (module_id, vertex_entry, topology, immediate_size) = match tier {
             Tier::High | Tier::Mid => (
@@ -351,35 +436,36 @@ impl VoxelPipelines {
     /// `VoxelInstanced` on Low). The fog's depth pipeline waits for the fog.
     pub fn new(device: &wgpu::Device, tier: Tier, layouts: &VoxelLayouts) -> Self {
         let builder = VoxelBuilder::new(device, tier, layouts);
-        let solid = |fragment_entry, cull_mode| VoxelDraw {
-            fragment_entry,
-            cull_mode,
-            blend: None,
-            depth_write: true,
-            write_mask: wgpu::ColorWrites::ALL,
-        };
+        let [opaque, cutout, translucent] = builder.solid_set(device, "boxel voxel");
         Self {
-            opaque: builder.build(
-                device,
-                "boxel voxel opaque",
-                solid("fs_opaque", Some(wgpu::Face::Back)),
-            ),
-            cutout: builder.build(device, "boxel voxel cutout", solid("fs_cutout", None)),
-            // Blended quads test depth but do not write it: the ones behind still show.
-            translucent: builder.build(
-                device,
-                "boxel voxel translucent",
-                VoxelDraw {
-                    fragment_entry: "fs_translucent",
-                    cull_mode: None,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    depth_write: false,
-                    write_mask: wgpu::ColorWrites::ALL,
-                },
-            ),
+            opaque,
+            cutout,
+            translucent,
             fog_depth: None,
+            shadowed: None,
             builder,
         }
+    }
+
+    /// High: builds the pipelines that receive sun shadows once (the next calls keep them), with
+    /// groups 0 to 2 of `groups` and the receivers' `receive` (ADR 0065). The first time
+    /// shadows are on costs creating these 3 pipelines, as the fog's does.
+    pub fn set_shadowed(
+        &mut self,
+        device: &wgpu::Device,
+        groups: &crate::shadow::VoxelGroups<'_>,
+        receive: &wgpu::BindGroupLayout,
+    ) {
+        if self.shadowed.is_some() || self.builder.tier != Tier::High {
+            return;
+        }
+        let builder = VoxelBuilder::shadowed(device, groups, receive);
+        let [opaque, cutout, translucent] = builder.solid_set(device, "boxel voxel shadowed");
+        self.shadowed = Some(ShadowedVoxels {
+            opaque,
+            cutout,
+            translucent,
+        });
     }
 
     /// Builds the fog's depth pipeline (`on`) or drops it. Its draw writes no color, so the

@@ -1,6 +1,6 @@
-//! The sun shadow maps on High (sun shadows plan sec. 4.2 and 4.3, ADR 0065, lane S3): the
-//! caster cull and one depth pass per cascade, before the main pass. Nothing reads the maps yet
-//! (the receivers are lane S4), so no frame looks different.
+//! The sun shadow maps on High (sun shadows plan sec. 4.2 to 4.4, ADR 0065, lanes S3 and S4):
+//! the caster cull and one depth pass per cascade, before the main pass, and the group the
+//! receivers read them through (`sun_shadow.wgsl`, [`ShadowPass::receivers`]).
 //!
 //! - The cull (`shadow_cull.wgsl`) runs one thread per chunk slot, like `cull.wgsl`, and writes
 //!   per cascade and page an opaque list (the face buckets that look away from the sun) and a
@@ -9,6 +9,9 @@
 //! - Each cascade is one depth-only render pass into its layer of a `Depth32Float` array,
 //!   cleared to 1 (the far side), with 2 multi-draws per page holding chunks: the opaque buckets
 //!   without a fragment stage, then the cutout bucket with its alpha test.
+//! - The receivers bind the maps, a `LessEqual` comparison sampler (linear: one 2x2 PCF
+//!   compare) and the whole uniform, whose entry 0 also holds the camera realm's strength `k`
+//!   ([`receive_layout`]). Only a frame that drew its maps has them.
 //!
 //! The resources exist only while shadows are on ([`crate::VoxelRenderer::set_sun_shadows`]):
 //! with shadows off High allocates nothing and records nothing. A frame without a shadow (night,
@@ -18,8 +21,9 @@ use crate::DEPTH_FORMAT;
 use crate::memory::{ARGS_BYTES, PageSet};
 use boxel_shaders::gpu::chunk_memory::MAX_PAGES;
 use boxel_shaders::gpu::shadow::{
-    CASCADE_STRIDE, CULL_WORKGROUP_SIZE, GROUP_CASCADE, MAX_CASCADES, STATE_DROPPED_OFFSET,
-    STATE_SIZE, ShadowCascadeGpu, UNIFORM_SIZE,
+    CASCADE_STRIDE, CULL_WORKGROUP_SIZE, GROUP_CASCADE, MAX_CASCADES, RECEIVE_MAPS,
+    RECEIVE_SAMPLER, RECEIVE_UNIFORM, STATE_DROPPED_OFFSET, STATE_SIZE, ShadowCascadeGpu,
+    UNIFORM_SIZE,
 };
 use boxel_shaders::gpu::{DrawRef, bindings};
 use boxel_shaders::{ShaderModuleId, create_module};
@@ -69,6 +73,8 @@ pub(crate) struct ShadowFrame<'a> {
     pub band: [i32; 2],
     /// The camera's realm.
     pub realm: u8,
+    /// The camera realm's shadow strength `k` (above 0: a frame without shadow draws nothing).
+    pub strength: f32,
     /// Pages with High draw lists (`L`): every page id is below it.
     pub list_pages: u32,
     /// Chunks a page holds at most.
@@ -122,6 +128,10 @@ pub(crate) struct ShadowPass {
     cull_group: Option<(wgpu::Buffer, wgpu::BindGroup)>,
     /// One cascade's entry of `uniform` (dynamic offset).
     cascade_group: wgpu::BindGroup,
+    /// The receivers' group 3 ([`receive_layout`]), built again with the maps.
+    receive_layout: wgpu::BindGroupLayout,
+    receive_sampler: wgpu::Sampler,
+    receive_group: wgpu::BindGroup,
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
     /// Texels per side of a block texture and its mip levels (the cutout's mip level).
@@ -136,11 +146,13 @@ pub(crate) struct ShadowPass {
 }
 
 impl ShadowPass {
-    /// Builds the pipelines, the uniform and the maps of `settings` (valid). `block_texture` is
-    /// the block texture array (the cutout's mip level comes from its size).
+    /// Builds the pipelines, the uniform and the maps of `settings` (valid), and the receivers'
+    /// group of `receive` ([`receive_layout`]). `block_texture` is the block texture array (the
+    /// cutout's mip level comes from its size).
     pub fn new(
         device: &wgpu::Device,
         groups: &VoxelGroups<'_>,
+        receive: &wgpu::BindGroupLayout,
         settings: &SunShadowSettings,
         block_texture: &wgpu::Texture,
     ) -> Self {
@@ -304,10 +316,25 @@ impl ShadowPass {
             Some("fs_shadow_cutout"),
         );
         let (maps, layers) = maps(device, settings);
+        let receive_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("boxel sun shadow compare"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let receive_group =
+            receive_group(device, receive, &maps, &receive_sampler, &uniform_buffer);
         Self {
             settings: *settings,
             maps,
             layers,
+            receive_layout: receive.clone(),
+            receive_sampler,
+            receive_group,
             uniform: uniform_buffer,
             state,
             lists: None,
@@ -338,8 +365,16 @@ impl ShadowPass {
         self.settings = *settings;
         if resized {
             (self.maps, self.layers) = maps(device, settings);
+            self.receive_group = receive_group(
+                device,
+                &self.receive_layout,
+                &self.maps,
+                &self.receive_sampler,
+                &self.uniform,
+            );
             self.lists = None;
             self.cull_group = None;
+            self.last = None;
         }
     }
 
@@ -364,6 +399,12 @@ impl ShadowPass {
     /// Testing: the last frame's cascades, `None` when it drew none.
     pub fn last_cascades(&self) -> Option<&ShadowCascades> {
         self.last.as_ref()
+    }
+
+    /// The receivers' group 3 when this frame drew its maps ([`ShadowPass::encode`]); `None`
+    /// after [`ShadowPass::skip`], and then the main pass draws with today's pipelines.
+    pub fn receivers(&self) -> Option<&wgpu::BindGroup> {
+        self.last.is_some().then_some(&self.receive_group)
     }
 
     /// Testing: the maps (`Depth32Float`, one layer per cascade, `COPY_SRC`).
@@ -396,6 +437,8 @@ impl ShadowPass {
         frame: &ShadowFrame<'_>,
     ) {
         self.read_sample();
+        // Set again once the maps are recorded: until then no receiver reads them.
+        self.last = None;
         let cascades = frame.cascades.cascades();
         let count = (cascades.len() as u32).min(self.settings.cascades);
         let pages = frame.list_pages.clamp(1, MAX_PAGES);
@@ -446,7 +489,8 @@ impl ShadowPass {
                 light: c.light.extend(c.distance).to_array(),
                 counts: [count, c.bucket_mask, casters, pages],
                 band: [frame.band[0], frame.band[1], i32::from(frame.realm), 0],
-                pad: [[0; 4]; 2],
+                receive: [frame.strength, 0.0, 0.0, 0.0],
+                pad: [0; 4],
             };
         }
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&entries));
@@ -602,6 +646,78 @@ fn maps(
         })
         .collect();
     (texture, layers)
+}
+
+/// The layout of the receivers' group 3 (`sun_shadow.wgsl`, `GROUP_RECEIVE`), for the fragment
+/// stage: the maps as a depth 2D array, a comparison sampler and the whole shadow uniform. The
+/// shadowed voxel pipelines are built with it.
+pub(crate) fn receive_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("boxel sun shadow receivers"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: RECEIVE_MAPS,
+                visibility: fragment,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: RECEIVE_SAMPLER,
+                visibility: fragment,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: RECEIVE_UNIFORM,
+                visibility: fragment,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The receivers' group of `maps` (every layer), `sampler` and `uniform`.
+fn receive_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    maps: &wgpu::Texture,
+    sampler: &wgpu::Sampler,
+    uniform: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let view = maps.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("boxel sun shadow maps"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        aspect: wgpu::TextureAspect::DepthOnly,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("boxel sun shadow receivers"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: RECEIVE_MAPS,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: RECEIVE_SAMPLER,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: RECEIVE_UNIFORM,
+                resource: uniform.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 /// Lists of `shape` (cascades, pages, chunks of a page).

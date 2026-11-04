@@ -1,6 +1,7 @@
 //! boxel's WGSL shaders (embedded with `include_str!`) and the `#[repr(C)]` mirrors of every GPU
 //! struct they read. Composition is plain concatenation: `common.wgsl` and `sun_off.wgsl` are
-//! prepended to the voxel modules. Every module is validated by naga in `cargo test` (WGSL
+//! prepended to the voxel modules (High's shadowed module takes `shadow_common.wgsl` and
+//! `sun_shadow.wgsl` in place of `sun_off.wgsl`). Every module is validated by naga in `cargo test` (WGSL
 //! front-end + GLSL 330 / ES 300 / 430 / ES 310 back-ends where the tier can run on GL), and every
 //! mirror struct has a layout test against naga's layouter (`tests/naga.rs`).
 //!
@@ -18,6 +19,9 @@ pub const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
 /// `common.wgsl` in every module that includes it, since `voxel_light` calls it. It adds no
 /// binding, `View` field or vertex attribute.
 pub const SUN_OFF_WGSL: &str = include_str!("../shaders/sun_off.wgsl");
+/// `sun_shadow.wgsl`: `sun_factor` from the sun shadow maps (ADR 0065, lane S4), High only, in
+/// place of [`SUN_OFF_WGSL`] in [`ShaderModuleId::VoxelPullShadowed`]. It binds group 3.
+pub const SUN_SHADOW_WGSL: &str = include_str!("../shaders/sun_shadow.wgsl");
 /// `voxel_pull.wgsl`: High/Mid vertex pulling (`vs_pull`, `fs_opaque`).
 pub const VOXEL_PULL_WGSL: &str = include_str!("../shaders/voxel_pull.wgsl");
 /// `voxel_instanced.wgsl`: Low instanced quads (`vs_instanced`, `fs_opaque`).
@@ -79,6 +83,9 @@ pub enum Stage {
 pub enum ShaderModuleId {
     /// common + `sun_off` + `voxel_pull` (tiers High, Mid).
     VoxelPull,
+    /// common + `shadow_common` + `sun_shadow` + `voxel_pull`: the voxels receiving sun shadows
+    /// (tier High, only while sun shadows are on and a frame has some, ADR 0065).
+    VoxelPullShadowed,
     /// common + `sun_off` + `voxel_instanced` (tier Low).
     VoxelInstanced,
     /// common + `sun_off` + cull (tier High).
@@ -129,6 +136,16 @@ fn common_sun_off(rest: &[&str]) -> String {
 }
 
 static VOXEL_PULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[VOXEL_PULL_WGSL]));
+// The shadowed twin of VOXEL_PULL: the same text but the sun factor.
+static VOXEL_PULL_SHADOWED: LazyLock<String> = LazyLock::new(|| {
+    [
+        COMMON_WGSL,
+        SHADOW_COMMON_WGSL,
+        SUN_SHADOW_WGSL,
+        VOXEL_PULL_WGSL,
+    ]
+    .join("\n")
+});
 static VOXEL_INSTANCED: LazyLock<String> =
     LazyLock::new(|| common_sun_off(&[VOXEL_INSTANCED_WGSL]));
 static CULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[CULL_WGSL]));
@@ -145,8 +162,9 @@ static SHADOW: LazyLock<String> =
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 16] = [
+    pub const ALL: [ShaderModuleId; 17] = [
         ShaderModuleId::VoxelPull,
+        ShaderModuleId::VoxelPullShadowed,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
         ShaderModuleId::Blit,
@@ -168,6 +186,7 @@ impl ShaderModuleId {
     pub const fn label(self) -> &'static str {
         match self {
             ShaderModuleId::VoxelPull => "boxel voxel_pull",
+            ShaderModuleId::VoxelPullShadowed => "boxel voxel_pull_shadowed",
             ShaderModuleId::VoxelInstanced => "boxel voxel_instanced",
             ShaderModuleId::Cull => "boxel cull",
             ShaderModuleId::Blit => "boxel blit",
@@ -190,6 +209,7 @@ impl ShaderModuleId {
     pub fn source(self) -> &'static str {
         match self {
             ShaderModuleId::VoxelPull => VOXEL_PULL.as_str(),
+            ShaderModuleId::VoxelPullShadowed => VOXEL_PULL_SHADOWED.as_str(),
             ShaderModuleId::VoxelInstanced => VOXEL_INSTANCED.as_str(),
             ShaderModuleId::Cull => CULL.as_str(),
             ShaderModuleId::Blit => BLIT_WGSL,
@@ -211,7 +231,7 @@ impl ShaderModuleId {
     /// Entry points and stages.
     pub const fn entry_points(self) -> &'static [(&'static str, Stage)] {
         match self {
-            ShaderModuleId::VoxelPull => &[
+            ShaderModuleId::VoxelPull | ShaderModuleId::VoxelPullShadowed => &[
                 ("vs_pull", Stage::Vertex),
                 ("fs_opaque", Stage::Fragment),
                 ("fs_cutout", Stage::Fragment),
@@ -291,10 +311,27 @@ impl ShaderModuleId {
         matches!(self, ShaderModuleId::VoxelInstanced | ShaderModuleId::Lod)
     }
 
+    /// True if only the High tier ever creates the module: the GPU cull, the far LOD's
+    /// GPU-driven path and everything of sun shadows (ADR 0065). Mid and Low never see their
+    /// text, bindings or layouts.
+    pub const fn high_only(self) -> bool {
+        matches!(
+            self,
+            ShaderModuleId::Cull
+                | ShaderModuleId::LodPull
+                | ShaderModuleId::LodCull
+                | ShaderModuleId::LodHiz
+                | ShaderModuleId::ShadowCull
+                | ShaderModuleId::Shadow
+                | ShaderModuleId::VoxelPullShadowed
+        )
+    }
+
     /// Lowest GL version the module must translate to (checked by naga tests).
     pub const fn min_gl(self) -> (u8, u8) {
         match self {
             ShaderModuleId::VoxelPull
+            | ShaderModuleId::VoxelPullShadowed
             | ShaderModuleId::Cull
             | ShaderModuleId::LodPull
             | ShaderModuleId::LodCull

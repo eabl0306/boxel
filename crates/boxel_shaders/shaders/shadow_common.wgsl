@@ -1,5 +1,6 @@
 // boxel: what the sun shadow modules share (ADR 0065, High only). Appended after common.wgsl and
-// sun_off.wgsl to shadow_cull.wgsl and shadow.wgsl.
+// sun_off.wgsl to shadow_cull.wgsl and shadow.wgsl, and after common.wgsl to sun_shadow.wgsl
+// (the receivers, which bind the whole uniform).
 //
 // The shadow uniform is MAX_SHADOW_CASCADES entries of ShadowCascade, 256 bytes each (the
 // dynamic offset step of the shadow draws' group 3, the largest uniform offset alignment wgpu
@@ -20,5 +21,6 @@ struct ShadowCascade {             // 256 bytes, mirrors boxel_shaders::gpu::sha
   light: vec4<f32>,                // xyz = unit direction toward the sun, w = where the shadows end (view distance)
   counts: vec4<u32>,               // x = cascades this frame, y = the face buckets that cast (bit f), z = chunks a page's list of one cascade holds (C), w = pages with lists (L)
   band: vec4<i32>,                 // x, y = the camera realm's voxels [x, y) in y relative to View::render_origin.y (saturated), z = the camera realm
-  pad: array<vec4<u32>, 2>,
+  receive: vec4<f32>,              // x = the camera realm's shadow strength k (the only realm shadowed), yzw = 0
+  pad: vec4<u32>,
 };

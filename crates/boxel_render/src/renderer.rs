@@ -18,7 +18,7 @@ use crate::path::{
 use crate::plugin::Resync;
 use crate::shadow::{
     ShadowCascades, ShadowFrame, ShadowPass, ShadowStats, ShadowView, SunShadowSettings,
-    VoxelGroups, shadow_cascades,
+    VoxelGroups, receive_layout, shadow_cascades,
 };
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
@@ -393,6 +393,9 @@ pub struct VoxelRenderer {
     shadow: Option<ShadowPass>,
     /// The shadow passes could not be created on this device: shadows stay off.
     shadow_failed: bool,
+    /// The receivers' group 3 layout, made the first time shadows are on and kept (the shadowed
+    /// voxel pipelines are built with it once).
+    receive_layout: Option<wgpu::BindGroupLayout>,
 }
 
 /// The renderer's per-world state, compared with a fresh renderer's
@@ -895,6 +898,7 @@ impl VoxelRenderer {
             device_type: device.adapter_info().device_type,
             shadow: None,
             shadow_failed: false,
+            receive_layout: None,
         })
     }
 
@@ -907,8 +911,10 @@ impl VoxelRenderer {
     ///
     /// Then each frame with a sun ([`crate::SceneLight::sun`]) that shades the camera's realm
     /// and some sky-lit chunk in that realm draws the casters into the maps before the main
-    /// pass ([`RenderStats::shadows`]). No receiver reads them yet (lane S4): the frame's
-    /// pixels are the same with shadows on and off.
+    /// pass ([`RenderStats::shadows`]), and draws the terrain with the pipelines that receive
+    /// them: the sky light of the camera's realm is up to `strength` lower in the sun's shadow.
+    /// Every other frame draws with today's pipelines, so its pixels are today's. The shadowed
+    /// pipelines are built the first time shadows apply, and kept.
     pub fn set_sun_shadows(&mut self, device: &wgpu::Device, settings: &SunShadowSettings) {
         if !settings.applies(self.tier, self.device_type) || settings.validate().is_err() {
             self.shadow = None;
@@ -932,10 +938,16 @@ impl VoxelRenderer {
             geometry,
         };
         let mut pass = None;
+        let receive = self
+            .receive_layout
+            .get_or_insert_with(|| receive_layout(device));
+        let path = &mut self.path;
         let built = boxel_gfx::run_in_error_scopes(device, || {
+            path.voxel_mut().set_shadowed(device, &groups, receive);
             pass = Some(ShadowPass::new(
                 device,
                 &groups,
+                receive,
                 settings,
                 &self.block_texture,
             ));
@@ -953,7 +965,8 @@ impl VoxelRenderer {
         }
     }
 
-    /// Records this frame's sun shadow cull and maps, if any (before the main pass).
+    /// Records this frame's sun shadow cull and maps, if any (before the main pass), and
+    /// returns the receivers' group when it did.
     fn encode_shadows(
         &mut self,
         device: &wgpu::Device,
@@ -961,10 +974,8 @@ impl VoxelRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view: &ViewParams,
         slots: u32,
-    ) {
-        let Some(shadow) = &mut self.shadow else {
-            return;
-        };
+    ) -> Option<wgpu::BindGroup> {
+        let shadow = self.shadow.as_mut()?;
         let (Some(sun), Some(table), Some(index), Some(list_pages)) = (
             view.light.sun.as_ref(),
             self.chunk_buffer.as_ref(),
@@ -972,7 +983,7 @@ impl VoxelRenderer {
             self.path.list_pages(),
         ) else {
             shadow.skip();
-            return;
+            return None;
         };
         // The camera realm's band: no realm shadows another (ADR 0039).
         let realm = usize::from(sun.camera_realm);
@@ -986,7 +997,7 @@ impl VoxelRenderer {
         let Some(top) = self.chunks.sky_lit_top(below, above) else {
             // No sky-lit chunk in the realm: nothing casts.
             shadow.skip();
-            return;
+            return None;
         };
         let origin_y = view.render_origin.y;
         let rel = |y: i64| {
@@ -1004,7 +1015,7 @@ impl VoxelRenderer {
         };
         let Some(cascades) = shadow_cascades(&shadow_view, sun, shadow.settings()) else {
             shadow.skip();
-            return;
+            return None;
         };
         let _span = frame_span!("render.shadows");
         shadow.encode(
@@ -1015,6 +1026,7 @@ impl VoxelRenderer {
                 cascades: &cascades,
                 band: [rel(below) as i32, rel(above) as i32],
                 realm: sun.camera_realm,
+                strength: sun.camera_strength(),
                 list_pages,
                 page_chunks: self.layout.page_chunks,
                 slots,
@@ -1026,6 +1038,7 @@ impl VoxelRenderer {
                 pages: &self.pages,
             },
         );
+        shadow.receivers().cloned()
     }
 
     /// Testing (High with sun shadows): the last frame's cascades, `None` when it drew none.
@@ -1957,7 +1970,8 @@ impl VoxelRenderer {
         }
         self.path.encode_compute(encoder, slot_count);
         // Sun shadows (ADR 0065): their cull and maps, before the main pass.
-        self.encode_shadows(device, queue, encoder, view, slot_count);
+        let receivers = self.encode_shadows(device, queue, encoder, view, slot_count);
+        self.path.set_sun_receivers(receivers);
         let fog_depth_draws;
         let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {
             // High with LOD to draw: the main pass ends after the opaque and cutout terrain, the

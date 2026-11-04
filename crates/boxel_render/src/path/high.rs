@@ -7,6 +7,7 @@ use crate::chunk_table::ChunkTable;
 use crate::memory::{ARGS_BYTES, PageSet};
 use crate::renderer::ViewParams;
 use boxel_shaders::gpu::chunk_memory::MAX_PAGES;
+use boxel_shaders::gpu::shadow::GROUP_RECEIVE;
 use boxel_shaders::gpu::{DrawRef, bindings};
 
 /// Buffers the High path needs from the renderer.
@@ -33,6 +34,9 @@ pub(crate) struct HighInputs<'a> {
 /// ever drops a bucket. The translucent buckets must be drawn back to front, so they come from
 /// the CPU as on Mid ([`translucent_draws`]): one `draw_indexed` per visible chunk with
 /// translucent quads, with its `DrawRef` in a small vertex buffer written every frame.
+///
+/// In a frame with sun shadows (ADR 0065) the same draws use the shadowed pipelines with the
+/// receivers' group 3 bound ([`TierPath::set_sun_receivers`]).
 pub(crate) struct HighPath {
     voxel: VoxelPipelines,
     cull: wgpu::ComputePipeline,
@@ -57,6 +61,8 @@ pub(crate) struct HighPath {
     translucent_capacity: usize,
     /// Page changes in `translucent`.
     switches: u32,
+    /// This frame's sun shadow receivers (group 3), if any.
+    receivers: Option<wgpu::BindGroup>,
 }
 
 /// High's two draw lists for `pages` page ids (ADR 0035): the indirect args and their
@@ -231,11 +237,27 @@ impl HighPath {
             translucent: Vec::new(),
             translucent_capacity,
             switches: 0,
+            receivers: None,
         }
     }
 
     /// Testing: the draw counts the last frame's cull wrote, opaque and cutout per page
     /// (waits for the GPU).
+    /// The opaque and cutout pipelines of this frame, with the receivers' group bound in `pass`
+    /// when the frame has sun shadows.
+    fn solid_pipelines(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> (&wgpu::RenderPipeline, &wgpu::RenderPipeline) {
+        match (&self.receivers, &self.voxel.shadowed) {
+            (Some(group), Some(shadowed)) => {
+                pass.set_bind_group(GROUP_RECEIVE, group, &[]);
+                (&shadowed.opaque, &shadowed.cutout)
+            }
+            _ => (&self.voxel.opaque, &self.voxel.cutout),
+        }
+    }
+
     pub fn read_draw_counts(
         &self,
         device: &wgpu::Device,
@@ -322,7 +344,8 @@ impl TierPath for HighPath {
         let stride = u64::from(self.stride);
         let cut = stride / 6;
         let mut draws = 0;
-        pass.set_pipeline(&self.voxel.opaque);
+        let (opaque, cutout) = self.solid_pipelines(pass);
+        pass.set_pipeline(opaque);
         for (p, geometry) in live() {
             pass.set_bind_group(bindings::GROUP_GEOMETRY, geometry, &[]);
             pass.multi_draw_indexed_indirect_count(
@@ -334,7 +357,7 @@ impl TierPath for HighPath {
             );
             draws += 1;
         }
-        pass.set_pipeline(&self.voxel.cutout);
+        pass.set_pipeline(cutout);
         let cutout_base = u64::from(self.lists.pages) * stride;
         for (p, geometry) in live() {
             pass.set_bind_group(bindings::GROUP_GEOMETRY, geometry, &[]);
@@ -356,11 +379,24 @@ impl TierPath for HighPath {
         pages: &PageSet,
         draw: TranslucentDraw,
     ) -> u32 {
-        let Some(pipeline) = self.voxel.translucent_for(draw) else {
+        let shadowed = match (draw, &self.receivers, &self.voxel.shadowed) {
+            (TranslucentDraw::Color, Some(group), Some(shadowed)) => {
+                Some((group, &shadowed.translucent))
+            }
+            _ => None,
+        };
+        let Some(pipeline) = shadowed
+            .map(|(_, p)| p)
+            .or_else(|| self.voxel.translucent_for(draw))
+        else {
             return 0;
         };
         if self.translucent.is_empty() {
             return 0;
+        }
+        // Group 3 again: the far LOD binds its own there in between (ADR 0031).
+        if let Some((group, _)) = shadowed {
+            pass.set_bind_group(GROUP_RECEIVE, group, &[]);
         }
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_pipeline(pipeline);
@@ -391,6 +427,10 @@ impl TierPath for HighPath {
 
     fn voxel_mut(&mut self) -> &mut VoxelPipelines {
         &mut self.voxel
+    }
+
+    fn set_sun_receivers(&mut self, receivers: Option<wgpu::BindGroup>) {
+        self.receivers = receivers;
     }
 
     fn list_pages(&self) -> Option<u32> {
