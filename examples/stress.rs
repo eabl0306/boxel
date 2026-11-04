@@ -236,9 +236,9 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
                       off: in its frame steps only
   --no-distance-fog   no fade into the sky at the view distance or the LOD's horizon (the same
                       cost; not in the summary)
-  --sun-shadows       sun shadow maps on High, integrated GPUs included (ADR 0065; no receivers
-                      yet, so the picture does not change); not in the summary, a line after it
-                      says what the last frame drew
+  --sun-shadows       sun shadows on High, integrated GPUs included (ADR 0065: the maps and the
+                      terrain receiving them); not in the summary, a line after it says what
+                      the last frame drew
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a

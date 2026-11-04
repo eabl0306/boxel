@@ -89,6 +89,9 @@
 //! The terrain fades into the sky over the last stretch before the view distance (or the LOD's
 //! horizon): the last 10 %, at most 64 blocks (`RenderSettings::distance_fog`).
 //! `--no-distance-fog` starts without it (a hard edge) and F10 toggles it.
+//!
+//! `--sun-shadows` turns on the sun's shadows on the High tier (ADR 0065), also on integrated
+//! GPUs, where the engine leaves them off unless asked; F11 toggles them. Mid and Low draw none.
 #![expect(clippy::print_stdout, clippy::print_stderr, reason = "CLI output")]
 
 #[path = "shared/cavern.rs"]
@@ -164,6 +167,7 @@ usage: voxel_world [GPU options] [options]
   --vertical-radius N     vertical mesh radius in chunks, up and down (default 8)
   --no-distance-fog       no fade into the sky at the view distance or the LOD's horizon: the
                           terrain ends with a hard edge (F10 toggles the fade)
+  --sun-shadows           sun shadows on the High tier, integrated GPUs too (F11 toggles them)
   --fixed-height          stream every layer of the generator and nothing else, whatever the
                           camera height (boxel M0 streaming, for comparisons)
   --size WxH              window size in logical pixels (default 1280x720)
@@ -300,6 +304,8 @@ struct Options {
     lod: lod::LodPreset,
     /// `--no-distance-fog` clears it: the fade at the view distance (F10 toggles it).
     distance_fog: bool,
+    /// `--sun-shadows`: sun shadows on High (F11 toggles them).
+    sun_shadows: bool,
     /// `--world-dir`: where the world is saved.
     world_dir: Option<PathBuf>,
     /// `--camera` was given (a saved camera does not replace it).
@@ -373,6 +379,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         fog_haze: 1.0,
         lod: lod::LodPreset::Off,
         distance_fog: true,
+        sun_shadows: false,
         world_dir: None,
         camera_given: false,
     };
@@ -402,6 +409,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--fog-haze" => o.fog_haze = fog::parse_haze(flag, &value()?)?,
             "--lod" => o.lod = lod::parse(flag, &value()?)?,
             "--no-distance-fog" => o.distance_fog = false,
+            "--sun-shadows" => o.sun_shadows = true,
             "--timeout" => o.timeout = Some(Duration::from_secs(number(flag, &value()?)?)),
             "--screenshot" => o.screenshot = Some(PathBuf::from(value()?)),
             "--expect-terrain" => o.expect_terrain = true,
@@ -2367,6 +2375,7 @@ fn main() -> AppExit {
                 } else {
                     DistanceFog::off()
                 },
+                sun_shadows: sun_shadows(options.sun_shadows),
                 ..RenderSettings::default()
             },
         })
@@ -2490,7 +2499,7 @@ fn main() -> AppExit {
         .init_resource::<FixedSteps>()
         .add_systems(Startup, spawn_camera)
         .add_systems(FixedUpdate, count_fixed_steps)
-        .add_systems(Update, toggle_distance_fog)
+        .add_systems(Update, (toggle_distance_fog, toggle_sun_shadows))
         .add_systems(
             Update,
             (
@@ -2675,6 +2684,37 @@ mod tests {
         };
         assert_eq!(press(&mut app), DistanceFog::off());
         assert_eq!(press(&mut app), DistanceFog::default());
+    }
+
+    #[test]
+    fn sun_shadows_option_and_the_f11_toggle() {
+        assert!(!parse(&[]).sun_shadows, "off unless asked");
+        assert!(parse(&["--sun-shadows"]).sun_shadows);
+        assert!(usage().contains("--sun-shadows"));
+        assert!(usage().contains("F11 toggles"));
+        assert_eq!(
+            sun_shadows(false),
+            boxel::render::SunShadowSettings {
+                on_integrated: true,
+                ..Default::default()
+            }
+        );
+        let mut app = App::new();
+        app.insert_resource(RenderSettings::default())
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, toggle_sun_shadows);
+        let press = |app: &mut App| {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::F11);
+            keys.clear_just();
+            keys.press(KeyCode::F11);
+            app.update();
+            app.world().resource::<RenderSettings>().sun_shadows
+        };
+        let on = press(&mut app);
+        assert!(on.enabled && on.on_integrated);
+        assert_eq!(on.validate(), Ok(()));
+        assert!(!press(&mut app).enabled);
     }
 
     #[test]
@@ -4219,6 +4259,26 @@ fn toggle_distance_fog(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Ren
     let fog = &mut settings.distance_fog;
     fog.enabled = !fog.enabled;
     eprintln!("distance fog: {}", on_off(fog.enabled));
+}
+
+/// The sun shadows of `--sun-shadows` and F11: on or off, and on integrated GPUs too (the
+/// player asked for them).
+fn sun_shadows(on: bool) -> boxel::render::SunShadowSettings {
+    boxel::render::SunShadowSettings {
+        enabled: on,
+        on_integrated: true,
+        ..boxel::render::SunShadowSettings::default()
+    }
+}
+
+/// F11: the sun shadows on or off (`RenderSettings::sun_shadows`; `--sun-shadows` starts with
+/// them on), named in the log.
+fn toggle_sun_shadows(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<RenderSettings>) {
+    if !keys.just_pressed(KeyCode::F11) {
+        return;
+    }
+    settings.sun_shadows = sun_shadows(!settings.sun_shadows.enabled);
+    eprintln!("sun shadows: {}", on_off(settings.sun_shadows.enabled));
 }
 
 /// The fog preset F7 shows and the haze factor of Shift+F7 (`--fog` and `--fog-haze`; only
