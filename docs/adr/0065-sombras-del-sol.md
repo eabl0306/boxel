@@ -414,8 +414,9 @@ Pruebas, `gpu_sun_shadows.rs` parte 3, en la RTX, la 780M y llvmpipe:
 Herramientas para ver y medir las sombras. No cambia el render.
 
 - **Línea en F3.** Con `RenderSettings::sun_shadows` prendidas, `boxel_debug` muestra
-  `Shadows 3 cascades  24 draws  sun 38 deg  53 MiB` (y `dropped N` si una lista se llenó),
-  justo debajo de `GPU chunks`. El sol sale de `SunPath` y el reloj, como en el extract.
+  `Shadows 3 cascades  24 draws  sun 38 deg  53 MiB` justo debajo de `GPU chunks`. Suma
+  `6 entity draws` cuando figuras o quads de celdas dan sombra (el S5), y `dropped N` si una lista
+  se llenó. El sol sale de `SunPath` y el reloj, como en el extract.
   `Shadows none drawn` es un frame sin nada que sombrear (de noche, sin cielo, un reino sin sol);
   `Shadows off here` es un renderer que no las dibuja (Mid, Low, una GPU integrada sin
   `on_integrated`). Con las sombras apagadas no hay línea, como las otras líneas opcionales.

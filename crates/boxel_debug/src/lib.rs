@@ -230,8 +230,8 @@ impl ShadowProbe {
             .map(|info| Self::at(info.shadows, path, time))
     }
 
-    /// `Shadows 3 cascades  24 draws  sun 34 deg  53 MiB` (with `dropped N` when a list was
-    /// full), `Shadows none drawn ...` in a frame with nothing to shadow (night, no sky above, a
+    /// `Shadows 3 cascades  24 draws  sun 34 deg  53 MiB` (with `6 entity draws` after the draws
+    /// when models or cell quads cast, and `dropped N` when a list was full), `Shadows none drawn ...` in a frame with nothing to shadow (night, no sky above, a
     /// realm without the sun), or `Shadows off here ...` where the renderer does not draw them.
     pub fn line(&self) -> String {
         let s = self.stats;
@@ -243,6 +243,9 @@ impl ShadowProbe {
         } else {
             format!("Shadows {} cascades  {} draws", s.cascades, s.draws)
         };
+        if s.cascades > 0 && s.entity_draws > 0 {
+            let _ = write!(line, "  {} entity draws", s.entity_draws);
+        }
         let _ = write!(
             line,
             "  sun {:.0} deg  {:.0} MiB",
@@ -1393,6 +1396,7 @@ mod tests {
         let drawn = ShadowStats {
             cascades: 3,
             draws: 24,
+            entity_draws: 0,
             dropped: 0,
             bytes: 53 << 20,
         };
@@ -1453,6 +1457,17 @@ mod tests {
             sun_degrees: 37.8,
         };
         assert!(line(Some(full)).unwrap().ends_with("  dropped 5"));
+        let figures = ShadowProbe {
+            stats: ShadowStats {
+                entity_draws: 6,
+                ..drawn
+            },
+            sun_degrees: 37.8,
+        };
+        assert_eq!(
+            line(Some(figures)).as_deref(),
+            Some("Shadows 3 cascades  24 draws  6 entity draws  sun 38 deg  53 MiB")
+        );
         let night = ShadowProbe {
             stats: ShadowStats {
                 cascades: 0,
@@ -1499,6 +1514,7 @@ mod tests {
             shadows: ShadowStats {
                 cascades: 3,
                 draws: 24,
+                entity_draws: 0,
                 dropped: 0,
                 bytes: 53 << 20,
             },
