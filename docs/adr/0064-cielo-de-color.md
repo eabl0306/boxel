@@ -3,8 +3,9 @@
 - Estado: aceptado (issue #11, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/colored-sky-plan.md`) el 2026-11-02, con sus respuestas a las preguntas abiertas
   (sección 11 del plan). Se construye por carriles (sección 7 del plan). Hechos: el C0 (este ADR),
-  el C1 (la luz, en `boxel_light`), el C2 (el mundo, en `boxel_world`) y el C3 (la malla, en
-  `boxel_mesh`). Faltan el C4 (render y shaders) y el C5 (depuración, demo y herramientas).
+  el C1 (la luz, en `boxel_light`), el C2 (el mundo, en `boxel_world`), el C3 (la malla, en
+  `boxel_mesh`) y el C4 (render y shaders, sección 12). Falta el C5 (depuración, demo y
+  herramientas).
 - Fecha: 2026-11-02
 
 ## Contexto
@@ -154,7 +155,7 @@ de color queda idéntico byte a byte y no paga nada.
   celdas cuyo color cambió.
 - Una fuente no puede tener filtro (`set_sky_source` lo rechaza), así que todo rayo sale blanco.
 
-### 8. Malla y GPU (carril C3 hecho, sección 11; C4 por construir)
+### 8. Malla y GPU (carriles C3 y C4 hechos, secciones 11 y 12)
 
 - La entrada de la paleta sigue en `[u32; 2]`. Un chunk teñido tiene entradas normales (las de
   hoy) y teñidas: 4 esquinas de un tipo de luz (cielo o bloque, 3 canales), el otro tipo plano para
@@ -166,8 +167,8 @@ de color queda idéntico byte a byte y no paga nada.
 - High dibuja exactas las caras con los dos tipos variando (decisión 1); Low y Mid las aplanan.
 - El fragment necesita un bit plano por quad que diga si la entrada es teñida. El plan lo ponía en
   el bit 16 de `VsOut::ao`, pero ya no está libre: los bits 16 a 31 son la máscara de luces
-  dinámicas (ADR 0062, `AO_DYNAMIC_SHIFT`). El C4 elige otro lugar: un varying plano nuevo, o 15
-  luces dinámicas en vez de 16.
+  dinámicas (ADR 0062, `AO_DYNAMIC_SHIFT`). El C4 lo puso en los bits libres de `VsOut::face`
+  y `VsOut::layer` (sección 12).
 - El término del cielo de `voxel_light` también va a cambiar con las sombras del sol (plan de
   sombras, carril S1, un factor `sun_factor`), que se espera antes del C4: el C4 multiplica cada
   canal del cielo teñido por ese mismo factor.
@@ -262,6 +263,60 @@ Para el C4:
 - **Celdas**: `CellVertex` suma el `u32` de `cell_sky_rgb` (o el cielo gris de `light` si está
   vacío).
 
+### 12. Carril C4: cómo quedó
+
+- **El tinte va en los bits libres de `VsOut::face` y `VsOut::layer`**, no en el bit 16 de `ao`
+  ni en un varying nuevo. `face` usa 3 bits y `layer` 12: quedan 49. Un quad con entrada teñida
+  pone ahí las 4 esquinas del tipo de luz que la entrada deja plano (48 bits, el formato de
+  `tinted_exact`) y el bit 31 de `face` (`TINT_QUAD`, `with_tint`). El fragment lee la cara y la
+  capa con máscara (`out_face`, `out_layer`); en un quad normal esos bits valen 0. Por qué:
+  - `ao` está lleno, y 15 luces dinámicas en vez de 16 cambia un límite público y no alcanza:
+    High necesita 48 bits más por quad para sus esquinas exactas.
+  - Un varying plano nuevo (`vec2<u32>`) costó en la RTX de 17 a 21 % de los fps en la
+    superficie, aun sin el camino teñido en el fragment (lo mismo que vio el ADR 0062). Con los
+    bits libres no hay varying nuevo y el costo queda en ruido (medidas abajo).
+  - Hay un solo camino teñido en el fragment: High pone las esquinas exactas, Mid y Low el valor
+    plano 4 veces (4 esquinas iguales interpoladas dan el valor exacto). Un quad normal corre el
+    código de antes.
+- **La cuenta `t`**: `ChunkGpu.flags` bits 7 a 19 (High y Mid), `ChunkImmediate.origin.w` (Low).
+  El bit 20, `FLAG_TINT_EXACT`, lo pone solo High (`ChunkTable::with_exact_tints`): las partes
+  exactas siguen a la paleta.
+- **Distinto de lo que pedía el C3**: las partes exactas van después de la paleta en los tres
+  tiers (`arena_len` suma `t` en todos). Así la memoria no depende del tier. Mid y Low no las
+  leen; cuestan 8 B por entrada teñida, solo en chunks teñidos. Una malla con más entradas
+  teñidas que paleta o partes exactas se dibuja sin tinte (`tinted_parts`).
+- **Shader**: cielo y bloque interpolados por canal; el cielo de cada canal por la curva, por el
+  color del cielo y por `sun_factor`, con el canal más brillante como nivel. Luces dinámicas, piso
+  de ambiente y máximo como siempre.
+- **Celdas**: `CellVertex` 44 B con `sky` (`0x0RGB`, de `cell_sky_rgb` o el nivel de cielo de su
+  luz tres veces). Llega al fragment en los bits 4 a 15 del varying del reino, que estaban libres.
+  Una celda cuyo cielo no es su nivel de cielo tres veces se sombrea como entrada teñida (cielo en
+  las esquinas, bloque plano). `LitCellQuad` no cambió. Las celdas móviles (ADR 0054) no se tiñen:
+  `set_moving_cell_quads` sigue tomando un `LightValue` por quad.
+- **Modelos**: `ModelVertex` 36 B con `sky`; `ModelDraw::sky_rgb` (`Option<[u8; 3]>`) sale de
+  `ChunkMap::sky_rgb_at` en la sonda. `model_shade` lee siempre el cielo por canal: sin tinte da
+  los mismos floats que antes. El factor del sol del S5 va en ese término.
+- **Pruebas**: `naga.rs` (el formato teñido igual al de `boxel_mesh`, la cuenta y el bit exacto
+  donde los pone el espejo, los bits del tinte en `face` y `layer` sin solaparse, `VsOut` con los
+  mismos 7 varyings, `CellVertex` 44 B, `ModelVertex` 36 B; `View` sin cambios, Low con un bloque
+  uniform y dos atributos). `gpu_light_filter` suma un invernadero
+  bajo vidrio rojo y un cuarto con ventana celeste: rojo al mediodía y nada sin teñir (piso,
+  paredes, una alfombra de celdas y un modelo), de noche oscuro y nunca más claro que con vidrio
+  común, celeste detrás de la ventana. Sin caras aplanadas los tres tiers dan lo mismo. Con una
+  lámpara junto a la ventana, Low y Mid dan lo mismo; High difiere de Mid solo donde están los
+  quads aplanados, y con las partes exactas cambiadas por el valor plano da los píxeles de Mid.
+  Todo igual en cada `FAR_SHIFTS`.
+
+Para el C5 y las sombras:
+
+- El C5 puede contar las entradas aplanadas como `flattened_only` de la prueba: una teñida cuya
+  `tinted_exact_corners` difiere de `tinted_corners`.
+- El S4 define `sun_factor` con la misma firma; el camino teñido ya lo llama. Para la normal del
+  fragment, el S4 lee la cara con `out_face(i)`, nunca `i.face` directo: en un quad teñido sus
+  bits altos llevan el tinte. Lo mismo con `out_layer(i)`.
+- El S5 multiplica el `sky` de `model_shade` por su factor. Las celdas pasan por `shade_fragment`,
+  así que toman el factor solas.
+
 ## Medidas
 
 Carril C1, criterion `light` y `sky_tile`, una corrida por lado contra main (47013e0), una detrás
@@ -308,8 +363,24 @@ La meta del plan para `glass_roof` era +40 % o menos. Sin vidrio, el camino de s
 igual porque `face_corner_lights` se fuerza inline: el camino de color también la llama, y sin
 eso el compilador la sacaba del bucle caliente (+3 a +5 % en `mesh/surface`).
 
+Carril C4, `just perf-smoke surface forest` contra main (b3f1344), un mundo sin vidrio:
+
+| Caso | fps | p99 ms | Frames sobre 6,94 ms | Veredicto |
+|---|---:|---:|---:|---|
+| rtx/surface/r16/uncapped | 1839 a 1842 (+0,2 %) | 1,59 a 1,61 | 0 a 0 | ok |
+| rtx/forest/r16/uncapped | 3522 a 3438 (-2,4 %) | 0,69 a 0,70 | 0 a 0 | ok |
+
+La primera versión, con el varying `vec2<u32>`, dio en la superficie 1861 a 1543 fps (-17,1 %) y,
+sin el camino teñido en el fragment, 1966 a 1544 (-21,5 %): el costo era el varying.
+
+De las 2576 imágenes de las pruebas de GPU de `boxel_render` de main, todas salen iguales byte a
+byte salvo 2 a 4 de `gpu_lod` (`seam_high` de High en la 780M y en llvmpipe, un píxel de 1 o 2
+niveles, distintos en cada corrida: el solape de orden de dibujo de High que ya cambia entre
+corridas de main, ADR 0062).
+
 ## El juego
 
+- `ModelDraw` tiene un campo nuevo, `sky_rgb`: el juego que arma draws a mano pone `None`.
 - Nada nuevo que registrar: los 16 vidrios de color y sus paneles ya tienen el filtro de ADR 0060,
   y el cielo lo sigue.
 - El juego prende `colored_sky`.
