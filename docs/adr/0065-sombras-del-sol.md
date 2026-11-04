@@ -4,7 +4,7 @@
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
   su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR), el S1
   (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU), el S3 (los mapas
-  de sombra) y el S4 (los receptores). Faltan el S5 (celdas y modelos) y el S6 (depuración, demo y
+  de sombra), el S4 (los receptores) y el S5 (celdas y modelos). Falta el S6 (depuración, demo y
   herramientas).
 - Fecha: 2026-11-03
 
@@ -168,7 +168,8 @@ Costos estimados a 1280x720. Cada carril mide los suyos.
   cielo teñido; el nivel que se pasa es el canal más brillante.
 - **Hojas**: dan sombra con huecos y la reciben como cualquier cara.
 - **Agua y caras translúcidas**: no dan sombra y la reciben (la sombra de un árbol cae en un lago).
-- **Celdas y modelos (ADR 0040, 0050)**: carril S5. Hasta entonces ni dan ni reciben.
+- **Celdas y modelos (ADR 0040, 0050)**: dan sombra y la reciben desde el carril S5 (sección
+  14). La mano de primera persona no.
 - **Quads emisivos y luces dinámicas (ADR 0062, 0063)**: sin cambios.
 - **LOD lejano y niebla**: el LOD queda más allá de la distancia de sombras. La niebla no cambia.
 
@@ -354,6 +355,60 @@ Pruebas, `gpu_sun_shadows.rs` parte 2, en la RTX, la 780M y llvmpipe:
 
 Quedan para el S5 las celdas y los modelos: hoy ni dan ni reciben sombra.
 
+### 14. Carril S5: cómo quedó
+
+Desde el S5, en High con sombras, los modelos de entidades y los quads de celda dan sombra y la
+reciben, como el terreno.
+
+- **Dan sombra.** El pase de cada cascada dibuja, además del terreno:
+  - Los modelos de la capa del mundo cuya caja toca la caja de la cascada (`ModelShadow`, los
+    mismos vértices que `vs_model`). El pipeline descarta las caras que miran al sol (`cull_mode`
+    Front: el espacio de luz tiene la orientación de la cámara), así una caja da sombra con sus
+    caras de espaldas, como las cubetas del terreno. Las cajas cutout prueban el alfa de la piel.
+    La caja de cada tramo de dibujo se calcula solo cuando cambian los vértices.
+  - Los quads de celda cutout (`CellShadow`): los de los chunks dentro de la ventana de la GPU,
+    del reino de la cámara y de la caja de la cascada, y todos los que se mueven. Un quad cuya
+    cara (la de su sombreado) no mira lejos del sol se colapsa, la regla del cutout del terreno,
+    y el alfa se prueba al mip de la cascada. Un cartel cerrado da sombra con su dorso. Los
+    translúcidos y los de patrón no dan sombra, como el vidrio y el agua.
+- **Reciben.** `ModelShadowed` y `CellShadowed` son `Model` y `Cell` con `shadow_common.wgsl` y
+  `sun_shadow.wgsl` en lugar de `sun_off.wgsl`, y nada más cambia (lo prueba `naga.rs`). Son
+  solo de High y se usan con el grupo 3 solo en los frames en que `ShadowPass::receivers` da
+  `Some`. Los demás frames dibujan con los pipelines de hoy.
+  - Las celdas pasan por `shade_fragment`, así que toman `sun_factor` sin cambios.
+  - Los modelos no tienen cara. `sun_factor_clip` saca la normal de las derivadas de pantalla
+    de `fragment_position`, vuelta hacia el ojo: sin varying ni atributo nuevo. `model_shade`
+    multiplica el cielo por el factor, con el canal más brillante del cielo como nivel. El
+    fragment lo pide al empezar, antes del `discard`, porque usa derivadas.
+  - `sun_off.wgsl` suma `sun_factor_clip`, que devuelve 1,0: Mid, Low y High sin sombras dan los
+    mismos floats que antes.
+  - `sun_shadow.wgsl` quedó en piezas que comparten los dos factores (`sun_skipped`,
+    `sun_ramp`, `sun_cascades`, `sun_strength`). Los vóxeles hacen las mismas cuentas que en el
+    S4.
+- La mano de primera persona (la capa de la vista) ni da ni recibe sombra.
+- `ShadowStats::entity_draws` cuenta los draws de modelos y celdas en los mapas.
+- **Distinto del plan**: el plan pedía la posición de la instancia y la normal de la cara
+  sombreada. La normal sale por fragmento de las derivadas, y la posición es la del fragmento.
+  Pasar la normal pedía un varying o bits en `ModelVertex`, y los dos llegan a Mid y Low.
+- **Límite**: la caja de una cascada sube hasta el tope de los chunks con cielo más unos
+  bloques. Un modelo muy por encima de ese tope (volando sobre todo el terreno) no da sombra.
+
+Pruebas, `gpu_sun_shadows.rs` parte 3, en la RTX, la 780M y llvmpipe:
+
+- **Los mapas**: un piso con una figura (una caja de modelo de 1 x 2 x 1, flotando un bloque) y
+  un cartel (seis quads de celda de un octavo de grosor), sus cajas como sólidos del rayo de la
+  CPU. A las 15:00 y a las 16:00, 279 y 251 texels salen por la figura o el cartel, y ninguno
+  falla.
+- **El oráculo**, con la figura y el cartel como casters y como superficies: 180 y 223 píxeles
+  del piso están en sombra solo por ellos, y fallan 1 y 3. En toda la imagen fallan 4 y 13 de
+  unos 34.300.
+- **Bajo un árbol de piedra**, a las 15:00: la figura y el cartel quedan en 0,78 de su brillo sin
+  sombras (0,6 de la luz del cielo, en sRGB); los mismos al sol, en 0,98 y 1,0.
+- **Nunca más claro** en todas las escenas. **Iguales byte a byte**: a medianoche, y con las
+  sombras apagadas después de haberlas prendido contra un renderer que nunca las tuvo.
+- En Mid y Low, con la figura y el cartel en la escena, la imagen con sombras prendidas es igual
+  byte a byte a la de sin ellas.
+
 ## Medidas
 
 Carril S1, `just perf-smoke surface` contra main (778e7bb), una corrida de 10 s por lado. No
@@ -410,6 +465,24 @@ siguen apagadas por defecto. La primera palanca del S7 sería mapas de 1024 en G
 
 Con las sombras apagadas: `rtx/surface/r16/uncapped` 2012 -> 1983 fps (-1,5 %), p50 0,45 -> 0,46
 ms, p99 1,08 -> 1,11 ms: en ruido.
+
+Carril S5, `just perf-smoke` en la RTX, una corrida de 10 s por lado (el smoke repite el par si
+los fps caen más del 15 %). El caso de modelos es el del ADR 0040: 50 figuras caminando delante
+de la cámara, posadas en cada frame. No cambia el mundo ni el mallador, así que `headless_world`
+da los mismos quads y chunks; el único código nuevo de CPU es la caja de cada tramo de modelos
+cuando cambian sus vértices.
+
+| Caso | Lados | fps | p50 ms | p99 ms | Frames sobre 6,94 ms |
+|---|---|---:|---:|---:|---:|
+| `--models 50` | este árbol, sin sombras -> con sombras | 1813 -> 1359 (-25,0 %) | 0,49 -> 0,66 | 1,36 -> 1,85 | 1 -> 0 |
+| `--models 50 --sun-shadows` | main -> este árbol | 1417 -> 1369 (-3,4 %) | 0,63 -> 0,65 | 1,79 -> 1,91 | 0 -> 0 |
+| sin modelos | main sin sombras -> este árbol con sombras | 1836 -> 1497 (-18,5 %) | 0,49 -> 0,59 | 1,61 -> 1,85 | 1 -> 0 |
+| `--sun-shadows` | main -> este árbol | 1502 -> 1496 (-0,4 %) | 0,60 -> 0,59 | 1,85 -> 1,86 | 0 -> 0 |
+
+Con 50 figuras las sombras cuestan 0,17 ms de p50 (meta del S4: 0,25), y de eso el S5 pone unos
+0,02 ms: que las figuras den y reciban sombra. Sin modelos el costo de las sombras es el del S4
+(0,49 -> 0,59 allí también) y con sombras en los dos lados los vóxeles no se mueven. Las filas
+con un lado sin sombras salen con 1 porque los fps caen más del 15 %, como en el S4.
 
 ## El juego
 
