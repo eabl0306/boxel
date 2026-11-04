@@ -3,8 +3,8 @@
 - Estado: aceptado (issue #9, fase P8 del plan de luz). El dueño aprobó el plan
   (`docs/planes/sun-shadows-plan.md`) el 2026-11-03 y aceptó tal cual las ocho recomendaciones de
   su sección 9. Se construye por carriles (sección 6 del plan). Hechos: el S0 (este ADR), el S1
-  (el gancho del sol en los shaders) y el S2 (el sol y las cascadas en la CPU). Faltan el S3 (los
-  mapas de sombra), el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
+  (el gancho del sol en los shaders), el S2 (el sol y las cascadas en la CPU) y el S3 (los mapas
+  de sombra). Faltan el S4 (los receptores), el S5 (celdas y modelos) y el S6 (depuración, demo y
   herramientas).
 - Fecha: 2026-11-03
 
@@ -121,7 +121,7 @@ Costos estimados a 1280x720. Cada carril mide los suyos.
 ### 5. Los casters (GPU, High, carril S3)
 
 - `FLAG_SKY_LIT`: el bit 31 de `ChunkGpu.flags`, puesto al subir el chunk si alguna entrada de su
-  paleta tiene cielo en alguna esquina. El cielo de color usa los bits 7 a 19.
+  paleta tiene cielo en alguna esquina. El cielo de color usa los bits 7 a 20.
 - `shadow_cull.wgsl`, un dispatch propio, un hilo por slot: salta los slots sin `FLAG_LIVE`, sin
   `FLAG_SKY_LIT` o fuera de la franja del reino de la cámara. No mira la ocultación de cuevas ni el
   frustum de la cámara (un árbol detrás de la cámara da sombra delante). Prueba la caja del chunk
@@ -259,6 +259,57 @@ Solo CPU: ningún shader, buffer ni pase cambia, y los tres tiers dibujan lo mis
 Para el S3: las cascadas cambian en cada frame en que cambia el origen de render (son relativas a
 la cámara), pero la caja en el mundo solo cambia con su clave, el ancla o el paso del sol. Las
 estructuras para la GPU (`ShadowUniform`) las define el S3 junto con su WGSL.
+
+### 12. Carril S3: cómo quedó
+
+Solo High y solo con las sombras prendidas. Nadie lee los mapas todavía: la imagen es la misma
+con sombras y sin ellas, en los tres tiers.
+
+- `FLAG_SKY_LIT`, el bit 31 de `ChunkGpu.flags`, se pone al subir un chunk si alguna esquina de
+  su paleta tiene cielo (una entrada teñida del cielo de color cuenta siempre). La tabla de chunks
+  guarda el tope de los chunks con cielo por altura: es el `casters_top` de las cascadas, cortado
+  al plano de arriba del reino de la cámara. Sin chunks con cielo en el reino no se dibuja nada.
+- `shadow_cull.wgsl` (`cull_shadow_casters`): un hilo por slot, como `cull.wgsl`. Salta los
+  slots sin `FLAG_LIVE`, sin `FLAG_SKY_LIT` o fuera de la franja del reino de la cámara. Por
+  cada cascada cuya caja toca el chunk, escribe las cubetas de espaldas al sol (`bucket_mask`)
+  y la de cutout. Listas por cascada y página: `3C` opacas y `C` de cutout, con
+  `C = min(chunks de una página, 2048)`. Una lista llena pierde la cubeta y la cuenta.
+- `shadow.wgsl`: `vs_shadow` (opacas, sin fragment) y `vs_shadow_cutout` + `fs_shadow_cutout`
+  (alfa a un mip fijo según el texel de la cascada). Cada esquina crece medio texel en su plano.
+  En cutout se colapsan las caras que no dan la espalda al sol, y las cruces y planos.
+  Sesgo: constante 1, pendiente 1,5. `cull_mode: None`, comparación `LessEqual`.
+- `shadow/pass.rs` (`ShadowPass`): una textura `Depth32Float` array (una capa por cascada,
+  `resolution` al cuadrado), el uniform, las listas y el estado del cull. Un pase de profundidad
+  por cascada después del cull de High y antes del pase principal, limpiado a 1. Sin sombras,
+  de noche o sin chunks con cielo no se graba nada.
+- `VoxelRenderer::set_sun_shadows` lo llama el `prepare` del plugin en cada frame, como
+  `set_memory_limits`. Mira `SunShadowSettings::applies` contra el tipo de adaptador: en Mid,
+  Low, con las sombras apagadas o en una GPU integrada sin `on_integrated` no existe nada.
+- `ViewParams::lens` (`CameraLens`): la dirección, el fov, el aspecto y la distancia de la
+  cámara, que las cascadas necesitan. Lo llena `ViewParams::from_camera`.
+- `RenderStats::shadows` (`ShadowStats`, también en `RenderInfo`): cascadas dibujadas,
+  multi-draws, cubetas perdidas (leídas uno o dos frames tarde) y bytes.
+- `stress --sun-shadows`: prende las sombras, también en GPU integradas, y al final dice qué
+  dibujó el último frame.
+- El espejo de la GPU es `boxel_shaders::gpu::shadow::ShadowCascadeGpu` (256 B por cascada,
+  `shadow_common.wgsl`). El uniform tiene 4 entradas; la entrada 0 lleva lo que comparte el frame.
+
+Pruebas: `tests/naga.rs` (los módulos nuevos son solo de High, los espejos y constantes, las
+escrituras del cull quedan en sus listas); `gpu_sun_shadows.rs` en la RTX, la 780M y llvmpipe:
+cada texel de cada cascada guarda la profundidad de la primera cara de espaldas que encuentra un
+rayo exacto en la CPU (a las 15:00 y a las 17:00; fallan unos 50 de 250.000 texels, todos junto a
+bordes); vidrio, agua y plantas no dejan nada; las hojas dan sombra con algunos huecos; un chunk
+oscuro y un chunk de otro reino no dibujan nada; la imagen principal es igual byte a byte con
+sombras y sin ellas; de noche no se dibuja nada; a 2^31, 2^40 y junto al límite del mundo los
+mapas salen iguales bit a bit; en Mid y Low no hay pase ni recursos y la imagen no cambia.
+
+Para el S4: los mapas están en `ShadowPass::maps` (`Depth32Float`, `D2Array`, con
+`TEXTURE_BINDING`), cada capa limpiada a 1 y con la profundidad del caster más cercano al sol.
+Un receptor está al sol si su profundidad es como mucho la del mapa (`LessEqual`). Para pasar a
+UV: `x = (ndc.x + 1) / 2`, `y = (1 - ndc.y) / 2`. El uniform (`ShadowCascade`) ya trae la
+matriz, el texel, el tramo de distancias, la dirección del sol, la distancia de sombras, el
+reino de la cámara y 32 bytes libres al final de cada entrada. Falta `k` por reino, que hoy no
+está en el uniform.
 
 ## Medidas
 

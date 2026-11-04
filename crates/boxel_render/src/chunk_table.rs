@@ -15,7 +15,7 @@ use crate::memory::PagedAlloc;
 use boxel_math::{I64Vec3, IVec3, wrap_to_i32};
 use boxel_mesh::{BUCKET_COUNT, TRANSLUCENT_BUCKET};
 use boxel_shaders::gpu::ChunkGpu;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 /// Half width of the GPU window, in voxels per axis: a chunk whose origin is nearer than this to
@@ -57,6 +57,9 @@ pub(crate) struct ChunkRecord {
     /// The tinted entries at the start of its light palette (ADR 0064, `0..=4096`;
     /// `crate::upload::tinted_parts`), each with its exact part after the palette.
     pub tinted: u16,
+    /// Some face has sky light at a corner ([`ChunkGpu::FLAG_SKY_LIT`], `upload::sky_lit`): the
+    /// chunk casts sun shadows (ADR 0065).
+    pub sky_lit: bool,
 }
 
 /// Chunk origin offsets along each face's normal, in face bucket order (`Face::ALL`): the chunk
@@ -100,13 +103,19 @@ impl ChunkRecord {
         }
         let live = if live { ChunkGpu::FLAG_LIVE } else { 0 };
         let tinted = u32::from(self.tinted).min(ChunkGpu::TINTED_MASK);
+        let sky_lit = if self.sky_lit {
+            ChunkGpu::FLAG_SKY_LIT
+        } else {
+            0
+        };
         ChunkGpu {
             origin: self.gpu_origin().to_array(),
             quad_base: self.alloc.alloc.offset,
             counts,
             flags: live
                 | u32::from(self.neighbors) << ChunkGpu::NEIGHBOR_SHIFT
-                | tinted << ChunkGpu::TINTED_SHIFT,
+                | tinted << ChunkGpu::TINTED_SHIFT
+                | sky_lit,
             light_base: self.light_base,
             light_len: self.light_len,
             page: u32::from(self.alloc.page),
@@ -156,6 +165,9 @@ pub(crate) struct ChunkTable {
     /// Tinted entries are drawn exactly (High, owner decision 1 of ADR 0064): the GPU entries of
     /// chunks with some are flagged [`ChunkGpu::FLAG_TINT_EXACT`].
     exact_tints: bool,
+    /// How many sky-lit records ([`ChunkRecord::sky_lit`]) there are at each origin `y`: the top
+    /// of the sun shadow casters ([`ChunkTable::sky_lit_top`]).
+    sky_lit: BTreeMap<i64, u32>,
 }
 
 impl ChunkTable {
@@ -179,6 +191,36 @@ impl ChunkTable {
             touched: Vec::new(),
             touched_bits: vec![0; capacity.div_ceil(64) as usize],
             exact_tints: false,
+            sky_lit: BTreeMap::new(),
+        }
+    }
+
+    /// The top (`y`, exclusive) of the sky-lit chunks that reach into `[below, above)`, cut to
+    /// `above`; `None` without one. Sun shadows reach toward the sun up to it (ADR 0065).
+    pub fn sky_lit_top(&self, below: i64, above: i64) -> Option<i64> {
+        if below >= above {
+            return None;
+        }
+        let from = below.saturating_sub(31);
+        self.sky_lit
+            .range(from..above)
+            .next_back()
+            .map(|(&y, _)| y.saturating_add(32).min(above))
+    }
+
+    /// Counts `record` among the sky-lit chunks (`add`) or takes it out.
+    fn count_sky_lit(&mut self, record: &ChunkRecord, add: bool) {
+        if !record.sky_lit {
+            return;
+        }
+        let y = record.origin.y;
+        if add {
+            *self.sky_lit.entry(y).or_default() += 1;
+        } else if let Some(n) = self.sky_lit.get_mut(&y) {
+            *n -= 1;
+            if *n == 0 {
+                self.sky_lit.remove(&y);
+            }
         }
     }
 
@@ -317,6 +359,10 @@ impl ChunkTable {
         }
         record.neighbors = self.neighbor_bits(record.origin);
         let old = self.records[slot as usize].replace(record);
+        if let Some(old) = old {
+            self.count_sky_lit(&old, false);
+        }
+        self.count_sky_lit(&record, true);
         if old.is_some_and(|r| self.in_window(r.origin)) {
             self.drawable -= 1;
         }
@@ -337,6 +383,7 @@ impl ChunkTable {
     pub fn remove(&mut self, id: u64) -> Option<(u32, ChunkRecord)> {
         let slot = self.by_id.remove(&id)?;
         let record = self.records[slot as usize].take()?;
+        self.count_sky_lit(&record, false);
         self.leave(record.origin, slot);
         self.touch(slot);
         self.free.insert(slot);
@@ -366,6 +413,7 @@ impl ChunkTable {
         self.translucent.clear();
         self.by_id.clear();
         self.origins.clear();
+        self.sky_lit.clear();
         self.drawable = 0;
     }
 
@@ -600,6 +648,7 @@ mod tests {
             walls: [0; 6],
             neighbors: 0,
             tinted: 0,
+            sky_lit: false,
         }
     }
 
@@ -684,6 +733,51 @@ mod tests {
         };
         assert_eq!(in_page.gpu(true), ChunkGpu { page: 7, ..gpu });
         assert_eq!(r.gpu(false), ChunkGpu { flags: 0, ..gpu });
+        let lit = ChunkRecord { sky_lit: true, ..r };
+        assert_eq!(
+            lit.gpu(true).flags,
+            ChunkGpu::FLAG_LIVE | ChunkGpu::FLAG_SKY_LIT
+        );
+        assert_eq!(lit.gpu(false).flags, ChunkGpu::FLAG_SKY_LIT);
+    }
+
+    /// The top of the sky-lit chunks in a band follows inserts, replacements, removals and
+    /// clears, and stops at the band's top.
+    #[test]
+    fn the_sky_lit_top_follows_the_chunks() {
+        let mut arena = ArenaAllocator::new(1 << 12, 64);
+        let mut table = ChunkTable::new(16);
+        let mut put = |table: &mut ChunkTable, id: u64, y: i64, sky_lit: bool| {
+            table.insert(ChunkRecord {
+                origin: I64Vec3::new(0, y, 64 * id as i64),
+                sky_lit,
+                ..record(&mut arena, id)
+            });
+        };
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), None);
+        put(&mut table, 1, 0, true);
+        put(&mut table, 2, 64, true);
+        put(&mut table, 3, 128, false);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), Some(96));
+        // A band that ends inside the chunk at 64; one that starts above it; one below all.
+        assert_eq!(table.sky_lit_top(i64::MIN, 80), Some(80));
+        assert_eq!(table.sky_lit_top(96, i64::MAX), None);
+        assert_eq!(table.sky_lit_top(95, i64::MAX), Some(96));
+        assert_eq!(table.sky_lit_top(-100, 0), None);
+        assert_eq!(table.sky_lit_top(10, 10), None);
+        // Replaced by a dark mesh, the chunk at 64 no longer counts; removed, neither does 0.
+        put(&mut table, 2, 64, false);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), Some(32));
+        put(&mut table, 3, 128, true);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), Some(160));
+        table.remove(3);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), Some(32));
+        table.remove(1);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), None);
+        put(&mut table, 4, -(1 << 40), true);
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), Some(-(1 << 40) + 32));
+        table.clear();
+        assert_eq!(table.sky_lit_top(i64::MIN, i64::MAX), None);
     }
 
     #[test]

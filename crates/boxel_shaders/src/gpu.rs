@@ -1,6 +1,8 @@
 //! `#[repr(C)]` mirrors of the WGSL structs (bytemuck `Pod`). Layouts are frozen and tested.
 use bytemuck::{Pod, Zeroable};
 
+pub mod shadow;
+
 /// Model boxes the `View` uniform holds after [`ViewUniform`] (`boxel_voxel::MAX_MODEL_BOXES`,
 /// ADR 0020): two `u32` words each, two boxes per `vec4<u32>`.
 pub const VIEW_BOX_CAPACITY: usize = 1024;
@@ -267,6 +269,9 @@ impl ChunkGpu {
     /// drawn exactly. Only High sets it (owner decision 1 of ADR 0064): Mid draws the same
     /// entries with the other kind of light flat, as Low does.
     pub const FLAG_TINT_EXACT: u32 = 1 << 20;
+    /// `flags` bit 31: some entry of the chunk's light palette has sky light at a corner. Only
+    /// the sun shadow cull reads it (ADR 0065): a chunk without it casts nothing.
+    pub const FLAG_SKY_LIT: u32 = 1 << 31;
 }
 
 const _: () = assert!(

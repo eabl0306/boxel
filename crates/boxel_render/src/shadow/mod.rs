@@ -11,13 +11,20 @@
 //!   `boxel_world::SunPath` and the world clock ([`crate::SceneLight::sun`]).
 //! - [`shadow_cascades`]: where the cascades of a frame are, camera-relative and snapped to their
 //!   texel grid.
+//! - The maps themselves (lane S3): on High, while shadows are on, a caster cull and one
+//!   depth pass per cascade before the main pass ([`ShadowStats`]). Nothing samples them yet.
 
 mod cascades;
+mod pass;
 
 pub use cascades::{
     CASCADE_BLEND, Cascade, MAX_CASCADES, SHADOW_ANCHOR, ShadowCascades, ShadowView, bucket_mask,
     cascade_splits, shadow_cascades,
 };
+pub use pass::{PAGE_CASTERS, ShadowStats};
+pub(crate) use pass::{ShadowFrame, ShadowPass, VoxelGroups, read_depth_layer};
+
+const _: () = assert!(MAX_CASCADES == boxel_shaders::gpu::shadow::MAX_CASCADES);
 
 use boxel_gfx::Tier;
 use boxel_math::DVec3;

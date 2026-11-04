@@ -224,6 +224,9 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
                       off: in its frame steps only
   --no-distance-fog   no fade into the sky at the view distance or the LOD's horizon (the same
                       cost; not in the summary)
+  --sun-shadows       sun shadow maps on High, integrated GPUs included (ADR 0065; no receivers
+                      yet, so the picture does not change); not in the summary, a line after it
+                      says what the last frame drew
   --pack DIR          block textures from a Minecraft Java resource pack (the directory with
                       pack.mcmeta; default: procedural); the summary records it and its load time
   --water Y           water in every air block at or below height Y (lakes and seas), with a
@@ -365,6 +368,8 @@ struct Options {
     idle_work: bool,
     /// `--no-distance-fog`: `RenderSettings::distance_fog` off.
     no_distance_fog: bool,
+    /// `--sun-shadows`: `RenderSettings::sun_shadows` on, also on integrated GPUs.
+    sun_shadows: bool,
     /// `--pack`.
     textures: TextureSource,
     /// `--bodies`, `--body-kind` and `--projectiles`.
@@ -449,6 +454,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         cave_culling: true,
         idle_work: true,
         no_distance_fog: false,
+        sun_shadows: false,
         textures: TextureSource::Procedural,
         bodies: BodyOptions::default(),
         models: 0,
@@ -667,6 +673,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--cave" => o.cave = true,
             "--idle-work" => o.idle_work = on_off(flag, &value()?)?,
             "--no-distance-fog" => o.no_distance_fog = true,
+            "--sun-shadows" => o.sun_shadows = true,
             "--ui" if cfg!(feature = "ui") => o.ui = true,
             "--ui" => return Err("--ui needs a build with --features ui".into()),
             "--fog" => o.fog = fog::parse(flag, &value()?)?,
@@ -1568,6 +1575,17 @@ impl Bench {
         if let Some(memory) = &self.info.chunk_memory {
             println!("{}", memory.line());
         }
+        if self.options.sun_shadows {
+            let s = info.shadows;
+            println!(
+                "stress: sun shadows (last frame): {} cascades, {} draws, {} buckets dropped, \
+                 {:.1} MiB",
+                s.cascades,
+                s.draws,
+                s.dropped,
+                s.bytes as f64 / f64::from(1 << 20)
+            );
+        }
         if let Some(switches) = switches {
             for line in switches.lines() {
                 println!("{line}");
@@ -2010,6 +2028,11 @@ fn main() -> AppExit {
                 } else {
                     DistanceFog::default()
                 },
+                sun_shadows: boxel::render::SunShadowSettings {
+                    enabled: options.sun_shadows,
+                    on_integrated: true,
+                    ..boxel::render::SunShadowSettings::default()
+                },
                 ..RenderSettings::default()
             },
         })
@@ -2323,6 +2346,13 @@ mod tests {
         assert!(!options(&[]).no_distance_fog);
         assert!(options(&["--no-distance-fog"]).no_distance_fog);
         assert!(usage().contains("--no-distance-fog"));
+    }
+
+    #[test]
+    fn sun_shadows_are_off_unless_asked() {
+        assert!(!options(&[]).sun_shadows);
+        assert!(options(&["--sun-shadows"]).sun_shadows);
+        assert!(usage().contains("--sun-shadows"));
     }
 
     #[test]

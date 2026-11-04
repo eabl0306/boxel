@@ -16,6 +16,10 @@ use crate::path::{
     TranslucentDraw, quad_index_buffer,
 };
 use crate::plugin::Resync;
+use crate::shadow::{
+    ShadowCascades, ShadowFrame, ShadowPass, ShadowStats, ShadowView, SunShadowSettings,
+    VoxelGroups, shadow_cascades,
+};
 use crate::sort::{SortedBucket, TranslucentSort, TranslucentSorter};
 use crate::targets::{Blit, Targets};
 use crate::texture_animation::TextureAnimator;
@@ -109,6 +113,22 @@ pub struct ViewParams {
     /// it at their own period, exactly). [`ViewParams::from_camera`] sets 0; the render plugin
     /// sets the app's elapsed time in ticks.
     pub texture_tick: u64,
+    /// What the sun shadow cascades need of the camera besides its place (ADR 0065).
+    pub lens: CameraLens,
+}
+
+/// The camera's direction and frustum shape ([`ViewParams::lens`]): sun shadows fit their
+/// cascades to slices of the frustum (`crate::shadow::ShadowView`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraLens {
+    /// Unit forward.
+    pub forward: Vec3,
+    /// Vertical field of view, radians.
+    pub fov_y_radians: f32,
+    /// Width over height.
+    pub aspect: f32,
+    /// The camera's view distance: shadows end at it if it is nearer than theirs.
+    pub view_distance: f32,
 }
 
 /// Game ticks a second: the rate of Minecraft's texture animations ([`ViewParams::texture_tick`]).
@@ -157,6 +177,13 @@ impl ViewParams {
             light: SceneLight::default(),
             fluid_time: 0.0,
             texture_tick: 0,
+            lens: CameraLens {
+                forward: view.forward,
+                fov_y_radians: camera.fov_y_radians,
+                // The projection's x scale is its y scale over the aspect.
+                aspect: view.proj.y_axis.y / view.proj.x_axis.x,
+                view_distance: camera.view_distance,
+            },
         }
     }
 }
@@ -239,6 +266,8 @@ pub struct RenderStats {
     pub models: ModelStats,
     /// Cell quads (ADR 0050; all 0 before the first chunk with some).
     pub cells: CellStats,
+    /// Sun shadow maps (ADR 0065; all 0 while shadows are off or on Mid and Low).
+    pub shadows: ShadowStats,
 }
 
 /// Renderer errors.
@@ -357,6 +386,13 @@ pub struct VoxelRenderer {
     lod_sealed: Option<(Arc<VisibleSet>, bool)>,
     /// The per-frame part of the View uniform the last frame wrote.
     view_uniform: ViewUniform,
+    /// The adapter's kind (sun shadows skip integrated GPUs unless asked).
+    device_type: wgpu::DeviceType,
+    /// The sun shadow maps (ADR 0065), High only, while [`VoxelRenderer::set_sun_shadows`] turns
+    /// them on.
+    shadow: Option<ShadowPass>,
+    /// The shadow passes could not be created on this device: shadows stay off.
+    shadow_failed: bool,
 }
 
 /// The renderer's per-world state, compared with a fresh renderer's
@@ -856,7 +892,175 @@ impl VoxelRenderer {
             lod_gpu_driven: crate::lod::gpu_driven_pays(&device.adapter_info()),
             lod_sealed: None,
             view_uniform: ViewUniform::default(),
+            device_type: device.adapter_info().device_type,
+            shadow: None,
+            shadow_failed: false,
         })
+    }
+
+    /// Sets the sun shadows of the next [`VoxelRenderer::render`] calls (ADR 0065), read every
+    /// frame by the render plugin. They are drawn only where `settings` apply
+    /// ([`SunShadowSettings::applies`]: High, and an integrated GPU only with `on_integrated`);
+    /// anywhere else, and while they are off or invalid, nothing of them exists. The first
+    /// settings that apply create the maps and passes (inside error scopes: if they fail, an
+    /// error is logged and shadows stay off on this renderer).
+    ///
+    /// Then each frame with a sun ([`crate::SceneLight::sun`]) that shades the camera's realm
+    /// and some sky-lit chunk in that realm draws the casters into the maps before the main
+    /// pass ([`RenderStats::shadows`]). No receiver reads them yet (lane S4): the frame's
+    /// pixels are the same with shadows on and off.
+    pub fn set_sun_shadows(&mut self, device: &wgpu::Device, settings: &SunShadowSettings) {
+        if !settings.applies(self.tier, self.device_type) || settings.validate().is_err() {
+            self.shadow = None;
+            return;
+        }
+        if let Some(shadow) = &mut self.shadow {
+            if shadow.settings() != settings {
+                shadow.set_settings(device, settings);
+            }
+            return;
+        }
+        if self.shadow_failed {
+            return;
+        }
+        let Some(geometry) = self.growth.geometry_layout.as_ref() else {
+            return;
+        };
+        let groups = VoxelGroups {
+            materials: &self.materials_layout,
+            view: &self.view_layout,
+            geometry,
+        };
+        let mut pass = None;
+        let built = boxel_gfx::run_in_error_scopes(device, || {
+            pass = Some(ShadowPass::new(
+                device,
+                &groups,
+                settings,
+                &self.block_texture,
+            ));
+            Ok(())
+        });
+        match (built, pass) {
+            (Ok(()), Some(pass)) => self.shadow = Some(pass),
+            (result, _) => {
+                tracing::error!(
+                    "sun shadow passes: {}; sun shadows stay off",
+                    result.err().unwrap_or_default()
+                );
+                self.shadow_failed = true;
+            }
+        }
+    }
+
+    /// Records this frame's sun shadow cull and maps, if any (before the main pass).
+    fn encode_shadows(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &ViewParams,
+        slots: u32,
+    ) {
+        let Some(shadow) = &mut self.shadow else {
+            return;
+        };
+        let (Some(sun), Some(table), Some(index), Some(list_pages)) = (
+            view.light.sun.as_ref(),
+            self.chunk_buffer.as_ref(),
+            self.lod_index.as_ref(),
+            self.path.list_pages(),
+        ) else {
+            shadow.skip();
+            return;
+        };
+        // The camera realm's band: no realm shadows another (ADR 0039).
+        let realm = usize::from(sun.camera_realm);
+        let planes = &view.light.realms.planes;
+        let below = realm
+            .checked_sub(1)
+            .and_then(|r| planes.get(r))
+            .copied()
+            .unwrap_or(i64::MIN);
+        let above = planes.get(realm).copied().unwrap_or(i64::MAX);
+        let Some(top) = self.chunks.sky_lit_top(below, above) else {
+            // No sky-lit chunk in the realm: nothing casts.
+            shadow.skip();
+            return;
+        };
+        let origin_y = view.render_origin.y;
+        let rel = |y: i64| {
+            y.saturating_sub(origin_y)
+                .clamp(i32::MIN.into(), i32::MAX.into())
+        };
+        let shadow_view = ShadowView {
+            render_origin: view.render_origin,
+            eye_rel: view.eye_rel,
+            forward: view.lens.forward,
+            fov_y_radians: view.lens.fov_y_radians,
+            aspect: view.lens.aspect,
+            view_distance: view.lens.view_distance,
+            casters_top: rel(top) as f32,
+        };
+        let Some(cascades) = shadow_cascades(&shadow_view, sun, shadow.settings()) else {
+            shadow.skip();
+            return;
+        };
+        let _span = frame_span!("render.shadows");
+        shadow.encode(
+            device,
+            queue,
+            encoder,
+            &ShadowFrame {
+                cascades: &cascades,
+                band: [rel(below) as i32, rel(above) as i32],
+                realm: sun.camera_realm,
+                list_pages,
+                page_chunks: self.layout.page_chunks,
+                slots,
+                view: &self.view_buffer,
+                view_group: &self.view_bind_group,
+                materials: &self.materials,
+                table,
+                index,
+                pages: &self.pages,
+            },
+        );
+    }
+
+    /// Testing (High with sun shadows): the last frame's cascades, `None` when it drew none.
+    #[doc(hidden)]
+    pub fn debug_shadow_cascades(&self) -> Option<ShadowCascades> {
+        self.shadow.as_ref()?.last_cascades().copied()
+    }
+
+    /// Testing (High with sun shadows): the depths of layer `layer` of the shadow maps, row by
+    /// row from the top (waits for the GPU); `None` without shadows.
+    #[doc(hidden)]
+    pub fn debug_read_shadow_map(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer: u32,
+    ) -> Option<Result<Vec<f32>, String>> {
+        let maps = self.shadow.as_ref()?.maps();
+        Some(crate::shadow::read_depth_layer(device, queue, maps, layer))
+    }
+
+    /// Testing (High with sun shadows): the last frame's shadow draw counts, opaque then cutout
+    /// of each page of cascade `c` at `(2c + k) * MAX_PAGES + p`, then the dropped buckets
+    /// (waits for the GPU); `None` without shadows.
+    #[doc(hidden)]
+    pub fn debug_shadow_counts(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Result<Vec<u32>, String>> {
+        let state = self.shadow.as_ref()?.state();
+        Some(
+            crate::memory::read_buffer(device, queue, state, 0, state.size())
+                .map(|bytes| bytemuck::pod_collect_to_vec::<u8, u32>(&bytes)),
+        )
     }
 
     /// Sets the fog of the next [`VoxelRenderer::render`] calls (ADR 0030), `None` for none.
@@ -1752,6 +1956,8 @@ impl VoxelRenderer {
             lod.prepare(device, queue, encoder, &self.targets, cull_view, sealed);
         }
         self.path.encode_compute(encoder, slot_count);
+        // Sun shadows (ADR 0065): their cull and maps, before the main pass.
+        self.encode_shadows(device, queue, encoder, view, slot_count);
         let fog_depth_draws;
         let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {
             // High with LOD to draw: the main pass ends after the opaque and cutout terrain, the
@@ -1886,6 +2092,11 @@ impl VoxelRenderer {
                 .map(ModelPass::stats)
                 .unwrap_or_default(),
             cells: self.cells.as_ref().map(CellPass::stats).unwrap_or_default(),
+            shadows: self
+                .shadow
+                .as_ref()
+                .map(ShadowPass::stats)
+                .unwrap_or_default(),
             ..self.lod_stats(self.stats)
         }
     }
@@ -2314,6 +2525,7 @@ mod tests {
                 walls: [0; 6],
                 neighbors: 0,
                 tinted: 0,
+                sky_lit: false,
             });
         };
         // A closed world seen from chunk (0, 0, 0): its 6 neighbors are visible, the rest of

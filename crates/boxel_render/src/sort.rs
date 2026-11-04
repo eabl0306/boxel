@@ -1333,6 +1333,7 @@ mod tests {
                 walls: [0; 6],
                 neighbors: 0,
                 tinted: 0,
+                sky_lit: false,
             });
         }
         table

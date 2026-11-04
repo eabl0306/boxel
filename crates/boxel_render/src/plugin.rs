@@ -295,6 +295,8 @@ pub struct RenderInfo {
     pub lod_arena_used_quads: u32,
     /// LOD arena size in quads (`RenderStats::lod_arena_capacity_quads`).
     pub lod_arena_capacity_quads: u32,
+    /// The sun shadow maps last frame (`RenderStats::shadows`, ADR 0065; all 0 while off).
+    pub shadows: crate::ShadowStats,
     /// Quads the UI pass draws each frame (feature `ui`, ADR 0033; 0 without it, before the
     /// first non-empty paint list and while the list is empty).
     pub ui_quads: u32,
@@ -1889,6 +1891,10 @@ fn prepare(
     let queue = &ready.ctx.queue;
     ready.renderer.set_translucent_sort(frame.translucent_sort);
     ready.renderer.set_memory_limits(&frame.chunk_memory);
+    // High only, and on integrated GPUs only when asked (`SunShadowSettings::applies`).
+    ready
+        .renderer
+        .set_sun_shadows(&ready.ctx.device, &frame.sun_shadows);
     // The frame's chunk changes; a resync frame first runs the clear it asks for (`meshes` then
     // holds every ready mesh), before this frame's visible set is taken.
     let errors = ready
@@ -2263,6 +2269,7 @@ fn cleanup(
             info.lod_upload_quads = stats.lod_upload_quads;
             info.lod_arena_used_quads = stats.lod_arena_used_quads;
             info.lod_arena_capacity_quads = stats.lod_arena_capacity_quads;
+            info.shadows = stats.shadows;
             #[cfg(feature = "ui")]
             {
                 let ui = ready.ui.as_ref().map(crate::ui::UiPass::stats);

@@ -88,11 +88,11 @@ pub use plugin::{DebugAllocProbe, frame_visibility, frame_visibility_with};
 #[doc(hidden)]
 pub use renderer::{AllocProbeReport, ResetState};
 pub use renderer::{
-    ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, MemoryDemand, MemoryReserve,
+    CameraLens, ChunkOp, DEFAULT_SKY_COLOR, FLUID_TIME_PERIOD, MemoryDemand, MemoryReserve,
     PATTERN_PERIOD_TICKS, RenderStats, RendererConfig, RendererError, ReserveMode,
     TEXTURE_TICKS_PER_SECOND, ViewParams, VoxelRenderer, pattern_phase, texture_tick,
 };
-pub use shadow::{SceneSun, SunShadowError, SunShadowSettings};
+pub use shadow::{SceneSun, ShadowStats, SunShadowError, SunShadowSettings};
 pub use smoke::RendererSmokeTest;
 pub use sort::TranslucentSort;
 pub use texture_animation::{DEFAULT_TEXTURE_UPLOAD_BUDGET, FrameKey, LayerAnimation};

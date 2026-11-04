@@ -893,6 +893,7 @@ pub(crate) fn upsert_resident(
         walls: wall_counts(mesh, &counts),
         neighbors: 0,
         tinted: tinted_parts(mesh).len() as u16,
+        sky_lit: crate::upload::sky_lit(mesh),
     };
     let inserted = chunks.insert(record);
     // `slot_for` succeeded above, so this cannot fail

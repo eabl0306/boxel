@@ -56,6 +56,19 @@ pub(crate) fn light_entries(mesh: &ChunkMesh) -> u32 {
     mesh.palette.len().max(1) as u32
 }
 
+/// True if some face of `mesh` has sky light at a corner ([`ChunkGpu::FLAG_SKY_LIT`]: only such
+/// chunks cast sun shadows, ADR 0065): an OR over the sky nibbles of its uploaded palette. A
+/// tinted entry (ADR 0064) has unequal sky channels at some corner, so some sky.
+pub(crate) fn sky_lit(mesh: &ChunkMesh) -> bool {
+    let tinted = (mesh.tinted_entries as usize).min(mesh.palette.len());
+    tinted > 0
+        || uploaded_palette(mesh)[tinted..].iter().any(|&entry| {
+            boxel_mesh::palette_corners(entry)
+                .iter()
+                .any(|c| c.sky() > 0)
+        })
+}
+
 /// The palette a mesh is uploaded with (see [`light_entries`]).
 pub(crate) fn uploaded_palette(mesh: &ChunkMesh) -> &[PaletteEntry] {
     if mesh.palette.is_empty() {
@@ -619,6 +632,28 @@ fn batch_len(pieces: &[(Piece, u64)], limit: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mesh is sky-lit when some corner of its palette has sky light; a mesh without a
+    /// palette is open sky; a tinted entry always has some sky.
+    #[test]
+    fn sky_lit_reads_the_palette_s_sky_nibbles() {
+        use boxel_mesh::palette_entry;
+        use boxel_voxel::LightValue;
+        let dark = LightValue::new(0, 15, 0, 0);
+        let one = LightValue::new(1, 0, 0, 0);
+        let mesh = |palette: Vec<PaletteEntry>, tinted| ChunkMesh {
+            quads: vec![PackedQuad::default()],
+            palette,
+            tinted_entries: tinted,
+            ..ChunkMesh::default()
+        };
+        assert!(sky_lit(&mesh(Vec::new(), 0)));
+        assert!(!sky_lit(&mesh(vec![palette_entry([dark; 4])], 0)));
+        let corner = palette_entry([dark, dark, dark, one]);
+        assert!(sky_lit(&mesh(vec![palette_entry([dark; 4]), corner], 0)));
+        // A tinted entry's corners are not LightValues; it is sky-lit by what it is.
+        assert!(sky_lit(&mesh(vec![[0, 0], palette_entry([dark; 4])], 1)));
+    }
 
     /// A pending mesh of `len` page entries in page 0: `len - 1` quads and one palette entry.
     fn pending(offset: u32, len: usize) -> PendingMesh {

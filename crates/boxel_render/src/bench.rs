@@ -71,6 +71,7 @@ impl CullBench {
                 walls: crate::memory::wall_counts(mesh, &bucket_counts(mesh)),
                 neighbors: 0,
                 tinted: crate::upload::tinted_parts(mesh).len() as u16,
+                sky_lit: false,
             });
         }
         Self {

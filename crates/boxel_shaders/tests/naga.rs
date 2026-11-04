@@ -811,8 +811,165 @@ fn sun_off_returns_one_and_binds_nothing() {
         }
     }
     // Every module that shades or culls voxels: VoxelPull, VoxelInstanced, Cull, Lod, LodPull,
-    // LodCull, Model, Cell.
-    assert_eq!(with_common, 8);
+    // LodCull, Model, Cell, and High's sun shadow cull and depth (ADR 0065, lane S3).
+    assert_eq!(with_common, 10);
+}
+
+/// The sun shadow modules (ADR 0065, lane S3) are High only and reach no other module: no other
+/// module holds their text, and they need GL 4.3 (storage buffers), no immediates. Their mirrors
+/// and constants match the Rust side.
+#[test]
+fn sun_shadow_modules_are_high_only_and_match_their_mirrors() {
+    use boxel_shaders::gpu::shadow::{
+        CASCADE_STRIDE, MAX_CASCADES, STATE_DROPPED_OFFSET, STATE_SIZE, ShadowCascadeGpu,
+    };
+    use boxel_shaders::{SHADOW_COMMON_WGSL, SHADOW_CULL_WGSL, SHADOW_WGSL};
+    use std::mem::{offset_of, size_of};
+    let shadow_modules = [ShaderModuleId::ShadowCull, ShaderModuleId::Shadow];
+    for id in ShaderModuleId::ALL {
+        let src = id.source();
+        let shadowed = shadow_modules.contains(&id);
+        assert_eq!(src.contains(SHADOW_COMMON_WGSL), shadowed, "{}", id.label());
+        assert!(!src.contains(SHADOW_CULL_WGSL) || id == ShaderModuleId::ShadowCull);
+        assert!(!src.contains(SHADOW_WGSL) || id == ShaderModuleId::Shadow);
+    }
+    for id in shadow_modules {
+        assert_eq!(id.min_gl(), (4, 3), "{}", id.label());
+        assert!(!id.uses_immediates(), "{}", id.label());
+    }
+    let (cull, _) = load(ShaderModuleId::ShadowCull);
+    let (shadow, _) = load(ShaderModuleId::Shadow);
+    for module in [&cull, &shadow] {
+        let (size, offsets) = struct_layout(module, "ShadowCascade");
+        assert_eq!(u64::from(size), CASCADE_STRIDE);
+        assert_eq!(size_of::<ShadowCascadeGpu>() as u64, CASCADE_STRIDE);
+        let rust = [
+            offset_of!(ShadowCascadeGpu, view_proj),
+            offset_of!(ShadowCascadeGpu, planes),
+            offset_of!(ShadowCascadeGpu, params),
+            offset_of!(ShadowCascadeGpu, light),
+            offset_of!(ShadowCascadeGpu, counts),
+            offset_of!(ShadowCascadeGpu, band),
+            offset_of!(ShadowCascadeGpu, pad),
+        ];
+        assert_eq!(offsets, rust.map(|o| o as u32));
+        assert_eq!(
+            const_u32(module, "MAX_SHADOW_CASCADES") as usize,
+            MAX_CASCADES
+        );
+    }
+    let (state, offsets) = struct_layout(&cull, "ShadowCullState");
+    assert_eq!(u64::from(offsets[1]), STATE_DROPPED_OFFSET);
+    assert_eq!(u64::from(state), STATE_SIZE);
+    assert_eq!(const_u32(&cull, "FLAG_SKY_LIT"), ChunkGpu::FLAG_SKY_LIT);
+    assert_eq!(
+        const_u32(&cull, "MAX_QUADS_PER_BUCKET"),
+        boxel_mesh::MAX_QUADS_PER_BUCKET
+    );
+    assert_eq!(
+        const_u32(&cull, "MAX_PAGES"),
+        boxel_shaders::gpu::chunk_memory::MAX_PAGES
+    );
+    assert_eq!(const_u32(&cull, "WALL_SHIFT"), ChunkGpu::WALL_SHIFT);
+    assert_eq!(
+        struct_layout(&cull, "DrawArgs").0 as usize,
+        size_of::<DrawIndexedIndirect>()
+    );
+    // Bit 31 is the sky-lit flag's, clear of the live flag, the neighbor bits and the colored
+    // sky's tint count and exact flag (bits 7 to 20, ADR 0064).
+    assert_eq!(ChunkGpu::FLAG_SKY_LIT, 1 << 31);
+    let others = ChunkGpu::FLAG_LIVE
+        | 0x3F << ChunkGpu::NEIGHBOR_SHIFT
+        | ChunkGpu::TINTED_MASK << ChunkGpu::TINTED_SHIFT
+        | ChunkGpu::FLAG_TINT_EXACT;
+    assert_eq!(others & ChunkGpu::FLAG_SKY_LIT, 0);
+    // The cull: 2 uniform blocks and 4 storage buffers (the Vulkan minimum per stage).
+    let count = |module: &naga::Module, space: fn(&naga::AddressSpace) -> bool| {
+        module
+            .global_variables
+            .iter()
+            .filter(|(_, g)| space(&g.space))
+            .count()
+    };
+    let uniform = |s: &naga::AddressSpace| matches!(s, naga::AddressSpace::Uniform);
+    let storage = |s: &naga::AddressSpace| matches!(s, naga::AddressSpace::Storage { .. });
+    assert_eq!((count(&cull, uniform), count(&cull, storage)), (2, 4));
+    // The depth: the voxel groups 0 to 2 and the cascade in group 3 (dynamic offset).
+    let groups: std::collections::BTreeSet<u32> = shadow
+        .global_variables
+        .iter()
+        .filter_map(|(_, g)| g.binding.as_ref().map(|b| b.group))
+        .collect();
+    assert_eq!(
+        groups.into_iter().collect::<Vec<_>>(),
+        [0, 1, 2, boxel_shaders::gpu::shadow::GROUP_CASCADE]
+    );
+    assert_eq!((count(&shadow, uniform), count(&shadow, storage)), (2, 2));
+}
+
+/// Where `shadow_cull.wgsl` writes draw `n` of cascade `c`'s page `p` opaque or cutout list,
+/// for `pages` pages of `cap` chunks; `None` when the list is full or does not exist. The same
+/// arithmetic as the shader, spelled out below.
+fn shadow_cull_slot(c: u32, p: u32, n: u32, cutout: bool, pages: u32, cap: u32) -> Option<u32> {
+    let pages = pages.min(boxel_shaders::gpu::chunk_memory::MAX_PAGES);
+    if p >= pages {
+        return None;
+    }
+    let base = (c * pages + p) * 4 * cap;
+    if cutout {
+        (n < cap).then(|| base + 3 * cap + n)
+    } else {
+        (n < 3 * cap).then(|| base + n)
+    }
+}
+
+/// The sun shadow cull's lists (ADR 0065): for any cascade count, page count and capacity, every
+/// write stays inside its own list, and no two lists overlap.
+#[test]
+fn shadow_cull_writes_stay_inside_their_lists() {
+    use boxel_shaders::gpu::shadow::MAX_CASCADES;
+    for line in [
+        "let pages = min(frame.counts.w, MAX_PAGES);",
+        "if (p >= pages) { return; }",
+        "let cascades = min(frame.counts.x, MAX_SHADOW_CASCADES);",
+        "let base = (c * pages + p) * 4u * cap;",
+        "let s = take((2u * c) * MAX_PAGES + p, 3u * cap);",
+        "if (s < 3u * cap) {",
+        "let i = base + s;",
+        "let s = take((2u * c + 1u) * MAX_PAGES + p, cap);",
+        "if (s < cap) {",
+        "let i = base + 3u * cap + s;",
+        "if (s >= cap) {",
+    ] {
+        assert!(boxel_shaders::SHADOW_CULL_WGSL.contains(line), "{line}");
+    }
+    for (cascades, pages, cap) in [(1, 1, 1), (3, 4, 8), (4, 5, 3), (2, 260, 2)] {
+        let max_pages = boxel_shaders::gpu::chunk_memory::MAX_PAGES;
+        let total = cascades * pages.min(max_pages) * 4 * cap;
+        let mut seen = vec![false; total as usize];
+        for c in 0..cascades.min(MAX_CASCADES as u32) {
+            for p in 0..pages + 2 {
+                for cutout in [false, true] {
+                    let room = if cutout { cap } else { 3 * cap };
+                    for n in 0..room + 2 {
+                        match shadow_cull_slot(c, p, n, cutout, pages, cap) {
+                            Some(i) => {
+                                assert!(i < total, "{c} {p} {n}: {i}");
+                                assert!(!seen[i as usize], "two draws at {i}");
+                                seen[i as usize] = true;
+                            }
+                            None => assert!(p >= pages.min(max_pages) || n >= room),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every entry used");
+    }
+    // A list's count index stays inside the counts.
+    let max_pages = boxel_shaders::gpu::chunk_memory::MAX_PAGES;
+    let last = (2 * (MAX_CASCADES as u32 - 1) + 1) * max_pages + max_pages - 1;
+    assert!(last < boxel_shaders::gpu::shadow::STATE_COUNTS);
 }
 
 /// The overlay and the block outline (ADR 0026) run on every tier, the Low one included: no

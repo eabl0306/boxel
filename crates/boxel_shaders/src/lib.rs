@@ -54,6 +54,14 @@ pub const MODEL_WGSL: &str = include_str!("../shaders/model.wgsl");
 /// `cell.wgsl`: the quads cells draw from their data, baked in the chunk meshes, one texture
 /// array of the content's images (`vs_cell`, `fs_cell`, ADR 0050).
 pub const CELL_WGSL: &str = include_str!("../shaders/cell.wgsl");
+/// `shadow_common.wgsl`: the shadow uniform's `ShadowCascade`, shared by the sun shadow modules
+/// (ADR 0065, High only).
+pub const SHADOW_COMMON_WGSL: &str = include_str!("../shaders/shadow_common.wgsl");
+/// `shadow_cull.wgsl`: the casters of the sun shadow cascades (`cull_shadow_casters`, ADR 0065).
+pub const SHADOW_CULL_WGSL: &str = include_str!("../shaders/shadow_cull.wgsl");
+/// `shadow.wgsl`: the casters' depth in a cascade's map (`vs_shadow`, `vs_shadow_cutout`,
+/// `fs_shadow_cutout`, ADR 0065).
+pub const SHADOW_WGSL: &str = include_str!("../shaders/shadow.wgsl");
 
 /// Shader stage of an entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +110,12 @@ pub enum ShaderModuleId {
     /// common + `sun_off` + cell: cell quads (all tiers, only once a chunk mesh has some,
     /// ADR 0050).
     Cell,
+    /// common + `sun_off` + `shadow_common` + `shadow_cull`: the casters of the sun shadow
+    /// cascades (tier High, only while sun shadows are on, ADR 0065).
+    ShadowCull,
+    /// common + `sun_off` + `shadow_common` + shadow: the casters' depth in the sun shadow maps
+    /// (tier High, only while sun shadows are on, ADR 0065).
+    Shadow,
 }
 
 // `common.wgsl` and the sun factor without shadows: what every voxel module starts with.
@@ -124,10 +138,14 @@ static LOD_PULL: LazyLock<String> =
 static LOD_CULL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[LOD_CULL_WGSL]));
 static MODEL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[MODEL_WGSL]));
 static CELL: LazyLock<String> = LazyLock::new(|| common_sun_off(&[CELL_WGSL]));
+static SHADOW_CULL: LazyLock<String> =
+    LazyLock::new(|| common_sun_off(&[SHADOW_COMMON_WGSL, SHADOW_CULL_WGSL]));
+static SHADOW: LazyLock<String> =
+    LazyLock::new(|| common_sun_off(&[SHADOW_COMMON_WGSL, SHADOW_WGSL]));
 
 impl ShaderModuleId {
     /// All modules.
-    pub const ALL: [ShaderModuleId; 14] = [
+    pub const ALL: [ShaderModuleId; 16] = [
         ShaderModuleId::VoxelPull,
         ShaderModuleId::VoxelInstanced,
         ShaderModuleId::Cull,
@@ -142,6 +160,8 @@ impl ShaderModuleId {
         ShaderModuleId::Ui,
         ShaderModuleId::Model,
         ShaderModuleId::Cell,
+        ShaderModuleId::ShadowCull,
+        ShaderModuleId::Shadow,
     ];
 
     /// Debug label.
@@ -161,6 +181,8 @@ impl ShaderModuleId {
             ShaderModuleId::Ui => "boxel ui",
             ShaderModuleId::Model => "boxel model",
             ShaderModuleId::Cell => "boxel cell",
+            ShaderModuleId::ShadowCull => "boxel shadow_cull",
+            ShaderModuleId::Shadow => "boxel shadow",
         }
     }
 
@@ -181,6 +203,8 @@ impl ShaderModuleId {
             ShaderModuleId::Ui => UI_WGSL,
             ShaderModuleId::Model => MODEL.as_str(),
             ShaderModuleId::Cell => CELL.as_str(),
+            ShaderModuleId::ShadowCull => SHADOW_CULL.as_str(),
+            ShaderModuleId::Shadow => SHADOW.as_str(),
         }
     }
 
@@ -252,6 +276,12 @@ impl ShaderModuleId {
                 ("vs_cell_pattern", Stage::Vertex),
                 ("fs_cell_pattern", Stage::Fragment),
             ],
+            ShaderModuleId::ShadowCull => &[("cull_shadow_casters", Stage::Compute)],
+            ShaderModuleId::Shadow => &[
+                ("vs_shadow", Stage::Vertex),
+                ("vs_shadow_cutout", Stage::Vertex),
+                ("fs_shadow_cutout", Stage::Fragment),
+            ],
         }
     }
 
@@ -268,7 +298,9 @@ impl ShaderModuleId {
             | ShaderModuleId::Cull
             | ShaderModuleId::LodPull
             | ShaderModuleId::LodCull
-            | ShaderModuleId::LodHiz => (4, 3),
+            | ShaderModuleId::LodHiz
+            | ShaderModuleId::ShadowCull
+            | ShaderModuleId::Shadow => (4, 3),
             ShaderModuleId::VoxelInstanced
             | ShaderModuleId::Blit
             | ShaderModuleId::Overlay
