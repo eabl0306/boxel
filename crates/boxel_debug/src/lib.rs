@@ -14,6 +14,11 @@
 //! `boxel_render::RenderInfo`. Missing resources (no world, no renderer yet) just hide their
 //! lines.
 //!
+//! Sun shadows (ADR 0065): while `RenderSettings::sun_shadows` is on, a `Shadows` line gives
+//! what the last frame drew into the shadow maps (`RenderInfo::shadows`) and the sun's elevation
+//! (`boxel_world::SunPath` at the clock), or says they are off where the renderer does not draw
+//! them (Mid, Low, an integrated GPU). With shadows off the line is hidden ([`ShadowProbe`]).
+//!
 //! Sky sources and realms (ADR 0061): a `Realm` line gives the realm at the eye with its daylight
 //! curve, and in a world whose registry has sky sources a `Source` line gives the source whose
 //! beam lights the [`CrosshairTarget`] ([`SourceProbe`]). [`SkySourceMarkers`] (off by default)
@@ -40,13 +45,15 @@ use boxel_camera::{Camera, CameraView};
 use boxel_ecs::prelude::*;
 use boxel_ecs::system::SystemParam;
 use boxel_math::{DVec3, UVec2};
-use boxel_render::{OverlayDraw, OverlayRect, PresentSettings, RenderInfo, SurfaceInfo};
+use boxel_render::{
+    OverlayDraw, OverlayRect, PresentSettings, RenderInfo, RenderSettings, ShadowStats, SurfaceInfo,
+};
 use boxel_transform::Transform;
 use boxel_voxel::{BlockPos, LightValue};
 use boxel_window::{ButtonInput, FramePacingInfo, KeyCode};
 use boxel_world::lifecycle::{TeardownSystems, WorldScopeApp, WorldTeardown};
 use boxel_world::{
-    ChunkMap, DaylightCurve, RealmLighting, RealmPlanes, SkyMap, TimeOfDay, WorldContent,
+    ChunkMap, DaylightCurve, RealmLighting, RealmPlanes, SkyMap, SunPath, TimeOfDay, WorldContent,
     WorldStats,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -181,6 +188,71 @@ fn light_text(light: Option<LightValue>, sky_rgb: Option<[u8; 3]>) -> String {
             text
         }
         None => "-".to_string(),
+    }
+}
+
+/// The sun shadows the overlay shows (ADR 0065), while `RenderSettings::sun_shadows` is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShadowProbe {
+    /// What the last frame drew into the maps (`RenderInfo::shadows`). No bytes: the renderer
+    /// draws no shadows here (Mid, Low, or an integrated GPU without `on_integrated`).
+    pub stats: ShadowStats,
+    /// The sun's elevation in degrees, on its step (negative at night).
+    pub sun_degrees: f64,
+}
+
+impl ShadowProbe {
+    /// The shadows of `stats` with the sun of `path` (the default one without it) at `time`
+    /// (noon without a clock), as the render extract places it.
+    pub fn at(stats: ShadowStats, path: Option<&SunPath>, time: Option<&TimeOfDay>) -> Self {
+        let noon = TimeOfDay::default();
+        let sun = path
+            .copied()
+            .unwrap_or_default()
+            .direction(time.unwrap_or(&noon));
+        Self {
+            stats,
+            sun_degrees: sun.y.clamp(-1.0, 1.0).asin().to_degrees(),
+        }
+    }
+
+    /// The probe of the overlay: [`ShadowProbe::at`] with the renderer's stats while `settings`
+    /// turn sun shadows on, `None` (no line) while they are off or without a renderer.
+    pub fn when_on(
+        settings: Option<&RenderSettings>,
+        render: Option<&RenderInfo>,
+        path: Option<&SunPath>,
+        time: Option<&TimeOfDay>,
+    ) -> Option<Self> {
+        let on = settings.is_some_and(|s| s.sun_shadows.enabled);
+        render
+            .filter(|_| on)
+            .map(|info| Self::at(info.shadows, path, time))
+    }
+
+    /// `Shadows 3 cascades  24 draws  sun 34 deg  53 MiB` (with `dropped N` when a list was
+    /// full), `Shadows none drawn ...` in a frame with nothing to shadow (night, no sky above, a
+    /// realm without the sun), or `Shadows off here ...` where the renderer does not draw them.
+    pub fn line(&self) -> String {
+        let s = self.stats;
+        if s.bytes == 0 {
+            return "Shadows off here (High only, integrated GPUs on request)".to_string();
+        }
+        let mut line = if s.cascades == 0 {
+            "Shadows none drawn".to_string()
+        } else {
+            format!("Shadows {} cascades  {} draws", s.cascades, s.draws)
+        };
+        let _ = write!(
+            line,
+            "  sun {:.0} deg  {:.0} MiB",
+            self.sun_degrees,
+            s.bytes as f64 / f64::from(1 << 20)
+        );
+        if s.dropped > 0 {
+            let _ = write!(line, "  dropped {}", s.dropped);
+        }
+        line
     }
 }
 
@@ -440,6 +512,8 @@ pub struct OverlayInputs {
     /// The sky source lighting the crosshair target (`None`: no target, or a registry without
     /// sky sources).
     pub source: Option<SourceProbe>,
+    /// The sun shadows (`None`: off in `RenderSettings`, or no renderer).
+    pub shadows: Option<ShadowProbe>,
     /// Lines added by apps ([`OverlayLines`]), shown last.
     pub extra: Vec<String>,
 }
@@ -616,6 +690,9 @@ pub fn overlay_lines(inputs: &OverlayInputs) -> Vec<String> {
             info.chunks, info.draws
         );
         lines.push(line);
+        if let Some(shadows) = &inputs.shadows {
+            lines.push(shadows.line());
+        }
     }
     lines.extend(inputs.extra.iter().cloned());
     lines
@@ -630,6 +707,8 @@ struct SkyView<'w> {
     planes: Option<Res<'w, RealmPlanes>>,
     lighting: Option<Res<'w, RealmLighting>>,
     curve: Option<Res<'w, DaylightCurve>>,
+    sun: Option<Res<'w, SunPath>>,
+    settings: Option<Res<'w, RenderSettings>>,
 }
 
 /// Rebuilds `OverlayDraw` from the current state. While hidden it holds only the crosshair and
@@ -706,6 +785,12 @@ fn build_overlay(
     let light = map
         .as_deref()
         .map(|map| LightProbe::at(map, camera.map(|(eye, _)| eye), target));
+    let shadows = ShadowProbe::when_on(
+        sky_view.settings.as_deref(),
+        render.as_deref(),
+        sky_view.sun.as_deref(),
+        time.as_deref(),
+    );
     let inputs = OverlayInputs {
         frames: (window.fps(), window.average(), window.worst()),
         presented_fps: render.is_some().then(|| presented.fps()),
@@ -720,6 +805,7 @@ fn build_overlay(
         time: time.as_deref().copied(),
         realm,
         source,
+        shadows,
         extra: extra
             .as_deref()
             .map(|e| e.iter().map(str::to_string).collect())
@@ -1300,6 +1386,135 @@ mod tests {
                 assert_eq!((limit, vsync), (144, false));
             }
         }
+    }
+
+    #[test]
+    fn lines_show_the_sun_shadows_only_while_they_are_on() {
+        let drawn = ShadowStats {
+            cascades: 3,
+            draws: 24,
+            dropped: 0,
+            bytes: 53 << 20,
+        };
+        let render = RenderInfo {
+            ready: true,
+            shadows: drawn,
+            ..RenderInfo::default()
+        };
+        let mut settings = RenderSettings::default();
+        let fifteen = TimeOfDay::at_clock(15.0);
+        let probe = |settings: &RenderSettings, render: &RenderInfo, time| {
+            ShadowProbe::when_on(Some(settings), Some(render), None, time)
+        };
+        // Off (the engine's default): no line, whatever the renderer says.
+        assert_eq!(probe(&settings, &render, Some(&fifteen)), None);
+        settings.sun_shadows.enabled = true;
+        assert_eq!(
+            ShadowProbe::when_on(Some(&settings), None, None, None),
+            None,
+            "no renderer, no line"
+        );
+        // On: the maps of the last frame and the sun of the default path at the clock (at 15:00
+        // the sun is 37.8 degrees up; at noon 60, the 30 degree tilt).
+        let line = |probe: Option<ShadowProbe>| {
+            let inputs = OverlayInputs {
+                render: Some(render.clone()),
+                shadows: probe,
+                ..OverlayInputs::default()
+            };
+            let lines = overlay_lines(&inputs);
+            let shadows: Vec<_> = lines.iter().filter(|l| l.starts_with("Shadows")).collect();
+            assert!(shadows.len() <= 1, "{lines:?}");
+            // Right after the GPU chunks line.
+            if let Some(at) = lines.iter().position(|l| l.starts_with("Shadows")) {
+                assert!(lines[at - 1].starts_with("GPU chunks"), "{lines:?}");
+            }
+            shadows.first().map(|l| l.to_string())
+        };
+        assert_eq!(
+            line(probe(&settings, &render, Some(&fifteen))).as_deref(),
+            Some("Shadows 3 cascades  24 draws  sun 38 deg  53 MiB")
+        );
+        assert_eq!(
+            line(probe(&settings, &render, None)).as_deref(),
+            Some("Shadows 3 cascades  24 draws  sun 60 deg  53 MiB"),
+            "noon without a clock, as the render extract"
+        );
+        let flat = SunPath { tilt_degrees: 0.0 };
+        let straight = ShadowProbe::when_on(Some(&settings), Some(&render), Some(&flat), None);
+        assert!(line(straight).unwrap().contains("sun 90 deg"));
+        // Full lists, nothing to draw at night, and a renderer that draws none (Mid, Low, an
+        // integrated GPU without on_integrated).
+        let full = ShadowProbe {
+            stats: ShadowStats {
+                dropped: 5,
+                ..drawn
+            },
+            sun_degrees: 37.8,
+        };
+        assert!(line(Some(full)).unwrap().ends_with("  dropped 5"));
+        let night = ShadowProbe {
+            stats: ShadowStats {
+                cascades: 0,
+                draws: 0,
+                ..drawn
+            },
+            sun_degrees: -12.2,
+        };
+        assert_eq!(
+            line(Some(night)).as_deref(),
+            Some("Shadows none drawn  sun -12 deg  53 MiB")
+        );
+        let midnight = probe(&settings, &render, Some(&TimeOfDay::at_clock(0.0))).unwrap();
+        assert!(midnight.sun_degrees < -59.0, "{midnight:?}");
+        let elsewhere = ShadowProbe {
+            stats: ShadowStats::default(),
+            sun_degrees: 37.8,
+        };
+        assert_eq!(
+            line(Some(elsewhere)).as_deref(),
+            Some("Shadows off here (High only, integrated GPUs on request)")
+        );
+        // The overlay hides it with the GPU line while the renderer is not ready.
+        let lines = overlay_lines(&OverlayInputs {
+            render: Some(RenderInfo::default()),
+            shadows: Some(full),
+            ..OverlayInputs::default()
+        });
+        assert!(!lines.iter().any(|l| l.starts_with("Shadows")), "{lines:?}");
+    }
+
+    #[test]
+    fn the_overlay_reads_the_shadow_settings_and_the_sun() {
+        let mut app = App::new();
+        app.add_plugins((
+            TimePlugin,
+            DebugOverlayPlugin {
+                visible: true,
+                ..DebugOverlayPlugin::default()
+            },
+        ))
+        .insert_resource(RenderInfo {
+            ready: true,
+            shadows: ShadowStats {
+                cascades: 3,
+                draws: 24,
+                dropped: 0,
+                bytes: 53 << 20,
+            },
+            ..RenderInfo::default()
+        })
+        .insert_resource(RenderSettings::default());
+        app.update();
+        let off = app.world().resource::<OverlayDraw>().rects.len();
+        app.world_mut()
+            .resource_mut::<RenderSettings>()
+            .sun_shadows
+            .enabled = true;
+        app.update();
+        let on = app.world().resource::<OverlayDraw>().rects.len();
+        // One more line, with its glyphs.
+        assert!(on > off, "{off} rects off, {on} on");
     }
 
     #[test]
