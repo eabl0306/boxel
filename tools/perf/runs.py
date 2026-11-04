@@ -52,6 +52,7 @@ PATH_SCENARIO = r'--scenario \S*\bpath\b'
 RADIUS_STEPS = r'^\s*--radius-steps\s'
 SWITCH_SCENARIO = r'--scenario \S*\bswitch\b'
 SKY_SOURCES_FLAG = r'^\s*--sky-sources\s'
+STAINED_GLASS_FLAG = r'^\s*--stained-glass\s'
 # A binary whose --help has this grows chunk memory (ADR 0035); older ones had a fixed arena.
 GROWS = r'^\s*--chunk-memory\s'
 
@@ -84,6 +85,15 @@ SCENARIOS = {
     'lit-cavern': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--sky-sources'),
                            'cueva iluminada por fuentes de cielo, quieta',
                            (CAVE_FLAG, SKY_SOURCES_FLAG)),
+    # Colored sky (ADR 0064): the demo's glass scene on the ground of the start column (a
+    # greenhouse under red glass with a black skylight and a lamp, a room lit through a light blue
+    # window), the camera still in the greenhouse. Its boxes take the colored light path and its
+    # chunks draw tinted entries. glass-house-clear is its twin with common glass (colored sky
+    # still on): the difference is the cost of the tint.
+    'glass-house': Scenario('static', (*OVERWORLD, '--stained-glass'),
+                            'invernadero de vidrio de color, quieto', (STAINED_GLASS_FLAG,)),
+    'glass-house-clear': Scenario('static', (*OVERWORLD, '--clear-glass'),
+                                  'invernadero de vidrio común, quieto', (STAINED_GLASS_FLAG,)),
     # Chunk memory growing (ADR 0035): settled at radius 8, radius 32 one second into the
     # measurement, from the default floor like every case.
     'grow': Scenario('static', (*OVERWORLD, '--cave', *CAVE_CAMERA, '--radius-steps', '8,32@1'),

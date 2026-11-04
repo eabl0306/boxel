@@ -375,6 +375,27 @@ class CaseTest(unittest.TestCase):
             self.assertTrue(runs.supports(lit, Case(scenario='lit-cavern')))
             self.assertTrue(runs.supports(lit, Case(scenario='cave-static')))
 
+    def test_the_glass_house_is_the_still_surface_with_the_glass_scene(self):
+        case = runs.parse_case('rtx/glass-house/r16')
+        args = case.args(10)
+        clear = runs.parse_case('rtx/glass-house-clear/r16').args(10)
+        surface = runs.parse_case('rtx/surface-static/r16').args(10)
+        self.assertEqual(args[args.index('--scenario') + 1], 'static')
+        self.assertIn('--stained-glass', args)
+        # the still surface plus the scene, and the twin with common glass in its place
+        self.assertEqual([a for a in args if a != '--stained-glass'], surface)
+        self.assertEqual(['--stained-glass' if a == '--clear-glass' else a for a in clear], args)
+        self.assertEqual(case.label, 'invernadero de vidrio de color, quieto, sin tope')
+        with tempfile.TemporaryDirectory() as d:
+            # a binary from before colored sky lacks both cases; one with --stained-glass has them
+            old = fake_binary(d, 'old', HELP)
+            self.assertFalse(runs.supports(old, Case(scenario='glass-house')))
+            self.assertFalse(runs.supports(old, Case(scenario='glass-house-clear')))
+            glass = fake_binary(d, 'glass', HELP + '  --stained-glass     colored sky on\n')
+            self.assertTrue(runs.supports(glass, Case(scenario='glass-house')))
+            self.assertTrue(runs.supports(glass, Case(scenario='glass-house-clear')))
+            self.assertTrue(runs.supports(glass, Case(scenario='surface-static')))
+
     def test_the_switch_case_flies_the_surface_and_changes_worlds(self):
         case = runs.parse_case('780m/switch/r16')
         args = case.args(10)
