@@ -1429,7 +1429,7 @@ mod tests {
             if let Some(at) = lines.iter().position(|l| l.starts_with("Shadows")) {
                 assert!(lines[at - 1].starts_with("GPU chunks"), "{lines:?}");
             }
-            shadows.first().map(|l| l.to_string())
+            shadows.first().map(ToString::to_string)
         };
         assert_eq!(
             line(probe(&settings, &render, Some(&fifteen))).as_deref(),
