@@ -1,5 +1,6 @@
 // Entity models (ADR 0040), on every tier (GL 3.3 included). Prepended with common.wgsl (the View
-// struct and the light curve). The CPU poses the boxes of every instance into plain vertices
+// struct and the light curve) and sun_off.wgsl (High's ModelShadowed: shadow_common.wgsl and
+// sun_shadow.wgsl, ADR 0065). The CPU poses the boxes of every instance into plain vertices
 // relative to the render origin, so all three tiers run this same pipeline on the same data.
 //
 // Exactly ONE uniform block (the View) and ONE texture (the instance's skin, read with
@@ -57,16 +58,26 @@ fn model_texel(i: ModelOut) -> vec4<f32> {
   return textureLoad(skin, t, i32(0));
 }
 
+// The sun factor of the fragment (ADR 0065, lane S5): sun_factor_clip, exactly 1.0 from
+// sun_off.wgsl, from the shadow maps in High's ModelShadowed. The level is the brightest sky
+// channel, as the terrain's tinted path passes. The fragment entries call it first, in uniform
+// control flow (it may take screen derivatives), before the cutout's discard.
+fn model_sun(i: ModelOut) -> f32 {
+  let rgb = (vec3(i.sky) >> vec3(8u, 4u, 0u)) & vec3(15u);
+  let level = f32(max(rgb.x, max(rgb.y, rgb.z)));
+  return sun_factor_clip(i.clip, i.view_dist, (i.data >> MODEL_REALM_SHIFT) & 15u, level);
+}
+
 // albedo * face shade * light, then the distance fog (`shade_fragment` of the terrain, with one
 // light for the whole instance and no AO). The sky is lit per channel from `sky` (ADR 0064),
 // each through the curve, as the terrain's tinted_light: without tint all three are the light's
-// sky level, and the floats are those of curve(sky level) * sky color. Sun shadows (ADR 0065,
-// lane S5) will scale the sky term by their factor here.
-fn model_shade(albedo: vec3<f32>, i: ModelOut) -> vec4<f32> {
+// sky level, and the floats are those of curve(sky level) * sky color. The sun factor `sun`
+// (model_sun) scales the sky term; 1.0 keeps those floats.
+fn model_shade(albedo: vec3<f32>, i: ModelOut, sun: f32) -> vec4<f32> {
   let l = vec4<f32>((vec4(i.data) >> vec4(LIGHT_SKY_SHIFT, LIGHT_RED_SHIFT, LIGHT_GREEN_SHIFT, LIGHT_BLUE_SHIFT)) & vec4(15u));
   let env = realm_env((i.data >> MODEL_REALM_SHIFT) & 15u);
   let rgb = vec3<f32>((vec3(i.sky) >> vec3(8u, 4u, 0u)) & vec3(15u));
-  let sky = vec3(level_curve(rgb.x), level_curve(rgb.y), level_curve(rgb.z)) * env.sky.rgb;
+  let sky = vec3(level_curve(rgb.x), level_curve(rgb.y), level_curve(rgb.z)) * env.sky.rgb * sun;
   let block = vec3(level_curve(l.y), level_curve(l.z), level_curve(l.w)) * view.light_params.y;
   let light = max(max(sky, block), env.ambient.rgb);
   let shade = f32((i.data >> 16u) & 255u) / 255.0;
@@ -78,14 +89,16 @@ fn model_shade(albedo: vec3<f32>, i: ModelOut) -> vec4<f32> {
 // Opaque boxes (pipeline with cull_mode Back): the skin's alpha is ignored, no discard.
 @fragment
 fn fs_model_opaque(i: ModelOut) -> @location(0) vec4<f32> {
-  return model_shade(model_texel(i).rgb, i);
+  let sun = model_sun(i);
+  return model_shade(model_texel(i).rgb, i, sun);
 }
 
 // Cutout boxes, the outer layers (pipeline with cull_mode None, so the inside of a hat shows
 // through its holes): alpha test, as the terrain's cutout bucket.
 @fragment
 fn fs_model_cutout(i: ModelOut) -> @location(0) vec4<f32> {
+  let sun = model_sun(i);
   let albedo = model_texel(i);
   if (!alpha_test_passes(albedo)) { discard; }
-  return model_shade(albedo.rgb, i);
+  return model_shade(albedo.rgb, i, sun);
 }

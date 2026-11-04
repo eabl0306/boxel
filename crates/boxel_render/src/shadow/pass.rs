@@ -8,7 +8,9 @@
 //!   which leaves today's look; [`ShadowStats::dropped`] counts them.
 //! - Each cascade is one depth-only render pass into its layer of a `Depth32Float` array,
 //!   cleared to 1 (the far side), with 2 multi-draws per page holding chunks: the opaque buckets
-//!   without a fragment stage, then the cutout bucket with its alpha test.
+//!   without a fragment stage, then the cutout bucket with its alpha test. The same pass draws
+//!   the entity models and the cutout cell quads whose boxes touch the cascade (lane S5), with
+//!   their own depth pipelines ([`CascadeTarget`]).
 //! - The receivers bind the maps, a `LessEqual` comparison sampler (linear: one 2x2 PCF
 //!   compare) and the whole uniform, whose entry 0 also holds the camera realm's strength `k`
 //!   ([`receive_layout`]). Only a frame that drew its maps has them.
@@ -18,7 +20,11 @@
 //! a realm without the sun, no sky-lit chunk in the camera's realm) records nothing either.
 use super::{ShadowCascades, SunShadowSettings};
 use crate::DEPTH_FORMAT;
+use crate::cells::CellPass;
+use crate::chunk_table::ChunkTable;
 use crate::memory::{ARGS_BYTES, PageSet};
+use crate::model::ModelPass;
+use boxel_math::{Frustum, I64Vec3};
 use boxel_shaders::gpu::chunk_memory::MAX_PAGES;
 use boxel_shaders::gpu::shadow::{
     CASCADE_STRIDE, CULL_WORKGROUP_SIZE, GROUP_CASCADE, MAX_CASCADES, RECEIVE_MAPS,
@@ -42,6 +48,22 @@ const DEPTH_BIAS_CONSTANT: i32 = 1;
 /// face (plan sec. 4.2), so a small bias covers box faces down to 1/16 block.
 const DEPTH_BIAS_SLOPE: f32 = 1.5;
 
+/// The depth state of every caster pipeline (the terrain's, the models' and the cells'): written,
+/// the nearest caster to the sun kept (depth 0 on its side), with the casters' bias.
+pub(crate) fn caster_depth() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: DEPTH_FORMAT,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState {
+            constant: DEPTH_BIAS_CONSTANT,
+            slope_scale: DEPTH_BIAS_SLOPE,
+            clamp: 0.0,
+        },
+    }
+}
+
 /// What the shadow passes did in the last frame ([`crate::RenderStats::shadows`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShadowStats {
@@ -49,6 +71,8 @@ pub struct ShadowStats {
     pub cascades: u32,
     /// Multi-draws recorded into the maps: 2 per cascade and page holding chunks.
     pub draws: u32,
+    /// Draws of entity models and cell quads recorded into the maps (lane S5).
+    pub entity_draws: u32,
     /// Buckets a full list left out, in the last frame read back (a frame or two behind).
     pub dropped: u32,
     /// Bytes of the shadow resources (maps, lists, state, uniform); 0 while shadows are off.
@@ -93,6 +117,32 @@ pub(crate) struct ShadowFrame<'a> {
     pub index: &'a wgpu::Buffer,
     /// The pages (group 2 of each).
     pub pages: &'a PageSet,
+    /// The frame's render origin (the cells' chunks are placed from it).
+    pub render_origin: I64Vec3,
+    /// The chunk table (the cells draw only chunks inside the GPU window).
+    pub chunks: &'a ChunkTable,
+    /// The entity models, if any (lane S5).
+    pub models: Option<&'a ModelPass>,
+    /// The cell quads, if any (lane S5).
+    pub cells: Option<&'a CellPass>,
+}
+
+/// One cascade as the entity casters see it (lane S5): what [`ModelPass::draw_casters`] and
+/// [`CellPass::draw_casters`] draw into its pass.
+pub(crate) struct CascadeTarget<'a> {
+    /// Its box, camera-relative: a model's or a chunk's box outside it is not drawn.
+    pub frustum: &'a Frustum,
+    /// Group 3 of the caster pipelines: one cascade's entry of the shadow uniform, at the
+    /// dynamic offset `offset`.
+    pub group: &'a wgpu::BindGroup,
+    pub offset: u32,
+    /// The frame's render origin.
+    pub render_origin: I64Vec3,
+    /// The camera realm's voxels `[below, above)` in `y` relative to the render origin: no
+    /// realm shadows another.
+    pub band: [i32; 2],
+    /// The chunk table.
+    pub chunks: &'a ChunkTable,
 }
 
 /// The lists of one size: `cascades * pages * 4 * casters` draws and their refs.
@@ -126,8 +176,10 @@ pub(crate) struct ShadowPass {
     /// The cull's group 0 and the chunk table it binds (rebuilt when the table or the lists
     /// change).
     cull_group: Option<(wgpu::Buffer, wgpu::BindGroup)>,
-    /// One cascade's entry of `uniform` (dynamic offset).
+    /// One cascade's entry of `uniform` (dynamic offset), and its layout (the caster pipelines'
+    /// group 3).
     cascade_group: wgpu::BindGroup,
+    cascade_layout: wgpu::BindGroupLayout,
     /// The receivers' group 3 ([`receive_layout`]), built again with the maps.
     receive_layout: wgpu::BindGroupLayout,
     receive_sampler: wgpu::Sampler,
@@ -286,18 +338,7 @@ impl ShadowPass {
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
                 },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    // The nearest caster to the sun (depth 0 on its side).
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState {
-                        constant: DEPTH_BIAS_CONSTANT,
-                        slope_scale: DEPTH_BIAS_SLOPE,
-                        clamp: 0.0,
-                    },
-                }),
+                depth_stencil: Some(caster_depth()),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: fragment.map(|entry| wgpu::FragmentState {
                     module: &module,
@@ -342,6 +383,7 @@ impl ShadowPass {
             cull_layout,
             cull_group: None,
             cascade_group,
+            cascade_layout,
             opaque,
             cutout,
             block_texels: block_texture.width(),
@@ -394,6 +436,12 @@ impl ShadowPass {
             bytes: self.bytes(),
             ..self.stats
         }
+    }
+
+    /// Group 3 of the caster pipelines: one cascade's entry of the shadow uniform (dynamic
+    /// offset). The models' and cells' depth pipelines are built with it (lane S5).
+    pub fn cascade_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.cascade_layout
     }
 
     /// Testing: the last frame's cascades, `None` when it drew none.
@@ -516,7 +564,14 @@ impl ShadowPass {
             .collect();
         let casters = u64::from(casters);
         let mut draws = 0;
-        for (layer, view) in self.layers.iter().enumerate().take(count as usize) {
+        let mut entity_draws = 0;
+        for ((layer, view), cascade) in self
+            .layers
+            .iter()
+            .enumerate()
+            .take(count as usize)
+            .zip(cascades)
+        {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("boxel sun shadow"),
                 color_attachments: &[],
@@ -532,17 +587,30 @@ impl ShadowPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let c = layer as u64;
+            let offset = (CASCADE_STRIDE * c) as u32;
+            pass.set_bind_group(bindings::GROUP_MATERIALS, frame.materials, &[]);
+            pass.set_bind_group(bindings::GROUP_VIEW, frame.view_group, &[]);
+            pass.set_bind_group(GROUP_CASCADE, &self.cascade_group, &[offset]);
+            let target = CascadeTarget {
+                frustum: &cascade.frustum,
+                group: &self.cascade_group,
+                offset,
+                render_origin: frame.render_origin,
+                band: frame.band,
+                chunks: frame.chunks,
+            };
+            if let Some(models) = frame.models {
+                entity_draws += models.draw_casters(&mut pass, &target);
+            }
+            if let Some(cells) = frame.cells {
+                entity_draws += cells.draw_casters(&mut pass, &target);
+            }
             if live.is_empty() {
                 continue;
             }
-            let c = layer as u64;
             pass.set_bind_group(bindings::GROUP_MATERIALS, frame.materials, &[]);
-            pass.set_bind_group(bindings::GROUP_VIEW, frame.view_group, &[]);
-            pass.set_bind_group(
-                GROUP_CASCADE,
-                &self.cascade_group,
-                &[(CASCADE_STRIDE * c) as u32],
-            );
+            pass.set_bind_group(GROUP_CASCADE, &self.cascade_group, &[offset]);
             pass.set_vertex_buffer(0, lists.refs.slice(..));
             pass.set_index_buffer(frame.index.slice(..), wgpu::IndexFormat::Uint32);
             for (cutout, pipeline) in [(false, &self.opaque), (true, &self.cutout)] {
@@ -570,6 +638,7 @@ impl ShadowPass {
         self.stats = ShadowStats {
             cascades: count,
             draws,
+            entity_draws,
             dropped: self.stats.dropped,
             bytes: 0,
         };

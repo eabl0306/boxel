@@ -39,13 +39,22 @@
 //! the moving ones) and drawn opaque after the cutout quads by a fourth pipeline of the same
 //! shader (`vs_cell_pattern`, `fs_cell_pattern`), with the pattern array as group 0: one uniform
 //! and one texture/sampler pair, as every other pipeline here.
+//!
+//! On High with sun shadows (ADR 0065, lane S5) the cutout quads cast into the shadow maps (a
+//! sign's board and text, an item in a frame: the quads whose face looks away from the sun, the
+//! chunks' ones inside the GPU window and the cascade's box, and every moving one), and the
+//! cutout, translucent and glow quads receive them through `CellShadowed`, the same shader with
+//! the shadow maps' sun factor. They are built the first time shadows are on
+//! ([`CellPass::set_shadowed`]).
 
 use crate::chunk_table::ChunkTable;
 use crate::renderer::ViewParams;
+use crate::shadow::{CascadeTarget, caster_depth};
 use crate::textures::BlockTextureData;
 use crate::{DEPTH_FORMAT, MAIN_COLOR_FORMAT};
 use boxel_math::{Aabb, I64Vec3, Vec3, wrap_to_i32};
 use boxel_mesh::{ChunkMesh, LitCellQuad};
+use boxel_shaders::gpu::shadow::{GROUP_CASCADE, GROUP_RECEIVE};
 use boxel_shaders::gpu::{CellVertex, bindings, cell};
 use boxel_shaders::{ShaderModuleId, create_module};
 use boxel_voxel::{BlockPos, CellBlend, CellImage, CellQuad, LightValue};
@@ -324,6 +333,62 @@ impl QuadList {
         true
     }
 
+    /// Draws the quads of the chunks inside the GPU window, the camera realm and `target`'s
+    /// cascade into its depth pass with `group` as group 0 (the caster pipeline set), runs of
+    /// consecutive chunks as one draw; every quad with `all` (the moving ones). The number of
+    /// draws.
+    fn draw_casters(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        group: &wgpu::BindGroup,
+        target: &CascadeTarget<'_>,
+        all: bool,
+    ) -> u32 {
+        let Some(vertex) = &self.vertex else {
+            return 0;
+        };
+        let mut draws = 0;
+        let mut flush = |pass: &mut wgpu::RenderPass<'_>, run: Range<u32>| {
+            if draws == 0 {
+                pass.set_bind_group(cell::GROUP_TEXTURES, group, &[]);
+                pass.set_vertex_buffer(0, vertex.slice(..));
+            }
+            pass.draw(run, 0..1);
+            draws += 1;
+        };
+        if all {
+            if !self.vertices.is_empty() {
+                flush(pass, 0..self.vertices.len() as u32);
+            }
+            return draws;
+        }
+        let mut run: Option<Range<u32>> = None;
+        for (origin, range) in &self.ranges {
+            let min = origin.saturating_sub(target.render_origin);
+            let in_band = (i64::from(target.band[0])..i64::from(target.band[1])).contains(&min.y);
+            let min = min.as_vec3();
+            let max = min + Vec3::splat(CHUNK_EDGE);
+            if !in_band
+                || !target.chunks.in_window(*origin)
+                || !target.frustum.intersects_aabb(&Aabb::new(min, max))
+            {
+                continue;
+            }
+            match &mut run {
+                Some(r) if r.end == range.start => r.end = range.end,
+                _ => {
+                    if let Some(r) = run.replace(range.clone()) {
+                        flush(pass, r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = run {
+            flush(pass, r);
+        }
+        draws
+    }
+
     fn drawn(&self) -> u32 {
         self.draws.iter().map(|r| r.len() as u32).sum::<u32>() / 6
     }
@@ -579,6 +644,17 @@ impl SortBench {
     }
 }
 
+/// High's cell pipelines of sun shadows (ADR 0065, lane S5).
+struct ShadowedCells {
+    /// `CellShadowed`: the twins of `pipeline`, `translucent` and `glow` that receive the
+    /// shadows (group 3).
+    pipeline: wgpu::RenderPipeline,
+    translucent: wgpu::RenderPipeline,
+    glow: wgpu::RenderPipeline,
+    /// `CellShadow`: the cutout quads' depth in a cascade's map.
+    caster: wgpu::RenderPipeline,
+}
+
 /// The pipelines, the cell textures and the vertices of the cell quads (one per renderer).
 pub(crate) struct CellPass {
     pipeline: wgpu::RenderPipeline,
@@ -588,6 +664,10 @@ pub(crate) struct CellPass {
     glow: wgpu::RenderPipeline,
     /// The pattern quads' pipeline (ADR 0056): `vs_cell_pattern` and `fs_cell_pattern`, opaque.
     pattern: wgpu::RenderPipeline,
+    /// Sun shadows' pipelines, from the first frame with shadows on (High only).
+    shadowed: Option<ShadowedCells>,
+    /// They could not be built: the cell quads neither cast nor receive.
+    shadowed_failed: bool,
     layout: wgpu::BindGroupLayout,
     /// The cell textures and their bind group, with the data they were made from.
     textures: Option<(Arc<BlockTextureData>, wgpu::Texture, wgpu::BindGroup)>,
@@ -646,72 +726,17 @@ impl CellPass {
             bind_group_layouts: &groups,
             immediate_size: 0,
         });
-        let [o0, o1, o2, o3, o4] = cell::ATTRIBUTE_OFFSETS;
-        let attribute = |format, offset, shader_location| wgpu::VertexAttribute {
-            format,
-            offset,
-            shader_location,
-        };
-        let attributes = [
-            attribute(wgpu::VertexFormat::Sint32x3, o0, 0),
-            attribute(wgpu::VertexFormat::Float32x3, o1, 1),
-            attribute(wgpu::VertexFormat::Float32x2, o2, 2),
-            attribute(wgpu::VertexFormat::Uint32x2, o3, 3),
-            attribute(wgpu::VertexFormat::Uint32, o4, 4),
-        ];
-        let build = |label: &str,
-                     (vertex, fragment): (&str, &str),
-                     blend: Option<wgpu::BlendState>,
-                     depth: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some(vertex),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: size_of::<CellVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &attributes,
-                    })],
-                },
-                // Both sides, as the terrain's cutout bucket (the sort drops the translucent
-                // quads that look away; `vs_cell_pattern` the pattern ones).
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                // Tested and written like the terrain (reverse-Z); the translucent quads too, as
-                // Minecraft's translucent items: drawn back to front, the ones behind still show.
-                // A glow is only tested.
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth),
-                    depth_compare: Some(wgpu::CompareFunction::Greater),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(fragment),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: MAIN_COLOR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        let build =
+            |label: &str, entries: (&str, &str), blend: Option<wgpu::BlendState>, depth: bool| {
+                cell_pipeline(
+                    device,
+                    label,
+                    &pipeline_layout,
+                    &module,
+                    (entries.0, Some(entries.1)),
+                    CellTarget::Main { blend, depth },
+                )
+            };
         let pipeline = build("boxel cell", ("vs_cell", "fs_cell"), None, true);
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
         let translucent_entries = ("vs_cell", "fs_cell_translucent");
@@ -730,6 +755,8 @@ impl CellPass {
             translucent,
             glow,
             pattern,
+            shadowed: None,
+            shadowed_failed: false,
             layout,
             textures: None,
             patterns: None,
@@ -740,6 +767,125 @@ impl CellPass {
             sorted: Sorted::default(),
             stats: CellStats::default(),
         }
+    }
+
+    /// High (sun shadows, ADR 0065): builds the pipelines that cast into the maps and receive
+    /// them once (the next calls keep them): `view` is the renderer's group 1, `cascade` the
+    /// casters' group 3 ([`crate::shadow::ShadowPass::cascade_layout`]), `receive` the
+    /// receivers' ([`crate::shadow::receive_layout`]). If they fail, an error is logged and the
+    /// cell quads neither cast nor receive on this renderer.
+    pub(crate) fn set_shadowed(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::BindGroupLayout,
+        cascade: &wgpu::BindGroupLayout,
+        receive: &wgpu::BindGroupLayout,
+    ) {
+        if self.shadowed.is_some() || self.shadowed_failed {
+            return;
+        }
+        let mut built = None;
+        let result = boxel_gfx::run_in_error_scopes(device, || {
+            built = Some(self.shadowed_pipelines(device, view, cascade, receive));
+            Ok(())
+        });
+        match (result, built) {
+            (Ok(()), Some(shadowed)) => self.shadowed = Some(shadowed),
+            (result, _) => {
+                tracing::error!(
+                    "cell quad shadow pipelines: {}; cell quads cast and receive no sun shadow",
+                    result.err().unwrap_or_default()
+                );
+                self.shadowed_failed = true;
+            }
+        }
+    }
+
+    fn shadowed_pipelines(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::BindGroupLayout,
+        cascade: &wgpu::BindGroupLayout,
+        receive: &wgpu::BindGroupLayout,
+    ) -> ShadowedCells {
+        let layout = |label, last: &wgpu::BindGroupLayout| {
+            let mut groups: [Option<&wgpu::BindGroupLayout>; 4] = [None; 4];
+            groups[cell::GROUP_TEXTURES as usize] = Some(&self.layout);
+            groups[bindings::GROUP_VIEW as usize] = Some(view);
+            groups[3] = Some(last);
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &groups,
+                immediate_size: 0,
+            })
+        };
+        debug_assert_eq!((GROUP_RECEIVE, GROUP_CASCADE), (3, 3));
+        let receiving = layout("boxel cell shadowed", receive);
+        let module = create_module(device, ShaderModuleId::CellShadowed);
+        let build = |label: &str, blend: Option<wgpu::BlendState>, depth| {
+            let fragment = if blend.is_some() {
+                "fs_cell_translucent"
+            } else {
+                "fs_cell"
+            };
+            cell_pipeline(
+                device,
+                label,
+                &receiving,
+                &module,
+                ("vs_cell", Some(fragment)),
+                CellTarget::Main { blend, depth },
+            )
+        };
+        let alpha = Some(wgpu::BlendState::ALPHA_BLENDING);
+        let casting = layout("boxel cell shadow", cascade);
+        let cast_module = create_module(device, ShaderModuleId::CellShadow);
+        ShadowedCells {
+            pipeline: build("boxel cell shadowed", None, true),
+            translucent: build("boxel cell shadowed translucent", alpha, true),
+            glow: build("boxel cell shadowed glow", alpha, false),
+            caster: cell_pipeline(
+                device,
+                "boxel cell shadow",
+                &casting,
+                &cast_module,
+                ("vs_cell_shadow", Some("fs_cell_shadow")),
+                CellTarget::Caster,
+            ),
+        }
+    }
+
+    /// Draws the cutout quads into `target`'s cascade (its depth pass): the chunks' ones inside
+    /// the GPU window, the camera realm and the cascade's box, and every moving one, of the
+    /// cell textures (once the content gave them) and the block textures. The quads whose face
+    /// does not look away from the sun are collapsed by the shader. The number of draws; none
+    /// before [`CellPass::set_shadowed`].
+    pub(crate) fn draw_casters(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        target: &CascadeTarget<'_>,
+    ) -> u32 {
+        let Some(shadowed) = &self.shadowed else {
+            return 0;
+        };
+        let lists = [&self.lists.cutout, &self.moving.cutout];
+        if lists
+            .iter()
+            .flat_map(|l| l.iter())
+            .all(|l| l.vertices.is_empty())
+        {
+            return 0;
+        }
+        pass.set_pipeline(&shadowed.caster);
+        pass.set_bind_group(GROUP_CASCADE, target.group, &[target.offset]);
+        let mut draws = 0;
+        for (all, [cells, blocks]) in [(false, lists[0]), (true, lists[1])] {
+            if let Some((_, _, group)) = &self.textures {
+                draws += cells.draw_casters(pass, group, target, all);
+            }
+            draws += blocks.draw_casters(pass, &self.blocks, target, all);
+        }
+        draws
     }
 
     /// Uses `quads` as the moving quads from the next [`CellPass::prepare`] on (uploaded then if
@@ -905,17 +1051,28 @@ impl CellPass {
     /// Draws this frame's cell quads into `pass` (group 1 already holds the View): the cutout
     /// ones of the cell textures (once the content gave them), then those of the block textures,
     /// then the pattern ones (once the content gave their textures), then the translucent ones
-    /// back to front. Leaves group 0 bound to one of the arrays. False if it drew nothing.
-    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
+    /// back to front. With `receivers` (High, a frame with sun shadows: the receivers' group 3)
+    /// the cutout, translucent and glow quads are drawn with the pipelines that receive them,
+    /// if they exist. Leaves group 0 bound to one of the arrays. False if it drew nothing.
+    pub(crate) fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        receivers: Option<&wgpu::BindGroup>,
+    ) -> bool {
         let cutout = || self.lists.cutout.iter().chain(&self.moving.cutout);
         let patterns = [&self.lists.pattern, &self.moving.pattern];
         let any_pattern = self.patterns.is_some() && patterns.iter().any(|l| !l.draws.is_empty());
         if cutout().all(|l| l.draws.is_empty()) && !any_pattern && self.sorted.runs.is_empty() {
             return false;
         }
+        let shadowed = receivers.zip(self.shadowed.as_ref());
+        if let Some((receivers, _)) = shadowed {
+            pass.set_bind_group(GROUP_RECEIVE, receivers, &[]);
+        }
+        let shadowed = shadowed.map(|(_, s)| s);
         let mut drew = false;
         if cutout().any(|l| !l.draws.is_empty()) {
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(shadowed.map_or(&self.pipeline, |s| &s.pipeline));
             if let Some((_, _, group)) = &self.textures {
                 drew |= self.lists.cutout[0].draw(pass, group);
                 drew |= self.moving.cutout[0].draw(pass, group);
@@ -931,11 +1088,20 @@ impl CellPass {
                 drew |= list.draw(pass, group);
             }
         }
-        drew | self.draw_translucent(pass)
+        drew | self.draw_translucent(pass, shadowed)
     }
 
-    /// The translucent quads in this frame's order, a draw per run of one list.
-    fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
+    /// The translucent quads in this frame's order, a draw per run of one list, with
+    /// `shadowed`'s pipelines if given.
+    fn draw_translucent(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        shadowed: Option<&ShadowedCells>,
+    ) -> bool {
+        let (translucent, glows) = match shadowed {
+            Some(s) => (&s.translucent, &s.glow),
+            None => (&self.translucent, &self.glow),
+        };
         let Some(index) = &self.sorted.index else {
             return false;
         };
@@ -964,7 +1130,7 @@ impl CellPass {
                 pass.set_index_buffer(index.slice(..), wgpu::IndexFormat::Uint32);
             }
             if pipeline != Some(*glow) {
-                pass.set_pipeline(if *glow { &self.glow } else { &self.translucent });
+                pass.set_pipeline(if *glow { glows } else { translucent });
                 pipeline = Some(*glow);
             }
             if bound != Some(*id) {
@@ -981,6 +1147,103 @@ impl CellPass {
     pub(crate) fn stats(&self) -> CellStats {
         self.stats
     }
+}
+
+/// What a cell pipeline draws into.
+#[derive(Clone, Copy)]
+enum CellTarget {
+    /// The main pass: the color target with `blend`, depth tested (reverse-Z) and written with
+    /// `depth`.
+    Main {
+        blend: Option<wgpu::BlendState>,
+        depth: bool,
+    },
+    /// A shadow map: depth only ([`caster_depth`]).
+    Caster,
+}
+
+/// A cell pipeline of `layout`: the [`CellVertex`] buffer into `entries.0` of `module`, then
+/// its `entries.1`, both sides of every quad (as the terrain's cutout bucket: the sort drops the
+/// translucent quads that look away; `vs_cell_pattern` the pattern ones; the casters' vertex
+/// stage the quads that do not look away from the sun).
+fn cell_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    (vertex, fragment): (&str, Option<&str>),
+    target: CellTarget,
+) -> wgpu::RenderPipeline {
+    let [o0, o1, o2, o3, o4] = cell::ATTRIBUTE_OFFSETS;
+    let attribute = |format, offset, shader_location| wgpu::VertexAttribute {
+        format,
+        offset,
+        shader_location,
+    };
+    let attributes = [
+        attribute(wgpu::VertexFormat::Sint32x3, o0, 0),
+        attribute(wgpu::VertexFormat::Float32x3, o1, 1),
+        attribute(wgpu::VertexFormat::Float32x2, o2, 2),
+        attribute(wgpu::VertexFormat::Uint32x2, o3, 3),
+        attribute(wgpu::VertexFormat::Uint32, o4, 4),
+    ];
+    let color;
+    let (depth_stencil, targets): (_, &[Option<wgpu::ColorTargetState>]) = match target {
+        // Tested and written like the terrain (reverse-Z); the translucent quads too, as
+        // Minecraft's translucent items: drawn back to front, the ones behind still show. A
+        // glow is only tested.
+        CellTarget::Main { blend, depth } => {
+            color = [Some(wgpu::ColorTargetState {
+                format: MAIN_COLOR_FORMAT,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })];
+            (
+                wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                },
+                &color,
+            )
+        }
+        CellTarget::Caster => (caster_depth(), &[]),
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(vertex),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<CellVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attributes,
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(depth_stencil),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: fragment.map(|entry| wgpu::FragmentState {
+            module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets,
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 #[cfg(test)]

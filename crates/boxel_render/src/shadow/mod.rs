@@ -16,7 +16,10 @@
 //! - The receivers (lane S4): in a frame that drew its maps, High's opaque, cutout and
 //!   translucent voxels are drawn with the shadowed pipelines (`sun_shadow.wgsl`), which scale
 //!   the sky term by `1 - k * (1 - v)`. Every other frame, and Mid and Low always, draw with
-//!   today's pipelines. Cells and models do not cast or receive yet (lane S5).
+//!   today's pipelines.
+//! - Entity models and cell quads (lane S5) cast into the same maps (their faces that look away
+//!   from the sun; the cells' cutout quads only) and receive them like the terrain: the models'
+//!   normal comes from the screen derivatives of their position (`sun_factor_clip`).
 
 mod cascades;
 mod pass;
@@ -25,8 +28,11 @@ pub use cascades::{
     CASCADE_BLEND, Cascade, MAX_CASCADES, SHADOW_ANCHOR, ShadowCascades, ShadowView, bucket_mask,
     cascade_splits, shadow_cascades,
 };
+pub(crate) use pass::{
+    CascadeTarget, ShadowFrame, ShadowPass, VoxelGroups, caster_depth, read_depth_layer,
+    receive_layout,
+};
 pub use pass::{PAGE_CASTERS, ShadowStats};
-pub(crate) use pass::{ShadowFrame, ShadowPass, VoxelGroups, read_depth_layer, receive_layout};
 
 const _: () = assert!(MAX_CASCADES == boxel_shaders::gpu::shadow::MAX_CASCADES);
 const _: () = assert!(CASCADE_BLEND == boxel_shaders::gpu::shadow::RECEIVE_BLEND);

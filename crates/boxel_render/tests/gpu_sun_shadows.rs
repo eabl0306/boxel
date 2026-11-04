@@ -40,8 +40,19 @@
 //!   shift that is not, at most [`MAX_MISMATCH`] of the pixels differ (shadow edges move by a
 //!   fraction of a texel).
 //!
+//! Part 3, entity models and cell quads (lane S5), on High: a figure (one box of a model) and a
+//! sign's board (six cell quads) in the scenes, their boxes given to the CPU rays as solids:
+//!
+//! - the maps: the texels whose ray from the sun first leaves the scene through the figure or
+//!   the board hold their depth (they cast with the faces that look away from the sun);
+//! - the oracle, with the figure and the board as casters and as surfaces seen: the floor in
+//!   their shadow is in shadow (enough such pixels, each judged), and their own faces receive;
+//! - a figure and a sign under a stone tree are darker than the same ones in the sun;
+//! - never brighter; byte-identical at midnight, and with shadows off after they were on
+//!   (today's pipelines); on Mid and Low (part 1's check) the same with them in the scene.
+//!
 //! Failing maps are reported as counts; failing images are saved under
-//! `CARGO_TARGET_TMPDIR/gpu_sun_shadows/`.
+//! `CARGO_TARGET_TMPDIR/gpu_sun_shadows/` (every image with `GPU_SUN_SHADOWS_SAVE=1`).
 #![expect(clippy::print_stderr, reason = "test progress and failure details")]
 use boxel_camera::{Camera, CameraView};
 use boxel_gfx::{
@@ -50,8 +61,9 @@ use boxel_gfx::{
 };
 use boxel_light::{LightInput, LightScratch, PaddedLight, SkyInput};
 use boxel_math::glam::DVec4;
-use boxel_math::{DVec3, I64Vec3, UVec2};
-use boxel_mesh::{ChunkMesh, MaterialTable, MeshInput, MeshOptions, Mesher};
+use boxel_math::{DVec3, I64Vec3, Quat, UVec2, Vec3};
+use boxel_mesh::{ChunkMesh, LitCellQuad, MaterialTable, MeshInput, MeshOptions, Mesher};
+use boxel_render::model::{Cuboid, Model, ModelDraw, ModelLayer, ModelTexture, PartPose};
 use boxel_render::shadow::{Cascade, ShadowCascades};
 use boxel_render::{
     DEFAULT_SKY_COLOR, DistanceFog, RendererConfig, SceneRealms, SceneSun, SunShadowSettings,
@@ -59,7 +71,8 @@ use boxel_render::{
 };
 use boxel_transform::Transform;
 use boxel_voxel::{
-    BlockRegistry, BlockState, CHUNK_VOLUME, ChunkData, LightTables, LocalPos, MAX_BLOCK_COORD,
+    BlockRegistry, BlockState, CHUNK_VOLUME, CellBlend, CellImage, CellQuad, ChunkData, Face,
+    LightTables, LightValue, LocalPos, MAX_BLOCK_COORD, TextureImage, TextureSpec,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -535,13 +548,18 @@ struct MapCheck {
     casters: usize,
     /// Of them, disagreeing.
     wrong: usize,
+    /// Of the casters, those that leave through a face of an entity's solid, and how many of
+    /// them disagree.
+    entity_casters: usize,
+    entity_wrong: usize,
     /// The first few disagreements.
     examples: Vec<String>,
 }
 
 /// Compares `depths` (one cascade's map) with the CPU rays through `solids` (relative to the
-/// frame's render origin).
-fn check_map(cascade: &Cascade, depths: &[f32], solids: &[Solid]) -> MapCheck {
+/// frame's render origin), of which those from `first_entity` on are entities (a model's box,
+/// a board of cell quads).
+fn check_map(cascade: &Cascade, depths: &[f32], solids: &[Solid], first_entity: usize) -> MapCheck {
     let res = f64::from(RESOLUTION);
     let inverse = cascade.view_proj.as_dmat4().inverse();
     let point = |x: f64, y: f64, z: f64| {
@@ -591,6 +609,10 @@ fn check_map(cascade: &Cascade, depths: &[f32], solids: &[Solid]) -> MapCheck {
                     (got - t).abs() <= 2.0 * slope + 2e-6
                 }
             };
+            if center.is_some_and(|(_, face)| face.0 >= first_entity) {
+                check.entity_casters += 1;
+                check.entity_wrong += usize::from(!ok);
+            }
             if !ok {
                 check.wrong += 1;
                 if check.examples.len() < 5 {
@@ -769,7 +791,7 @@ fn check_high(
             })
             .collect();
         for (c, (cascade, depths)) in cascades.cascades().iter().zip(&maps).enumerate() {
-            let check = check_map(cascade, depths, &solids);
+            let check = check_map(cascade, depths, &solids, solids.len());
             eprintln!(
                 "gpu_sun_shadows: {label}: {hours}:00 cascade {c}: {} texels judged, {} with a \
                  caster, {} wrong",
@@ -902,7 +924,9 @@ fn check_high(
     Ok(())
 }
 
-/// Mid and Low: shadows on draw nothing, allocate nothing, change nothing.
+/// Mid and Low: shadows on draw nothing, allocate nothing, change nothing, with entity models
+/// and cell quads in the scene too.
+#[expect(clippy::too_many_arguments, reason = "the meshes of two parts")]
 fn check_lower(
     report: &mut Report,
     label: &str,
@@ -911,6 +935,7 @@ fn check_lower(
     tier: Tier,
     b: &Blocks,
     m: &Meshes,
+    e: &EntityScenes,
 ) -> Result<(), String> {
     let (device, queue, errors) = device_for(adapter, caps, tier)?;
     let mut r = renderer(&device, &queue, tier, b)?;
@@ -920,6 +945,19 @@ fn check_lower(
     r.set_sun_shadows(&device, &settings());
     let on = shoot(&device, &queue, &mut r, &v)?;
     report.same_image(&format!("{label}_{tier}"), &on, &off);
+    r.set_cell_textures(&device, &queue, &Arc::new(sign_textures()));
+    place(&mut r, I64Vec3::ZERO, &[(I64Vec3::ZERO, &e.floor)])?;
+    r.set_models(
+        &device,
+        vec![figure_at(&figure(), 1, &ENTITY_SCENE[1], I64Vec3::ZERO)],
+        Quat::IDENTITY,
+    );
+    let on = shoot(&device, &queue, &mut r, &v)?;
+    r.set_sun_shadows(&device, &SunShadowSettings::default());
+    let off = shoot(&device, &queue, &mut r, &v)?;
+    report.same_image(&format!("{label}_{tier}_entities"), &on, &off);
+    r.set_sun_shadows(&device, &settings());
+    shoot(&device, &queue, &mut r, &v)?;
     let stats = r.stats().shadows;
     report.expect(stats == boxel_render::ShadowStats::default(), || {
         format!("{label} {tier}: {stats:?}")
@@ -1129,49 +1167,59 @@ struct PixelCheck {
     lit: usize,
     /// Of the shadow ones, seen through water.
     wet_shadow: usize,
+    /// Of the shadow ones, in the sun but for the entities (the oracle without their solids
+    /// says sun), and how many of them disagree.
+    by_entities: usize,
+    by_entities_wrong: usize,
     wrong: usize,
     examples: Vec<String>,
 }
 
+/// `solids` relative to the voxel of `eye` (the render origin of the views here).
+fn relative(solids: &[Solid], eye: DVec3) -> Vec<Solid> {
+    let base = eye.floor();
+    solids
+        .iter()
+        .map(|s| Solid {
+            min: s.min - base,
+            max: s.max - base,
+        })
+        .collect()
+}
+
+/// The unit direction of the ray from the eye of `view` through the image point `(x, y)`.
+fn eye_ray(view: &ViewParams, x: f64, y: f64) -> DVec3 {
+    let inverse = view.view_proj.as_dmat4().inverse();
+    let ndc = DVec4::new(
+        2.0 * x / f64::from(WIDTH) - 1.0,
+        1.0 - 2.0 * y / f64::from(HEIGHT),
+        0.5,
+        1.0,
+    );
+    let p = inverse * ndc;
+    (p.truncate() / p.w - view.eye_rel.as_dvec3()).normalize()
+}
+
 /// Compares `on` (shadows) over `off` (none) with the oracle, for `view` of a scene of
-/// `solids` (they cast) and `water` (seen only), in blocks from the origin chunk with the eye
-/// at `eye`.
+/// `solids` (they cast; those from `first_entity` on are entities) and `water` (seen only), in
+/// blocks from the origin chunk with the eye at `eye`.
 #[expect(clippy::too_many_arguments, reason = "one scene's whole description")]
 fn check_pixels(
     view: &ViewParams,
     eye: DVec3,
     cascades: &ShadowCascades,
     solids: &[Solid],
+    first_entity: usize,
     water: &[Solid],
     on: &RgbaImage,
     off: &RgbaImage,
     light: DVec3,
 ) -> PixelCheck {
-    let base = eye.floor();
-    let rel = |s: &[Solid]| -> Vec<Solid> {
-        s.iter()
-            .map(|s| Solid {
-                min: s.min - base,
-                max: s.max - base,
-            })
-            .collect()
-    };
-    let (solids, water) = (rel(solids), rel(water));
-    let inverse = view.view_proj.as_dmat4().inverse();
+    let (solids, water) = (relative(solids, eye), relative(water, eye));
     let origin = view.eye_rel.as_dvec3();
-    let ray = |x: f64, y: f64| {
-        let ndc = DVec4::new(
-            2.0 * x / f64::from(WIDTH) - 1.0,
-            1.0 - 2.0 * y / f64::from(HEIGHT),
-            0.5,
-            1.0,
-        );
-        let p = inverse * ndc;
-        (p.truncate() / p.w - origin).normalize()
-    };
     // What a ray from the eye sees: the opaque face, and the water in front of it if any.
     let seen = |x: f64, y: f64| {
-        let dir = ray(x, y);
+        let dir = eye_ray(view, x, y);
         let opaque = first_entry(origin, dir, &solids);
         let wet = first_entry(origin, dir, &water)
             .filter(|w| opaque.is_none_or(|o| w.0 < o.0))
@@ -1200,7 +1248,8 @@ fn check_pixels(
                 continue;
             };
             // Every surface the pixel shows must say the same, away from shadow edges.
-            let mut points = vec![(origin + dir * t, normal(face))];
+            let surface = (origin + dir * t, normal(face));
+            let mut points = vec![surface];
             if let Some(w) = wet {
                 let (tw, _) = first_entry(origin, dir, &water).unwrap_or((t, w));
                 points.push((origin + dir * tw, DVec3::Y));
@@ -1224,6 +1273,12 @@ fn check_pixels(
             }
             if truth == Sun::Shadow && wet.is_some() {
                 check.wet_shadow += 1;
+            }
+            let by_entities = truth == Sun::Shadow
+                && oracle(surface.0, surface.1, light, &solids[..first_entity]) == Some(Sun::Lit);
+            if by_entities {
+                check.by_entities += 1;
+                check.by_entities_wrong += usize::from(got != Some(truth));
             }
             if got != Some(truth) {
                 check.wrong += 1;
@@ -1348,6 +1403,7 @@ fn check_receivers(
             eye.at,
             &cascades,
             solids,
+            solids.len(),
             water,
             &on,
             &off,
@@ -1512,6 +1568,373 @@ fn check_receivers(
     Ok(())
 }
 
+// ---------------------------------------------------------------- part 3: models and cells
+
+/// The figure's skin and the sign's image: colors the measure tells apart from the stone.
+const FIGURE_SKIN: [u8; 4] = [200, 90, 70, 255];
+const SIGN_IMAGE: [u8; 4] = [70, 110, 210, 255];
+
+/// A floor, a figure floating a block above it (a model's box, a block wide and deep and two
+/// tall: in the map it casts alone, not with the floor) and a sign's board floating apart (six
+/// cell quads, an eighth of a block thick). The entities' solids come after the terrain's.
+const ENTITY_SCENE: [Solid; 3] = [
+    Solid::new([4.0, 2.0, 4.0], [28.0, 4.0, 28.0]),
+    Solid::new([12.0, 5.0, 12.0], [13.0, 7.0, 13.0]),
+    Solid::new([18.0, 6.0, 16.0], [20.0, 7.0, 16.125]),
+];
+
+/// [`tree`]'s solids with stone leaves, then a figure standing in the canopy's shadow at 15:00
+/// and one in the sun, a board in the shadow and one in the sun.
+const TREE_SCENE: [Solid; 7] = [
+    Solid::new([4.0, 2.0, 4.0], [28.0, 4.0, 28.0]),
+    Solid::new([12.0, 4.0, 12.0], [13.0, 9.0, 13.0]),
+    Solid::new([10.0, 9.0, 10.0], [15.0, 10.0, 15.0]),
+    Solid::new([16.0, 4.0, 9.0], [17.0, 6.0, 10.0]),
+    Solid::new([6.0, 4.0, 20.0], [7.0, 6.0, 21.0]),
+    Solid::new([14.0, 6.0, 9.0], [15.5, 7.0, 9.125]),
+    Solid::new([8.0, 6.0, 22.0], [10.0, 7.0, 22.125]),
+];
+
+/// The floor of [`ENTITY_SCENE`].
+fn floor(b: &Blocks) -> ChunkData {
+    chunk(|x, y, z| match (x, y, z) {
+        (4..28, 2..4, 4..28) => b.stone,
+        _ => BlockState::AIR,
+    })
+}
+
+/// The cell textures of the boards: one image of [`SIGN_IMAGE`].
+fn sign_textures() -> boxel_render::BlockTextureData {
+    boxel_render::generate_block_textures(&[TextureSpec {
+        name: "test:board".to_string(),
+        image: TextureImage::solid(16, SIGN_IMAGE),
+    }])
+}
+
+/// `mesh` with a board of cell quads on every solid of `boards`: six quads, each shaded as the
+/// face it is, showing image 0 under full sky light.
+fn with_boards(mut mesh: ChunkMesh, boards: &[Solid]) -> ChunkMesh {
+    for s in boards {
+        for (axis, high, face) in [
+            (1, true, Face::PosY),
+            (1, false, Face::NegY),
+            (0, true, Face::PosX),
+            (0, false, Face::NegX),
+            (2, true, Face::PosZ),
+            (2, false, Face::NegZ),
+        ] {
+            let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+            let corners = [0usize, 1, 2, 3].map(|k| {
+                let pick = |a: usize, max: bool| (if max { s.max[a] } else { s.min[a] }) as f32;
+                let mut c = [0.0f32; 3];
+                c[axis] = pick(axis, high);
+                c[u] = pick(u, k & 1 == 1);
+                c[v] = pick(v, k >> 1 == 1);
+                c
+            });
+            mesh.cell_quads.push(LitCellQuad {
+                quad: CellQuad {
+                    corners,
+                    uv: [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                    image: 0,
+                    source: CellImage::Cell,
+                    face,
+                    full_bright: false,
+                    tint: [255; 3],
+                    blend: CellBlend::Cutout,
+                },
+                light: LightValue::FULL_SKY,
+            });
+        }
+    }
+    mesh.hash = mesh.compute_hash();
+    mesh
+}
+
+/// The figure: one box of [`FIGURE_SKIN`], a block wide and deep and two tall, its feet at its
+/// origin.
+fn figure() -> (Arc<Model>, ModelTexture) {
+    let mut b = Model::builder([64, 64]);
+    let body = b.part("body", None, PartPose::default());
+    b.cuboid(
+        body,
+        Cuboid::new([0.0, 0.0], [-8.0, 0.0, -8.0], [16.0, 32.0, 16.0]),
+    );
+    let model = Arc::new(b.build().expect("valid figure"));
+    let skin = ModelTexture::new(64, 64, FIGURE_SKIN.repeat(64 * 64)).expect("valid skin");
+    (model, skin)
+}
+
+/// The figure filling solid `s` (a block wide and deep, two tall), shifted by `shift`, in full
+/// sky light.
+fn figure_at(figure: &(Arc<Model>, ModelTexture), id: u64, s: &Solid, shift: I64Vec3) -> ModelDraw {
+    let (model, skin) = figure;
+    ModelDraw {
+        id,
+        model: Arc::clone(model),
+        texture: skin.clone(),
+        pose: model.rest_pose(),
+        layer: ModelLayer::World,
+        position: DVec3::new(s.min.x + 0.5, s.min.y, s.min.z + 0.5) + shift.as_dvec3(),
+        rotation: Quat::IDENTITY,
+        origin: Vec3::new(0.0, 32.0, 0.0),
+        scale: 1.0,
+        light: LightValue::FULL_SKY,
+        sky_rgb: None,
+        realm: boxel_render::model::ModelRealm::default(),
+    }
+}
+
+/// The mean of the channel sums of `on` over those of `off`, over the pixels whose ray from
+/// the eye first meets solid `index` of `solids` (and its neighbors' rays too), and how many.
+fn mean_ratio(
+    view: &ViewParams,
+    eye: DVec3,
+    solids: &[Solid],
+    index: usize,
+    on: &RgbaImage,
+    off: &RgbaImage,
+) -> (usize, f64) {
+    let solids = relative(solids, eye);
+    let origin = view.eye_rel.as_dvec3();
+    let hit = |x: f64, y: f64| first_entry(origin, eye_ray(view, x, y), &solids).map(|h| h.1.0);
+    let sum = |p: &[u8]| p[..3].iter().map(|&c| f64::from(c)).sum::<f64>();
+    let (mut n, mut total) = (0, 0.0);
+    for py in 0..HEIGHT {
+        for px in 0..WIDTH {
+            let (x, y) = (f64::from(px) + 0.5, f64::from(py) + 0.5);
+            let inside = [(0.0, 0.0), (-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)]
+                .iter()
+                .all(|(dx, dy)| hit(x + dx, y + dy) == Some(index));
+            if !inside {
+                continue;
+            }
+            let i = ((py * WIDTH + px) * 4) as usize;
+            n += 1;
+            total += sum(&on.data[i..i + 4]) / sum(&off.data[i..i + 4]).max(1.0);
+        }
+    }
+    (n, if n > 0 { total / n as f64 } else { 0.0 })
+}
+
+/// Looking down at [`ENTITY_SCENE`]'s figure, board and their shadows from the south.
+const ABOVE: Eye = Eye {
+    at: DVec3::new(15.5, 13.0, 24.5),
+    yaw: 0.0,
+    pitch: -0.75,
+};
+
+/// Under [`TREE_SCENE`]'s canopy, at the figure and the board in its shadow.
+const UNDER_TREE: Eye = Eye {
+    at: DVec3::new(15.0, 7.5, 18.5),
+    yaw: 0.0,
+    pitch: -0.15,
+};
+
+/// At [`TREE_SCENE`]'s figure and board in the sun.
+const IN_THE_SUN: Eye = Eye {
+    at: DVec3::new(8.5, 9.5, 28.5),
+    yaw: 0.0,
+    pitch: -0.35,
+};
+
+/// The meshes of part 3.
+struct EntityScenes {
+    /// [`ENTITY_SCENE`]'s floor and board.
+    floor: ChunkMesh,
+    /// [`TREE_SCENE`]'s tree and boards.
+    tree: ChunkMesh,
+}
+
+/// High: models and cell quads cast into the maps and receive them.
+fn check_entities(
+    report: &mut Report,
+    label: &str,
+    adapter: &wgpu::Adapter,
+    caps: &AdapterCaps,
+    b: &Blocks,
+    e: &EntityScenes,
+) -> Result<(), String> {
+    let (device, queue, errors) = device_for(adapter, caps, Tier::High)?;
+    let (device, queue) = (&device, &queue);
+    let textures = Arc::new(sign_textures());
+    let new_renderer = || -> Result<VoxelRenderer, String> {
+        let mut r = renderer(device, queue, Tier::High, b)?;
+        r.set_cell_textures(device, queue, &textures);
+        Ok(r)
+    };
+    let mut r = new_renderer()?;
+    let settings = settings();
+    let save_all = std::env::var_os("GPU_SUN_SHADOWS_SAVE").is_some();
+    let fig = figure();
+    // The floor scene: the maps, then the oracle at 15:00 and 16:00.
+    place(&mut r, I64Vec3::ZERO, &[(I64Vec3::ZERO, &e.floor)])?;
+    r.set_models(
+        device,
+        vec![figure_at(&fig, 1, &ENTITY_SCENE[1], I64Vec3::ZERO)],
+        Quat::IDENTITY,
+    );
+    for hours in [15.0, 16.0] {
+        let v = sunlit(look(ABOVE, I64Vec3::ZERO, &[]), hours, 0.4, |_| true);
+        let (on, off, cascades) = on_and_off(device, queue, &mut r, &settings, &v)?;
+        let what = format!("{label}_entities_{hours}");
+        report.never_brighter(&what, &on, &off);
+        let cascades = cascades.ok_or_else(|| format!("{what}: no cascades"))?;
+        // The maps of a frame with shadows: `on_and_off` drew one without them last.
+        shoot(device, queue, &mut r, &v)?;
+        let stats = r.stats().shadows;
+        report.expect(stats.entity_draws >= 2, || format!("{what}: {stats:?}"));
+        let maps = read_maps(device, queue, &r, cascades.cascades().len())?;
+        let solids = relative(&ENTITY_SCENE, ABOVE.at);
+        let (mut entity_casters, mut entity_wrong) = (0, 0);
+        for (c, (cascade, depths)) in cascades.cascades().iter().zip(&maps).enumerate() {
+            let check = check_map(cascade, depths, &solids, 1);
+            eprintln!(
+                "gpu_sun_shadows: {label}: entities {hours}:00 cascade {c}: {} texels judged, {} \
+                 with a caster, {} of the entities, {} wrong ({} of the entities)",
+                check.judged, check.casters, check.entity_casters, check.wrong, check.entity_wrong
+            );
+            report.expect(
+                check.wrong as f64 <= MAX_MISMATCH * check.judged as f64,
+                || {
+                    format!(
+                        "{what}: cascade {c}: {} of {} texels wrong: {:?}",
+                        check.wrong, check.judged, check.examples
+                    )
+                },
+            );
+            entity_casters += check.entity_casters;
+            entity_wrong += check.entity_wrong;
+        }
+        report.expect(
+            entity_casters >= 100 && entity_wrong as f64 <= 0.02 * entity_casters as f64,
+            || format!("{what}: {entity_wrong} of {entity_casters} entity texels wrong"),
+        );
+        let check = check_pixels(
+            &v,
+            ABOVE.at,
+            &cascades,
+            &ENTITY_SCENE,
+            1,
+            &[],
+            &on,
+            &off,
+            sun_at(hours),
+        );
+        eprintln!(
+            "gpu_sun_shadows: {label}: entities {hours}:00: {} pixels judged ({} shadow, {} of \
+             them cast by the entities, {} sun), {} wrong ({} of the entities' shadow)",
+            check.judged,
+            check.shadow,
+            check.by_entities,
+            check.lit,
+            check.wrong,
+            check.by_entities_wrong
+        );
+        let bad = check.wrong as f64 > MAX_MISMATCH * check.judged as f64
+            || check.by_entities < 100
+            || check.by_entities_wrong as f64 > 0.05 * check.by_entities as f64
+            || check.lit < 100;
+        if bad || save_all {
+            report.fail_or_save(
+                bad,
+                format!(
+                    "{what}: {} of {} pixels disagree with the oracle, {} of the {} the entities \
+                     shade: {:?}",
+                    check.wrong,
+                    check.judged,
+                    check.by_entities_wrong,
+                    check.by_entities,
+                    check.examples
+                ),
+                &[(&format!("{what}_on"), &on), (&format!("{what}_off"), &off)],
+            );
+        }
+    }
+    // Under a tree: the oracle, and the figure and the board there darker than in the sun.
+    place(&mut r, I64Vec3::ZERO, &[(I64Vec3::ZERO, &e.tree)])?;
+    let figures = || {
+        vec![
+            figure_at(&fig, 1, &TREE_SCENE[3], I64Vec3::ZERO),
+            figure_at(&fig, 2, &TREE_SCENE[4], I64Vec3::ZERO),
+        ]
+    };
+    r.set_models(device, figures(), Quat::IDENTITY);
+    let mut ratios = Vec::new();
+    let mut views = Vec::new();
+    for (name, eye, seen) in [("under", UNDER_TREE, [3, 5]), ("sun", IN_THE_SUN, [4, 6])] {
+        let v = sunlit(look(eye, I64Vec3::ZERO, &[]), 15.0, 0.4, |_| true);
+        let (on, off, cascades) = on_and_off(device, queue, &mut r, &settings, &v)?;
+        let what = format!("{label}_entities_tree_{name}");
+        report.never_brighter(&what, &on, &off);
+        let cascades = cascades.ok_or_else(|| format!("{what}: no cascades"))?;
+        let check = check_pixels(
+            &v,
+            eye.at,
+            &cascades,
+            &TREE_SCENE,
+            3,
+            &[],
+            &on,
+            &off,
+            sun_at(15.0),
+        );
+        let [figure, board] =
+            seen.map(|index| mean_ratio(&v, eye.at, &TREE_SCENE, index, &on, &off));
+        eprintln!(
+            "gpu_sun_shadows: {label}: tree, {name}: {} pixels judged ({} shadow, {} sun), {} \
+             wrong; with shadows over without, (pixels, mean): figure {figure:?}, board \
+             {board:?}",
+            check.judged, check.shadow, check.lit, check.wrong
+        );
+        let bad = check.wrong as f64 > MAX_MISMATCH * check.judged as f64 || check.judged < 1000;
+        if bad || save_all {
+            report.fail_or_save(
+                bad,
+                format!(
+                    "{what}: {} of {} pixels disagree with the oracle: {:?}",
+                    check.wrong, check.judged, check.examples
+                ),
+                &[(&format!("{what}_on"), &on), (&format!("{what}_off"), &off)],
+            );
+        }
+        ratios.push([figure, board]);
+        views.push(v);
+    }
+    // Under the tree darker than in the sun, the figure and the board alike.
+    let darker = |(n, under): (usize, f64), (m, sun): (usize, f64)| {
+        n >= 200 && m >= 200 && under < 0.85 && sun > under + 0.1
+    };
+    for (k, what) in ["figure", "board"].into_iter().enumerate() {
+        let (under, sun) = (ratios[0][k], ratios[1][k]);
+        report.expect(darker(under, sun), || {
+            format!("{label}: the {what} under the tree {under:?}, in the sun {sun:?}")
+        });
+    }
+    let v = views.swap_remove(0);
+    r.set_sun_shadows(device, &SunShadowSettings::default());
+    let off = shoot(device, queue, &mut r, &v)?;
+    r.set_sun_shadows(device, &settings);
+    // Byte-identical: at midnight, and with shadows off after they were on (the `off` above)
+    // against a renderer that never had them.
+    let midnight = sunlit(look(SOUTH, I64Vec3::ZERO, &[]), 0.0, 0.4, |_| true);
+    let (on_night, off_night, drawn) = on_and_off(device, queue, &mut r, &settings, &midnight)?;
+    report.same_image(&format!("{label}_entities_midnight"), &on_night, &off_night);
+    report.expect(drawn.is_none(), || {
+        format!("{label}: entities at midnight: cascades")
+    });
+    let mut fresh = new_renderer()?;
+    place(&mut fresh, I64Vec3::ZERO, &[(I64Vec3::ZERO, &e.tree)])?;
+    fresh.set_models(device, figures(), Quat::IDENTITY);
+    let never = shoot(device, queue, &mut fresh, &v)?;
+    report.same_image(&format!("{label}_entities_off"), &off, &never);
+    let errors = errors.lock().map(|e| e.clone()).unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!("uncaptured errors: {errors:?}"));
+    }
+    Ok(())
+}
+
 #[test]
 fn sun_shadows_on_high_only() {
     let b = Blocks::new();
@@ -1530,6 +1953,13 @@ fn sun_shadows_on_high_only() {
         leafy: mesh(&b.registry, &tree(&b, b.leaves), false),
         stony: mesh(&b.registry, &tree(&b, b.stone), false),
         room: m.room.clone(),
+    };
+    let entities = EntityScenes {
+        floor: with_boards(mesh(&b.registry, &floor(&b), false), &ENTITY_SCENE[2..]),
+        tree: with_boards(
+            mesh(&b.registry, &tree(&b, b.stone), false),
+            &TREE_SCENE[5..],
+        ),
     };
     // The CPU rays agree with themselves: straight down through the pillar, it leaves through
     // the floor's bottom; beside it, through the floor; the slab's bottom is half a block down.
@@ -1558,11 +1988,15 @@ fn sun_shadows_on_high_only() {
         for tier in allowed_tiers(&caps) {
             let result = if tier == Tier::High {
                 high += 1;
-                check_high(&mut report, &label, adapter, &caps, &b, &m).and_then(|()| {
-                    check_receivers(&mut report, &label, adapter, &caps, &b, &scenes)
-                })
+                check_high(&mut report, &label, adapter, &caps, &b, &m)
+                    .and_then(|()| {
+                        check_receivers(&mut report, &label, adapter, &caps, &b, &scenes)
+                    })
+                    .and_then(|()| {
+                        check_entities(&mut report, &label, adapter, &caps, &b, &entities)
+                    })
             } else {
-                check_lower(&mut report, &label, adapter, &caps, tier, &b, &m)
+                check_lower(&mut report, &label, adapter, &caps, tier, &b, &m, &entities)
             };
             if let Err(e) = result {
                 report.fail(format!("{label} {tier}: {e}"), &[]);

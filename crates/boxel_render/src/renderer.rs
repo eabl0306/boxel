@@ -975,6 +975,7 @@ impl VoxelRenderer {
         view: &ViewParams,
         slots: u32,
     ) -> Option<wgpu::BindGroup> {
+        self.shadow_entities(device);
         let shadow = self.shadow.as_mut()?;
         let (Some(sun), Some(table), Some(index), Some(list_pages)) = (
             view.light.sun.as_ref(),
@@ -1036,9 +1037,29 @@ impl VoxelRenderer {
                 table,
                 index,
                 pages: &self.pages,
+                render_origin: view.render_origin,
+                chunks: &self.chunks,
+                models: self.models.as_ref(),
+                cells: self.cells.as_ref(),
             },
         );
         shadow.receivers().cloned()
+    }
+
+    /// While sun shadows are on: the models' and cells' pipelines that cast and receive them,
+    /// built once (lane S5), and the models' boxes for this frame's cascades.
+    fn shadow_entities(&mut self, device: &wgpu::Device) {
+        let (Some(shadow), Some(receive)) = (&self.shadow, &self.receive_layout) else {
+            return;
+        };
+        let cascade = shadow.cascade_layout();
+        if let Some(models) = &mut self.models {
+            models.set_shadowed(device, &self.view_layout, cascade, receive);
+            models.prepare_casters();
+        }
+        if let Some(cells) = &mut self.cells {
+            cells.set_shadowed(device, &self.view_layout, cascade, receive);
+        }
     }
 
     /// Testing (High with sun shadows): the last frame's cascades, `None` when it drew none.
@@ -1971,7 +1992,8 @@ impl VoxelRenderer {
         self.path.encode_compute(encoder, slot_count);
         // Sun shadows (ADR 0065): their cull and maps, before the main pass.
         let receivers = self.encode_shadows(device, queue, encoder, view, slot_count);
-        self.path.set_sun_receivers(receivers);
+        self.path.set_sun_receivers(receivers.clone());
+        let receivers = receivers.as_ref();
         let fog_depth_draws;
         let draws = if let Some(lod) = self.lod.as_mut().filter(|l| l.culls_after_solid()) {
             // High with LOD to draw: the main pass ends after the opaque and cutout terrain, the
@@ -1993,8 +2015,8 @@ impl VoxelRenderer {
                 let _span = frame_span!("render.lod");
                 lod.draw(&mut pass);
             }
-            draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
-            draw_cells(self.cells.as_ref(), &self.materials, &mut pass);
+            draw_world_models(self.models.as_ref(), &self.materials, &mut pass, receivers);
+            draw_cells(self.cells.as_ref(), &self.materials, &mut pass, receivers);
             self.outline.draw(&mut pass);
             // The far water (one layer, a depth prepass then its color) before the near water,
             // which blends over it where it is in front.
@@ -2017,10 +2039,10 @@ impl VoxelRenderer {
             }
             // The entity models with the solid terrain, before the outline (an edge behind a
             // model stays hidden) and the water (which tints a model behind it).
-            draw_world_models(self.models.as_ref(), &self.materials, &mut pass);
+            draw_world_models(self.models.as_ref(), &self.materials, &mut pass, receivers);
             // The cell quads (ADR 0050) with them, for the same reasons: the translucent ones
             // too, blended and writing depth, so water in front tints them (ADR 0055).
-            draw_cells(self.cells.as_ref(), &self.materials, &mut pass);
+            draw_cells(self.cells.as_ref(), &self.materials, &mut pass, receivers);
             // Over the solid terrain, under the water (not counted in the draws).
             self.outline.draw(&mut pass);
             // The far water before the near water, as above.
@@ -2064,7 +2086,7 @@ impl VoxelRenderer {
         {
             let mut pass = self.targets.begin_overlay_depth_pass(encoder);
             pass.set_bind_group(bindings::GROUP_VIEW, &self.view_bind_group, &[]);
-            models.draw(&mut pass, ModelLayer::View);
+            models.draw(&mut pass, ModelLayer::View, None);
         }
         self.stats.visible_chunks = visible;
         self.stats.draws = draws;
@@ -2323,10 +2345,11 @@ fn draw_world_models(
     models: Option<&ModelPass>,
     materials: &wgpu::BindGroup,
     pass: &mut wgpu::RenderPass<'_>,
+    receivers: Option<&wgpu::BindGroup>,
 ) {
     if let Some(models) = models.filter(|m| m.draws_in(ModelLayer::World)) {
         let _span = frame_span!("render.models");
-        models.draw(pass, ModelLayer::World);
+        models.draw(pass, ModelLayer::World, receivers);
         pass.set_bind_group(bindings::GROUP_MATERIALS, materials, &[]);
     }
 }
@@ -2337,10 +2360,11 @@ fn draw_cells(
     cells: Option<&CellPass>,
     materials: &wgpu::BindGroup,
     pass: &mut wgpu::RenderPass<'_>,
+    receivers: Option<&wgpu::BindGroup>,
 ) {
     if let Some(cells) = cells {
         let _span = frame_span!("render.cells");
-        if cells.draw(pass) {
+        if cells.draw(pass, receivers) {
             pass.set_bind_group(bindings::GROUP_MATERIALS, materials, &[]);
         }
     }
