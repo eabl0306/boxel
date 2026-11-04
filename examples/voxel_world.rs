@@ -49,6 +49,12 @@
 //! the day. F3 shows the source whose beam lights the face under the crosshair and the realm at
 //! the eye, and B toggles the markers of the sources and their beams (`SkySourceMarkers`).
 //!
+//! `--stained-glass` turns colored sky on (`WorldSettings::colored_sky`, ADR 0064) and builds
+//! the demo's glass scene on the ground around the start (`boxel_demo::worldgen::GlassHouse`):
+//! a greenhouse under a red glass roof with a black skylight and a lamp, and a closed room lit
+//! through a light blue window. The camera starts in the greenhouse (`--glass-view window`: in
+//! the room), unless `--camera` or `--walk` says otherwise. F3 shows the tinted sky at the eye.
+//!
 //! `--frames`, `--duration`, `--screenshot`, `--minimize-test`, `--resize-test`, `--vsync-test`
 //! and the like make it close by itself (`--duration` keeps the interactive path: fly camera
 //! on, nothing rendered while hidden); the last summary line gives the update and presented
@@ -123,6 +129,7 @@ use boxel::world::{
     WorldSystems,
 };
 use boxel_demo::rules::{Kind, Kinds};
+use boxel_demo::worldgen::{Glass, GlassHouse, GlassView};
 use player::WalkPlugin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -175,6 +182,11 @@ usage: voxel_world [GPU options] [options]
   --sky-sources           demo: a cavern lit by sky sources on the ground around the start,
                           with the camera inside (unless --camera or --walk); B toggles the
                           markers of the sources and their beams
+  --stained-glass         demo: colored sky on, and a greenhouse under red glass and a room
+                          with a light blue window on the ground around the start, with the
+                          camera in the greenhouse (unless --camera or --walk)
+  --glass-view VIEW       with --stained-glass, where the camera starts: greenhouse (the
+                          default) or window (in the room)
   --pack DIR              block textures from a Minecraft Java resource pack (the directory
                           with pack.mcmeta; default: procedural textures)
   --world-dir DIR         save the world in DIR on exit and load it from there on start (made
@@ -270,6 +282,10 @@ struct Options {
     lamps: bool,
     /// `--sky-sources`.
     sky_sources: bool,
+    /// `--stained-glass`.
+    stained_glass: bool,
+    /// `--glass-view` (`None`: not given).
+    glass_view: Option<GlassView>,
     /// `--pack`.
     textures: TextureSource,
     /// `--fog`.
@@ -348,6 +364,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         time: None,
         lamps: false,
         sky_sources: false,
+        stained_glass: false,
+        glass_view: None,
         textures: TextureSource::Procedural,
         fog: fog::FogPreset::Off,
         fog_res: boxel::render::fog::FogResolution::Half,
@@ -497,10 +515,21 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--time" => o.time = Some(clock::parse_clock(flag, &value()?)?),
             "--lamps" => o.lamps = true,
             "--sky-sources" => o.sky_sources = true,
+            "--stained-glass" => o.stained_glass = true,
+            "--glass-view" => {
+                let v = value()?;
+                o.glass_view = Some(
+                    GlassView::from_name(&v)
+                        .ok_or_else(|| format!("{flag}: {v:?} is not greenhouse or window"))?,
+                );
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     o.world.validate(o.fixed_height)?;
+    if o.glass_view.is_some() && !o.stained_glass {
+        return Err("--glass-view needs --stained-glass".to_string());
+    }
     if (o.expect_terrain || o.compare_to.is_some()) && o.screenshot.is_none() {
         return Err("--expect-terrain and --compare-to need --screenshot".to_string());
     }
@@ -1942,6 +1971,129 @@ impl Plugin for SkySourcesPlugin {
     }
 }
 
+/// The demo registry, with the sky source (`--sky-sources`) and the stained glass
+/// (`--stained-glass`) after its blocks: every other state keeps its id.
+fn demo_registry(sky_sources: bool, stained_glass: bool) -> BlockRegistry {
+    let mut b = boxel_demo::blocks::builder();
+    if sky_sources {
+        boxel_demo::blocks::add_sky_source(&mut b);
+    }
+    if stained_glass {
+        boxel_demo::blocks::add_stained_glass(&mut b);
+    }
+    b.build()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The colored sky demo (ADR 0064)
+
+/// How far below the start the glass scene looks for the ground.
+const GLASS_GROUND_DEPTH: i64 = 256;
+
+/// `--stained-glass`: where the scene goes until it is built, and the camera to move in.
+#[derive(Resource, Debug)]
+struct GlassDemo {
+    /// `None` once built.
+    start: Option<DVec3>,
+    /// Move the fly camera to `view` once built, keeping its input on or off (`None`: it
+    /// stays, with `--camera` or `--walk`).
+    camera: Option<bool>,
+    view: GlassView,
+}
+
+/// `--stained-glass`: builds the [`GlassHouse`] once its columns are loaded, and moves the fly
+/// camera in.
+fn build_glass_house(
+    mut demo: ResMut<GlassDemo>,
+    map: Res<ChunkMap>,
+    content: Res<WorldContent>,
+    mut edits: ResMut<EditQueue>,
+    cameras: Query<Entity, With<FlyCamera>>,
+    mut commands: Commands,
+) {
+    let Some(start) = demo.start else {
+        return;
+    };
+    let registry = &content.registry;
+    let column = (start.x.floor() as i64, start.z.floor() as i64);
+    let Some(found) = GlassHouse::around(
+        column,
+        start.y.floor() as i64,
+        GLASS_GROUND_DEPTH,
+        Glass::Stained,
+        |p| map.block_at(p),
+        GlassHouse::ground_test(registry),
+    ) else {
+        return;
+    };
+    demo.start = None;
+    let Some(house) = found else {
+        println!("boxel: --stained-glass found no ground under the start");
+        return;
+    };
+    let mut placed = 0;
+    for &(pos, name) in &house.cells {
+        if let Some(state) = registry.by_name(name) {
+            edits.set_block(pos, state);
+            placed += 1;
+        }
+    }
+    let f = house.floor;
+    let camera = |view| {
+        let c = house.camera(view);
+        format!("{},{},{},{},{}", c[0], c[1], c[2], c[3], c[4])
+    };
+    println!(
+        "boxel: --stained-glass built a glass house of {placed} blocks, floor at {} {} {}, \
+         cameras {} (greenhouse) and {} (window)",
+        f.x,
+        f.y,
+        f.z,
+        camera(GlassView::Greenhouse),
+        camera(GlassView::WindowRoom),
+    );
+    if let Some(enabled) = demo.camera {
+        let [x, y, z, yaw, pitch] = house.camera(demo.view);
+        let (yaw, pitch) = ((yaw as f32).to_radians(), (pitch as f32).to_radians());
+        for camera in &cameras {
+            commands.entity(camera).insert((
+                Transform::from_yaw_pitch(DVec3::new(x, y, z), yaw, pitch),
+                FlyCamera {
+                    enabled,
+                    yaw,
+                    pitch,
+                    ..FlyCamera::default()
+                },
+            ));
+        }
+    }
+}
+
+/// `--stained-glass`: inserts the [`GlassDemo`] and adds [`build_glass_house`] (after the lamps
+/// and the cavern: they all write the edit queue, and before the world's systems).
+struct StainedGlassPlugin {
+    start: DVec3,
+    camera: Option<bool>,
+    view: GlassView,
+}
+
+impl Plugin for StainedGlassPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(GlassDemo {
+            start: Some(self.start),
+            camera: self.camera,
+            view: self.view,
+        })
+        .add_systems(
+            Update,
+            build_glass_house
+                .after(place_demo_lamps)
+                .after(build_cavern)
+                .before(WorldSystems::Interest),
+        );
+    }
+}
+
 /// Metadata of a saved world: the world options and seed it was made with.
 const WORLD_META: &str = "voxel_world:world";
 /// Metadata of a saved world: the camera on exit, as `x,y,z,yaw,pitch` (degrees).
@@ -2173,12 +2325,9 @@ fn main() -> AppExit {
         .map(|timeout| spawn_watchdog(timeout.saturating_add(WATCHDOG_GRACE)));
 
     let generator = options.world.generator(options.seed);
-    // `--sky-sources`: the demo blocks and the source after them (every other id stays).
-    let registry = Arc::new(if options.sky_sources {
-        boxel_demo::blocks::registry_with_sky_source()
-    } else {
-        boxel_demo::blocks::registry()
-    });
+    // `--sky-sources` and `--stained-glass`: the demo blocks, then the source and the stained
+    // glass after them (every other id stays).
+    let registry = Arc::new(demo_registry(options.sky_sources, options.stained_glass));
     let store = match options.world_dir.clone() {
         Some(dir) => match open_world(&dir, &registry, generator.name(), &mut options) {
             Ok(store) => Some(store),
@@ -2191,6 +2340,7 @@ fn main() -> AppExit {
     };
     let world_settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
+        colored_sky: options.stained_glass,
         ..WorldSettings::default()
     };
     let mut plugins = DefaultPlugins
@@ -2263,6 +2413,15 @@ fn main() -> AppExit {
         app.add_plugins(SkySourcesPlugin {
             start: DVec3::new(x, y, z),
             camera: move_in.then_some(!options.automation()),
+        });
+    }
+    if options.stained_glass {
+        let [x, y, z, ..] = options.camera;
+        let move_in = !options.camera_given && !options.walk;
+        app.add_plugins(StainedGlassPlugin {
+            start: DVec3::new(x, y, z),
+            camera: move_in.then_some(!options.automation()),
+            view: options.glass_view.unwrap_or(GlassView::Greenhouse),
         });
     }
     // `--fog`: the plugin only when asked (off adds nothing at all); F7 cycles the presets,
@@ -2645,12 +2804,13 @@ mod tests {
     /// ordered against the fly camera's grab (both use `CursorOptions`), and walking against the
     /// camera's moves. Every update is one fixed step (a synthetic clock).
     fn picking_app() -> App {
-        picking_app_with(None, None)
+        picking_app_with(None, None, None)
     }
 
-    /// [`picking_app`], with the `--lamps` demo around `lamps` and the `--sky-sources` cavern
-    /// around `cavern` (the camera moves in, its input off).
-    fn picking_app_with(lamps: Option<DVec3>, cavern: Option<DVec3>) -> App {
+    /// [`picking_app`], with the `--lamps` demo around `lamps`, the `--sky-sources` cavern
+    /// around `cavern` and the `--stained-glass` scene around `glass` (the camera moves in, its
+    /// input off).
+    fn picking_app_with(lamps: Option<DVec3>, cavern: Option<DVec3>, glass: Option<DVec3>) -> App {
         use boxel::ecs::schedule::{LogLevel, ScheduleBuildSettings};
         use boxel::world::jobs::InlineExecutor;
         use boxel::worldgen::FlatGenerator;
@@ -2665,12 +2825,11 @@ mod tests {
                     ("boxel:grass".to_string(), 1),
                 ])),
                 executor: Arc::new(InlineExecutor),
-                registry: Arc::new(if cavern.is_some() {
-                    boxel_demo::blocks::registry_with_sky_source()
-                } else {
-                    boxel_demo::blocks::registry()
-                }),
-                ..WorldPlugin::default()
+                registry: Arc::new(demo_registry(cavern.is_some(), glass.is_some())),
+                settings: WorldSettings {
+                    colored_sky: glass.is_some(),
+                    ..WorldSettings::default()
+                },
             },
             FluidPlugin,
             DaylightPlugin,
@@ -2702,6 +2861,13 @@ mod tests {
             app.add_plugins(SkySourcesPlugin {
                 start,
                 camera: Some(false),
+            });
+        }
+        if let Some(start) = glass {
+            app.add_plugins(StainedGlassPlugin {
+                start,
+                camera: Some(false),
+                view: GlassView::Greenhouse,
             });
         }
         player::clock::fixed_frames(&mut app, player::clock::STEP);
@@ -3871,7 +4037,7 @@ mod tests {
     #[test]
     fn lamps_demo_places_its_blocks_once_the_ground_is_loaded() {
         let start = DVec3::new(0.5, 6.0, 0.5);
-        let app = picking_app_with(Some(start), None);
+        let app = picking_app_with(Some(start), None, None);
         assert_eq!(app.world().resource::<LampsDemo>().start, None, "placed");
         // On the grass (top at y = 3) of the flat world.
         let ground = |p: BlockPos| {
@@ -3901,7 +4067,7 @@ mod tests {
         assert!(parse(&["--sky-sources"]).sky_sources);
         assert!(usage().contains("--sky-sources"));
         let start = DVec3::new(0.5, 6.0, 0.5);
-        let mut app = picking_app_with(None, Some(start));
+        let mut app = picking_app_with(None, Some(start), None);
         assert_eq!(app.world().resource::<CavernDemo>().start, None, "built");
         // On the grass (top at y = 3) of the flat world.
         let ground = |p: BlockPos| {
@@ -3953,6 +4119,87 @@ mod tests {
         let sky = |x, y, z| map.light_at(BlockPos::new(x, y, z)).expect("cached").sky();
         assert_eq!(sky(0, 4, 0), 15, "on the floor");
         assert!(sky(-cavern::HALF, 4, 0) < 15, "under the ledge");
+    }
+
+    #[test]
+    fn stained_glass_demo_builds_its_house_on_the_ground_with_tinted_sky() {
+        use boxel::debug_overlay::{LightProbe, OverlayInputs, overlay_lines};
+        use boxel_demo::worldgen::glass_house::{ROOM_X, WINDOW_ROWS};
+        assert!(parse(&["--stained-glass"]).stained_glass);
+        assert_eq!(
+            parse(&["--stained-glass", "--glass-view", "window"]).glass_view,
+            Some(GlassView::WindowRoom)
+        );
+        assert!(parse_options(&["--glass-view".to_string(), "window".to_string()]).is_err());
+        assert!(usage().contains("--stained-glass"));
+        let start = DVec3::new(0.5, 6.0, 0.5);
+        let mut app = picking_app_with(None, None, Some(start));
+        assert_eq!(app.world().resource::<GlassDemo>().start, None, "built");
+        // On the grass (top at y = 3) of the flat world.
+        let ground = |p: BlockPos| {
+            Some(if p.y <= 3 {
+                BlockState(1)
+            } else {
+                BlockState::AIR
+            })
+        };
+        let house =
+            GlassHouse::around((0, 0), 6, GLASS_GROUND_DEPTH, Glass::Stained, ground, |s| {
+                s != BlockState::AIR
+            })
+            .expect("loaded")
+            .expect("ground");
+        assert_eq!(house.floor, BlockPos::new(0, 3, 0));
+        let registry = demo_registry(false, true);
+        for &(pos, name) in &house.cells {
+            assert_eq!(
+                block_at(&app, pos),
+                registry.by_name(name),
+                "{pos:?} {name}"
+            );
+        }
+        // The camera moved into the greenhouse.
+        let [x, y, z, ..] = house.camera(GlassView::Greenhouse);
+        let eye = DVec3::new(x, y, z);
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&Transform, With<FlyCamera>>();
+        let camera = cameras.single(app.world()).expect("one camera");
+        assert_eq!(camera.translation, eye);
+        // Settled again: the sky at the eye is the red roof's, and F3 says so; gameplay still
+        // sees the open sky (ADR 0064, decision 2).
+        let begin = Instant::now();
+        loop {
+            app.update();
+            let stats = *app.world().resource::<WorldStats>();
+            if stats.is_settled() {
+                break;
+            }
+            assert!(begin.elapsed() < Duration::from_secs(60), "{stats:?}");
+        }
+        let map = app.world().resource::<ChunkMap>();
+        let probe = LightProbe::at(map, Some(eye), None);
+        assert_eq!(
+            probe.eye.map(boxel::voxel::LightValue::sky),
+            Some(15),
+            "gameplay's sky"
+        );
+        assert_eq!(probe.eye_sky_rgb, Some([13, 7, 6]), "under red glass");
+        let lines = overlay_lines(&OverlayInputs {
+            light: Some(probe),
+            ..OverlayInputs::default()
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Light eye sky 15") && l.ends_with("tinted sky 13 7 6")),
+            "{lines:?}"
+        );
+        // The room is lit through its light blue window only.
+        let window = BlockPos::new(ROOM_X[1], 3 + WINDOW_ROWS[0], 0);
+        assert_eq!(map.sky_rgb_at(window), Some([6, 13, 13]), "in the window");
+        let inside = BlockPos::new(ROOM_X[1] - 1, window.y, 0);
+        assert_eq!(map.sky_rgb_at(inside), Some([5, 12, 12]), "behind it");
     }
 
     #[test]

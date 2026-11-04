@@ -32,6 +32,13 @@
 //! roof), the `lit-cavern` case of `tools/perf`. With `--edits` the script also places a source
 //! over the ground, blocks its beam, opens it again and removes it.
 //!
+//! `--stained-glass` turns colored sky on (`WorldSettings::colored_sky`, ADR 0064) and builds the
+//! demo's glass scene on the ground of the start column (`boxel_demo::worldgen::GlassHouseWorld`:
+//! a greenhouse under red glass with a black skylight and a lamp, and a room lit through a light
+//! blue window), with the camera moved into the greenhouse: the `glass-house` case of
+//! `tools/perf`. `--clear-glass` builds the same scene with common glass, colored sky still on:
+//! its clear twin, `glass-house-clear`.
+//!
 //! `--bodies N --body-kind item|mob --projectiles M` add physics bodies around the start (see
 //! [`bodies`]): what they add to the frame is the physics part of the frame rule (ADR 0016).
 //!
@@ -133,7 +140,7 @@ use boxel::world::{
     BakedLights, ChunkId, ChunkMeshEvent, ChunkVisibility, WorldContent, WorldStats, WorldSystems,
 };
 use boxel::worldgen::lod::LodSource;
-use boxel_demo::worldgen::LitCaves;
+use boxel_demo::worldgen::{Glass, GlassHouseWorld, GlassView, LitCaves};
 use edits::EditScript;
 use report::{FrameRecord, RecordLog, RunInfo, Summary};
 use spans::{SpanLog, SpanRow};
@@ -207,6 +214,11 @@ usage: stress [--scenario static|fly|dive|spin|path|switch] [GPU options] [optio
                       down source of range 64 in every other column under each cave roof); with
                       --edits the script also places a source, blocks its beam and removes it;
                       the summary's world gets +sky-sources
+  --stained-glass     colored sky on, and the demo's glass scene (a greenhouse under red glass,
+                      a room with a light blue window) on the ground of the start column, with
+                      the camera in the greenhouse; the summary's world gets +stained-glass
+  --clear-glass       the same scene with common glass, colored sky on (its clear twin; the
+                      summary's world gets +clear-glass)
   --time HH[:MM]      clock time of the world, kept still (default 12:00)
   --light on|off      voxel light and ambient occlusion (default on); off: neither, the look and
                       the cost of the world before light
@@ -352,6 +364,8 @@ struct Options {
     edits: bool,
     /// `--sky-sources`.
     sky_sources: bool,
+    /// `--stained-glass` or `--clear-glass`.
+    glass: Option<Glass>,
     /// `--time`, clock hours.
     time: f64,
     /// `--light`: voxel light and ambient occlusion on (the default) or off.
@@ -446,6 +460,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         screenshot_yaw: None,
         edits: false,
         sky_sources: false,
+        glass: None,
         time: 12.0,
         light: true,
         ao: None,
@@ -639,6 +654,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--edits" => o.edits = true,
             "--sky-sources" => o.sky_sources = true,
+            "--stained-glass" => o.glass = Some(Glass::Stained),
+            "--clear-glass" => o.glass = Some(Glass::Clear),
             "--time" => o.time = clock::parse_clock(flag, &value()?)?,
             "--pack" => o.textures = pack::parse(flag, &value()?)?,
             "--sort" => {
@@ -953,6 +970,48 @@ fn find_cave(options: &mut Options, generator: &dyn WorldGenerator) -> Result<St
     let description = found.describe();
     options.path = found.path;
     Ok(description)
+}
+
+/// The demo registry, with the sky source (`--sky-sources`) and the stained glass
+/// (`--stained-glass`, `--clear-glass`) after its blocks: every other state keeps its id.
+fn stress_registry(options: &Options) -> BlockRegistry {
+    let mut b = boxel_demo::blocks::builder();
+    if options.sky_sources {
+        boxel_demo::blocks::add_sky_source(&mut b);
+    }
+    if options.glass.is_some() {
+        boxel_demo::blocks::add_stained_glass(&mut b);
+    }
+    b.build()
+}
+
+/// `--stained-glass` and `--clear-glass`: `generator` with the glass scene on the ground of the
+/// start column and the camera moved into its greenhouse, and the `glass:` line.
+fn glass_house(
+    options: &mut Options,
+    generator: Arc<dyn WorldGenerator>,
+    registry: &BlockRegistry,
+    glass: Glass,
+) -> Result<(Arc<dyn WorldGenerator>, String), String> {
+    let [x, _, z, ..] = options.camera;
+    let column = (x.floor() as i64, z.floor() as i64);
+    let world = GlassHouseWorld::around(generator, registry, column, glass);
+    let house = world
+        .house
+        .as_ref()
+        .ok_or("--stained-glass: no ground under the start")?;
+    options.camera = house.camera(GlassView::Greenhouse);
+    let f = house.floor;
+    let c = options.camera;
+    let kind = match glass {
+        Glass::Stained => "stained",
+        Glass::Clear => "clear",
+    };
+    let line = format!(
+        "glass: {kind} floor={},{},{} camera={},{},{},{},{}",
+        f.x, f.y, f.z, c[0], c[1], c[2], c[3], c[4]
+    );
+    Ok((Arc::new(world), line))
 }
 
 /// Horizontal unit direction of `yaw` (radians). Components within 1e-12 of zero are zero, so
@@ -1701,6 +1760,7 @@ fn world_settings(
         vertical_bounds,
         cave_culling: options.cave_culling,
         idle_work: options.idle_work,
+        colored_sky: options.glass.is_some(),
         ..WorldSettings::default()
     };
     if let Some(ao) = options.ao {
@@ -1756,7 +1816,7 @@ fn run_info(options: &Options, present: String) -> RunInfo {
         },
         seed: options.seed,
         world: format!(
-            "{}{}",
+            "{}{}{}",
             match options.water {
                 Some(level) => format!("{}+water{level}", options.world.label()),
                 None => options.world.label(),
@@ -1765,6 +1825,11 @@ fn run_info(options: &Options, present: String) -> RunInfo {
                 "+sky-sources"
             } else {
                 ""
+            },
+            match options.glass {
+                Some(Glass::Stained) => "+stained-glass",
+                Some(Glass::Clear) => "+clear-glass",
+                None => "",
             }
         ),
         trees: options.world.has_trees(),
@@ -1984,6 +2049,21 @@ fn main() -> AppExit {
     } else {
         inner
     };
+    let registry = Arc::new(stress_registry(&options));
+    // `--stained-glass`: after the sources, so the scene is built over them.
+    let inner = match options.glass {
+        Some(glass) => match glass_house(&mut options, inner, &registry, glass) {
+            Ok((world, line)) => {
+                println!("stress: {line}");
+                world
+            }
+            Err(e) => {
+                eprintln!("stress: {e}");
+                return AppExit::from_code(1);
+            }
+        },
+        None => inner,
+    };
     let fixed_bounds = options.fixed_height.then(|| inner.vertical_chunks());
     let first: Arc<dyn WorldGenerator> = Arc::new(CountingGenerator {
         inner,
@@ -2043,11 +2123,7 @@ fn main() -> AppExit {
                 last: Arc::clone(&job_clock),
             }),
             settings: world_settings(&options, fixed_bounds),
-            registry: Arc::new(if options.sky_sources {
-                boxel_demo::blocks::registry_with_sky_source()
-            } else {
-                boxel_demo::blocks::registry()
-            }),
+            registry,
         });
     if let Some(threads) = options.async_threads {
         plugins = plugins.set(TaskPoolPlugin {
@@ -2781,6 +2857,47 @@ mod tests {
         assert!(back.forward().x < -0.99, "{:?}", back.forward());
         let still = camera_at(Scenario::Path, start, 8.0, 20.0, 3.0, &[]);
         assert_eq!(still.translation, DVec3::new(0.5, -990.5, 2.5));
+    }
+
+    #[test]
+    fn stained_glass_builds_the_scene_and_moves_the_start_into_the_greenhouse() {
+        for (flag, glass, block) in [
+            (
+                "--stained-glass",
+                Glass::Stained,
+                boxel_demo::worldgen::glass_house::RED,
+            ),
+            (
+                "--clear-glass",
+                Glass::Clear,
+                boxel_demo::worldgen::glass_house::CLEAR_GLASS,
+            ),
+        ] {
+            let mut o = options(&["--world", "overworld", "--scenario", "static", flag]);
+            assert_eq!(o.glass, Some(glass));
+            assert!(world_settings(&o, None).colored_sky);
+            let registry = stress_registry(&o);
+            let generator = o.world.generator(o.seed);
+            let (world, line) = glass_house(&mut o, generator, &registry, glass).expect("ground");
+            assert!(line.starts_with("glass: "), "{line}");
+            // The camera stands in the greenhouse, under its roof.
+            let [x, y, z, ..] = o.camera;
+            let eye = BlockPos::from_world(DVec3::new(x, y, z));
+            let roof = BlockPos::new(
+                eye.x,
+                eye.y - 2 + boxel_demo::worldgen::glass_house::ROOF,
+                eye.z,
+            );
+            let at = |p: BlockPos| {
+                let (chunk, local) = p.split();
+                world.generate(ChunkKey::new(chunk), &registry).get(local)
+            };
+            assert_eq!(at(eye), BlockState::AIR, "{flag}");
+            assert_eq!(Some(at(roof)), registry.by_name(block), "{flag}");
+            let info = run_info(&o, String::new());
+            assert!(info.world.ends_with(&flag[2..]), "{}", info.world);
+        }
+        assert!(!world_settings(&options(&[]), None).colored_sky);
     }
 
     #[test]

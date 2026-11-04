@@ -19,7 +19,16 @@
 //! loaded, and the memory of the gameplay light cache and of the sky tiles; and `beams: tiles=N
 //! beams=N jobs=N private_generations=N waiting=N boxes=N beam_mib=X`: the chunk columns with
 //! a beam tile (ADR 0061), the beams in them, the builds run and the chunks they generated, the
-//! jobs still waiting for one, the light boxes that had beams, and the memory of the tiles.
+//! jobs still waiting for one, the light boxes that had beams, and the memory of the tiles;
+//! and `colored: sky=on|off boxes=N padded=N chunk_light=N meshes=N tinted_entries=N
+//! flattened=N`: colored sky (ADR 0064), the light boxes of mesh jobs that took its path, those
+//! whose light came out tinted and the chunk lights kept tinted (all since start), the meshes
+//! with tinted palette entries, those entries, and of them the flattened ones (a face lit by
+//! tinted sky and by a lamp, both varying, that Low and Mid draw with one of them flat).
+//! `--stained-glass` turns colored sky on and builds the demo's glass scene on the ground of the
+//! viewer's column (`boxel_demo::worldgen::GlassHouseWorld`, as stress's `glass-house` case),
+//! with the viewer in its greenhouse, and prints `glass: stained|clear floor=X,Y,Z eye=X,Y,Z`
+//! first; `--clear-glass` builds the same scene with common glass, its clear twin.
 //! `--sky-sources` lights the caves near the viewer for it with the demo's lit cavern
 //! (`boxel_demo::worldgen::LitCaves`, as stress's `lit-cavern` case): a down sky source of range
 //! 64 in every other column under each cave roof, within 24 chunk layers of the viewer. Compare `quads=`
@@ -98,8 +107,8 @@ use boxel::camera::{Camera, CameraView};
 use boxel::log::LogPlugin;
 use boxel::log::span_times::{self, SpanFrame, SpanTimes};
 use boxel::math::I64Vec3;
-use boxel::mesh::ChunkMesh;
 use boxel::mesh::{AoPolicy, LightQuantization};
+use boxel::mesh::{ChunkMesh, tinted_corners, tinted_exact_corners};
 use boxel::prelude::*;
 use boxel::render::{DEFAULT_SKY_COLOR, DistanceFog, ViewParams, cull_counts};
 use boxel::voxel::{CHUNK_SIZE, LocalPos, MAX_BLOCK_COORD, MAX_CHUNK_COORD};
@@ -113,7 +122,7 @@ use boxel::world::visibility::{eye_in_open, visible_chunks};
 use boxel::world::{
     ChunkVisibility, SkyMap, VisibilityView, WorldContent, WorldStats, WorldSystems,
 };
-use boxel_demo::worldgen::{LitCaves, OverworldGenerator};
+use boxel_demo::worldgen::{Glass, GlassHouseWorld, GlassView, LitCaves, OverworldGenerator};
 use lod::LodPreset;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -156,6 +165,10 @@ usage: headless_world [options]
   --sky-sources        light the caves within 24 layers of the viewer with sky sources, the
                        demo's lit cavern: a down source of range 64 in every other column under
                        each roof (ADR 0061)
+  --stained-glass      colored sky on, and the demo's glass scene (a greenhouse under red glass,
+                       a room with a light blue window) on the ground of the viewer's column,
+                       with the viewer in the greenhouse (ADR 0064)
+  --clear-glass        the same scene with common glass (colored sky on): its clear twin
   --help               this text";
 
 /// The whole help: [`USAGE`], `--lod` and the world options.
@@ -210,6 +223,8 @@ struct Options {
     reopen: bool,
     /// `--sky-sources`.
     sky_sources: bool,
+    /// `--stained-glass` or `--clear-glass`.
+    glass: Option<Glass>,
 }
 
 /// `Ok(None)` for `--help`.
@@ -236,6 +251,7 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
         spans: false,
         reopen: false,
         sky_sources: false,
+        glass: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -288,6 +304,8 @@ fn parse_options(args: &[String]) -> Result<Option<Options>, String> {
             "--spans" => o.spans = true,
             "--reopen" => o.reopen = true,
             "--sky-sources" => o.sky_sources = true,
+            "--stained-glass" => o.glass = Some(Glass::Stained),
+            "--clear-glass" => o.glass = Some(Glass::Clear),
             "--camera" => {
                 let v = value()?;
                 let parts: Vec<f64> = v
@@ -345,6 +363,40 @@ fn find_cave(o: &mut Options, generator: &dyn WorldGenerator, seed: u64) -> Resu
     o.camera = Some([found.eye.x, found.eye.y, found.eye.z, yaw, pitch]);
     o.viewer_y = found.eye.y;
     Ok(format!("cave: {}", found.describe()))
+}
+
+/// `--stained-glass` and `--clear-glass`: `generator` with the glass scene on the ground of the
+/// viewer's column, the viewer moved into its greenhouse (`--camera`'s yaw and pitch stay
+/// unless none was given), and the `glass:` line.
+fn glass_house(
+    o: &mut Options,
+    generator: Arc<dyn WorldGenerator>,
+    registry: &BlockRegistry,
+    glass: Glass,
+) -> Result<(Arc<dyn WorldGenerator>, String), String> {
+    let [x, _, z, ..] = o
+        .camera
+        .unwrap_or([VIEWER.x, o.viewer_y, VIEWER.z, 0.0, 0.0]);
+    let column = (x.floor() as i64, z.floor() as i64);
+    let world = GlassHouseWorld::around(generator, registry, column, glass);
+    let house = world
+        .house
+        .as_ref()
+        .ok_or("--stained-glass: no ground under the viewer")?;
+    let camera = house.camera(GlassView::Greenhouse);
+    let look = o.camera.map_or([camera[3], camera[4]], |c| [c[3], c[4]]);
+    o.camera = Some([camera[0], camera[1], camera[2], look[0], look[1]]);
+    o.viewer_y = camera[1];
+    let f = house.floor;
+    let kind = match glass {
+        Glass::Stained => "stained",
+        Glass::Clear => "clear",
+    };
+    let line = format!(
+        "glass: {kind} floor={},{},{} eye={},{},{}",
+        f.x, f.y, f.z, camera[0], camera[1], camera[2]
+    );
+    Ok((Arc::new(world), line))
 }
 
 /// `--ao` values.
@@ -582,11 +634,39 @@ fn main() -> AppExit {
             }
         }
     }
+    // The demo blocks, then the source and the stained glass after them (every other id stays).
+    let registry = {
+        let mut b = boxel_demo::blocks::builder();
+        if options.sky_sources {
+            boxel_demo::blocks::add_sky_source(&mut b);
+        }
+        if options.glass.is_some() {
+            boxel_demo::blocks::add_stained_glass(&mut b);
+        }
+        Arc::new(b.build())
+    };
+    if options.sky_sources {
+        let layer = (options.viewer_y.floor() as i64) >> 5;
+        generator = Arc::new(LitCaves::around(generator, layer, 24));
+    }
+    if let Some(glass) = options.glass {
+        match glass_house(&mut options, generator, &registry, glass) {
+            Ok((world, line)) => {
+                println!("{line}");
+                generator = world;
+            }
+            Err(e) => {
+                eprintln!("headless_world: {e}");
+                return AppExit::from_code(1);
+            }
+        }
+    }
     let settings = WorldSettings {
         vertical_bounds: options.fixed_height.then(|| generator.vertical_chunks()),
         ao_policy: options.ao,
         light: options.light,
         idle_work: options.idle_work,
+        colored_sky: options.glass.is_some(),
         ..WorldSettings::default()
     };
     let wait = if options.hz > 0.0 {
@@ -617,13 +697,6 @@ fn main() -> AppExit {
         None
     };
     let lod_settings = options.lod.settings();
-    let registry = if options.sky_sources {
-        let layer = (options.viewer_y.floor() as i64) >> 5;
-        generator = Arc::new(LitCaves::around(generator, layer, 24));
-        Arc::new(boxel_demo::blocks::registry_with_sky_source())
-    } else {
-        Arc::new(boxel_demo::blocks::registry())
-    };
     // `--reopen`: the world is saved in memory from the start (no autosave: the close writes it).
     let reopen = if options.reopen {
         let backend = Arc::new(MemoryStore::new());
@@ -981,6 +1054,35 @@ fn beams_line(sky: &SkyMap, stats: &WorldStats) -> String {
     )
 }
 
+/// The `colored:` line: colored sky (ADR 0064), its light boxes and chunk lights, the meshes
+/// with tinted entries, those entries and the flattened ones (a tinted entry whose exact
+/// corners, which High draws, differ from what Low and Mid draw).
+fn colored_line(map: &ChunkMap, stats: &WorldStats, colored_sky: bool) -> String {
+    let (mut meshes, mut entries, mut flattened) = (0, 0, 0);
+    for (_, _, mesh) in map.ready_meshes() {
+        let t = mesh.tinted_entries as usize;
+        if t == 0 || t > mesh.palette.len() || t > mesh.tinted_exact.len() {
+            continue;
+        }
+        meshes += 1;
+        entries += t;
+        flattened += (0..t)
+            .filter(|&i| {
+                tinted_corners(mesh.palette[i])
+                    != tinted_exact_corners(mesh.palette[i], mesh.tinted_exact[i])
+            })
+            .count();
+    }
+    format!(
+        "colored: sky={} boxes={} padded={} chunk_light={} meshes={meshes} \
+         tinted_entries={entries} flattened={flattened}",
+        if colored_sky { "on" } else { "off" },
+        stats.colored_light_boxes,
+        stats.colored_padded,
+        stats.colored_chunk_light,
+    )
+}
+
 /// The `sky:` line: light paths, sky walks and the memory of the light caches.
 fn sky_line(map: &ChunkMap, sky: &SkyMap, stats: &WorldStats, light: bool) -> String {
     let cache: usize = map
@@ -1073,6 +1175,7 @@ fn drive(
             println!("{}", light_line(&map, settings.ao_policy));
             println!("{}", sky_line(&map, &sky, &stats, settings.light));
             println!("{}", beams_line(&sky, &stats));
+            println!("{}", colored_line(&map, &stats, settings.colored_sky));
             if run.options.cull
                 && let Some((transform, viewer)) = viewers.iter().next()
             {
